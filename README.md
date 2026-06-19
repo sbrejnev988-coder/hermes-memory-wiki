@@ -174,6 +174,8 @@ MEMORY_WIKI_LLM_PACK=0 python3 smoke_test.py
 ├── plugin.yaml              # Метаданные плагина (v1.4.0)
 ├── smoke_test.py            # End-to-end smoke suite
 ├── memory_wiki_cli.py       # Standalone CLI для maintenance
+├── embed_stub.py            # Embedding-сервер (:4000), character n-gram хеширование
+├── qdrant_stub.py           # Qdrant-совместимая векторная БД (:6333), JSON-хранилище
 ├── .gitignore               # Исключает runtime DB, бэкапы, секреты
 ├── LICENSE                  # MIT
 └── README.md
