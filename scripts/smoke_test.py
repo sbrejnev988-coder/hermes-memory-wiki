@@ -12,7 +12,7 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict
 
-PLUGIN = Path(__file__).resolve().parent / "__init__.py"
+PLUGIN = Path(__file__).resolve().parents[1] / "__init__.py"
 KEEP_HOME = os.environ.get("MEMORY_WIKI_KEEP_SMOKE_HOME") == "1"
 
 

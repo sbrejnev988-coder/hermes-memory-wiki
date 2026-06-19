@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict
 
-PLUGIN = Path(__file__).resolve().parent / "__init__.py"
+PLUGIN = Path(__file__).resolve().parents[1] / "__init__.py"
 
 
 def load_provider(home: str | None = None):
