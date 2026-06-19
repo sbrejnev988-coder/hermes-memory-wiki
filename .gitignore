@@ -1,16 +1,44 @@
+# Python cache
 __pycache__/
-*.pyc
-*.pyo
-backups/
-*.bak*
-.env
+*.py[cod]
 .pytest_cache/
+.mypy_cache/
+
+# Hermes/runtime memory data
+memory-wiki/
+memory_wiki.sqlite*
+*.sqlite
 *.sqlite3
-*.sqlite3-*
-dashboards/
+*.db
+*.db-*
+*.wal
+*.shm
+*.journal
 pages/
+dashboards/
 snapshots/
 spool/
 recovery/
 journal/
+journal-checkpoints/
+sync-bundles/
+
+# Local/private files
+.env
+*.env
+*.log
 logs/
+sessions/
+vault/
+secrets/
+backups/
+.patch_backups/
+*.bak*
+*.zip
+*.tar
+*.tar.gz
+
+# OS/editor
+.DS_Store
+.idea/
+.vscode/

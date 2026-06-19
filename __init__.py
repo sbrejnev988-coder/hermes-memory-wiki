@@ -170,7 +170,7 @@ MAX_RENDER_TOPICS = 250
 MIN_AUTO_INGEST_SCORE = 2
 MIN_EXPLICIT_INGEST_SCORE = 1
 CANONICAL_TOPICS = {
-    "preferences", "hermes", "memory-wiki", "server", "android", "openclaw", "proxy", "api", "telegram",
+    "preferences", "hermes", "memory-wiki", "server", "android", "exampleapp", "proxy", "api", "telegram",
     "config", "database", "github", "project-scoping", "secrets", "projects", "tasks", "lessons", "decisions",
     "operations", "bridge", "ibkr-zorro", "heart", "smoke", "general",
 }
@@ -227,7 +227,7 @@ SECRET_PATTERNS = [
     # `key=value` assignments.  Redact those before any recall/export.
     (re.compile(r"(?is)((?:password|passwd|pass|пароль)[\s\S]{0,240}?```(?:text|bash|sh)?\s*)((?=[A-Za-z0-9_@./+=\-]*\d)[A-Za-z0-9_@./+=\-]{8,})(\s*```)") , r"\1<PASSWORD_REDACTED>\3"),
     (re.compile(r"(?i)\b(password|passwd|pass|пароль)\s+(?!(?:auth(?:entication)?|disabled|enabled|login|logins|mode|modes|field|fields|value|values|manager|protected|vault|entry|entries|ssh|path|policy|required|only|is|are|was|were|есть|нет|доступ|аутентификация)\b)([A-Za-z0-9_@./+=\-]{8,})(?=\s|$|[.,;:!?\)\]])"), r"\1 <PASSWORD_REDACTED>"),
-    (re.compile(r"(?i)\b(root|Hermesusclaw|Hermes|madmax|xiaomi)\s+((?=[A-Za-z0-9_@./+=\-]*\d)[A-Za-z0-9_@./+=\-]{8,})(?=\s|$|[.,;:!?\)\]])"), r"\1 <CREDENTIAL_REDACTED>"),
+    (re.compile(r"(?i)\b(root|admin|user|service|hermes)\s+((?=[A-Za-z0-9_@./+=\-]*\d)[A-Za-z0-9_@./+=\-]{8,})(?=\s|$|[.,;:!?\)\]])"), r"\1 <CREDENTIAL_REDACTED>"),
     (re.compile(r"\b(?:sk|rk|pk|ak)-[A-Za-z0-9_\-]{16,}\b"), "<API_KEY_REDACTED>"),
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"), "<GITHUB_TOKEN_REDACTED>"),
     (re.compile(r"\bglpat-[A-Za-z0-9_\-]{16,}\b"), "<GITLAB_TOKEN_REDACTED>"),
@@ -521,7 +521,7 @@ def is_ephemeral_fragment(text: str) -> bool:
     if not s:
         return True
     low = s.lower()
-    if re.match(r"(?i)^(memory-wiki quality policy|secrets memory summary|server environment summary|telegram summary|proxy/api summary|openclaw summary|hermes operational memory summary|user workflow preferences summary|topic summary for )", s):
+    if re.match(r"(?i)^(memory-wiki quality policy|secrets memory summary|server environment summary|telegram summary|proxy/api summary|exampleapp summary|hermes operational memory summary|user workflow preferences summary|topic summary for )", s):
         return False
     if low.startswith(("tool results were processed", "[hermes proxy]", "{", "system note:", "previous turn was interrupted")):
         return True
@@ -617,7 +617,7 @@ def canonical_topic(topic: str, claim: str = "") -> str:
         return "memory-wiki"
     if "memory-wiki" in low_claim or "memory_wiki" in low_claim or "memory wiki" in low_claim:
         return "memory-wiki"
-    if "openclaw" in low: return "openclaw"
+    if "exampleapp" in low: return "exampleapp"
     if "telegram" in low or "bot token" in low: return "telegram"
     if "android" in low or "termux" in low or "proot" in low: return "android"
     if "sqlite" in low or "database" in low: return "database"
@@ -629,7 +629,7 @@ def infer_scope(text: str, source: str = "", topic: str = "") -> str:
     low = f"{text} {source} {topic}".lower()
     if source.startswith("turn:") or source in ("pre_compress",):
         if any(x in low for x in ("сейчас", "temporary", "this session", "текущ", "лог", "команду")): return "session"
-    if any(x in low for x in ("project", "workspace", "repo", "/workspace/", "openclaw", "memory-wiki", "проект")): return "project"
+    if any(x in low for x in ("project", "workspace", "repo", "/workspace/", "exampleapp", "memory-wiki", "проект")): return "project"
     if any(x in low for x in ("android", "termux", "proot", "server", "vps", "path", "installed", "порт", "port")): return "device"
     if any(x in low for x in ("user prefers", "пользователь предпочитает", "не надо", "do not", "never", "нравится")): return "user"
     return "global"
@@ -916,7 +916,7 @@ class MemoryWikiProvider(MemoryProvider):
             {"name":"memory_wiki_journal_status","description":"Inspect append-only JSONL journal health, hash chain and recent events.","parameters":P({"verify":{"type":"boolean","default":True},"limit":{"type":"integer","default":5}}, [])},
             {"name":"memory_wiki_journal_checkpoint","description":"Write a logical JSON checkpoint of SQLite tables for journal-based recovery. Secret values are redacted by default.","parameters":P({"name":{"type":"string","default":"manual"},"include_secret_values":{"type":"boolean","default":False}}, [])},
             {"name":"memory_wiki_semantic_status","description":"Check embedding (:4000) and Qdrant (:6333) health and point count.","parameters":P({}, [])},
-            {"name":"memory_wiki_reindex","description":"Re-index all active claims into Qdrant vector store.","parameters":P({"limit":{"type":"integer","default":0},"force":{"type":"boolean","default":false}}, [])},
+            {"name":"memory_wiki_reindex","description":"Re-index all active claims into Qdrant vector store.","parameters":P({"limit":{"type":"integer","default":0},"force":{"type":"boolean","default":False}}, [])},
             {"name":"memory_wiki_debug_search","description":"Search with full breakdown: FTS rank, vector rank, RRF score per claim.","parameters":P({"query":{"type":"string"},"limit":{"type":"integer","default":10},"topic":{"type":"string","default":""}}, ["query"])},
             {"name":"memory_wiki_compare_search","description":"Compare FTS-only vs vector-only vs hybrid retrieval.","parameters":P({"query":{"type":"string"},"limit":{"type":"integer","default":10},"topic":{"type":"string","default":""}}, ["query"])},
             {"name":"memory_wiki_query_mode","description":"Detect query type (technical/semantic/mixed) without searching.","parameters":P({"query":{"type":"string"}}, ["query"])},
@@ -2558,7 +2558,7 @@ class MemoryWikiProvider(MemoryProvider):
             ("android", ("android","termux","андроид","apk","oauth","proot")),
             ("hermes", ("hermes","plugin","tool registry","плагин","память")),
             ("telegram", ("telegram","bot token","tg_","чат","канал")),
-            ("openclaw", ("openclaw","openclaw.json","/home/.openclaw")),
+            ("exampleapp", ("exampleapp","exampleapp.json","/home/.exampleapp")),
             ("server", ("vps","server","systemd","ssh","nginx","port","health","сервер","сервис")),
             ("proxy", ("proxy","прокси","gateway","deepseek")),
             ("api", ("api","openai","model","gpt","claude","endpoint")),
@@ -2998,7 +2998,7 @@ class MemoryWikiProvider(MemoryProvider):
             (('android','termux','phone','proot','андроид'), 'android'),
             (('hermes','plugin','плагин','tool'), 'hermes'),
             (('сервер','server','ssh','vps','service','systemd'), 'server'),
-            (('рустем','rustem','openclaw'), 'openclaw'),
+            (('demo','demo','exampleapp'), 'exampleapp'),
             (('telegram','телеграм','bot','бот'), 'telegram'),
             (('preference','preferences','предпочитает','пользователь'), 'preferences'),
         ]
