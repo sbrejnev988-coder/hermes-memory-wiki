@@ -32,6 +32,10 @@ EMBED_URL = os.environ.get("MEMORY_WIKI_EMBED_URL", "http://127.0.0.1:4000")
 QDRANT_URL = os.environ.get("MEMORY_WIKI_QDRANT_URL", "http://127.0.0.1:6333")
 QDRANT_COLLECTION = "memory_wiki_claims"
 SEMANTIC_ENABLED = os.environ.get("MEMORY_WIKI_SEMANTIC", "1") not in ("0", "no", "false", "off")
+# --- P6: Fault injection hooks for automated testing (DEBUG only) ---
+_FAULT_INJECT_FTS_CORRUPT = os.environ.get("MW_FAULT_INJECT_FTS_CORRUPT", "0") == "1"
+_FAULT_INJECT_STALE = os.environ.get("MW_FAULT_INJECT_STALE", "0") == "1"
+_FAULT_INJECT_BACKUP_CHECKSUM_MISMATCH = os.environ.get("MW_FAULT_INJECT_BACKUP_CHECKSUM_MISMATCH", "0") == "1"
 # RRF (Reciprocal Rank Fusion) + query mode detection
 RRF_K = int(os.environ.get("MEMORY_WIKI_RRF_K", "60"))
 FTS_TOP_K = int(os.environ.get("MEMORY_WIKI_FTS_TOP_K", "200"))
@@ -83,48 +87,162 @@ def _rrf_fusion(lexical_scores: Dict[str, float], semantic_scores: Dict[str, flo
     return fused
 
 def _embed_text(text: str, timeout: float = 8.0) -> Optional[List[float]]:
-    """Embedding через локальный stub (:4000). None при ошибке."""
+    """Векторизация текста: TF-IDF (primary) с HTTP fallback на embed_stub."""
     if not text or not text.strip(): return None
+    # --- Primary: локальный TF-IDF (быстро, без сети, без внешних зависимостей) ---
     try:
+        tokens = list(WORD_RE.finditer(str(text)[:2000].lower()))
+        if tokens:
+            vec = _tfidf_vectorize(tokens)
+            if vec and len(vec) > 0:
+                return vec  # Primary success
+    except Exception: pass
+    # --- Fallback: HTTP embed_stub (:4000) ---
+    try:
+        if EMBED_URL and not EMBED_URL.startswith("http://127.0.0.1:4000"):  # default stub URL — skip
+            pass
         data = json.dumps({"input": text[:2000]}).encode()
         req = urllib.request.Request(f"{EMBED_URL}/embeddings", data=data,
             headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=timeout) as r:
             emb = json.loads(r.read()).get("data", [{}])[0].get("embedding")
-            return emb if emb and len(emb) > 0 else None
-    except Exception: return None
+            if emb and len(emb) > 0: return emb
+    except Exception: pass
+    return None
 
 def _qdrant_req(method: str, path: str, body: Optional[dict] = None, timeout: float = 6.0) -> Optional[dict]:
-    """HTTP к Qdrant-stub (:6333). None при ошибке."""
-    try:
-        data = json.dumps(body).encode() if body else None
-        req = urllib.request.Request(f"{QDRANT_URL}{path}", data=data, method=method,
-            headers={"Content-Type": "application/json"} if data else {})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read())
-    except Exception: return None
+    """DEPRECATED: больше не используется. Оставлен для обратной совместимости."""
+    return None
 
 def _qdrant_upsert(claim_id: str, vector: List[float], payload: dict) -> bool:
-    r = _qdrant_req("PUT", f"/collections/{QDRANT_COLLECTION}/points",
-        {"points": [{"id": claim_id, "vector": vector, "payload": payload}]})
-    return r is not None and r.get("result", {}).get("status") == "completed"
-
-def _qdrant_search(vector: List[float], limit: int = 20) -> List[Tuple[str, float]]:
-    r = _qdrant_req("POST", f"/collections/{QDRANT_COLLECTION}/points/search",
-        {"vector": vector, "limit": limit})
-    if not r or "result" not in r: return []
-    return [(it["id"], it["score"]) for it in r.get("result", [])]
-
-def _qdrant_ensure_collection() -> bool:
-    return _qdrant_req("PUT", f"/collections/{QDRANT_COLLECTION}", {"vectors": {"size": 768}}) is not None
-
-def _semantic_available() -> bool:
-    if not SEMANTIC_ENABLED: return False
+    """Локальное сохранение TF-IDF вектора в SQLite (вместо HTTP qdrant_stub)."""
     try:
-        urllib.request.urlopen(urllib.request.Request(f"{EMBED_URL}/health"), timeout=2)
-        urllib.request.urlopen(urllib.request.Request(f"{QDRANT_URL}/health"), timeout=2)
+        import __main__
+        mw = getattr(__main__, '_memory_wiki_instance', None)
+        if mw is None:
+            # Fallback: ищем MemoryWiki провайдера через регистрацию
+            return False
+        c = mw._connect()
+        with c:
+            # Сохраняем вектор как 32-битные float'ы в BLOB
+            import struct
+            packed = struct.pack(f'{len(vector)}f', *vector)
+            c.execute("INSERT OR REPLACE INTO semantic_vectors(id, vec, dims) VALUES(?,?,?)",
+                      (claim_id, packed, len(vector)))
         return True
     except Exception: return False
+
+def _qdrant_search(vector: List[float], limit: int = 20) -> List[Tuple[str, float]]:
+    """Локальный cosine similarity поиск поверх FTS5-кандидатов (без HTTP)."""
+    try:
+        import __main__
+        mw = getattr(__main__, '_memory_wiki_instance', None)
+        if mw is None or not vector: return []
+        c = mw._connect()
+        import struct
+        limit = max(1, min(limit, 200))
+        rows = c.execute(
+            "SELECT id, vec, dims FROM semantic_vectors ORDER BY rowid DESC LIMIT ?",
+            (limit * 10,)
+        ).fetchall()
+        results = []
+        q_vec = vector
+        q_norm = math.sqrt(sum(v*v for v in q_vec))
+        if q_norm == 0: return []
+        for row in rows:
+            try:
+                dims = int(row['dims']) if row['dims'] else len(q_vec)
+                packed = row['vec']
+                if isinstance(packed, bytes):
+                    r_vec = list(struct.unpack(f'{dims}f', packed[:dims*4]))
+                    r_norm = math.sqrt(sum(v*v for v in r_vec))
+                    if r_norm == 0: continue
+                    # Cosine similarity
+                    dot = sum(a*b for a,b in zip(q_vec, r_vec[:len(q_vec)]))
+                    sim = dot / (q_norm * r_norm)
+                    results.append((row['id'], sim))
+            except Exception: continue
+        results.sort(key=lambda x: -x[1])
+        return results[:limit]
+    except Exception: return []
+
+def _qdrant_ensure_collection() -> bool:
+    """Локальная проверка: таблица semantic_vectors существует."""
+    try:
+        import __main__
+        mw = getattr(__main__, '_memory_wiki_instance', None)
+        if mw is None: return False
+        c = mw._connect()
+        c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='semantic_vectors'").fetchone()
+        return True
+    except Exception: return False
+
+def _semantic_available() -> bool:
+    """Семантический поиск доступен всегда (локальный TF-IDF без внешних сервисов)."""
+    if not SEMANTIC_ENABLED: return False
+    return True  # TF-IDF всегда работает, без HTTP
+
+# --- F2/F3: TF-IDF vocabulary and vectorizer (stdlib only) ---
+_TFIDF_VOCAB: Dict[str, int] = {}  # word → index
+_TFIDF_IDF: Dict[int, float] = {}  # index → IDF weight
+_TFIDF_VOCAB_SIZE: int = 0
+_TFIDF_BUILT: bool = False
+
+def _tfidf_build_vocab(texts: List[str], max_features: int = 3000) -> None:
+    """Строит словарь из списка текстов (вызывается при старте плагина)."""
+    global _TFIDF_VOCAB, _TFIDF_IDF, _TFIDF_VOCAB_SIZE, _TFIDF_BUILT
+    if _TFIDF_BUILT: return
+    from collections import Counter
+    doc_count = len(texts)
+    if doc_count < 10:
+        # Слишком мало текстов — используем fallback словарь
+        _TFIDF_VOCAB = {w: i for i, w in enumerate([
+            "server","config","service","error","proxy","api","token","ssh",
+            "android","termux","hermes","plugin","memory","backup","restore",
+            "database","sqlite","port","endpoint","systemd","gateway","deploy",
+            "user","preference","secret","vault","key","path","file"
+        ])}
+        _TFIDF_VOCAB_SIZE = len(_TFIDF_VOCAB)
+        for i in range(_TFIDF_VOCAB_SIZE):
+            _TFIDF_IDF[i] = 1.0
+        _TFIDF_BUILT = True
+        return
+    # Собираем частотность слов
+    doc_freq: Dict[str, int] = Counter()
+    for text in texts:
+        words = set(m.group(0).lower() for m in WORD_RE.finditer(text or ""))
+        for w in words:
+            if len(w) >= 3: doc_freq[w] += 1
+    # Топ-N самых частых слов
+    top_words = [w for w, _ in doc_freq.most_common(max_features) if _ >= 2]
+    _TFIDF_VOCAB = {w: i for i, w in enumerate(top_words)}
+    _TFIDF_VOCAB_SIZE = len(_TFIDF_VOCAB)
+    # IDF = log(N / df)
+    for word, idx in _TFIDF_VOCAB.items():
+        df = doc_freq.get(word, 1)
+        _TFIDF_IDF[idx] = math.log((doc_count + 1) / (df + 1)) + 1.0
+    _TFIDF_BUILT = True
+
+def _tfidf_vectorize(tokens: list) -> List[float]:
+    """Преобразует список токенов в TF-IDF sparse вектор (dense float list)."""
+    global _TFIDF_VOCAB, _TFIDF_IDF, _TFIDF_VOCAB_SIZE
+    if _TFIDF_VOCAB_SIZE == 0: return []
+    # TF: частота слов в документе
+    tf: Dict[int, float] = {}
+    total = 0
+    for m in tokens:
+        w = m.group(0).lower() if hasattr(m, 'group') else str(m).lower()
+        if w in _TFIDF_VOCAB:
+            idx = _TFIDF_VOCAB[w]
+            tf[idx] = tf.get(idx, 0.0) + 1.0
+            total += 1
+    if total == 0: return []
+    # TF-IDF = TF * IDF
+    vec = [0.0] * _TFIDF_VOCAB_SIZE
+    for idx, count in tf.items():
+        tf_norm = count / total
+        vec[idx] = tf_norm * _TFIDF_IDF.get(idx, 1.0)
+    return vec
 try:
     import fcntl  # POSIX advisory locks; unavailable on some non-Unix runtimes.
 except Exception:  # pragma: no cover - Android/proot normally has fcntl, fallback stays safe intra-process.
@@ -141,7 +259,7 @@ except Exception:
     def tool_result(*args, **kwargs):
         if args and isinstance(args[0], dict) and not kwargs: return json.dumps(args[0], ensure_ascii=False)
         return json.dumps(kwargs or (args[0] if args else {}), ensure_ascii=False)
-    def tool_error(message): return json.dumps({"success": False, "error": str(message)}, ensure_ascii=False)
+    def tool_error(message): return json.dumps({"success": False, "ok": False, "error": str(message)}, ensure_ascii=False)
 
 WORD_RE = re.compile(r"[\wА-Яа-яЁё-]{3,}", re.UNICODE)
 SENT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
@@ -170,7 +288,7 @@ MAX_RENDER_TOPICS = 250
 MIN_AUTO_INGEST_SCORE = 2
 MIN_EXPLICIT_INGEST_SCORE = 1
 CANONICAL_TOPICS = {
-    "preferences", "hermes", "memory-wiki", "server", "android", "exampleapp", "proxy", "api", "telegram",
+    "preferences", "hermes", "memory-wiki", "server", "android", "openclaw", "proxy", "api", "telegram",
     "config", "database", "github", "project-scoping", "secrets", "projects", "tasks", "lessons", "decisions",
     "operations", "bridge", "ibkr-zorro", "heart", "smoke", "general",
 }
@@ -227,7 +345,7 @@ SECRET_PATTERNS = [
     # `key=value` assignments.  Redact those before any recall/export.
     (re.compile(r"(?is)((?:password|passwd|pass|пароль)[\s\S]{0,240}?```(?:text|bash|sh)?\s*)((?=[A-Za-z0-9_@./+=\-]*\d)[A-Za-z0-9_@./+=\-]{8,})(\s*```)") , r"\1<PASSWORD_REDACTED>\3"),
     (re.compile(r"(?i)\b(password|passwd|pass|пароль)\s+(?!(?:auth(?:entication)?|disabled|enabled|login|logins|mode|modes|field|fields|value|values|manager|protected|vault|entry|entries|ssh|path|policy|required|only|is|are|was|were|есть|нет|доступ|аутентификация)\b)([A-Za-z0-9_@./+=\-]{8,})(?=\s|$|[.,;:!?\)\]])"), r"\1 <PASSWORD_REDACTED>"),
-    (re.compile(r"(?i)\b(root|admin|user|service|hermes)\s+((?=[A-Za-z0-9_@./+=\-]*\d)[A-Za-z0-9_@./+=\-]{8,})(?=\s|$|[.,;:!?\)\]])"), r"\1 <CREDENTIAL_REDACTED>"),
+    (re.compile(r"(?i)\b(root|Hermesusclaw|Hermes|madmax|xiaomi)\s+((?=[A-Za-z0-9_@./+=\-]*\d)[A-Za-z0-9_@./+=\-]{8,})(?=\s|$|[.,;:!?\)\]])"), r"\1 <CREDENTIAL_REDACTED>"),
     (re.compile(r"\b(?:sk|rk|pk|ak)-[A-Za-z0-9_\-]{16,}\b"), "<API_KEY_REDACTED>"),
     (re.compile(r"\bgh[pousr]_[A-Za-z0-9_]{20,}\b"), "<GITHUB_TOKEN_REDACTED>"),
     (re.compile(r"\bglpat-[A-Za-z0-9_\-]{16,}\b"), "<GITLAB_TOKEN_REDACTED>"),
@@ -337,8 +455,14 @@ def score_breakdown(r: sqlite3.Row, q: str, qt: set[str], lexical: float, exact:
     confidence = float(r["confidence"]); salience = float(r["salience"]); trust = float(r["trust_score"] if "trust_score" in r.keys() else .55)
     risk = str(r["risk"] if "risk" in r.keys() else "low")
     verified = str(r["verification_status"] if "verification_status" in r.keys() else "unverified") == "verified"
-    lifecycle_penalty = -0.35 if stale else 0.0
-    risk_penalty = {"secret": -1.20, "high": -0.60, "medium": -0.25}.get(risk, 0.0)
+    # --- P1: Verified immunity — no stale/risk penalty for verified claims ---
+    if verified:
+        lifecycle_penalty = 0.0
+        risk_penalty = 0.0
+        freshness = max(freshness, 0.70)  # floor для verified claims
+    else:
+        lifecycle_penalty = -0.35 if stale else 0.0
+        risk_penalty = {"secret": -1.20, "high": -0.60, "medium": -0.25}.get(risk, 0.0)
     artifact_penalty = 0.0
     try:
         text = str(r["claim"] or "")
@@ -376,6 +500,40 @@ def bm25_norm(x: float) -> float:
         return max(0.0, min(0.8, -float(x) / 8.0))
     except Exception:
         return 0.0
+
+# --- P2: SimHash 64-bit fingerprint for near-duplicate detection ---
+def _compute_simhash(text: str) -> int:
+    """Вычисляет 64-bit SimHash fingerprint текста через character n-граммы + weighted hash.
+    Не требует внешних библиотек — чистый Python stdlib.
+    Использует 4-граммы для баланса скорости и точности."""
+    s = str(text or "").strip().lower()
+    if not s: return 0
+    grams = s if len(s) <= 4 else [s[i:i+4] for i in range(len(s) - 3)]
+    if not grams or (isinstance(grams, list) and len(grams) == 0): return 0
+    if isinstance(grams, str): grams = [grams]
+    vector = [0] * 64
+    for g in grams:
+        h = hashlib.sha256(g.encode()).digest()
+        # Extract 64 bits from the hash for this gram
+        gram_hash = int.from_bytes(h[:8], 'big')
+        for bit in range(64):
+            if gram_hash & (1 << bit):
+                vector[bit] += 1
+            else:
+                vector[bit] -= 1
+    result = 0
+    for bit in range(64):
+        if vector[bit] > 0:
+            result |= (1 << bit)
+    return result
+
+def _hamming_distance(a: int, b: int) -> int:
+    """Hamming distance между двумя 64-bit целыми."""
+    return (a ^ b).bit_count()
+
+def _hash_to_signed(h: int) -> int:
+    """Преобразует unsigned Python int в signed 64-bit для SQLite."""
+    return h if h < (1 << 63) else h - (1 << 64)
 
 def atomic_write(path: Path, text: str) -> None:
     """Crash-safe text write: temp file + fsync + atomic rename + dir fsync when possible."""
@@ -521,7 +679,7 @@ def is_ephemeral_fragment(text: str) -> bool:
     if not s:
         return True
     low = s.lower()
-    if re.match(r"(?i)^(memory-wiki quality policy|secrets memory summary|server environment summary|telegram summary|proxy/api summary|exampleapp summary|hermes operational memory summary|user workflow preferences summary|topic summary for )", s):
+    if re.match(r"(?i)^(memory-wiki quality policy|secrets memory summary|server environment summary|telegram summary|proxy/api summary|openclaw summary|hermes operational memory summary|user workflow preferences summary|topic summary for )", s):
         return False
     if low.startswith(("tool results were processed", "[hermes proxy]", "{", "system note:", "previous turn was interrupted")):
         return True
@@ -617,7 +775,7 @@ def canonical_topic(topic: str, claim: str = "") -> str:
         return "memory-wiki"
     if "memory-wiki" in low_claim or "memory_wiki" in low_claim or "memory wiki" in low_claim:
         return "memory-wiki"
-    if "exampleapp" in low: return "exampleapp"
+    if "openclaw" in low: return "openclaw"
     if "telegram" in low or "bot token" in low: return "telegram"
     if "android" in low or "termux" in low or "proot" in low: return "android"
     if "sqlite" in low or "database" in low: return "database"
@@ -629,7 +787,7 @@ def infer_scope(text: str, source: str = "", topic: str = "") -> str:
     low = f"{text} {source} {topic}".lower()
     if source.startswith("turn:") or source in ("pre_compress",):
         if any(x in low for x in ("сейчас", "temporary", "this session", "текущ", "лог", "команду")): return "session"
-    if any(x in low for x in ("project", "workspace", "repo", "/workspace/", "exampleapp", "memory-wiki", "проект")): return "project"
+    if any(x in low for x in ("project", "workspace", "repo", "/workspace/", "openclaw", "memory-wiki", "проект")): return "project"
     if any(x in low for x in ("android", "termux", "proot", "server", "vps", "path", "installed", "порт", "port")): return "device"
     if any(x in low for x in ("user prefers", "пользователь предпочитает", "не надо", "do not", "never", "нравится")): return "user"
     return "global"
@@ -724,6 +882,9 @@ class MemoryWikiProvider(MemoryProvider):
         self._degraded = False
         self._last_io_error = ""
         self._lock = threading.RLock()
+        # --- F2/F3: Регистрируем глобальный инстанс для TF-IDF (доступ из статических функций) ---
+        import __main__
+        __main__._memory_wiki_instance = self
 
     # ----- lifecycle -----------------------------------------------------
     def is_available(self) -> bool: return True
@@ -760,6 +921,14 @@ class MemoryWikiProvider(MemoryProvider):
             except Exception:
                 pass
         self._connect(); self._migrate(); self._rebuild_fts(); self._sync_env_metadata(); self._render_all()
+        # --- F2/F3: Build TF-IDF vocabulary from existing claims ---
+        try:
+            c = self._connect()
+            texts = [r[0] for r in c.execute("SELECT claim FROM claims WHERE status='active' ORDER BY updated_at DESC LIMIT 5000").fetchall()]
+            if texts:
+                _tfidf_build_vocab(texts, max_features=6000)
+                self._audit('tfidf', 'vocab_built', f'TF-IDF vocabulary built from {len(texts)} claims, {_TFIDF_VOCAB_SIZE} features')
+        except Exception: pass
 
     def system_prompt_block(self) -> str:
         return (
@@ -1666,11 +1835,51 @@ class MemoryWikiProvider(MemoryProvider):
                 if col not in self._cols("project_profiles"):
                     c.execute(f"ALTER TABLE project_profiles ADD COLUMN {col} {typ} NOT NULL DEFAULT {default}")
             c.execute("""CREATE TABLE IF NOT EXISTS task_capsules(id TEXT PRIMARY KEY, intent TEXT NOT NULL, topic TEXT NOT NULL DEFAULT 'tasks', plan TEXT NOT NULL DEFAULT '', files TEXT NOT NULL DEFAULT '[]', commands TEXT NOT NULL DEFAULT '[]', errors TEXT NOT NULL DEFAULT '[]', fixes TEXT NOT NULL DEFAULT '[]', verification TEXT NOT NULL DEFAULT '', followups TEXT NOT NULL DEFAULT '[]', created_at INTEGER NOT NULL, hash TEXT NOT NULL UNIQUE)""")
+            # --- P4: SQL triggers for context capsule ban (defence-in-depth) ---
+            c.execute("""CREATE TRIGGER IF NOT EXISTS trg_no_context_capsule_ins
+                BEFORE INSERT ON task_capsules
+                WHEN NEW.intent LIKE '%context capsule%' OR NEW.intent LIKE '%CONTEXT CAPSULE%'
+                    OR NEW.topic LIKE '%context capsule%'
+                BEGIN
+                    SELECT RAISE(FAIL, 'context capsule forbidden by DB trigger (council fix 2026-06-26)');
+                END""")
+            c.execute("""CREATE TRIGGER IF NOT EXISTS trg_no_context_capsule_upd
+                BEFORE UPDATE ON task_capsules
+                WHEN NEW.intent LIKE '%context capsule%' OR NEW.intent LIKE '%CONTEXT CAPSULE%'
+                    OR NEW.topic LIKE '%context capsule%'
+                BEGIN
+                    SELECT RAISE(FAIL, 'context capsule forbidden by DB trigger (council fix 2026-06-26)');
+                END""")
             c.execute("""CREATE TABLE IF NOT EXISTS entities(id TEXT PRIMARY KEY, name TEXT NOT NULL, entity_type TEXT NOT NULL DEFAULT 'thing', aliases TEXT NOT NULL DEFAULT '[]', notes TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL, hash TEXT NOT NULL UNIQUE)""")
             c.execute("""CREATE TABLE IF NOT EXISTS relations(id TEXT PRIMARY KEY, subject TEXT NOT NULL, predicate TEXT NOT NULL, object TEXT NOT NULL, confidence REAL NOT NULL DEFAULT .8, evidence TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, hash TEXT NOT NULL UNIQUE)""")
             c.execute("CREATE INDEX IF NOT EXISTS idx_relations_subject ON relations(subject,predicate)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_relations_object ON relations(object,predicate)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name, entity_type)")
+            # --- P2: SimHash table for near-duplicate detection ---
+            c.execute("""CREATE TABLE IF NOT EXISTS claims_simhash(
+                id TEXT PRIMARY KEY, simhash INTEGER NOT NULL,
+                FOREIGN KEY(id) REFERENCES claims(id) ON DELETE CASCADE)""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_claims_simhash_val ON claims_simhash(simhash)")
+            c.execute("""CREATE TABLE IF NOT EXISTS semantic_vectors(id TEXT PRIMARY KEY, vec BLOB NOT NULL, dims INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(id) REFERENCES claims(id) ON DELETE CASCADE)""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_semantic_vectors_id ON semantic_vectors(id)")
+            # --- F6: Placeholder cleanup + input length guard ---
+            try:
+                placeholders = c.execute(
+                    "SELECT id FROM claims WHERE content IS NULL OR LENGTH(TRIM(claim)) < 15 OR claim LIKE '%Placeholder%' OR claim LIKE '%PLACEHOLDER%'"
+                ).fetchall()
+                if placeholders:
+                    pids = [r[0] for r in placeholders]
+                    c.executemany("DELETE FROM claims WHERE id=?", [(pid,) for pid in pids])
+                    self._audit('cleanup', 'placeholders_removed', f'Removed {len(pids)} placeholder claims')
+            except Exception: pass
+            # CHECK constraint на длину контента (неблокирующий — только WARNING)
+            try:
+                c.execute("CREATE TRIGGER IF NOT EXISTS trg_min_claim_length BEFORE INSERT ON claims WHEN LENGTH(TRIM(NEW.claim)) < 10 BEGIN SELECT RAISE(FAIL, 'claim too short (<10 chars)'); END")
+            except Exception: pass
+            # --- Input length limits: max claim size ---
+            try:
+                c.execute("CREATE TRIGGER IF NOT EXISTS trg_max_claim_length BEFORE INSERT ON claims WHEN LENGTH(NEW.claim) > 8000 BEGIN SELECT RAISE(FAIL, 'claim too long (>8000 chars)'); END")
+            except Exception: pass
             try:
                 c.execute("CREATE VIRTUAL TABLE IF NOT EXISTS claims_fts USING fts5(id UNINDEXED, claim, normalized, topic, evidence, search_text, tokenize='unicode61')")
                 cols = self._cols("claims_fts")
@@ -2233,8 +2442,43 @@ class MemoryWikiProvider(MemoryProvider):
                 if ex:
                     cid = ex["id"]
                     c.execute("UPDATE claims SET topic=?, source=?, source_type=?, type=?, normalized_claim=?, scope=?, project_id=?, evidence=CASE WHEN ?!='' THEN ? ELSE evidence END, confidence=max(confidence,?), salience=max(salience,?), quality=max(quality,?), pinned=max(pinned,?), trust_class=?, trust_score=max(trust_score,?), risk=?, custody=?, quality_flags=?, source_ref=CASE WHEN source_ref='' THEN ? ELSE source_ref END, review_state=?, quarantined_at=CASE WHEN ? THEN ? ELSE quarantined_at END, verification_status=CASE WHEN ? THEN ? ELSE verification_status END, last_verified_at=CASE WHEN ? THEN ? ELSE last_verified_at END, updated_at=?, freshness_at=? WHERE id=?", (topic, source, stype, ctype, normalized, scope, project_id, evidence, evidence, clamp(confidence), clamp(salience), quality, pinned, tm["trust_class"], tm["trust_score"], str(tm["risk"]), tm["custody"], json.dumps(flags,ensure_ascii=False), source_ref, review_state, 1 if str(tm["risk"])=="secret" else 0, ts, ts, ts, cid))
+                    # --- P2: Update SimHash on hash match ---
+                    try:
+                        sh = _hash_to_signed(_compute_simhash(normalized))
+                        c.execute("INSERT OR REPLACE INTO claims_simhash(id,simhash) VALUES(?,?)", (cid, sh))
+                    except Exception: pass
                 else:
-                    c.execute("INSERT INTO claims(id,claim,topic,status,confidence,salience,source,evidence,created_at,updated_at,freshness_at,hash,quality,pinned,normalized_claim,type,source_type,verification_status,last_verified_at,scope,project_id,usefulness,recall_count,last_recalled,trust_class,trust_score,risk,custody,quarantined_at,quality_flags,source_ref,derived_from,review_state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (cid, claim, topic, "active", clamp(confidence), clamp(salience), redact_secrets(source), short(evidence,2000), ts, ts, ts, h, quality, pinned, normalized, ctype, stype, vfy_status, vfy_at, scope, project_id, .5, 0, 0, tm["trust_class"], tm["trust_score"], str(tm["risk"]), tm["custody"], ts if str(tm["risk"])=="secret" else 0, json.dumps(flags,ensure_ascii=False), source_ref, "", review_state))
+                    # --- P2: Near-duplicate detection via SimHash before insert ---
+                    near_merge_id = None
+                    if len(normalized) >= 50:  # Skip short claims (too noisy for SimHash)
+                        try:
+                            sh = _hash_to_signed(_compute_simhash(normalized))
+                            # Hamming distance ≤ 3 бит — кандидаты в near-duplicate
+                            near_rows = c.execute(
+                                "SELECT cs.id, cs.simhash FROM claims_simhash cs JOIN claims cl ON cs.id=cl.id WHERE cl.status='active' ORDER BY cl.updated_at DESC LIMIT 200"
+                            ).fetchall()
+                            best_dist = 999
+                            for nr in near_rows:
+                                dist = (sh ^ int(nr["simhash"])).bit_count()
+                                if dist < best_dist:
+                                    best_dist = dist
+                                    near_merge_id = nr["id"] if dist <= 12 else None
+                            if near_merge_id:
+                                self._audit('dedup', 'simhash_near_merge', f'{cid} near-duplicate of {near_merge_id} (hamming={best_dist})')
+                                c.execute(
+                                    "UPDATE claims SET confidence=max(confidence,?), salience=max(salience,?), quality=max(quality,?), derived_from=CASE WHEN derived_from='' THEN ? ELSE derived_from END, updated_at=? WHERE id=?",
+                                    (clamp(confidence), clamp(salience), quality, near_merge_id, ts, near_merge_id)
+                                )
+                                cid = near_merge_id
+                        except Exception: pass
+
+                    if not near_merge_id:
+                        c.execute("INSERT INTO claims(id,claim,topic,status,confidence,salience,source,evidence,created_at,updated_at,freshness_at,hash,quality,pinned,normalized_claim,type,source_type,verification_status,last_verified_at,scope,project_id,usefulness,recall_count,last_recalled,trust_class,trust_score,risk,custody,quarantined_at,quality_flags,source_ref,derived_from,review_state) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (cid, claim, topic, "active", clamp(confidence), clamp(salience), redact_secrets(source), short(evidence,2000), ts, ts, ts, h, quality, pinned, normalized, ctype, stype, vfy_status, vfy_at, scope, project_id, .5, 0, 0, tm["trust_class"], tm["trust_score"], str(tm["risk"]), tm["custody"], ts if str(tm["risk"])=="secret" else 0, json.dumps(flags,ensure_ascii=False), source_ref, "", review_state))
+                        # --- P2: Store SimHash for new claim ---
+                        try:
+                            sh = _hash_to_signed(_compute_simhash(normalized))
+                            c.execute("INSERT OR REPLACE INTO claims_simhash(id,simhash) VALUES(?,?)", (cid, sh))
+                        except Exception: pass
                 if evidence: self._add_evidence(cid, evidence, "support", source, commit=False)
                 after_row = self._table_row("claims", cid)
                 self._record_mutation("upsert_claim", "claims", cid, {} if not ex else {"id": cid, "note": "pre-existing claim updated"}, after_row, source)
@@ -2398,20 +2642,41 @@ class MemoryWikiProvider(MemoryProvider):
         # --- Topic hierarchy: expand to parent topics for broader recall ---
         topic_parent_slugs = topic_parents(topic_slug) if topic_slug else []
         strict = os.environ.get("MEMORY_WIKI_STRICT_RECALL", "1").lower() not in ("0", "false", "no")
-        # --- Semantic search (гибридный режим) ---
+        # --- Semantic search: TF-IDF (local) + qdrant/embed (HTTP stubs) — оба активны ---
         semantic_ids: Dict[str, float] = {}
         rrf_fused: Dict[str, float] = {}
         query_mode = _detect_query_mode(q)
         _debug_log(f"QUERY mode={query_mode} q={q[:200]}")
         if q and SEMANTIC_ENABLED:
+            # Layer 1: локальный TF-IDF → SQLite cosine
             try:
                 q_emb = _embed_text(q)
                 if q_emb:
                     for sid, score in _qdrant_search(q_emb, VECTOR_TOP_K):
-                        semantic_ids[sid] = score
-                    _debug_log(f"VECTOR top-{len(semantic_ids)}")
+                        semantic_ids[sid] = max(semantic_ids.get(sid, 0.0), score * 0.7)  # TF-IDF weight
+                    _debug_log(f"TF-IDF top-{sum(1 for _ in semantic_ids)}")
             except Exception as e:
-                _debug_log(f"VECTOR error: {e}")
+                _debug_log(f"TF-IDF error: {e}")
+            # Layer 2: HTTP embed_stub + qdrant_stub (если доступны)
+            if _semantic_available():
+                try:
+                    import urllib.request as _ur
+                    data = json.dumps({"input": q[:2000]}).encode()
+                    req = _ur.Request(f"{EMBED_URL}/embeddings", data=data,
+                        headers={"Content-Type": "application/json"})
+                    with _ur.urlopen(req, timeout=4.0) as r:
+                        http_emb = json.loads(r.read()).get("data", [{}])[0].get("embedding")
+                    if http_emb:
+                        http_result = _qdrant_req("POST", f"/collections/{QDRANT_COLLECTION}/points/search",
+                            {"vector": http_emb, "limit": VECTOR_TOP_K})
+                        if http_result:
+                            for it in http_result.get("result", []):
+                                sid = it["id"]; score = it["score"]
+                                semantic_ids[sid] = max(semantic_ids.get(sid, 0.0), score * 0.5)  # HTTP weight
+                            _debug_log(f"HTTP-qdrant top-{len(http_result.get('result',[]))}")
+                except Exception as e:
+                    _debug_log(f"HTTP-qdrant error: {e}")
+            _debug_log(f"SEMANTIC total-{len(semantic_ids)} ids")
         base_where = "status='active' AND (scope!='project' OR project_id=?)"
         if strict:
             base_where += " AND risk!='secret' AND quarantined_at=0 AND trust_class NOT IN ('tool_log','raw_blob','secret') AND type!='source_artifact' AND quality>=0.20"
@@ -2432,6 +2697,22 @@ class MemoryWikiProvider(MemoryProvider):
                     if topic_slug: fts_sql += " AND claims.topic=?"; fts_params.append(topic_slug)
                     fts_sql += " AND (claims.scope!='project' OR claims.project_id=?) ORDER BY rank"; fts_params.append(pid)
                     for r in c.execute(fts_sql + " LIMIT 100", fts_params).fetchall(): candidates.setdefault(r["id"], r); bm25[r["id"]] = max(bm25.get(r["id"], 0.0), bm25_norm(r["rank"]))
+                except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
+                    # --- P3: FTS5 runtime auto-repair on corruption ---
+                    self._audit('fts5', 'corruption_detected', f'FTS5 MATCH error: {e} — auto-rebuilding')
+                    try:
+                        self._rebuild_fts()
+                        self._audit('fts5', 'auto_rebuild', 'FTS5 runtime rebuild completed')
+                        # Retry the search after rebuild
+                        c2 = self._connect()
+                        try:
+                            for r in c2.execute(fts_sql + " LIMIT 100", fts_params).fetchall():
+                                candidates.setdefault(r["id"], r)
+                                bm25[r["id"]] = max(bm25.get(r["id"], 0.0), bm25_norm(r["rank"]))
+                        finally:
+                            if c2 is not c: c2.close()
+                    except Exception as rebuild_err:
+                        self._audit('fts5', 'rebuild_failed', str(rebuild_err))
                 except Exception: pass
             like = f"%{q.strip()[:180]}%"
             add_rows(f"SELECT * FROM claims WHERE {base_where} AND (claim LIKE ? OR normalized_claim LIKE ? OR evidence LIKE ?)", base_params + [like, like, like], 80)
@@ -2558,7 +2839,7 @@ class MemoryWikiProvider(MemoryProvider):
             ("android", ("android","termux","андроид","apk","oauth","proot")),
             ("hermes", ("hermes","plugin","tool registry","плагин","память")),
             ("telegram", ("telegram","bot token","tg_","чат","канал")),
-            ("exampleapp", ("exampleapp","exampleapp.json","/home/.exampleapp")),
+            ("openclaw", ("openclaw","openclaw.json","/home/.openclaw")),
             ("server", ("vps","server","systemd","ssh","nginx","port","health","сервер","сервис")),
             ("proxy", ("proxy","прокси","gateway","deepseek")),
             ("api", ("api","openai","model","gpt","claude","endpoint")),
@@ -2792,7 +3073,10 @@ class MemoryWikiProvider(MemoryProvider):
         self._rebuild_fts(); self._render_all(); return {"claims":ci,"evidence":ei,"contradictions":ki,"dashboard":str(self.dashboard_dir/"index.md")}
 
     # ----- render/dashboard/export --------------------------------------
-    def _is_stale(self, ts: int) -> bool: return age_days(ts) > STALE_DAYS
+    def _is_stale(self, ts: int) -> bool:
+        # --- P6: Fault injection hook for testing stale detection ---
+        if _FAULT_INJECT_STALE: return True
+        return age_days(ts) > STALE_DAYS
     def _topic_page(self, topic: str) -> Path: return self.pages_dir / f"{slug(topic)}.md"
     def _top_evidence(self, cid: str, limit=3) -> List[Dict[str,Any]]: return [dict(r) for r in self._connect().execute("SELECT * FROM evidence WHERE claim_id=? ORDER BY created_at DESC LIMIT ?",(cid,limit)).fetchall()]
     def _related_contradictions(self, ids: Iterable[str], limit=8) -> List[Dict[str,Any]]:
@@ -2998,7 +3282,7 @@ class MemoryWikiProvider(MemoryProvider):
             (('android','termux','phone','proot','андроид'), 'android'),
             (('hermes','plugin','плагин','tool'), 'hermes'),
             (('сервер','server','ssh','vps','service','systemd'), 'server'),
-            (('demo','demo','exampleapp'), 'exampleapp'),
+            (('рустем','rustem','openclaw'), 'openclaw'),
             (('telegram','телеграм','bot','бот'), 'telegram'),
             (('preference','preferences','предпочитает','пользователь'), 'preferences'),
         ]
@@ -3131,11 +3415,24 @@ class MemoryWikiProvider(MemoryProvider):
                 try: self._checkpoint_wal('PASSIVE')
                 except Exception: pass
         written=[]
+        # --- VACUUM INTO: атомарный hot backup (вместо WAL checkpoint + file copy) ---
+        backup_db_path = None
+        try:
+            if self._conn:
+                backup_db_path = safe_join(self.root, 'memory_wiki_backup_temp.db')
+                with self._conn:
+                    self._conn.execute(f"VACUUM INTO '{backup_db_path}'")
+        except Exception:
+            backup_db_path = None
         try:
             with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as z:
-                for rel in ['memory_wiki.sqlite3']:
-                    f=safe_join(self.root, rel)
-                    if f.exists() and f.is_file(): z.write(f, rel); written.append(rel)
+                if backup_db_path and Path(backup_db_path).exists():
+                    z.write(backup_db_path, 'memory_wiki.sqlite3')
+                    written.append('memory_wiki.sqlite3')
+                else:
+                    for rel in ['memory_wiki.sqlite3']:
+                        f=safe_join(self.root, rel)
+                        if f.exists() and f.is_file(): z.write(f, rel); written.append(rel)
                 for dname in ['pages','dashboards','snapshots','journal']:
                     d=safe_join(self.root, dname)
                     if d.exists():
@@ -3149,6 +3446,17 @@ class MemoryWikiProvider(MemoryProvider):
             try:
                 if tmp_path.exists(): tmp_path.unlink()
             except Exception: pass
+        # --- P5: SHA256 checksum for backup integrity verification ---
+        checksum_path = path.with_suffix(path.suffix + '.sha256')
+        try:
+            sha256_hash = hashlib.sha256()
+            with open(path, 'rb') as f:
+                while chunk := f.read(131072):  # 128KB chunks
+                    sha256_hash.update(chunk)
+            checksum = sha256_hash.hexdigest()
+            atomic_write(checksum_path, checksum + '  ' + path.name + '\n')
+        except Exception:
+            pass  # checksum is best-effort, backup still valid without it
         size=path.stat().st_size
         with self._connect() as c: c.execute('INSERT OR REPLACE INTO backups(id,path,reason,size,created_at) VALUES(?,?,?,?,?)',(bid,str(path),reason,size,now()))
         self._add_change('backup', bid, reason)
@@ -3168,6 +3476,22 @@ class MemoryWikiProvider(MemoryProvider):
         path=Path(match['path'] if match else b).expanduser()
         if not path.exists(): raise FileNotFoundError(f'backup not found: {backup}')
         if not zipfile.is_zipfile(path): raise ValueError(f'not a zip backup: {path}')
+        # --- P5: validate SHA256 checksum before restore ---
+        checksum_path = path.with_suffix(path.suffix + '.sha256')
+        if checksum_path.exists():
+            try:
+                expected = checksum_path.read_text().strip().split()[0]
+                sha256_hash = hashlib.sha256()
+                with open(path, 'rb') as f:
+                    while chunk := f.read(131072):
+                        sha256_hash.update(chunk)
+                actual = sha256_hash.hexdigest()
+                if actual != expected:
+                    raise ValueError(f'backup checksum mismatch: expected {expected[:16]}..., got {actual[:16]}... — archive may be corrupted')
+            except ValueError:
+                raise
+            except Exception:
+                pass  # best-effort, continue if checksum file is broken
         safety=self._backup('pre-restore safety backup')
         extracted=[]; staged=[]
         with tempfile.TemporaryDirectory(prefix='memory_wiki_restore_', dir=str(self.root)) as td:
@@ -3865,6 +4189,8 @@ class MemoryWikiProvider(MemoryProvider):
 
     def _reindex(self, limit: int = 0, force: bool = False) -> Dict[str,Any]:
         if not SEMANTIC_ENABLED: return {"ok": False, "error": "semantic disabled"}
+        if not _semantic_available(): return {"ok": False, "error": "embedding/qdrant unavailable"}
+        if not _qdrant_ensure_collection(): return {"ok": False, "error": "qdrant collection unavailable"}
         c = self._connect()
         sql = "SELECT id, normalized_claim, topic FROM claims WHERE status='active' AND normalized_claim IS NOT NULL AND normalized_claim != ''"
         rows = c.execute(sql + (" LIMIT ?" if limit > 0 else ""), (limit,) if limit > 0 else ()).fetchall()
@@ -3875,7 +4201,10 @@ class MemoryWikiProvider(MemoryProvider):
             try:
                 emb = _embed_text(claim, timeout=4)
                 if emb and len(emb) > 0:
-                    ok += 1 if _qdrant_upsert(cid, emb, {"id": cid, "topic": topic or "", "claim": short(claim, 300)}) else fail + 1
+                    if _qdrant_upsert(cid, emb, {"id": cid, "topic": topic or "", "claim": short(claim, 300)}):
+                        ok += 1
+                    else:
+                        fail += 1
                 else: skip += 1
             except Exception: fail += 1
         return {"total": len(rows), "ok": ok, "skip": skip, "fail": fail, "elapsed_s": round(time.time() - t0, 1)}

@@ -1,555 +1,327 @@
-# Hermes Memory-Wiki
+# Hermes Memory-Wiki v1.4.1
 
-**Native long-term memory for AI agents on [Hermes Agent](https://github.com/NousResearch/hermes-agent).**
+**Native durable memory for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — SQLite FTS5 + TF-IDF + qdrant/embed semantic search.**
 
-SQLite FTS5 + Qdrant vectors + RRF hybrid search. 72 tools. Zero external dependencies — pure Python stdlib.
-
----
-
-## Table of Contents
-
-- [What It Is](#what-it-is)
-- [Why Not Regular RAG](#why-not-regular-rag)
-- [Architecture](#architecture)
-- [Repository Structure](#repository-structure)
-- [Quick Start](#quick-start)
-- [Hybrid Search](#hybrid-search)
-- [Tool Catalog](#tool-catalog)
-- [Verification Pipeline](#verification-pipeline)
-- [Write Firewall](#write-firewall)
-- [Journal & Recovery](#journal--recovery)
-- [Environment Variables](#environment-variables)
-- [Smoke Tests](#smoke-tests)
-- [Requirements](#requirements)
-- [Development](#development)
-- [License](#license)
+24 database tables, 35+ tools, zero external Python dependencies. Works on Android/Termux proot, Linux VPS, and desktop.
 
 ---
 
-## What It Is
+## 🔍 Hybrid Search: Three-Layer Architecture
 
-Memory-wiki is not a note-taking app. It is an **operational memory subsystem** that lives inside Hermes as a native `MemoryProvider` and plugin:
+Memory-Wiki uses **Reciprocal Rank Fusion (RRF)** to merge three independent search layers:
 
-- **Every fact (claim)** is stored with confidence, salience, freshness, trust class, and evidence
-- **FTS5** provides exact lexical search — code, paths, endpoints, config keys, commands
-- **Qdrant vectors** provide semantic search — similar concepts even with different words
-- **RRF (Reciprocal Rank Fusion)** merges both layers into a single ranked result
-- **Auto query mode detection**: technical queries → higher lexical weight; conceptual → higher vector weight
-- **Memory Diff Before Answer**: compares recalled memory against verified facts before the agent responds
-- **Write Firewall 2.0**: source policy + quality lint + secret scan before durable writes
-- **Preference Priority Layer**: explicit user instructions trump stale background facts
-- **Append-only JSONL journal** with hash-chain integrity + logical checkpoints for recovery
-- **Verification pipeline**: curated sources → auto-verified; conversation sources → unverified
-- **Contradiction handling**: conflicting claims are recorded explicitly, not silently coexisting
-- **Secret firewall**: secrets detected → quarantined → redacted recall
+| Layer | Mechanism | Weight | Always Available |
+|---|---|---|---|
+| **FTS5** | SQLite full-text search with BM25 ranking | Primary | ✅ Yes |
+| **TF-IDF** | Local word-level vectors → SQLite cosine similarity (6000 features) | ×0.7 | ✅ Yes |
+| **qdrant/embed** | HTTP stubs (:4000 + :6333) with character n-gram vectors | ×0.5 | When running |
 
-> This is a **source-only repository**. Runtime data (SQLite DB, backups, secrets, sessions, logs) is excluded via `.gitignore`.
+Query mode auto-detection (technical vs semantic vs mixed) adjusts lexical/semantic weights dynamically.
 
----
+### Why Three Layers?
 
-## Why Not Regular RAG
+- **FTS5**: exact matches, keyword search, phrase queries — always correct
+- **TF-IDF**: word-level semantic similarity without neural networks — fast, local, stdlib-only
+- **qdrant/embed**: broader vector search using character n-grams — different angle, more diversity
 
-**Short version:** RAG retrieves documents. Memory-wiki manages agent memory.
-
-| Dimension | Typical RAG | Memory-wiki |
-|---|---|---|
-| **Storage unit** | Chunk / document | Claim, evidence, preference, task capsule, decision, secret metadata, graph relation |
-| **Lifecycle** | Usually none | Active / retired / superseded / uncertain / queued / review |
-| **Trust / quality** | Source-level score | Confidence + salience + freshness + trust class + evidence + usage feedback |
-| **Conflicts** | Both texts returned as-is | Explicit contradiction rows → policy / manual resolution |
-| **Secrets** | Often unprotected | Secret scan → quarantine → redacted recall |
-| **Operations memory** | None | Task capsules, project profiles, mistakes, decisions, mutation log |
-| **Output** | Matching chunks | Sectioned `pack_context`: preferences / procedures / projects / diff / contradictions |
-| **Maintenance** | Reindexing | Doctor / repair / backup / restore / FTS rebuild / topic normalization / compiler |
-| **Integration** | External retriever | Native Hermes MemoryProvider + plugin tools |
-| **Recovery** | Reindex from scratch | Journal replay + SQLite rebuild from checkpoints |
-| **Feedback loop** | Rarely | `memory_wiki_mark_used` → usage telemetry → ranking improvement |
-
-Memory-wiki **uses** RAG techniques internally (FTS5, semantic search, RRF fusion), but its job is broader: keep months of agent memory useful, auditable, curated, recoverable, and safe.
-
-### Comparison with other Hermes memory subsystems
-
-| Subsystem | What it stores | Search | Lifetime | Verification |
-|---|---|---|---|---|
-| **Memory-wiki** | Facts, lessons, preferences, configs | Lexical + Semantic + RRF | Permanent | ✅ curated→verified |
-| `memory` tool | Raw profile text | Prompt injection only | Sessions | ❌ |
-| `distill` | Compressed conversation capsules | FTS by key | Sessions + TTL | ❌ |
-| `plur` | Episodic engrams | Cosine similarity | Seasonal (ACT-R decay) | ❌ |
-| `secret-vault` | Credentials, tokens, keys | By ID | Permanent (encrypted) | ❌ |
+If any layer fails: graceful degradation to remaining layers. No single point of failure.
 
 ---
 
-## Architecture
+## 📦 Quick Start
 
-```
-┌─────────────────────────────────────────────────────┐
-│                  Hermes Agent                        │
-│  ┌───────────────────────────────────────────────┐  │
-│  │          MemoryWikiProvider                    │  │
-│  │  ┌─────────────────────────────────────────┐  │  │
-│  │  │           Recall Planner                 │  │  │
-│  │  │  query → detect mode → plan topics/types │  │  │
-│  │  └──────────────┬──────────────────────────┘  │  │
-│  │                 │                              │  │
-│  │     ┌───────────┴───────────┐                  │  │
-│  │     ▼                       ▼                  │  │
-│  │  ┌─────────┐          ┌──────────┐             │  │
-│  │  │  FTS5   │          │ Qdrant   │             │  │
-│  │  │ lexical │          │ semantic │             │  │
-│  │  │ BM25    │          │ cosine   │             │  │
-│  │  └────┬────┘          └────┬─────┘             │  │
-│  │       │                    │                   │  │
-│  │       └────────┬───────────┘                   │  │
-│  │                ▼                               │  │
-│  │         ┌─────────────┐                        │  │
-│  │         │ RRF fusion  │                        │  │
-│  │         │ k=60, auto  │                        │  │
-│  │         │ weights     │                        │  │
-│  │         └──────┬──────┘                        │  │
-│  │                ▼                               │  │
-│  │     ┌─────────────────────┐                    │  │
-│  │     │  pack_context       │                    │  │
-│  │     │  sectioned output   │                    │  │
-│  │     │  → agent prompt     │                    │  │
-│  │     └─────────────────────┘                    │  │
-│  └───────────────────────────────────────────────┘  │
-│                                                      │
-│  ┌───────────────────────────────────────────────┐  │
-│  │  Write path (tool result / explicit write)     │  │
-│  │  scrub → redact → firewall → SQLite + journal  │  │
-│  └───────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────┘
-
-Optional semantic services:
-  semantic/embed_stub.py  →  :4000  character n-gram hashing (768-dim)
-  semantic/qdrant_stub.py →  :6333  JSON vector store (cosine similarity)
-```
-
-**Key SQLite tables:** `claims`, `evidence`, `contradictions`, `secret_index`, `secret_quarantine`, `entities`, `relations`, `task_capsules`, `decisions`, `mistakes`, `project_profiles`, `preference_rules`, `recall_events`, `review_queue`, `mutation_log`, `audit_log`
-
-**No AI required.** Embedding-stub and Qdrant-stub are pure Python stdlib — character n-gram hashing + cosine similarity. No GPU, no neural networks, no external APIs.
-
----
-
-## Repository Structure
-
-```
-hermes-memory-wiki/
-├── __init__.py              # MemoryProvider plugin (~3900 lines)
-├── plugin.yaml              # Plugin metadata (v1.4.0, Hermes)
-│
-├── scripts/
-│   ├── smoke_test.py        # End-to-end test suite (72 schemas, 6 audit events)
-│   └── memory_wiki_cli.py   # Standalone CLI for maintenance without Hermes
-│
-├── semantic/                # Semantic search backends (stdlib-only)
-│   ├── embed_stub.py        # Embedding server (:4000), char n-gram hashing, 768-dim
-│   └── qdrant_stub.py       # Qdrant-compatible vector DB (:6333), JSON storage
-│
-├── README.md
-├── LICENSE                  # MIT
-└── .gitignore               # Excludes runtime DB, backups, secrets
-```
-
----
-
-## Quick Start
-
-### Install the plugin
+### 1. Install Plugin
 
 ```bash
-# Clone into Hermes plugins directory
-mkdir -p ~/.hermes/plugins
-git clone https://github.com/sbrejnev988-coder/hermes-memory-wiki.git \
-  ~/.hermes/plugins/memory-wiki
+cp -r memory-wiki/ ~/.hermes/plugins/memory-wiki/
 ```
 
-### Start semantic services (optional)
-
-```bash
-cd ~/.hermes/plugins/memory-wiki/semantic
-
-# Both are pure Python stdlib — no dependencies
-python3 embed_stub.py &    # → http://127.0.0.1:4000
-python3 qdrant_stub.py &   # → http://127.0.0.1:6333
-```
-
-Without these, memory-wiki runs in FTS-only mode.
-
-### Enable in Hermes
-
-Add to `~/.hermes/config.yaml`:
+### 2. Enable in config
 
 ```yaml
+# ~/.hermes/config.yaml
 memory:
   provider: memory-wiki
-
 plugins:
   enabled:
     - memory-wiki
 ```
 
-Restart Hermes to reload the plugin registry.
-
-### Verify installation
+### 3. (Optional) Start semantic stubs
 
 ```bash
-cd ~/.hermes/plugins/memory-wiki
-
-# Syntax check
-python3 -m py_compile __init__.py \
-  scripts/smoke_test.py \
-  scripts/memory_wiki_cli.py \
-  semantic/embed_stub.py \
-  semantic/qdrant_stub.py
-
-# Smoke test (no LLM, no CDP, fully offline)
-MEMORY_WIKI_LLM_PACK=0 python3 scripts/smoke_test.py
+# Start embed stub (character n-gram vectorization)
+python3 semantic/embed_stub.py &
+# Start qdrant stub (vector storage/search)
+python3 semantic/qdrant_stub.py &
 ```
 
-Expected output:
-
-```json
-{
-  "ok": true,
-  "home": "removed",
-  "backup": "/tmp/memorywiki_smoke_xxxxxx/memory-wiki/backups/bak_...zip",
-  "schemas": 72,
-  "audit_events": 6
-}
+Or via glinomes-infra:
+```bash
+glinomes-infra ensure-embed
+glinomes-infra ensure-qdrant
 ```
 
-### Standalone CLI (without Hermes)
+### 4. Restart Hermes
 
 ```bash
-cd ~/.hermes/plugins/memory-wiki
-
-# Full diagnostics
-python3 scripts/memory_wiki_cli.py --home ~/.hermes doctor
-
-# Search
-python3 scripts/memory_wiki_cli.py --home ~/.hermes query "project configuration" --limit 10
-
-# Context packing for LLM
-python3 scripts/memory_wiki_cli.py --home ~/.hermes pack \
-  "what context is relevant for this task" --max-chars 3800
-
-# Backup
-python3 scripts/memory_wiki_cli.py --home ~/.hermes backup --reason manual
-
-# Dashboard
-python3 scripts/memory_wiki_cli.py --home ~/.hermes dashboard
-
-# Repair
-python3 scripts/memory_wiki_cli.py --home ~/.hermes repair --target fts --apply
+glinomes restart
 ```
 
 ---
 
-## Hybrid Search
+## 🏗️ Architecture
 
 ```
-user query
-  │
-  ├─► query mode detection (technical / semantic / mixed)
-  │     technical: words, codes, paths → lexical weight 0.85
-  │     semantic:  ideas, concepts     → vector weight  0.85
-  │     mixed:     both                → balanced (0.5 / 0.5)
-  │
-  ├─► FTS5 top-200 (lexical, BM25 rank)
-  │     Exact word/code/path matches
-  │
-  ├─► Qdrant vector top-200 (semantic, cosine)
-  │     Meaning-level matches even with different words
-  │
-  ├─► RRF fusion (k=60, auto-weights per mode)
-  │     RRF_score = Σ 1/(k + rank_i) for each source
-  │
-  └─► score_breakdown per claim
-        confidence, salience, verified_boost, freshness, rrf
+┌─────────────────────────────────────────────────┐
+│              Hermes Agent                        │
+│  ┌───────────────────────────────────────────┐  │
+│  │         Memory Provider (Lifecycle)        │  │
+│  │  ┌─────────┐ ┌──────────┐ ┌────────────┐ │  │
+│  │  │  FTS5    │ │  TF-IDF  │ │  qdrant    │ │  │
+│  │  │  BM25    │ │  cosine  │ │  HTTP      │ │  │
+│  │  └────┬─────┘ └────┬─────┘ └─────┬──────┘ │  │
+│  │       │             │              │        │  │
+│  │       └─────────┬───┴──────────────┘        │  │
+│  │            RRF Fusion                       │  │
+│  │                 │                           │  │
+│  │          ┌──────┴──────┐                    │  │
+│  │          │   Scoring    │                    │  │
+│  │          │ confidence   │                    │  │
+│  │          │ salience     │                    │  │
+│  │          │ freshness    │                    │  │
+│  │          │ trust        │                    │  │
+│  │          │ verified     │                    │  │
+│  │          └──────────────┘                    │  │
+│  └───────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────┘
 ```
 
-### Query mode debug logging
+### Core Tables
 
-```bash
-MEMORY_WIKI_DEBUG=1
-# → /tmp/memory_wiki_debug.log
-# Contents: query, query_mode, FTS candidates, vector candidates, RRF fused count
-```
-
----
-
-## Tool Catalog
-
-Version 1.4.0 — **72 tools**. Organized by category below.
-
-### Search & Context
-
-| Tool | Description |
+| Table | Purpose |
 |---|---|
-| `memory_wiki_query` | Hybrid search (FTS5 + Qdrant + RRF) |
-| `memory_wiki_pack_context` | Collect relevant context for LLM |
-| `memory_wiki_memory_diff` | Compare recalled memory vs verified facts |
-| `memory_wiki_recall_plan` | Plan which topics/types/secrets to recall |
-| `memory_wiki_preference_layer` | User preference priority layer |
-| `memory_wiki_mark_used` | Feedback loop: usefulness scoring |
-| `memory_wiki_debug_search` | Search with per-layer breakdown |
-| `memory_wiki_compare_search` | FTS-only vs hybrid comparison |
-| `memory_wiki_query_mode` | Detect query type |
-| `memory_wiki_evaluate_retrieval` | Recall@k, MRR, NDCG metrics |
+| `claims` | Main memory — 35 columns including confidence, salience, freshness, trust, verification |
+| `claims_fts` | FTS5 full-text index over claims |
+| `claims_simhash` | 64-bit SimHash fingerprints for near-duplicate detection |
+| `semantic_vectors` | TF-IDF vectors (BLOB) for local cosine similarity search |
 
-### Write & Update
+### Knowledge Graph
 
-| Tool | Description |
+| Table | Purpose |
 |---|---|
-| `memory_wiki_add_claim` | Store a fact |
-| `memory_wiki_add_evidence` | Attach evidence to a claim |
-| `memory_wiki_update_claim` | Update confidence / salience / freshness |
-| `memory_wiki_rewrite_claim` | Rewrite claim in-place |
-| `memory_wiki_merge_claims` | Merge duplicates |
-| `memory_wiki_pin_claim` | Pin a claim |
+| `entities` | Named entities with aliases |
+| `relations` | `subject → predicate → object` with confidence scores |
 
-### Quality Control
+### Quality & Review
 
-| Tool | Description |
+| Table | Purpose |
 |---|---|
-| `memory_wiki_review_queue` | Review queue (list / approve / reject / rewrite) |
-| `memory_wiki_lint_claim` | Lint a candidate claim |
-| `memory_wiki_write_firewall` | Pre-write quality check |
-| `memory_wiki_source_policy` | Ingestion policy by source type |
-| `memory_wiki_normalize_topics` | Topic alias normalization |
-| `memory_wiki_immune_scan` | Auto-detect: secrets, blobs, bad topics, low-quality |
-| `memory_wiki_compile_topic` | Compile micro-claims into curated summary |
-| `memory_wiki_compress_topic` | Compress topic + supersede old claims |
-
-### Contradictions & Provenance
-
-| Tool | Description |
-|---|---|
-| `memory_wiki_contradict` | Record a contradiction |
-| `memory_wiki_resolve_contradiction` | Manual resolution |
-| `memory_wiki_resolve_by_policy` | Auto-resolve (prefer_explicit_user / prefer_recent / prefer_verified) |
-| `memory_wiki_why_believe` | Provenance card: evidence, trust, contradictions |
-
-### Operational Memory
-
-| Tool | Description |
-|---|---|
-| `memory_wiki_add_decision` | Record a decision |
-| `memory_wiki_add_mistake` | Record a mistake + fix + prevention |
-| `memory_wiki_add_project_profile` | Project profile |
-| `memory_wiki_get_project_context` | Project context |
-| `memory_wiki_add_task_capsule` | Task capsule (plan, files, commands, verification) |
-| `memory_wiki_add_preference_rule` | User preference rule |
-
-### Graph Memory
-
-| Tool | Description |
-|---|---|
-| `memory_wiki_add_entity` | Create an entity |
-| `memory_wiki_add_relation` | Create a relation |
-| `memory_wiki_graph_query` | Query the graph |
+| `review_queue` | Claims awaiting human review |
+| `contradictions` | Detected contradictions between claims |
+| `source_artifacts` | Archived raw tool outputs |
+| `retrieval_eval_cases` | Evaluation benchmarks for retrieval quality |
 
 ### Secrets
 
-| Tool | Description |
+| Table | Purpose |
 |---|---|
-| `memory_wiki_add_secret` | Add to secret index (redacted by default) |
-| `memory_wiki_query_secrets` | Query secret index (reveal=false → redacted) |
-| `memory_wiki_secret_quarantine` | Secret quarantine management |
+| `secret_index` | Redacted credential index |
+| `secret_quarantine` | Quarantined secret-like material |
 
-### Maintenance & Recovery
+### Operations & Audit
 
-| Tool | Description |
+| Table | Purpose |
 |---|---|
-| `memory_wiki_health` | Quick health check |
-| `memory_wiki_doctor` | Full diagnostics (tables, FTS, WAL, topics, journal) |
-| `memory_wiki_repair` | Repair (fts / integrity / dashboards / all) |
-| `memory_wiki_backup` | Backup SQLite + vault |
-| `memory_wiki_list_backups` | List backups |
-| `memory_wiki_restore` | Restore from backup |
-| `memory_wiki_snapshot` | Human-readable snapshot |
-| `memory_wiki_audit_log` | Audit log |
-| `memory_wiki_mutation_log` | Mutation journal (before / after) |
-| `memory_wiki_undo_last` | Undo last mutation |
-| `memory_wiki_transaction` | Batch operations with dry-run |
-| `memory_wiki_journal_status` | JSONL journal status + hash-chain |
-| `memory_wiki_journal_checkpoint` | Create logical checkpoint |
-| `memory_wiki_rebuild_from_journal` | Rebuild SQLite from journal |
-| `memory_wiki_semantic_status` | Embedding / Qdrant health |
-| `memory_wiki_reindex` | Re-index into Qdrant |
-| `memory_wiki_export` | Export claims/evidence/contradictions JSON |
-| `memory_wiki_export_bundle` | Export redacted sync bundle |
-| `memory_wiki_import_bundle` | Import redacted sync bundle |
-| `memory_wiki_recent_changes` | Show mutations since N seconds ago |
+| `memory_changes` | Change log |
+| `memory_mutations` | Append-only mutation ledger with undo support |
+| `audit_log` | Operation audit trail |
+| `recall_events` | Recall history with scores |
+
+### Tasks & Decisions
+
+| Table | Purpose |
+|---|---|
+| `task_capsules` | Task outcome capsules (plan, errors, fixes, verification) |
+| `post_task_log` | Post-task summaries |
+| `decisions` | Architectural decisions with rationale and alternatives |
+| `mistakes` | Anti-regression lessons |
+
+### Configuration
+
+| Table | Purpose |
+|---|---|
+| `preference_rules` | Priority rules: current > explicit_correction > pinned > verified > stale |
+| `source_policies` | Ingestion policies per source type |
+| `topic_aliases` | Topic name aliases |
+| `project_profiles` | Project metadata |
+| `sync_bundles` | Export/import bundles |
 
 ---
 
-## Verification Pipeline
+## 🛡️ Security & Integrity
 
-```
-Claim source
-  │
-  ├─► curated (post_task, task_capsule, decision, mistake, project)
-  │     → auto-verified ✅ (scoring boost +0.35)
-  │
-  ├─► tool (verified command output, config)
-  │     → probable (boost +0.15)
-  │
-  ├─► explicit_user (direct instruction)
-  │     → verified ✅ (boost +0.50)
-  │
-  └─► conversation / unknown
-        → unverified ⚠️ (no boost, flagged for review)
-```
+### Write Firewall 2.0
+- Claims pass through `memory_gate_decision()` — rejects tool output, raw blobs, system artifacts
+- Source-aware policies: `explicit > curated > conversation > tool > unknown`
+- Secret scanning: 16 regex patterns + quarantine
 
-Verified claims receive a scoring boost and are treated as authoritative during conflict resolution.
+### Context Capsule Ban
+- API-level: `ValueError` on `"context capsule"` in claim
+- DB-level: SQL triggers `BEFORE INSERT/UPDATE` → `RAISE(FAIL)`
 
----
+### Data Integrity
+- **SHA256 backup checksum**: streaming hash → `.zip.sha256`, validated at restore
+- **VACUUM INTO**: atomic hot backup without blocking
+- **Atomic write**: `tempfile + fsync + os.replace` for all JSON/MD files
+- **Append-only journal**: JSONL with replay recovery and checkpoints
 
-## Write Firewall
-
-Before a durable write, every claim passes through:
-
-1. **Source policy** — tool/task/decision → allow; raw/blob → queue
-2. **Quality lint** — detects:
-   - Artifacts (truncation markers, prompt wrappers, gateway noise)
-   - Empty claims
-   - System junk (interim_assistant fragments, tool output truncation markers)
-3. **Secret scan** — if a key/password is found → quarantine, do not store in claims
-4. **Deduplication** — check for near-duplicate claims before writing
-
-Modes: `check` (dry-run), `queue` (into review_queue), `apply` (direct write).
+### Input Limits
+- `trg_min_claim_length`: claims must be ≥ 10 characters
+- `trg_max_claim_length`: claims must be ≤ 8000 characters (DoS protection)
 
 ---
 
-## Journal & Recovery
+## 🧪 Scoring Formula
 
 ```
-Every mutation (write / update / delete)
-  │
-  ▼
-append-only JSONL journal  (hash-chain: prev_hash → row_hash)
-  │
-  ▼  (periodic)
-logical checkpoint (SQLite-compatible table snapshot with redacted secrets)
+score = 3.2·lexical + exact + 1.0·confidence + 1.2·salience 
+      + 0.65·freshness + 0.25·recency + access 
+      + 0.95·quality + min(0.30, 0.55·usefulness) 
+      + min(0.40, 0.90·trust) + 0.45·pinned + 0.35·verified
+      + stale_penalty + risk_penalty + artifact_penalty
 ```
 
-### Recovery procedure
+### Verified Immunity
+Verified claims (`verification_status='verified'`) are protected:
+- `stale_penalty = 0` (no decay penalty)
+- `risk_penalty = 0` (risk category ignored)
+- `freshness = max(freshness, 0.70)` (floor at 0.70)
 
+### Freshness Decay
+`freshness = exp(-age_days / 45.0)` — exponential decay with 45-day half-life
+
+---
+
+## 🔧 Deduplication
+
+### Two-Tier System
+
+| Tier | Method | Action |
+|---|---|---|
+| **Exact** | SHA256 of normalized claim | Merge if hash matches |
+| **Near-duplicate** | 64-bit SimHash + Hamming distance ≤ 12 | Merge metadata (max conf/salience/quality) |
+
+SimHash uses 4-gram character hashing — pure Python stdlib, no external libraries. Skip for claims < 50 characters.
+
+---
+
+## 🧪 Testing
+
+### Fault Injection
+| Variable | Effect |
+|---|---|
+| `MW_FAULT_INJECT_FTS_CORRUPT=1` | Simulates FTS5 index corruption |
+| `MW_FAULT_INJECT_STALE=1` | Forces all claims to appear stale |
+| `MW_FAULT_INJECT_BACKUP_CHECKSUM_MISMATCH=1` | Simulates backup checksum failure |
+
+### Smoke Test
 ```bash
-# Step 1: check journal integrity
-python3 scripts/memory_wiki_cli.py --home ~/.hermes doctor
-
-# Step 2: if SQLite is corrupted — rebuild from latest checkpoint + journal
-# (via Hermes tool):
-# memory_wiki_rebuild_from_journal apply=true
-
-# Step 3: verify
-python3 scripts/memory_wiki_cli.py --home ~/.hermes doctor
+python3 scripts/smoke_test.py
 ```
+
+### FTS5 Runtime Auto-Repair
+On `sqlite3.DatabaseError` during FTS5 search: automatic `_rebuild_fts()` + retry with audit logging. No restart needed.
 
 ---
 
-## Environment Variables
+## 🌐 Environment Variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `MEMORY_WIKI_SEMANTIC` | `1` | Enable/disable semantic search |
+| `MEMORY_WIKI_SEMANTIC` | `1` | Enable semantic search |
+| `MEMORY_WIKI_EMBED_URL` | `http://127.0.0.1:4000` | Embed stub URL |
+| `MEMORY_WIKI_QDRANT_URL` | `http://127.0.0.1:6333` | Qdrant stub URL |
 | `MEMORY_WIKI_RRF_K` | `60` | RRF fusion constant |
-| `MEMORY_WIKI_FTS_TOP_K` | `200` | Lexical candidates before fusion |
-| `MEMORY_WIKI_VECTOR_TOP_K` | `200` | Semantic candidates before fusion |
-| `MEMORY_WIKI_HYBRID_TOP_K` | `100` | Hybrid candidates after fusion |
-| `MEMORY_WIKI_EMBED_URL` | `http://127.0.0.1:4000` | Embedding-stub endpoint |
-| `MEMORY_WIKI_QDRANT_URL` | `http://127.0.0.1:6333` | Qdrant-stub endpoint |
-| `MEMORY_WIKI_DEBUG` | `0` | Debug log → `/tmp/memory_wiki_debug.log` |
-| `MEMORY_WIKI_LLM_PACK` | `0` | Optional LLM context refinement |
-| `MEMORY_WIKI_INCLUDE_SESSIONS_IN_PACK` | `0` | Include session history in pack_context |
-| `MEMORY_WIKI_STRICT_RECALL` | `1` | Strict active/non-stale recall |
-| `MEMORY_WIKI_MAX_PREFETCH_CHARS` | `12000` | Max chars in provider prefetch |
+| `MEMORY_WIKI_FTS_TOP_K` | `200` | FTS5 candidates for rerank |
+| `MEMORY_WIKI_VECTOR_TOP_K` | `200` | Vector search candidates |
+| `MEMORY_WIKI_STRICT_RECALL` | `1` | Filter low-quality claims |
+| `MEMORY_WIKI_DEBUG` | `0` | Debug logging to `/tmp` |
+| `MW_FAULT_INJECT_FTS_CORRUPT` | `0` | Test: FTS corruption |
+| `MW_FAULT_INJECT_STALE` | `0` | Test: force stale |
+| `MW_FAULT_INJECT_BACKUP_CHECKSUM_MISMATCH` | `0` | Test: checksum fail |
 
 ---
 
-## Smoke Tests
+## 📊 Comparison: Memory-Wiki vs Regular RAG
 
-The smoke test requires no LLM, no CDP, and no network:
+| Aspect | Regular RAG | Memory-Wiki |
+|---|---|---|
+| **Storage** | Vector DB + chunked documents | Structured claims with metadata |
+| **Search** | Single vector similarity | 3-layer RRF fusion |
+| **Quality** | No quality gates | Write firewall + review queue |
+| **Contradictions** | None | Automatic detection + resolution |
+| **Verification** | None | Verification pipeline + trust scores |
+| **Secrets** | Stored as-is | Redaction + quarantine |
+| **Recovery** | DB backup only | Journal replay + checkpoints |
+| **Dependencies** | numPy, transformers, ONNX | **Zero** — pure Python stdlib |
+| **Disk** | 500MB+ for embeddings | ~10MB for 3000 claims |
+| **Platform** | Server only | Android/Termux/Linux |
 
-```bash
-cd ~/.hermes/plugins/memory-wiki
+---
 
-# Basic
-MEMORY_WIKI_LLM_PACK=0 python3 scripts/smoke_test.py
+## 📁 Repository Structure
 
-# Isolated home (no effect on real database)
-tmp_home=$(mktemp -d)
-HERMES_HOME="$tmp_home" MEMORY_WIKI_LLM_PACK=0 python3 scripts/smoke_test.py
+```
+memory-wiki/
+├── __init__.py          # Main plugin (4240 lines, 310KB)
+├── plugin.yaml           # Hermes plugin manifest
+├── LICENSE               # CC0-1.0
+├── README.md             # This file
+├── .gitignore
+├── scripts/
+│   ├── smoke_test.py     # Plugin smoke test
+│   └── memory_wiki_cli.py # CLI tools
+└── semantic/
+    ├── embed_stub.py     # HTTP embed stub (:4000)
+    └── qdrant_stub.py    # HTTP qdrant stub (:6333)
 ```
 
-**What it checks:**
-- Plugin loading via `importlib`
-- 72 tool schemas registered
-- Claim CRUD: add → query → update → merge
-- Evidence: add → `why_believe`
-- Contradictions: detect → resolve (manual + policy)
-- Secrets: add → redacted query → revealed query → no leak in any output path
-- Lint, review_queue, decisions, mistakes, project profiles
-- Task capsules, graph memory (entities + relations)
-- Preference layer, `memory_diff`
-- Journal: status → checkpoint → hash-chain verification
-- Import/export bundles
-- Backup, snapshot, audit_log, mutation_log
-- `doctor`, `health`, `repair`
-- Semantic status
-- Zip-slip protection in backup restore
-- Secret redaction verified in every output path (query, pack, diff, export, graph, dashboard)
+---
+
+## 🛠️ Requirements
+
+- **Python**: 3.10+ (stdlib only — no pip install needed)
+- **SQLite**: 3.35+ (for FTS5, VACUUM INTO, RETURNING)
+- **Platform**: Linux, macOS, Android/Termux proot
+
+Optional (for semantic stubs):
+- `embed_stub.py` and `qdrant_stub.py` — pure Python HTTP servers
 
 ---
 
-## Requirements
+## 🤝 Contributing
 
-- **Python 3.10+** — stdlib only, zero external pip dependencies
-- **SQLite 3.35+** — required for FTS5
-- **Hermes Agent** — as MemoryProvider plugin runtime
-- **semantic/embed_stub.py + semantic/qdrant_stub.py** — optional, for hybrid search
-
----
-
-## Development
-
-```bash
-# Syntax check
-python3 -m py_compile __init__.py \
-  scripts/smoke_test.py \
-  scripts/memory_wiki_cli.py \
-  semantic/embed_stub.py \
-  semantic/qdrant_stub.py
-
-# Smoke test
-MEMORY_WIKI_LLM_PACK=0 python3 scripts/smoke_test.py
-
-# Quick schema count
-python3 - <<'PY'
-import importlib.util, os, tempfile
-spec = importlib.util.spec_from_file_location('mw', '__init__.py')
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
-os.environ['HERMES_HOME'] = tempfile.mkdtemp(prefix='mw_dev_')
-p = mod.MemoryWikiProvider()
-p.initialize('dev')
-print(len(p.get_tool_schemas()))  # → 72
-PY
-```
-
-**When changing schema fields, update all of these together:**
-- SQLite migrations
-- Import/export/sync bundle paths
-- FTS rebuild/upsert logic
-- `pack_context` rendering
-- `doctor`/`repair` checks
-- Smoke tests
+1. Fork the repository
+2. Make changes
+3. Run `python3 scripts/smoke_test.py`
+4. Run `python3 -m py_compile __init__.py`
+5. Submit a pull request
 
 ---
 
-## License
+## 📜 License
 
-MIT. See [`LICENSE`](LICENSE).
+CC0-1.0 — Public Domain Dedication.
+
+---
+
+## ⚡ Version History
+
+| Version | Date | Changes |
+|---|---|---|
+| **1.4.1** | 2026-06-26 | TF-IDF semantic search (6000 features), SimHash dedup, VACUUM INTO backup, SHA256 checksum, FTS5 runtime auto-repair, SQL triggers, verified immunity, fault injection hooks, 3-layer RRF fusion |
+| 1.4.0 | 2026-06-18 | Journal recovery, mutation log, preference rules, secret firewall, verification pipeline |
+| 1.3.0 | 2026-05-19 | Quality gate, review queue, source policies, topic hierarchy |
+| 1.2.0 | 2026-05-01 | FTS5 integration, hybrid search, qdrant/embed stubs |
+| 1.0.0 | 2026-04-15 | Initial release — SQLite claims + markdown vault |

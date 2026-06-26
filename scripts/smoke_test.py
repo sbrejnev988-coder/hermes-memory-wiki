@@ -116,7 +116,7 @@ def main() -> int:
         secret_result = call(
             "memory_wiki_add_secret",
             {
-                "subject": "Demo",
+                "subject": "Rustem",
                 "scope": "VPS SSH",
                 "secret_type": "password",
                 "locator": "1.2.3.4/user",
@@ -126,10 +126,10 @@ def main() -> int:
         )
         assert secret_result.get("id"), secret_result
         assert_no_secret_leak(secret_result, secret_value, "add_secret response")
-        redacted_secrets = call("memory_wiki_query_secrets", {"query": "Demo VPS", "limit": 5, "reveal": False})
+        redacted_secrets = call("memory_wiki_query_secrets", {"query": "Rustem VPS", "limit": 5, "reveal": False})
         assert redacted_secrets.get("secrets"), redacted_secrets
         assert_no_secret_leak(redacted_secrets, secret_value, "redacted secret query")
-        revealed_secrets = call("memory_wiki_query_secrets", {"query": "Demo VPS", "limit": 5, "reveal": True})
+        revealed_secrets = call("memory_wiki_query_secrets", {"query": "Rustem VPS", "limit": 5, "reveal": True})
         assert secret_value in json.dumps(revealed_secrets, ensure_ascii=False), revealed_secrets
 
         alpha = call(
@@ -211,15 +211,15 @@ def main() -> int:
                 "verification": "ok",
             },
         )
-        call("memory_wiki_add_entity", {"name": "Demo VPS", "entity_type": "server", "aliases": ["exampleapp server"]})
-        call("memory_wiki_add_relation", {"subject": "Demo VPS", "predicate": "hosts", "object": "ExampleApp", "evidence": "smoke"})
-        graph = call("memory_wiki_graph_query", {"query": "Demo", "limit": 10})
+        call("memory_wiki_add_entity", {"name": "Rustem VPS", "entity_type": "server", "aliases": ["openclaw server"]})
+        call("memory_wiki_add_relation", {"subject": "Rustem VPS", "predicate": "hosts", "object": "OpenClaw", "evidence": "smoke"})
+        graph = call("memory_wiki_graph_query", {"query": "Rustem", "limit": 10})
         assert graph.get("entities") or graph.get("relations"), graph
-        packed = call("memory_wiki_pack_context", {"query": "Demo ExampleApp secret", "max_chars": 2500})
+        packed = call("memory_wiki_pack_context", {"query": "Rustem OpenClaw secret", "max_chars": 2500})
         assert packed.get("context") is not None, packed
         assert_no_secret_leak(packed, secret_value, "packed context")
 
-        memory_diff = call("memory_wiki_memory_diff", {"query": "Demo ExampleApp", "verified_facts": ["Demo VPS hosts ExampleApp"], "limit": 8})
+        memory_diff = call("memory_wiki_memory_diff", {"query": "Rustem OpenClaw", "verified_facts": ["Rustem VPS hosts OpenClaw"], "limit": 8})
         assert memory_diff.get("remembered") is not None and "answer_basis" in memory_diff, memory_diff
         pref_rule = call("memory_wiki_add_preference_rule", {"rule": "Current explicit user instruction overrides durable memory during smoke", "priority": 990, "scope": "smoke", "source": "smoke"})
         assert pref_rule.get("id", "").startswith("pref_") or pref_rule.get("id", "").startswith("pref"), pref_rule
@@ -307,7 +307,8 @@ def main() -> int:
         with zipfile.ZipFile(bad_zip, "w") as z:
             z.writestr("../evil.txt", "bad")
         bad_restore = call_raw("memory_wiki_restore", {"backup": str(bad_zip)})
-        assert not bad_restore.get("success", True), bad_restore
+        # В live Hermes tool_error может вернуть только {"error": ...} без success=false.
+        assert (bad_restore.get("success") is False) or bool(bad_restore.get("error")), bad_restore
         assert "unsafe zip member" in bad_restore.get("error", "").lower(), bad_restore
         assert not (Path(home) / "evil.txt").exists(), "zip slip wrote outside memory-wiki root"
 
