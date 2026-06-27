@@ -1,9 +1,16 @@
-"""memory-wiki v1.4.0: native Hermes active-memory wiki vault.
+"""memory-wiki v1.5.0: native Hermes active-memory wiki vault.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
 logical checkpoints for replay recovery. Runs inside MemoryProvider lifecycle,
 so recall is near prompt building and session lifecycle, not bolted on as MCP.
+
+v1.5.0 — Memory OS Integration (2026-06-27):
+  + Cross-source collapse (salience ranking + Hebbian corroboration)
+  + Social closer detection (skip search for trivial messages)
+  + Context sanitization (12 injection patterns)
+  + LLM-powered session extraction (auto-claims from session transcripts)
+  + Exponential decay scanner for claims
 """
 from __future__ import annotations
 
@@ -23,6 +30,36 @@ import zipfile
 import stat
 import urllib.request
 import urllib.error
+
+# ── Memory OS Integration v1.5.0 ──────────────────────────────────────
+try:
+    from .memory_wiki_context_guard import is_social_close, sanitize_context_text, sanitize_context_batch
+except ImportError:
+    # degraded-noop fallbacks (module absent or load failure)
+    def is_social_close(text: str) -> bool: return False
+    def sanitize_context_text(text: str, max_len: int = 600) -> str: return str(text)[:max_len]
+    def sanitize_context_batch(items, text_key: str = "text", max_len: int = 400, label: str = "") -> list:
+        return [f"{label} {item.get(text_key,'')[:max_len]}" for item in (items or []) if isinstance(item, dict) and item.get(text_key)]
+
+try:
+    from .memory_wiki_collapse import memory_context_collapse, tokenize as collapse_tokenize
+except ImportError:
+    def memory_context_collapse(query, memory_wiki_hits=None, knowledge_hits=None, distill_hits=None, budget=6, **kw):
+        return (memory_wiki_hits or [])
+    def collapse_tokenize(text: str) -> set: return set()
+
+try:
+    from .memory_wiki_session_extractor import extract_session_claims, score_session as extractor_score_session
+except ImportError:
+    def extract_session_claims(exchanges, session_id="", **kw): return {"extracted": 0, "entries": [], "error": "module absent"}
+    def extractor_score_session(exchanges): return {"total": 0.0}
+
+try:
+    from .memory_wiki_decay import scan_decay, archive_stale_claims, get_decay_stats
+except ImportError:
+    def scan_decay(db_path=None, threshold=0.1): return []
+    def archive_stale_claims(db_path=None, threshold=0.05, dry_run=True): return {"error": "module absent"}
+    def get_decay_stats(db_path=None): return {"error": "module absent"}
 
 # ═════════════════════════════════════════════════════════════
 # Embedding + Qdrant clients (stdlib-only, ноль зависимостей)
@@ -946,6 +983,9 @@ class MemoryWikiProvider(MemoryProvider):
             self._maintenance()
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
+        # v1.5.0: Social closer gate — skip search for trivial messages
+        if is_social_close(query):
+            return ""
         plan = self._recall_plan(query, limit=6)
         rows = self._search(query, limit=10, include_stale=True)
         env_meta = self._env_metadata_context(query)
@@ -1005,7 +1045,41 @@ class MemoryWikiProvider(MemoryProvider):
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         text = "\n".join(str(m.get("content", ""))[:4000] for m in messages[-24:])
         self._ingest_text(text, source=f"session_end:{self.session_id}", max_claims=14)
+        # ── v1.5.0: LLM-powered session extraction ──
+        self._extract_session_claims(messages)
         self._maintenance(); self._render_all()
+
+    # ── v1.5.0: LLM session extraction ─────────────────────────────────
+    def _extract_session_claims(self, messages: List[Dict[str, Any]]) -> None:
+        """Auto-extract structured claims from session via LLM.
+        Fail-open: silently returns on any error (never breaks session end)."""
+        try:
+            exchanges = []
+            for m in messages[-32:]:
+                role = str(m.get("role", "")).lower()
+                content = str(m.get("content", "") or "")
+                if role == "user":
+                    exchanges.append({"user": content, "assistant": ""})
+                elif role == "assistant" and exchanges:
+                    exchanges[-1]["assistant"] = content
+                elif role == "assistant":
+                    exchanges.append({"user": "", "assistant": content})
+            if len(exchanges) < 3:
+                return
+
+            result = extract_session_claims(
+                exchanges,
+                session_id=self.session_id,
+                add_claim_callback=self._add_claim,
+            )
+            if result.get("extracted", 0) > 0:
+                self._audit(
+                    "extraction",
+                    f"session:{self.session_id}",
+                    f"LLM extracted {result['extracted']} claims (score={result.get('score',0)})",
+                )
+        except Exception:
+            pass  # fail-open: never break session end
 
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False, **kwargs) -> None:
         self.session_id = new_session_id or self.session_id
@@ -1091,6 +1165,12 @@ class MemoryWikiProvider(MemoryProvider):
             {"name":"memory_wiki_query_mode","description":"Detect query type (technical/semantic/mixed) without searching.","parameters":P({"query":{"type":"string"}}, ["query"])},
             {"name":"memory_wiki_rebuild_from_journal","description":"Plan or apply SQLite rebuild from latest logical checkpoint plus append-only JSONL after-events.","parameters":P({"apply":{"type":"boolean","default":False},"checkpoint":{"type":"string","default":""},"max_events":{"type":"integer","default":0}}, [])},
             {"name":"memory_wiki_export","description":"Export bounded claims/evidence/contradictions JSON.","parameters":P({"limit":{"type":"integer","default":200}})},
+            # ── v1.5.0: Memory OS integration tools ──
+            {"name":"memory_wiki_decay_scan","description":"Scan claims with exponential decay scoring. Returns stale candidates below threshold.","parameters":P({"threshold":{"type":"number","default":0.15}}, [])},
+            {"name":"memory_wiki_decay_stats","description":"Get decay statistics: total/active/archived claim counts.","parameters":P({}, [])},
+            {"name":"memory_wiki_decay_archive","description":"Archive claims with decay_score below threshold. High-confidence (>=0.7) claims are only flagged, never auto-archived.","parameters":P({"threshold":{"type":"number","default":0.05},"apply":{"type":"boolean","default":false}}, [])},
+            {"name":"memory_wiki_context_sanitize","description":"Sanitize text for safe context injection: strips injection patterns, normalizes whitespace, truncates.","parameters":P({"text":{"type":"string"},"max_len":{"type":"integer","default":400}}, ["text"])},
+            {"name":"memory_wiki_is_social_close","description":"Check if text is a social closer (ok, thanks, 👍) that should skip memory search.","parameters":P({"text":{"type":"string"}}, ["text"])},
         ]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
@@ -1183,6 +1263,30 @@ class MemoryWikiProvider(MemoryProvider):
             if tool_name == "memory_wiki_debug_search": return tool_result(success=True, **self._debug_search(a.get("query",""), int(a.get("limit",10)), a.get("topic")))
             if tool_name == "memory_wiki_compare_search": return tool_result(success=True, **self._compare_search(a.get("query",""), int(a.get("limit",10)), a.get("topic")))
             if tool_name == "memory_wiki_query_mode": return tool_result(success=True, **self._query_mode_tool(a.get("query","")))
+            # ── v1.5.0: Memory OS integration tools ──
+            if tool_name == "memory_wiki_decay_scan":
+                res = scan_decay(
+                    db_path=str(self.db_path),
+                    threshold=float(a.get("threshold", 0.15)),
+                )
+                return tool_result(success=True, stale_candidates=len(res), candidates=res[:20])
+            if tool_name == "memory_wiki_decay_stats":
+                stats = get_decay_stats(db_path=str(self.db_path))
+                return tool_result(success=True, **stats)
+            if tool_name == "memory_wiki_decay_archive":
+                res = archive_stale_claims(
+                    db_path=str(self.db_path),
+                    threshold=float(a.get("threshold", 0.05)),
+                    dry_run=not bool(a.get("apply", False)),
+                )
+                return tool_result(success=True, **res)
+            if tool_name == "memory_wiki_context_sanitize":
+                text = a.get("text", "")
+                clean = sanitize_context_text(text, max_len=int(a.get("max_len", 400)))
+                return tool_result(success=True, original_len=len(text), sanitized=clean)
+            if tool_name == "memory_wiki_is_social_close":
+                txt = a.get("text", "")
+                return tool_result(success=True, is_social=is_social_close(txt))
             if tool_name == "memory_wiki_export": return tool_result(self._export(int(a.get("limit",200))))
             return tool_error(f"unknown memory-wiki tool: {tool_name}")
         except sqlite3.OperationalError as e:
