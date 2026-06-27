@@ -1,18 +1,17 @@
 """
-memory_wiki_decay.py — Exponential decay scoring for memory-wiki claims.
-Adapted from Memory OS (ClaudioDrews/memory-os) scripts/decay_scanner.py, MIT License.
+decay.py — Exponential decay scoring for memory-wiki claims.
 
 Computes decay_score for claims based on age, confidence, and salience.
 Pure SQLite-based — no Qdrant/Docker/Redis required.
 
 Formula: decay_score = exp(-ln(2) * age_days / half_life)
-  - high-confidence/high-salience claims → 180d half-life
-  - medium → 90d
-  - low → 30d
+  - high-confidence/high-salience claims -> 180d half-life
+  - medium -> 90d
+  - low -> 30d
 
 CLI usage:
-  python3 memory_wiki_decay.py --dry-run
-  python3 memory_wiki_decay.py --threshold 0.15 --archive
+  python3 decay.py --dry-run
+  python3 decay.py --threshold 0.15 --archive
 """
 
 from __future__ import annotations

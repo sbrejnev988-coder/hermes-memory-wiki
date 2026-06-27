@@ -1,12 +1,11 @@
 """
-memory_wiki_collapse.py — Cross-source salience ranking for memory-wiki.
-Adapted from Memory OS (ClaudioDrews/memory-os) icarus/collapse.py, MIT License.
+collapse.py — Cross-source salience ranking for memory-wiki.
 
 Unifies recall candidates from multiple sources (memory_wiki_query, knowledge_search,
-distill_pack_context) into a single salience-ranked survivor list with Hebbian
-cross-source corroboration amplification.
+distill_pack_context) into a single salience-ranked survivor list with cross-source
+corroboration amplification ("fire together, wire together" principle).
 
-Pure functions, zero dependencies, ~15KB. No Docker/Redis/Qdrant required.
+Pure functions, zero dependencies. No Docker/Redis/Qdrant required.
 """
 
 from __future__ import annotations

@@ -1,12 +1,11 @@
 """
-memory_wiki_session_extractor.py — LLM-powered session extraction for memory-wiki.
-Adapted from Memory OS (ClaudioDrews/memory-os) icarus/hooks.py, MIT License.
+extractor.py — LLM-powered session extraction for memory-wiki.
 
 At session end, builds transcript from exchanges, sends to LLM (DeepSeek via local
 proxy :18089), extracts structured claims as {type, summary, content, training_value},
 and feeds them into memory_wiki_add_claim.
 
-No Docker/Redis/Qdrant required. Uses local DeepSeek proxy.
+No Docker/Redis/Qdrant required.
 """
 
 from __future__ import annotations
@@ -207,7 +206,7 @@ def _llm_extract_entries(transcript: str) -> list[dict]:
         raw = body["choices"][0]["message"]["content"]
 
         if raw is None:
-            logger.warning("memory_wiki: LLM extraction returned content:null")
+            logger.warning("extractor: LLM extraction returned content:null")
             return []
 
         extracted = _parse_json_robust(raw)
@@ -224,7 +223,7 @@ def _llm_extract_entries(transcript: str) -> list[dict]:
                     extracted = []
 
         if not isinstance(extracted, list):
-            logger.warning("memory_wiki: LLM extraction returned non-list: %s", type(extracted))
+            logger.warning("extractor: LLM extraction returned non-list: %s", type(extracted))
             return []
 
         allowed_types = {"decision", "resolution", "note"}
@@ -251,7 +250,7 @@ def _llm_extract_entries(transcript: str) -> list[dict]:
     except (urllib.error.URLError, json.JSONDecodeError, KeyError,
             IndexError, ValueError, ConnectionError, TimeoutError,
             OSError) as e:
-        logger.warning("memory_wiki: LLM extraction failed (%s)", type(e).__name__)
+        logger.warning("extractor: LLM extraction failed (%s)", type(e).__name__)
         return []
 
 
@@ -293,7 +292,7 @@ def extract_session_claims(
 
     if not entries:
         logger.info(
-            "memory_wiki: extraction produced nothing for session %s (score=%.2f, %d exchanges)",
+            "extractor: extraction produced nothing for session %s (score=%.2f, %d exchanges)",
             session_id or "?", scores["total"], len(exchanges),
         )
         return {"extracted": 0, "entries": [], "score": scores["total"]}
@@ -316,10 +315,10 @@ def extract_session_claims(
                 )
                 added.append({"id": cid, **entry})
             except Exception as e:
-                logger.warning("memory_wiki: claim add failed: %s", e)
+                logger.warning("extractor: claim add failed: %s", e)
 
     logger.info(
-        "memory_wiki: extracted %d entries from session %s (score=%.2f)",
+        "extractor: extracted %d entries from session %s (score=%.2f)",
         len(added), session_id or "?", scores["total"],
     )
     return {

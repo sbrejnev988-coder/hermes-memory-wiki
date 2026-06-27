@@ -6,7 +6,7 @@ An agent that forgets everything between sessions is not a collaborator — it's
 
 **40+ tools. 24 database tables. Zero external Python dependencies.** Runs on Android/Termux proot, Linux VPS, or desktop — anywhere Python 3.10 and SQLite 3.35 live.
 
-v1.5.0 integrates algorithms from [Memory OS](https://github.com/ClaudioDrews/memory-os): cross-source salience collapse with Hebbian corroboration, social closer detection, context injection sanitization, LLM-powered session extraction, and exponential decay scanning.
+v1.5.0 adds cross-source salience collapse with cross-source corroboration, social closer detection, context injection sanitization, LLM-powered session extraction, and exponential decay scanning.
 
 ---
 
@@ -45,7 +45,7 @@ Memory-Wiki runs as a native Hermes `MemoryProvider` plugin — it hooks into se
 │  │                               │                                │  │
 │  │  ┌────────────────────────────┴───────────────────────────┐  │  │
 │  │  │                Collapse (v1.5.0)                       │  │  │
-│  │  │  Cross-source salience ranking + Hebbian corroboration │  │  │
+│  │  │  Cross-source salience ranking + corroboration boost   │  │  │
 │  │  │  Prune weak, amplify strong, dedup, budget survivors   │  │  │
 │  │  └────────────────────────────┬───────────────────────────┘  │  │
 │  │                               │                                │  │
@@ -83,7 +83,7 @@ Query mode auto-detection (technical vs semantic vs mixed) adjusts lexical/seman
 Before v1.5.0, recall emitted everything from every source — noise, duplicates, and weak signal all consumed context budget equally. Now, all candidates from memory-wiki, knowledge_search, and distill capsules flow through a single salience-ranked collapse:
 
 1. **Prune** — weak paths removed relative to the strongest (not an absolute floor)
-2. **Amplify** — cross-source agreement boosts salience: a fact that surfaces from memory-wiki AND knowledge_search outranks a lone strong hit (Hebbian: "fire together, wire together")
+2. **Amplify** — cross-source agreement boosts salience: a fact that surfaces from memory-wiki AND knowledge_search outranks a lone strong hit ("fire together, wire together")
 3. **Budget** — single cross-source budget (default 6 survivors)
 4. **Dedup** — near-duplicate suppression by token overlap
 
@@ -91,9 +91,7 @@ The collapse is fail-open: any error returns inputs unchanged.
 
 ---
 
-## Key Capabilities
-
-### Durable Claims, Not Dead Documents
+## Durable Claims, Not Dead Documents
 
 Every memory is a structured claim — not a chunked paragraph. Each claim carries:
 
@@ -105,6 +103,22 @@ Every memory is a structured claim — not a chunked paragraph. Each claim carri
 - **contradictions**: automated detection of conflicting claims
 - **evidence**: linked proof (file paths, command output, URLs)
 
+### Scoring Formula
+
+```
+score = 3.2·lexical + exact + 1.0·confidence + 1.2·salience
+      + 0.65·freshness + 0.25·recency + access
+      + 0.95·quality + min(0.30, 0.55·usefulness)
+      + min(0.40, 0.90·trust) + 0.45·pinned + 0.35·verified
+      + staleness_penalty + risk_penalty + artifact_penalty
+```
+
+**Verified Immunity**: verified claims are protected — no staleness penalty, no risk penalty, freshness floor at 0.70.
+
+---
+
+## Key Subsystems
+
 ### Write Firewall 2.0
 
 Not everything should become memory. The firewall rejects:
@@ -114,6 +128,7 @@ Not everything should become memory. The firewall rejects:
 - Path-only fragments, non-semantic blobs
 - Secret-like material (16 regex patterns → quarantine)
 - Context capsules (API-level ValueError + SQL trigger)
+- Claims below quality threshold (claim_quality < 0.35)
 
 Source-aware policies: explicit corrections > curated summaries > conversation fragments > raw tool output.
 
@@ -134,17 +149,17 @@ Every mutation (add/update/retire/verify) writes to an append-only JSONL journal
 
 At session end, the last 32 message exchanges are assembled into a transcript and sent to an LLM (configurable: DeepSeek, OpenRouter, or custom endpoint) with a specialized "session archivist" prompt. The LLM extracts structured entries — decisions, resolutions, discoveries — and feeds them directly into the claim store. Sessions below a significance threshold (score < 0.2) are skipped. Entirely optional: disable with `MW_EXTRACTION_ENABLED=0`.
 
-### Scoring Formula
+### Exponential Decay Scanner (v1.5.0)
 
-```
-score = 3.2·lexical + exact + 1.0·confidence + 1.2·salience
-      + 0.65·freshness + 0.25·recency + access
-      + 0.95·quality + min(0.30, 0.55·usefulness)
-      + min(0.40, 0.90·trust) + 0.45·pinned + 0.35·verified
-      + staleness_penalty + risk_penalty + artifact_penalty
-```
+Claims age. The decay scanner applies `exp(-ln(2) · age_days / half_life)`:
 
-**Verified Immunity**: verified claims are protected — no staleness penalty, no risk penalty, freshness floor at 0.70.
+| Confidence × Salience | Half-life |
+|---|---|
+| ≥ 0.7 | 180 days |
+| 0.4–0.7 | 90 days |
+| < 0.4 | 30 days |
+
+High-confidence claims (≥0.7) are **never** auto-archived — only flagged for human review. A monthly cron job reports stale candidates.
 
 ### Deduplication
 
@@ -167,32 +182,10 @@ Beyond flat claims, memory-wiki supports typed records:
 
 | Type | Schema | Example |
 |---|---|---|
-| **Decision** | decision, rationale, alternatives, topic | "Use SQLite for memory store", "Faster than Postgres for <100K rows, zero setup" |
-| **Mistake** | trigger, mistake, fix, prevention | "Edited config.yaml with sed", "sed -i destroyed YAML structure", "Use Node.js script + SCP" |
+| **Decision** | decision, rationale, alternatives, topic | "Use SQLite for memory store — faster than Postgres for <100K rows, zero setup" |
+| **Mistake** | trigger, mistake, fix, prevention | "Edited config.yaml with sed — sed -i destroyed YAML structure — Use Node.js script + SCP" |
 | **Task Capsule** | intent, plan, files, commands, errors, fixes, verification, followups | Full post-mortem of a completed task |
 | **Project Profile** | project_id, root, purpose, commands, services, notes | Repository metadata for context injection |
-
-### Exponential Decay Scanner (v1.5.0)
-
-Claims age. The decay scanner applies `exp(-ln(2) · age_days / half_life)`:
-
-- High confidence×salience (≥0.7) → 180-day half-life
-- Medium → 90 days
-- Low → 30 days
-
-High-confidence claims (≥0.7) are **never** auto-archived — only flagged for human review. A monthly cron job reports stale candidates.
-
-### Fault Injection for Testing
-
-Three environment variables enable fault simulation without breaking production:
-
-| Variable | Effect |
-|---|---|
-| `MW_FAULT_INJECT_FTS_CORRUPT=1` | Simulates FTS5 index corruption |
-| `MW_FAULT_INJECT_STALE=1` | Forces all claims to appear stale |
-| `MW_FAULT_INJECT_BACKUP_CHECKSUM_MISMATCH=1` | Simulates backup checksum failure |
-
-FTS5 runtime auto-repair: on `DatabaseError` during search, rebuilds FTS index and retries — no restart needed.
 
 ---
 
@@ -277,7 +270,7 @@ glinomes restart
 | `memory_wiki_reindex` | Re-index all active claims into Qdrant |
 | `memory_wiki_undo_last` | Undo most recent mutation |
 
-### v1.5.0 Additions
+### v1.5.0
 | Tool | Purpose |
 |---|---|
 | `memory_wiki_decay_scan` | Scan claims with exponential decay scoring |
@@ -288,24 +281,25 @@ glinomes restart
 
 ---
 
-## Comparison: Memory-Wiki vs RAG vs Memory OS
+## Comparison: Memory-Wiki vs Classic RAG
 
-| Aspect | Classic RAG | Memory OS | Memory-Wiki |
-|---|---|---|---|
-| **Infrastructure** | Vector DB + embed model | Docker (Qdrant+Redis+ARQ) | **SQLite + stdlib stubs** |
-| **Storage** | Chunked documents | 7 layers (MD → Qdrant) | Structured claims (24 tables) |
-| **Search** | Single vector similarity | Collapse: 4-source ranking | **3-layer RRF + collapse** |
-| **Quality gates** | None | training_value + verified | **Write firewall + review queue** |
-| **Contradictions** | None | None | **Automatic detection** |
-| **Verification** | None | Passive field | **Active pipeline + immunity** |
-| **Secrets** | Stored as-is | Plain SQLite | **Redaction + quarantine + vault** |
-| **Recovery** | DB backup | DB backup | **Journal replay + checkpoints** |
-| **Dependencies** | numpy, transformers, ONNX | Docker, Redis, ARQ, fastembed | **Zero** |
-| **Disk (3000 items)** | 500MB+ | 200MB+ | **~10MB** |
-| **Platform** | Server only | Server only | **Android/Termux/Linux** |
-| **Session extraction** | N/A | ✅ LLM archivist | ✅ **LLM archivist (v1.5.0)** |
-| **Decay/archival** | N/A | ✅ Qdrant-based | ✅ **SQLite-based (v1.5.0)** |
-| **Cross-agent handoff** | N/A | ✅ fabric_pending | N/A (single-agent) |
+| Aspect | Classic RAG | Memory-Wiki |
+|---|---|---|
+| **Storage model** | Chunked documents in vector DB | Structured claims in SQLite (24 tables) |
+| **Metadata** | Source filename, chunk index | confidence, salience, freshness, trust, verification |
+| **Search** | Single cosine similarity | 3-layer RRF fusion (FTS5 + TF-IDF + qdrant) |
+| **Search resilience** | Vector DB down = dead | Any 1-2 layers alive = works |
+| **Quality control** | None — anything chunked is retrievable | Write firewall + review queue + claim_quality scoring |
+| **Contradictions** | None — identical facts in different chunks | Automatic detection + resolution tracking |
+| **Verification** | None | Full pipeline: unverified → verified → disputed with evidence |
+| **Secrets** | Stored as-is in text chunks | Scanned, quarantined, vaulted, redacted at recall |
+| **Provenance** | None — who said what is lost | Every claim: source, evidence, why_believe, audit trail |
+| **Recovery** | Vector DB backup | Append-only JSONL journal + logical checkpoints + replay |
+| **Dependencies** | numpy, transformers, ONNX, 500MB+ | **Zero** — pure Python stdlib |
+| **Disk usage** (3000 items) | 500MB+ for embeddings | ~10MB for claims + indices |
+| **Platform** | Server only | Android/Termux/Linux/desktop |
+| **Session extraction** | N/A | LLM archivist: transcript → structured claims |
+| **Decay/archival** | N/A | Exponential decay: 3-tier half-life, high-conf protection |
 
 ---
 
@@ -333,21 +327,21 @@ glinomes restart
 
 ```
 memory-wiki/
-├── __init__.py                         # Main plugin (v1.5.0, ~4400 lines)
-├── plugin.yaml                          # Hermes plugin manifest
-├── memory_wiki_collapse.py              # Cross-source salience ranking
-├── memory_wiki_context_guard.py         # Social closer + injection sanitizer
-├── memory_wiki_decay.py                 # Exponential decay scanner
-├── memory_wiki_session_extractor.py     # LLM-powered session archivist
-├── LICENSE                              # CC0-1.0
-├── README.md                            # This file
+├── __init__.py         # Main plugin (v1.5.0, ~4400 lines)
+├── plugin.yaml          # Hermes plugin manifest
+├── collapse.py          # Cross-source salience ranking
+├── guard.py             # Social closer + injection sanitizer
+├── decay.py             # Exponential decay scanner
+├── extractor.py         # LLM-powered session archivist
+├── LICENSE              # CC0-1.0
+├── README.md            # This file
 ├── .gitignore
 ├── scripts/
-│   ├── smoke_test.py                    # Plugin smoke test
-│   └── memory_wiki_cli.py               # CLI tools
+│   ├── smoke_test.py    # Plugin smoke test
+│   └── cli.py           # CLI tools
 └── semantic/
-    ├── embed_stub.py                    # HTTP embed stub (:4000)
-    └── qdrant_stub.py                   # HTTP qdrant stub (:6333)
+    ├── embed_stub.py    # HTTP embed stub (:4000)
+    └── qdrant_stub.py   # HTTP qdrant stub (:6333)
 ```
 
 ---
@@ -359,11 +353,14 @@ memory-wiki/
 python3 scripts/smoke_test.py
 
 # Compile check
-python3 -m py_compile __init__.py memory_wiki_collapse.py memory_wiki_context_guard.py memory_wiki_decay.py memory_wiki_session_extractor.py
+python3 -m py_compile __init__.py collapse.py guard.py decay.py extractor.py
 
 # Fault injection tests
 MW_FAULT_INJECT_FTS_CORRUPT=1 python3 scripts/smoke_test.py
 MW_FAULT_INJECT_STALE=1 python3 scripts/smoke_test.py
+
+# FTS5 runtime auto-repair: on DatabaseError during search,
+# rebuilds FTS index and retries — no restart needed.
 ```
 
 ---
@@ -380,7 +377,7 @@ MW_FAULT_INJECT_STALE=1 python3 scripts/smoke_test.py
 
 | Version | Date | Changes |
 |---|---|---|
-| **1.5.0** | 2026-06-27 | Cross-source collapse (salience + Hebbian), social closer gate, context sanitization (12 injection patterns), LLM session extraction, exponential decay scanner, 5 new tools — algorithms adapted from Memory OS |
+| **1.5.0** | 2026-06-27 | Cross-source collapse (salience + corroboration), social closer gate, context sanitization (12 injection patterns), LLM session extraction, exponential decay scanner, 5 new tools |
 | 1.4.1 | 2026-06-26 | TF-IDF semantic search (6000 features), SimHash dedup, VACUUM INTO backup, SHA256 checksum, FTS5 runtime auto-repair, SQL triggers, verified immunity, fault injection hooks, 3-layer RRF fusion |
 | 1.4.0 | 2026-06-18 | Append-only JSONL journal, hash-chained events, logical checkpoints, replay recovery, mutation log with undo, preference priority rules, secret firewall, verification pipeline |
 | 1.3.0 | 2026-05-19 | Quality gate, review queue, source policies, topic hierarchy, contradiction detection |
@@ -392,9 +389,3 @@ MW_FAULT_INJECT_STALE=1 python3 scripts/smoke_test.py
 ## License
 
 CC0-1.0 — Public Domain Dedication. No attribution required.
-
----
-
-## Acknowledgments
-
-v1.5.0 collapse, social closer, context sanitization, and decay scanner algorithms adapted from [Memory OS](https://github.com/ClaudioDrews/memory-os) by Claudio Drews (MIT License). Session extraction architecture inspired by Memory OS `on_session_end` → `_llm_extract_entries` pipeline.

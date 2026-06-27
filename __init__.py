@@ -5,11 +5,11 @@ $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
 logical checkpoints for replay recovery. Runs inside MemoryProvider lifecycle,
 so recall is near prompt building and session lifecycle, not bolted on as MCP.
 
-v1.5.0 — Memory OS Integration (2026-06-27):
-  + Cross-source collapse (salience ranking + Hebbian corroboration)
-  + Social closer detection (skip search for trivial messages)
-  + Context sanitization (12 injection patterns)
-  + LLM-powered session extraction (auto-claims from session transcripts)
+v1.5.0 — Cross-Source Collapse & Session Intelligence (2026-06-27):
+  + Cross-source collapse: salience ranking with cross-source corroboration
+  + Social closer detection: skip search for trivial messages
+  + Context sanitization: 12 injection-pattern regexes
+  + LLM-powered session extraction: auto-claims from session transcripts
   + Exponential decay scanner for claims
 """
 from __future__ import annotations
@@ -31,31 +31,30 @@ import stat
 import urllib.request
 import urllib.error
 
-# ── Memory OS Integration v1.5.0 ──────────────────────────────────────
+# ── v1.5.0 modules (stdlib-only, zero-dependency) ─────────────────────
 try:
-    from .memory_wiki_context_guard import is_social_close, sanitize_context_text, sanitize_context_batch
+    from .guard import is_social_close, sanitize_context_text, sanitize_context_batch
 except ImportError:
-    # degraded-noop fallbacks (module absent or load failure)
     def is_social_close(text: str) -> bool: return False
     def sanitize_context_text(text: str, max_len: int = 600) -> str: return str(text)[:max_len]
     def sanitize_context_batch(items, text_key: str = "text", max_len: int = 400, label: str = "") -> list:
         return [f"{label} {item.get(text_key,'')[:max_len]}" for item in (items or []) if isinstance(item, dict) and item.get(text_key)]
 
 try:
-    from .memory_wiki_collapse import memory_context_collapse, tokenize as collapse_tokenize
+    from .collapse import memory_context_collapse, tokenize as collapse_tokenize
 except ImportError:
     def memory_context_collapse(query, memory_wiki_hits=None, knowledge_hits=None, distill_hits=None, budget=6, **kw):
         return (memory_wiki_hits or [])
     def collapse_tokenize(text: str) -> set: return set()
 
 try:
-    from .memory_wiki_session_extractor import extract_session_claims, score_session as extractor_score_session
+    from .extractor import extract_session_claims, score_session as extractor_score_session
 except ImportError:
     def extract_session_claims(exchanges, session_id="", **kw): return {"extracted": 0, "entries": [], "error": "module absent"}
     def extractor_score_session(exchanges): return {"total": 0.0}
 
 try:
-    from .memory_wiki_decay import scan_decay, archive_stale_claims, get_decay_stats
+    from .decay import scan_decay, archive_stale_claims, get_decay_stats
 except ImportError:
     def scan_decay(db_path=None, threshold=0.1): return []
     def archive_stale_claims(db_path=None, threshold=0.05, dry_run=True): return {"error": "module absent"}
@@ -1165,7 +1164,7 @@ class MemoryWikiProvider(MemoryProvider):
             {"name":"memory_wiki_query_mode","description":"Detect query type (technical/semantic/mixed) without searching.","parameters":P({"query":{"type":"string"}}, ["query"])},
             {"name":"memory_wiki_rebuild_from_journal","description":"Plan or apply SQLite rebuild from latest logical checkpoint plus append-only JSONL after-events.","parameters":P({"apply":{"type":"boolean","default":False},"checkpoint":{"type":"string","default":""},"max_events":{"type":"integer","default":0}}, [])},
             {"name":"memory_wiki_export","description":"Export bounded claims/evidence/contradictions JSON.","parameters":P({"limit":{"type":"integer","default":200}})},
-            # ── v1.5.0: Memory OS integration tools ──
+            # ── v1.5.0: Collapse & decay tools ──
             {"name":"memory_wiki_decay_scan","description":"Scan claims with exponential decay scoring. Returns stale candidates below threshold.","parameters":P({"threshold":{"type":"number","default":0.15}}, [])},
             {"name":"memory_wiki_decay_stats","description":"Get decay statistics: total/active/archived claim counts.","parameters":P({}, [])},
             {"name":"memory_wiki_decay_archive","description":"Archive claims with decay_score below threshold. High-confidence (>=0.7) claims are only flagged, never auto-archived.","parameters":P({"threshold":{"type":"number","default":0.05},"apply":{"type":"boolean","default":false}}, [])},
@@ -1263,7 +1262,7 @@ class MemoryWikiProvider(MemoryProvider):
             if tool_name == "memory_wiki_debug_search": return tool_result(success=True, **self._debug_search(a.get("query",""), int(a.get("limit",10)), a.get("topic")))
             if tool_name == "memory_wiki_compare_search": return tool_result(success=True, **self._compare_search(a.get("query",""), int(a.get("limit",10)), a.get("topic")))
             if tool_name == "memory_wiki_query_mode": return tool_result(success=True, **self._query_mode_tool(a.get("query","")))
-            # ── v1.5.0: Memory OS integration tools ──
+            # ── v1.5.0: Collapse & decay tools ──
             if tool_name == "memory_wiki_decay_scan":
                 res = scan_decay(
                     db_path=str(self.db_path),
@@ -3325,7 +3324,7 @@ class MemoryWikiProvider(MemoryProvider):
         }
         metrics.update({'top_artifacts':top_artifacts,'health_components':components})
         score = sum(components.values()) / max(1, len(components))
-        return {"version":"1.3.0-memory-os","health_score":round(score,3),"metrics":metrics,"issues":issues,"schema_anomalies":schema_anomalies,"low_quality":bad,"bad_topics":topics,"raw_blobs":blobs,"secret_hits":secrets}
+        return {"version":"1.3.0-collapse","health_score":round(score,3),"metrics":metrics,"issues":issues,"schema_anomalies":schema_anomalies,"low_quality":bad,"bad_topics":topics,"raw_blobs":blobs,"secret_hits":secrets}
 
     def _explain_recall(self, query: str, limit: int = 10, topic: Optional[str]=None) -> List[Dict[str, Any]]:
         rows = self._search(query, limit, True, topic); qt=tokens(query); out=[]
@@ -3437,7 +3436,7 @@ class MemoryWikiProvider(MemoryProvider):
         return {"path":path,"content":"\n".join(text.splitlines()[:max(10,min(limit,200))])}
 
 
-    # ----- v1.0 operational memory OS extensions ------------------------
+    # ── v1.0 operational extensions ──
     def _doctor(self, repair: bool=False) -> Dict[str, Any]:
         checks=[]; repairs=[]
         def add(name, ok, detail="", suggested_action=""):

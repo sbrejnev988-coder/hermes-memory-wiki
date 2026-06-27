@@ -1,13 +1,12 @@
 """
-memory_wiki_context_guard.py — Safe context injection guard for memory-wiki.
-Adapted from Memory OS (ClaudioDrews/memory-os) icarus/hooks.py, MIT License.
+guard.py — Safe context injection guard for memory-wiki.
 
 Provides:
   - Social closer detection (skip search for trivial messages)
   - Prompt injection sanitization (regex-based pattern stripping)
   - Context text sanitization (truncation + normalization)
 
-Pure functions, zero dependencies. No Docker/Redis/Qdrant required.
+Pure functions, zero dependencies.
 """
 
 from __future__ import annotations
