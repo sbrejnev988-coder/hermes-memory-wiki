@@ -1,6 +1,6 @@
 # Hermes Memory-Wiki v1.5.0
 
-**Persistent, self-curating memory for [Hermes Agent](https://github.com/NousResearch/hermes-agent) — no cloud, no Docker, no pip install.**
+**Hermes Memory OS — native long-term agent memory: 72 tools, hybrid search (FTS5 lexical + Qdrant semantic + RRF fusion), structured claims & evidence, write firewall, secret redaction, graph/project memory, task capsules, append-only journal with recovery, transactions, undo, backups & self-healing. Stdlib-only Python.**
 
 An agent that forgets everything between sessions is not a collaborator — it's a CLI wrapper. Memory-Wiki gives Hermes a real memory: structured claims with confidence scoring, hybrid semantic search, a verification pipeline, an append-only journal with replay recovery, and automatic session extraction via LLM. Every session adds durable knowledge instead of evaporating.
 

@@ -1,3 +1,3 @@
 name: memory-wiki
 version: 1.5.0
-description: Native Hermes active-memory wiki vault — SQLite FTS5 + TF-IDF + semantic stubs, 3-layer RRF hybrid search, 40+ tools, zero dependencies. v1.5.0 adds cross-source collapse (salience ranking with cross-source corroboration), social closer detection, context injection sanitization, LLM-powered session extraction, and exponential decay scanner.
+description: "Hermes Memory OS — native long-term agent memory: 72 tools, hybrid search (FTS5 lexical + Qdrant semantic + RRF fusion), structured claims & evidence, write firewall, secret redaction, graph/project memory, task capsules, append-only journal with recovery, transactions, undo, backups & self-healing. Stdlib-only Python."
