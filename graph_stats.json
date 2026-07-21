@@ -2,10 +2,31 @@
   "claims_active": 2358,
   "entities": 807,
   "relations": 7574,
-  "claim_embeddings": 2358,
-  "entity_embeddings": 807,
-  "fts5_docs": 2358,
-  "embedding_model": "tfidf-local",
-  "embedding_dims": 256,
-  "co_occurrence_edges": 500
+  "collection_v6": "memory_wiki_claims_v6",
+  "embed_model": "perplexity/pplx-embed-v1-4b",
+  "embed_dims": 2560,
+  "indexed_points": 800,
+  "total_to_index": 2358,
+  "progress_pct": "34%",
+  "fts5_indexed": 2358,
+  "fts5_match_hermes": 1890,
+  "embed_provider": "openrouter",
+  "vector_size": 2560,
+  "cron": {
+    "auto_reindex": "every_30min",
+    "curator": "daily_4am_deepseekproxy"
+  },
+  "tables": [
+    "claims",
+    "entities",
+    "relations",
+    "claim_embeddings",
+    "entity_embeddings",
+    "claims_fts",
+    "evidence",
+    "contradictions",
+    "secret_index",
+    "task_capsules",
+    "audit_log"
+  ]
 }
