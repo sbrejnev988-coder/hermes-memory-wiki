@@ -1,4 +1,4 @@
-"""memory-wiki v1.12.0: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.13.0: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -3284,6 +3284,49 @@ class MemoryWikiProvider(MemoryProvider):
                               source="tool:patch_outcome_add", confidence=0.9, salience=0.8)
         return {"id": cid, "patch_id": patch_id, "outcome": outcome}
 
+    def _ingest_idempotent(self, claim_text: str, source_event_id: str = "", phase_sep_version: str = "1") -> str | None:
+        """Check dedup: same source_event_id + content_hash → already ingested."""
+        if not source_event_id: return None
+        content_hash = hashlib.sha256(claim_text.encode()).hexdigest()[:16]
+        c = self._connect()
+        row = c.execute("SELECT id FROM claims WHERE evidence LIKE ? AND evidence LIKE ? LIMIT 1",
+            (f"%source_event:{source_event_id}%", f"%content_hash:{content_hash}%")).fetchone()
+        return row["id"] if row else None
+
+    def _mark_ingested(self, claim_id: str, source_event_id: str, content_hash: str) -> None:
+        c = self._connect()
+        c.execute("UPDATE claims SET evidence = evidence || ? WHERE id=?",
+            (f" | source_event:{source_event_id} content_hash:{content_hash}", claim_id))
+        c.commit()
+
+    def _resolve_temporal(self, topic: str, claim_text: str) -> Dict[str, Any]:
+        """Check if new claim supersedes existing active claims on same topic."""
+        c = self._connect()
+        rows = c.execute("SELECT id,claim,temporal_status FROM claims WHERE topic=? AND status IN ('active','current') ORDER BY created_at DESC LIMIT 20", (topic,)).fetchall()
+        superseded = []
+        for r in rows:
+            if r["temporal_status"] == "superseded": continue
+            n = slug(claim_text.lower()); o = slug(str(r["claim"] or "").lower())
+            for sig in ["no longer","replaced","changed to","now uses","instead of","rather than","заменён","перешёл на","больше не"]:
+                if sig in n:
+                    superseded.append(r["id"]); break
+            if not superseded:
+                vals_n = set(re.findall(r'\d+\.\d+|port\s+\d+|model[\s:]+\S+', n))
+                vals_o = set(re.findall(r'\d+\.\d+|port\s+\d+|model[\s:]+\S+', o))
+                if vals_n and vals_o and vals_n != vals_o:
+                    superseded.append(r["id"])
+        return {"action": "insert_and_supersede" if superseded else "insert", "supersedes": superseded}
+
+    def _apply_supersession(self, superseded_ids: list, new_claim_id: str) -> int:
+        """Mark superseded claims as historical."""
+        c = self._connect()
+        for sid in superseded_ids:
+            c.execute("UPDATE claims SET temporal_status='superseded', superseded_by_id=?, status='historical' WHERE id=?",
+                      (new_claim_id, sid))
+        c.commit()
+        return len(superseded_ids)
+
+
     def _add_claim(self, claim: str, topic="general", evidence="", source="tool", confidence=.7, salience=.7) -> str:
         raw_claim=scrub_memory_artifacts(str(claim or "")); raw_evidence=scrub_memory_artifacts(str(evidence or ""))
         raw_secret=bool(secret_scan(raw_claim + " " + raw_evidence).get("raw_secret"))
@@ -3524,6 +3567,24 @@ class MemoryWikiProvider(MemoryProvider):
             self._upsert_fts(row["id"]); self._render_all()
 
     # ----- search/scoring -----------------------------------------------
+
+    def _apply_diversity(self, scored: list, query_mode: str) -> list:
+        """MMR diversity: max 3 per cluster, max 40% per source, penalty for near-duplicates."""
+        if len(scored) <= 3: return scored
+        selected = [scored[0]]
+        src_count = {str(scored[0].get("source","") or scored[0].get("topic","")): 1}
+        cl_count = {str(scored[0].get("topic","general")): 1}
+        for item in scored[1:]:
+            src = str(item.get("source","") or item.get("topic",""))
+            cl = str(item.get("topic","general"))
+            if cl_count.get(cl,0) >= 3: continue
+            if src_count.get(src,0) > 0 and (src_count[src]+1)/(len(selected)+1) > 0.4:
+                item["score"] = float(item.get("score",0)) * 0.6
+            selected.append(item)
+            src_count[src] = src_count.get(src,0) + 1
+            cl_count[cl] = cl_count.get(cl,0) + 1
+        return selected
+
 
     def _rerank_status(self) -> Dict[str, Any]:
         with _RERANK_LOCK:
@@ -3779,6 +3840,7 @@ class MemoryWikiProvider(MemoryProvider):
             d = self._sanitize_row(r); d["score"] = round(score, 4); d["score_parts"] = {k: round(v,4) for k,v in parts.items() if abs(v) > 0.0001}; scored.append(d)
         scored.sort(key=lambda x: x["score"], reverse=True)
         scored = self._rerank_rows(q, scored, query_mode)
+        scored = self._apply_diversity(scored, query_mode)
         ids = [x["id"] for x in scored[:limit]]
         if ids:
             with c:
