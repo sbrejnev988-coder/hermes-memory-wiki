@@ -1,4 +1,4 @@
-"""memory-wiki v1.15.2: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.15.3: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -584,7 +584,7 @@ def _qdrant_upsert(claim_id: str, vector: List[float], payload: dict, collection
     stored_payload["claim_id"] = str(claim_id)
     result = _qdrant_req(
         "PUT",
-        f"/collections/{QDRANT_COLLECTION}/points?wait=true",
+        f"/collections/{coll}/points?wait=true",
         {
             "points": [{
                 "id": _qdrant_point_id(claim_id),
@@ -2558,7 +2558,19 @@ class MemoryWikiProvider(MemoryProvider):
                 confidence REAL NOT NULL DEFAULT .70, salience REAL NOT NULL DEFAULT .70, source TEXT NOT NULL DEFAULT '', evidence TEXT NOT NULL DEFAULT '',
                 created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, freshness_at INTEGER NOT NULL, access_count INTEGER NOT NULL DEFAULT 0,
                 last_accessed INTEGER NOT NULL DEFAULT 0, hash TEXT NOT NULL UNIQUE)""")
-            for col, typ, default in [("salience","REAL","0.70"),("access_count","INTEGER","0"),("last_accessed","INTEGER","0"),("quality","REAL","0.50"),("pinned","INTEGER","0"),("normalized_claim","TEXT","''"),("type","TEXT","'fact'"),("source_type","TEXT","'unknown'"),("last_verified_at","INTEGER","0"),("verification_status","TEXT","'unverified'"),("scope","TEXT","'global'"),("project_id","TEXT","''"),("usefulness","REAL","0.50"),("recall_count","INTEGER","0"),("last_recalled","INTEGER","0"),("trust_class","TEXT","'fact'"),("trust_score","REAL","0.55"),("risk","TEXT","'low'"),("custody","TEXT","'{}'"),("quarantined_at","INTEGER","0"),("quality_flags","TEXT","'[]'"),("source_ref","TEXT","''"),("derived_from","TEXT","''"),("review_state","TEXT","'accepted'"),("secrecy_level","TEXT","'public'")]:
+            for col, typ, default in [("salience","REAL","0.70"),("access_count","INTEGER","0"),("last_accessed","INTEGER","0"),("quality","REAL","0.50"),("pinned","INTEGER","0"),("normalized_claim","TEXT","''"),("type","TEXT","'fact'"),("source_type","TEXT","'unknown'"),("last_verified_at","INTEGER","0"),("verification_status","TEXT","'unverified'"),("scope","TEXT","'global'"),("project_id","TEXT","''"),("usefulness","REAL","0.50"),("recall_count","INTEGER","0"),("last_recalled","INTEGER","0"),("trust_class","TEXT","'fact'"),("trust_score","REAL","0.55"),("risk","TEXT","'low'"),("custody","TEXT","'{}'"),("quarantined_at","INTEGER","0"),("quality_flags","TEXT","'[]'"),("source_ref","TEXT","''"),("derived_from","TEXT","''"),("review_state","TEXT","'accepted'"),("secrecy_level","TEXT","'public'"),
+                ("temporal_status","TEXT","'current'"),
+                ("valid_from","INTEGER","0"),
+                ("valid_to","INTEGER","0"),
+                ("superseded_by_id","TEXT","''"),
+                ("memory_class","TEXT","'durable'"),
+                ("decay_policy","TEXT","'default'"),
+                ("expires_at","INTEGER","0"),
+                ("successful_recall_count","INTEGER","0"),
+                ("irrelevant_recall_count","INTEGER","0"),
+                ("harmful_recall_count","INTEGER","0"),
+                ("contradicted_count","INTEGER","0"),
+                ("last_successful_recall_at","INTEGER","0")]:
                 if col not in self._cols("claims"): c.execute(f"ALTER TABLE claims ADD COLUMN {col} {typ} NOT NULL DEFAULT {default}")
             if "normalized_claim" in self._cols("claims"):
                 c.execute("UPDATE claims SET normalized_claim=claim WHERE normalized_claim='' OR normalized_claim IS NULL")
@@ -2635,6 +2647,7 @@ class MemoryWikiProvider(MemoryProvider):
             c.execute("""CREATE TABLE IF NOT EXISTS audit_log(id TEXT PRIMARY KEY, op TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL)""")
             c.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(created_at)")
             # ═══ v1.15.0: Embedding metadata migration ═══
+            c.executescript(_OUTBOX_TABLE)
             c.execute("""CREATE TABLE IF NOT EXISTS reindex_jobs(
                 id TEXT PRIMARY KEY,
                 source_collection TEXT NOT NULL,
@@ -3603,7 +3616,7 @@ class MemoryWikiProvider(MemoryProvider):
                 emb = _embed_document(normalized)
                 if emb is not None:
                     _outbox_enqueue("upsert","claim",cid,{"vector":emb,"qdrant_payload":{"id":cid,"topic":topic,"claim":short(normalized,300)}})
-                    _qdrant_upsert(cid, emb, {"id": cid, "topic": topic, "claim": short(normalized, 300)})
+                    # Qdrant upsert deferred to outbox worker — no direct call here
         except Exception:
             pass
         temporal_result = self._resolve_temporal(topic, claim)
@@ -5682,7 +5695,7 @@ class MemoryWikiProvider(MemoryProvider):
             failed = int(job_row["failed_count"])
 
         # Resume from last processed ID
-        sql = "SELECT id, normalized_claim, topic FROM claims WHERE status='active' AND normalized_claim IS NOT NULL AND normalized_claim != '' ORDER BY id"
+        sql = "SELECT id, normalized_claim, topic FROM claims WHERE status='active' AND normalized_claim IS NOT NULL AND normalized_claim != ''"
         if limit > 0:
             sql += " LIMIT ?"
             params = (limit,)
@@ -5743,7 +5756,7 @@ class MemoryWikiProvider(MemoryProvider):
         if not _semantic_available(): return {"ok": False, "error": "embedding/qdrant unavailable"}
         if not _qdrant_ensure_collection(): return {"ok": False, "error": "qdrant collection unavailable"}
         c = self._connect()
-        sql = "SELECT id, normalized_claim, topic FROM claims WHERE status='active' AND normalized_claim IS NOT NULL AND normalized_claim != '' ORDER BY id"
+        sql = "SELECT id, normalized_claim, topic FROM claims WHERE status='active' AND normalized_claim IS NOT NULL AND normalized_claim != ''"
         rows = c.execute(sql + (" LIMIT ?" if limit > 0 else ""), (limit,) if limit > 0 else ()).fetchall()
         ok = skip = fail = 0; t0 = time.time()
         for r in rows:

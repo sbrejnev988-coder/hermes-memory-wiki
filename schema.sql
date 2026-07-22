@@ -75,7 +75,6 @@ CREATE TABLE secret_quarantine(
                 redacted_value TEXT NOT NULL DEFAULT '', original_hash TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT 'active', created_at INTEGER NOT NULL, resolved_at INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(table_name,row_id,field,original_hash));
-CREATE TABLE sqlite_stat1(tbl,idx,stat);
 CREATE INDEX idx_claims_topic ON claims(topic);
 CREATE INDEX idx_claims_updated ON claims(updated_at);
 CREATE INDEX idx_claims_freshness ON claims(freshness_at);
@@ -157,6 +156,7 @@ CREATE TABLE IF NOT EXISTS reindex_jobs(
     failed_count INTEGER DEFAULT 0,
     status TEXT DEFAULT 'running',
     started_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL DEFAULT 0,
     completed_at INTEGER
 );
 
@@ -164,6 +164,8 @@ CREATE TABLE IF NOT EXISTS reindex_jobs(
 CREATE TABLE IF NOT EXISTS recall_feedback(
     id TEXT PRIMARY KEY,
     recall_event_id TEXT NOT NULL,
+    query TEXT NOT NULL DEFAULT '',
+    notes TEXT NOT NULL DEFAULT '',
     claim_id TEXT NOT NULL,
     retrieved INTEGER DEFAULT 1,
     injected INTEGER DEFAULT 0,
