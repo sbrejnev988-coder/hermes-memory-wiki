@@ -10,7 +10,19 @@ CREATE TABLE claims(
                     updated_at INTEGER NOT NULL,
                     freshness_at INTEGER NOT NULL,
                     hash TEXT NOT NULL UNIQUE
-                , salience REAL NOT NULL DEFAULT 0.70, access_count INTEGER NOT NULL DEFAULT 0, last_accessed INTEGER NOT NULL DEFAULT 0, quality REAL NOT NULL DEFAULT 0.50, pinned INTEGER NOT NULL DEFAULT 0, normalized_claim TEXT NOT NULL DEFAULT '', type TEXT NOT NULL DEFAULT 'fact', source_type TEXT NOT NULL DEFAULT 'unknown', last_verified_at INTEGER NOT NULL DEFAULT 0, verification_status TEXT NOT NULL DEFAULT 'unverified', scope TEXT NOT NULL DEFAULT 'global', project_id TEXT NOT NULL DEFAULT '', usefulness REAL NOT NULL DEFAULT 0.50, recall_count INTEGER NOT NULL DEFAULT 0, last_recalled INTEGER NOT NULL DEFAULT 0, trust_class TEXT NOT NULL DEFAULT 'fact', trust_score REAL NOT NULL DEFAULT 0.55, risk TEXT NOT NULL DEFAULT 'low', custody TEXT NOT NULL DEFAULT '{}', quarantined_at INTEGER NOT NULL DEFAULT 0, secrecy_level TEXT NOT NULL DEFAULT 'public', semantic_tokens TEXT DEFAULT '');
+                , salience REAL NOT NULL DEFAULT 0.70, access_count INTEGER NOT NULL DEFAULT 0, last_accessed INTEGER NOT NULL DEFAULT 0, quality REAL NOT NULL DEFAULT 0.50, pinned INTEGER NOT NULL DEFAULT 0, normalized_claim TEXT NOT NULL DEFAULT '', type TEXT NOT NULL DEFAULT 'fact', source_type TEXT NOT NULL DEFAULT 'unknown', last_verified_at INTEGER NOT NULL DEFAULT 0, verification_status TEXT NOT NULL DEFAULT 'unverified', scope TEXT NOT NULL DEFAULT 'global', project_id TEXT NOT NULL DEFAULT '', usefulness REAL NOT NULL DEFAULT 0.50,
+                temporal_status TEXT NOT NULL DEFAULT 'current',
+                valid_from INTEGER NOT NULL DEFAULT 0,
+                valid_to INTEGER NOT NULL DEFAULT 0,
+                superseded_by_id TEXT NOT NULL DEFAULT '',
+                memory_class TEXT NOT NULL DEFAULT 'durable',
+                decay_policy TEXT NOT NULL DEFAULT 'default',
+                expires_at INTEGER NOT NULL DEFAULT 0,
+                successful_recall_count INTEGER NOT NULL DEFAULT 0,
+                irrelevant_recall_count INTEGER NOT NULL DEFAULT 0,
+                harmful_recall_count INTEGER NOT NULL DEFAULT 0,
+                contradicted_count INTEGER NOT NULL DEFAULT 0,
+                last_successful_recall_at INTEGER NOT NULL DEFAULT 0, recall_count INTEGER NOT NULL DEFAULT 0, last_recalled INTEGER NOT NULL DEFAULT 0, trust_class TEXT NOT NULL DEFAULT 'fact', trust_score REAL NOT NULL DEFAULT 0.55, risk TEXT NOT NULL DEFAULT 'low', custody TEXT NOT NULL DEFAULT '{}', quarantined_at INTEGER NOT NULL DEFAULT 0, secrecy_level TEXT NOT NULL DEFAULT 'public', semantic_tokens TEXT DEFAULT '');
 CREATE TABLE evidence(
                     id TEXT PRIMARY KEY,
                     claim_id TEXT NOT NULL,
@@ -126,6 +138,7 @@ CREATE TABLE IF NOT EXISTS index_outbox(
     object_type TEXT DEFAULT 'claim',
     object_id TEXT NOT NULL,
     payload_json TEXT,
+    payload_hash TEXT,
     attempts INTEGER DEFAULT 0,
     status TEXT DEFAULT 'pending',
     last_error TEXT,

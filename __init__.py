@@ -1,4 +1,4 @@
-"""memory-wiki v1.15.1: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.15.2: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -145,22 +145,14 @@ def _active_collection_name() -> str:
 
 def _ensure_collection() -> bool:
     coll = _active_collection_name()
-    try:
-        req = urllib.request.Request(f"{QDRANT_URL}/collections/{coll}",method="GET",
-            headers={"Content-Type":"application/json"})
-        with urllib.request.urlopen(req,timeout=5) as r:
-            if r.status==200: return True
-    except urllib.error.HTTPError as e:
-        if e.code!=404: _debug_log(f"Qdrant collection check error: {e}"); return False
-    except: return False
-    try:
-        body = json.dumps({"vectors":{"size":QDRANT_VECTOR_SIZE,"distance":"Cosine"}}).encode()
-        req = urllib.request.Request(f"{QDRANT_URL}/collections/{coll}",data=body,method="PUT",
-            headers={"Content-Type":"application/json"})
-        with urllib.request.urlopen(req,timeout=10) as r:
-            _debug_log(f"Created Qdrant collection: {coll}"); return True
-    except Exception as e:
-        _debug_log(f"Failed to create collection {coll}: {e}"); return False
+    existing = _qdrant_req("GET", f"/collections/{coll}")
+    if existing is not None:
+        return True
+    result = _qdrant_req("PUT", f"/collections/{coll}", {"vectors":{"size":QDRANT_VECTOR_SIZE,"distance":"Cosine"}})
+    if result is not None:
+        _debug_log(f"Created Qdrant collection: {coll}")
+        return True
+    return False
 
 def _check_manifest_change() -> str | None:
     mpath = Path(os.environ.get("HERMES_HOME",str(Path.home()/".hermes")))/"memory-wiki"/"embedding_manifest.json"
@@ -193,9 +185,13 @@ def _ensure_outbox() -> None:
         db=sqlite3.connect(str(_mk_db_path()));db.executescript(_OUTBOX_TABLE);db.commit();db.close()
     except Exception as e: _debug_log(f"outbox init failed: {e}")
 
-def _outbox_enqueue(operation: str, object_type: str, object_id: str, payload: dict) -> str:
+def _outbox_enqueue(operation: str, object_type: str, object_id: str, payload: dict, conn=None) -> str:
     import uuid; oid=uuid.uuid4().hex[:16]; now=int(time.time())
     try:
+        if conn:
+            conn.execute("INSERT INTO index_outbox(id,operation,object_type,object_id,payload_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+                (oid,operation,object_type,object_id,json.dumps(payload,ensure_ascii=False) if payload else"{}",now,now))
+            return oid
         db=sqlite3.connect(str(_mk_db_path()))
         db.execute("INSERT INTO index_outbox(id,operation,object_type,object_id,payload_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
             (oid,operation,object_type,object_id,json.dumps(payload,ensure_ascii=False) if payload else"{}",now,now))
@@ -204,20 +200,24 @@ def _outbox_enqueue(operation: str, object_type: str, object_id: str, payload: d
 
 def _outbox_process(batch_size=50) -> dict:
     try:
-        db=sqlite3.connect(str(_mk_db_path()));now=int(time.time())
+        db=sqlite3.connect(str(_mk_db_path()))
+        db.row_factory = sqlite3.Row
+        now=int(time.time())
         rows=db.execute("SELECT*FROM index_outbox WHERE status='pending' ORDER BY created_at LIMIT ?",(batch_size,)).fetchall()
         ok=0;fail=0
         for r in rows:
             try:
                 pl=json.loads(r["payload_json"] or"{}")
                 if r["operation"]=="upsert" and pl.get("vector"):
-                    _qdrant_upsert(r["object_id"],pl["vector"],pl.get("qdrant_payload",{}))
+                    result = _qdrant_upsert(r["object_id"],pl["vector"],pl.get("qdrant_payload",{}), collection=pl.get("collection"))
+                    if not result:
+                        raise RuntimeError("Qdrant upsert returned False")
                 db.execute("UPDATE index_outbox SET status='completed',updated_at=? WHERE id=?",(now,r["id"]));ok+=1
             except Exception as e:
                 a=int(r["attempts"])+1;st="failed" if a>=5 else"pending"
                 db.execute("UPDATE index_outbox SET attempts=?,status=?,last_error=?,updated_at=? WHERE id=?",(a,st,str(e)[:500],now,r["id"]));fail+=1
         db.commit();db.close();return {"processed":ok+fail,"ok":ok,"fail":fail}
-    except Exception as e: return {"processed":0,"ok":0,"fail":0,"error":str(e)}
+    except Exception as e: return {"processed":0,"ok":0,"fail":0,"error":str(e)[:500]}
 
 
 # --- Consistency guard: EMBED_DIMENSIONS must match QDRANT_VECTOR_SIZE ---
@@ -602,7 +602,7 @@ def _qdrant_search(vector: List[float], limit: int = 20) -> List[Tuple[str, floa
         return []
     result = _qdrant_req(
         "POST",
-        f"/collections/{QDRANT_COLLECTION}/points/query",
+        f"/collections/{_active_collection_name()}/points/query",
         {
             "query": vector,
             "limit": max(1, int(limit)),
@@ -626,7 +626,7 @@ def _qdrant_ensure_collection() -> bool:
     Проверяет совместимость существующей коллекции: размерность, метрика.
     При несовпадении возвращает False (требуется ручной reindex с force=True).
     """
-    result = _qdrant_req("GET", f"/collections/{QDRANT_COLLECTION}")
+    result = _qdrant_req("GET", f"/collections/{_active_collection_name()}")
     if result and result.get("status") == "ok":
         # Проверить конфигурацию существующей коллекции
         vectors = (
@@ -662,7 +662,7 @@ def _qdrant_ensure_collection() -> bool:
 _OPENROUTER_HEALTH_CACHE = {"checked_at": 0.0, "available": False}
 
 def _qdrant_count(collection: str = None) -> int | None:
-    coll = collection or QDRANT_COLLECTION
+    coll = collection or _active_collection_name()
     try:
         req = urllib.request.Request(f"{QDRANT_URL}/collections/{coll}", method="GET",
             headers={"Content-Type": "application/json"})
@@ -673,18 +673,13 @@ def _qdrant_count(collection: str = None) -> int | None:
 
 def _switch_alias(new_collection: str) -> bool:
     alias = "memory_wiki_claims_active"
-    try:
-        body = json.dumps({"actions": [{"create_alias": {"collection_name": new_collection, "alias_name": alias}}]}).encode()
-        req = urllib.request.Request(f"{QDRANT_URL}/collections/aliases", data=body, method="POST",
-            headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=10) as r: return True
-    except Exception:
-        try:
-            body2 = json.dumps({"actions": [{"delete_alias": {"alias_name": alias}}, {"create_alias": {"collection_name": new_collection, "alias_name": alias}}]}).encode()
-            req2 = urllib.request.Request(f"{QDRANT_URL}/collections/aliases", data=body2, method="POST",
-                headers={"Content-Type": "application/json"})
-            with urllib.request.urlopen(req2, timeout=10) as r: return True
-        except Exception: return False
+    result = _qdrant_req("POST", "/collections/aliases", {
+        "actions": [
+            {"delete_alias": {"alias_name": alias}},
+            {"create_alias": {"collection_name": new_collection, "alias_name": alias}}
+        ]
+    })
+    return result is not None
 
 def _semantic_available() -> bool:
     """Проверить embedding-сервис (stub или OpenRouter) и Qdrant."""
