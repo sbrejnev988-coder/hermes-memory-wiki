@@ -1,4 +1,4 @@
-"""memory-wiki v1.18.2: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.18.3: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -200,7 +200,11 @@ def _outbox_enqueue(operation: str, object_type: str, object_id: str, payload: d
         db.execute("INSERT INTO index_outbox(id,operation,object_type,object_id,payload_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
             (oid,operation,object_type,object_id,json.dumps(payload,ensure_ascii=False) if payload else"{}",now,now))
         db.commit();db.close();return oid
-    except Exception as e: _debug_log(f"outbox enqueue failed: {e}"); return ""
+    except Exception as e:
+        _debug_log(f"outbox enqueue failed: {e}")
+        if conn is not None:
+            raise
+        return ""
 
 def _outbox_process(batch_size=50) -> dict:
     try:
@@ -1544,7 +1548,8 @@ class MemoryWikiProvider(MemoryProvider):
         if SEMANTIC_ENABLED:
             try:
                 alias_check = _qdrant_req("GET", "/aliases")
-                alias_exists = alias_check and alias_check.get("status") == "ok"
+                aliases = (((alias_check or {}).get("result") or {}).get("aliases") or [])
+                alias_exists = any(str(item.get("alias_name") or "") == "memory_wiki_claims_active" for item in aliases)
                 if not alias_exists:
                     coll = _active_collection_name()
                     if not _ensure_collection():
@@ -2887,7 +2892,10 @@ class MemoryWikiProvider(MemoryProvider):
             c = conn or self._connect(); ts=now(); aid="aud_"+sha(f"{op}:{status}:{detail}:{ts}")[:14]
             c.execute("INSERT OR IGNORE INTO audit_log(id,op,status,detail,created_at) VALUES(?,?,?,?,?)", (aid, short(op,120), short(status,40), short(redact_secrets(detail),1600), ts))
             if conn is None: c.commit()
-        except Exception: pass
+        except Exception:
+            if conn is not None:
+                raise
+            pass
 
     def _record_mutation(self, operation: str, target_table: str = "", target_id: str = "", before: Any = None, after: Any = None, reason: str = "", batch_id: str = "", reversible: bool = True, conn=None) -> str:
         """Append-only mutation ledger. If conn is provided, executes within existing transaction."""
