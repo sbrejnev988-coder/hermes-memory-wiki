@@ -642,7 +642,8 @@ def _qdrant_ensure_collection() -> bool:
     Проверяет совместимость существующей коллекции: размерность, метрика.
     При несовпадении возвращает False (требуется ручной reindex с force=True).
     """
-    result = _qdrant_req("GET", f"/collections/{_active_collection_name()}")
+    coll = _active_collection_name()
+    result = _qdrant_req("GET", f"/collections/{coll}")
     if result and result.get("status") == "ok":
         # Проверить конфигурацию существующей коллекции
         vectors = (
@@ -2683,24 +2684,8 @@ class MemoryWikiProvider(MemoryProvider):
                 CHECK(status IN ('running','completed','failed','rolled_back'))
             )""")
             c.execute("CREATE INDEX IF NOT EXISTS idx_reindex_status ON reindex_jobs(status)")
-
-            # Fix embedding metadata — deepseek-v4-pro → pplx-embed-v1-4b
-            try:
-                c.execute("ALTER TABLE semantic_vectors ADD COLUMN provider TEXT NOT NULL DEFAULT 'openrouter'")
-            except sqlite3.OperationalError:
-                pass  # Column already exists
-            try:
-                c.execute("ALTER TABLE semantic_vectors ADD COLUMN model TEXT NOT NULL DEFAULT 'perplexity/pplx-embed-v1-4b'")
-            except sqlite3.OperationalError:
-                pass
-            try:
-                c.execute("ALTER TABLE semantic_vectors ADD COLUMN instruction_hash TEXT NOT NULL DEFAULT ''")
-            except sqlite3.OperationalError:
-                pass
-            try:
-                c.execute("ALTER TABLE semantic_vectors ADD COLUMN manifest_hash TEXT NOT NULL DEFAULT ''")
-            except sqlite3.OperationalError:
-                pass
+            if "updated_at" not in self._cols("reindex_jobs"):
+                c.execute("ALTER TABLE reindex_jobs ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0")
 
             # ═══ v1.15.0: Enhanced recall feedback ═══
             # Upgrade recall_events with full lifecycle tracking
@@ -2991,6 +2976,25 @@ class MemoryWikiProvider(MemoryProvider):
             self._make_secret_index_from_raw('preference_rules', rid, 'rule', raw_rule, rule)
         ts = now()
         with self._connect() as c:
+
+
+            # Fix embedding metadata — deepseek-v4-pro → pplx-embed-v1-4b
+            try:
+                c.execute("ALTER TABLE semantic_vectors ADD COLUMN provider TEXT NOT NULL DEFAULT 'openrouter'")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            try:
+                c.execute("ALTER TABLE semantic_vectors ADD COLUMN model TEXT NOT NULL DEFAULT 'perplexity/pplx-embed-v1-4b'")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                c.execute("ALTER TABLE semantic_vectors ADD COLUMN instruction_hash TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                c.execute("ALTER TABLE semantic_vectors ADD COLUMN manifest_hash TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass
             c.execute("""INSERT INTO preference_rules(id,rule,priority,scope,source,status,created_at,updated_at,hash)
                          VALUES(?,?,?,?,?,?,?,?,?)
                          ON CONFLICT(id) DO UPDATE SET rule=excluded.rule,priority=excluded.priority,scope=excluded.scope,source=excluded.source,status=excluded.status,updated_at=excluded.updated_at""",
@@ -5765,7 +5769,7 @@ class MemoryWikiProvider(MemoryProvider):
             return {"ok": True, "collection": target_coll, "count": target_count, "total": total_active,
                     "ok_count": ok, "failed": failed, "status": "completed", "alias_switched": True}
 
-        c.execute("UPDATE reindex_jobs SET status='completed', completed_at=? WHERE id=?",
+        c.execute("UPDATE reindex_jobs SET status='running', completed_at=? WHERE id=?",
                   (int(time.time()), job_id))
         c.commit()
         return {"ok": True, "collection": target_coll, "count": target_count or 0, "total": total_active,
