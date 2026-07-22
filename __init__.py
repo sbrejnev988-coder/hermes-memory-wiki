@@ -1,4 +1,4 @@
-"""memory-wiki v1.17.5: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.18.0: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -1540,6 +1540,17 @@ class MemoryWikiProvider(MemoryProvider):
         old_collection = _check_manifest_change()
         if old_collection:
             _debug_log(f"Embedding manifest changed. Old collection: {old_collection}. Run memory_wiki_reindex to migrate.")
+        # Alias bootstrap: ensure memory_wiki_claims_active points to active collection
+        if SEMANTIC_ENABLED:
+            try:
+                alias_check = _qdrant_req("GET", "/collections/memory_wiki_claims_active")
+                if not alias_check or alias_check.get("status") != "ok":
+                    coll = _active_collection_name()
+                    _ensure_collection()
+                    _switch_alias(coll)
+                    _debug_log(f"Bootstrap: alias memory_wiki_claims_active → {coll}")
+            except Exception as e:
+                _debug_log(f"Alias bootstrap skipped: {e}")
         # --- F2/F3: Build TF-IDF vocabulary from existing claims ---
         try:
             c = self._connect()
@@ -3468,13 +3479,14 @@ class MemoryWikiProvider(MemoryProvider):
                     superseded.append(r["id"])
         return {"action": "insert_and_supersede" if superseded else "insert", "supersedes": superseded}
 
-    def _apply_supersession(self, superseded_ids: list, new_claim_id: str) -> int:
+    def _apply_supersession(self, superseded_ids: list, new_claim_id: str, conn=None) -> int:
         """Mark superseded claims as historical."""
-        c = self._connect()
+        c = conn or self._connect()
         for sid in superseded_ids:
             c.execute("UPDATE claims SET temporal_status='superseded', superseded_by_id=?, status='archived' WHERE id=?",
                       (new_claim_id, sid))
-        c.commit()
+        if not conn:
+            c.commit()
         return len(superseded_ids)
 
 
@@ -3639,15 +3651,12 @@ class MemoryWikiProvider(MemoryProvider):
                 after_row = self._table_row("claims", cid)
                 self._record_mutation("upsert_claim", "claims", cid, {} if not ex else {"id": cid, "note": "pre-existing claim updated"}, after_row, source)
             self._upsert_fts(cid); self._detect_contradictions_for(cid); self._add_change("upsert_claim", cid, claim); self._render_topic(topic); self._render_dashboards()
-        # --- Embedding: сохраняем в Qdrant для семантического поиска (опционально, не ломает create) ---
-        try:
+            # Transactional outbox + temporal — inside same SQLite transaction as claim
             if SEMANTIC_ENABLED:
-                _outbox_enqueue("embed_and_upsert","claim",cid,{"text":normalized,"topic":topic,"collection":_active_collection_name()})
-        except Exception:
-            pass
-        temporal_result = self._resolve_temporal(topic, claim, cid)
-        if temporal_result.get("supersedes"):
-            self._apply_supersession(temporal_result["supersedes"], cid)
+                _outbox_enqueue("embed_and_upsert","claim",cid,{"text":normalized,"topic":topic,"collection":_active_collection_name()}, conn=c)
+            temporal_result = self._resolve_temporal(topic, claim, cid)
+            if temporal_result.get("supersedes"):
+                self._apply_supersession(temporal_result["supersedes"], cid, conn=c)
         return cid
 
 
@@ -5735,6 +5744,7 @@ class MemoryWikiProvider(MemoryProvider):
         rows = c.execute(sql, params).fetchall()
         batch_size = 20
         ok = 0
+        failed_ids = []
         base_processed = processed
 
         for i in range(0, len(rows), batch_size):
@@ -5769,13 +5779,13 @@ class MemoryWikiProvider(MemoryProvider):
                       (int(time.time()), job_id))
             c.commit()
             return {"ok": True, "collection": target_coll, "count": target_count, "total": total_active,
-                    "ok_count": ok, "failed": failed, "status": "completed", "alias_switched": True}
+                    "ok_count": ok, "failed": failed, "failed_ids": failed_ids[:20], "status": "completed", "alias_switched": True}
 
         c.execute("UPDATE reindex_jobs SET status='running', completed_at=NULL WHERE id=?",
                   (job_id,))
         c.commit()
         return {"ok": True, "collection": target_coll, "count": target_count or 0, "total": total_active,
-                "ok_count": ok, "failed": failed, "status": "partial", "alias_switched": False}
+                "ok_count": ok, "failed": failed, "failed_ids": failed_ids[:20], "status": "partial", "alias_switched": False}
 
 
         if not SEMANTIC_ENABLED: return {"ok": False, "error": "semantic disabled"}
