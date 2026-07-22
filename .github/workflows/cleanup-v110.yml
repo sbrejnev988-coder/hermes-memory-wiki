@@ -1,0 +1,33 @@
+name: Clean generated Python cache from v1.10.0 release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/cleanup-v110.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  clean:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Remove generated artifacts and self-clean
+        run: |
+          git rm -r --ignore-unmatch __pycache__ scripts/__pycache__
+          printf '\n__pycache__/\n*.py[cod]\n*.db\n*.sqlite*\n.env\n*.bak*\n' >> .gitignore
+          awk '!seen[$0]++' .gitignore > .gitignore.clean
+          mv .gitignore.clean .gitignore
+          rm -f .github/workflows/cleanup-v110.yml
+          rmdir .github/workflows 2>/dev/null || true
+          rmdir .github 2>/dev/null || true
+          git config user.name 'KekehaMan'
+          git config user.email '239237811+sbrejnev988-coder@users.noreply.github.com'
+          git add -A
+          git diff --cached --check
+          git commit -m 'chore: remove generated caches from v1.10.0 release'
+          git push origin main
