@@ -32,6 +32,10 @@ import uuid
 import urllib.request
 import urllib.error
 
+def _xml_escape(s: str) -> str:
+    """Escape XML special chars."""
+    return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;").replace("'","&apos;")
+
 # ── Core modules (stdlib-only, zero-dependency) ────────────────────────
 try:
     from .guard import is_social_close, sanitize_context_text, sanitize_context_batch
@@ -3633,10 +3637,7 @@ class MemoryWikiProvider(MemoryProvider):
         # --- Embedding: сохраняем в Qdrant для семантического поиска (опционально, не ломает create) ---
         try:
             if SEMANTIC_ENABLED:
-                emb = _embed_document(normalized)
-                if emb is not None:
-                    _outbox_enqueue("embed_and_upsert","claim",cid,{"text":normalized,"topic":topic,"collection":_active_collection_name()})
-                    # Qdrant upsert deferred to outbox worker — no direct call here
+                _outbox_enqueue("embed_and_upsert","claim",cid,{"text":normalized,"topic":topic,"collection":_active_collection_name()})
         except Exception:
             pass
         temporal_result = self._resolve_temporal(topic, claim, cid)
@@ -3837,7 +3838,7 @@ class MemoryWikiProvider(MemoryProvider):
             claim_type = str(c.get("type", "") or c.get("claim_type", "fact"))
             temporal = str(c.get("temporal_status", "current"))
             conf = float(c.get("confidence", 0.5) or 0.5)
-            entry = f'<claim id="{cid[:12]}" type="{claim_type}" temporal="{temporal}" confidence="{conf:.2f}">{text}</claim>'
+            entry = f'<claim id="{_xml_escape(cid[:12])}" type="{_xml_escape(claim_type)}" temporal="{_xml_escape(temporal)}" confidence="{_xml_escape(f"{conf:.2f}")}">{_xml_escape(text)}</claim>'
 
             if claim_type in ("decision", "patch_outcome"):
                 sections["relevant_decisions"].append(entry)
