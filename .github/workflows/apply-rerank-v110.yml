@@ -1,0 +1,71 @@
+name: Apply Memory-Wiki v1.10.0 smart rerank
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/apply-rerank-v110.yml'
+      - '.github/apply_rerank_v110.py'
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Apply v1.10.0 patch
+        run: python .github/apply_rerank_v110.py
+      - name: Verify source and disabled toggle
+        run: |
+          python -m py_compile __init__.py scripts/test_rerank.py
+          python scripts/test_rerank.py
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          source = Path('__init__.py').read_text()
+          assert source.startswith('"""memory-wiki v1.10.0:')
+          assert 'MEMORY_WIKI_RERANK_ENABLED", "0"' in source
+          assert 'def _rerank_rows' in source
+          assert 'scored = self._rerank_rows(q, scored, query_mode)' in source
+          manifest = Path('plugin.yaml').read_text()
+          names = re.findall(r'^  - (memory_wiki_[a-z0-9_]+)$', manifest, re.M)
+          assert len(names) == len(set(names)) == 82, len(names)
+          readme = Path('README.md').read_text()
+          assert 'MEMORY_WIKI_RERANK_ENABLED=0' in readme
+          assert 'MEMORY_WIKI_RERANK_ENABLED=1' in readme
+          print('version_manifest_toggle_ok tools=82')
+          PY
+      - name: Diff and secret checks
+        run: |
+          git diff --check
+          python - <<'PY'
+          from pathlib import Path
+          import re
+          patterns = [
+              re.compile(r'sk-or-v1-[A-Za-z0-9_-]{20,}'),
+              re.compile(r'gh[pousr]_[A-Za-z0-9]{20,}'),
+              re.compile(r'-----BEGIN (?:RSA |OPENSSH |EC )?PRIVATE KEY-----'),
+          ]
+          for path in [Path('__init__.py'), Path('README.md'), Path('plugin.yaml'), Path('scripts/test_rerank.py')]:
+              text = path.read_text(errors='ignore')
+              for pattern in patterns:
+                  assert not pattern.search(text), f'secret-like material in {path}'
+          print('secret_scan_ok')
+          PY
+      - name: Commit final clean tree
+        run: |
+          rm -f .github/apply_rerank_v110.py .github/workflows/apply-rerank-v110.yml
+          rmdir .github/workflows 2>/dev/null || true
+          rmdir .github 2>/dev/null || true
+          git config user.name 'KekehaMan'
+          git config user.email '239237811+sbrejnev988-coder@users.noreply.github.com'
+          git add -A
+          git commit -m 'v1.10.0: add optional smart Cohere reranking via OpenRouter'
+          git push origin main
