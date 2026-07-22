@@ -1,4 +1,4 @@
-"""memory-wiki v1.13.0: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.14.0: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -3327,6 +3327,37 @@ class MemoryWikiProvider(MemoryProvider):
         return len(superseded_ids)
 
 
+    def _resolve_scope(self, scope_type: str = "global", scope_id: str = "") -> Dict[str, Any]:
+        """Resolve scope for retrieval: exact match → broader scopes."""
+        scopes = ["agent", "session", "task", "branch", "repository", "project", "device", "user", "global"]
+        if scope_type not in scopes:
+            scope_type = "global"
+        idx = scopes.index(scope_type)
+        fallback_chain = scopes[idx:]  # exact → increasingly broader
+        return {"current": scope_type, "scope_id": scope_id, "fallback_chain": fallback_chain}
+
+    def _scope_filter(self, claims: list, target_scope: str, target_id: str) -> list:
+        """Filter claims by scope: exact match preferred, broader accepted with penalty."""
+        filtered = []
+        for c in claims:
+            ev = str(c.get("evidence", ""))
+            scope_type = "global"
+            scope_id = ""
+            for m in re.finditer(r'scope:(\w+):([^\s|]+)', ev):
+                scope_type = m.group(1)
+                scope_id = m.group(2)
+                break
+            if scope_type == target_scope and scope_id == target_id:
+                filtered.append({**c, "scope_match": "exact", "scope_score": 1.0})
+            elif target_scope in ("global",) or scope_type in ("global",):
+                filtered.append({**c, "scope_match": "broad", "scope_score": 0.7})
+            elif scope_type == "repository" and target_scope == "project":
+                filtered.append({**c, "scope_match": "parent", "scope_score": 0.6})
+            else:
+                filtered.append({**c, "scope_match": "fallback", "scope_score": 0.4})
+        return sorted(filtered, key=lambda x: -x.get("scope_score", 0))
+
+
     def _add_claim(self, claim: str, topic="general", evidence="", source="tool", confidence=.7, salience=.7) -> str:
         raw_claim=scrub_memory_artifacts(str(claim or "")); raw_evidence=scrub_memory_artifacts(str(evidence or ""))
         raw_secret=bool(secret_scan(raw_claim + " " + raw_evidence).get("raw_secret"))
@@ -3584,6 +3615,66 @@ class MemoryWikiProvider(MemoryProvider):
             src_count[src] = src_count.get(src,0) + 1
             cl_count[cl] = cl_count.get(cl,0) + 1
         return selected
+
+
+    def _pack_context(self, claims: List[Dict[str, Any]], token_budget: int = 4000, max_claims: int = 16, max_per_cluster: int = 3, max_per_source: int = 5) -> str:
+        """Pack claims into structured XML context blocks respecting token budget."""
+        if not claims: return "<memory_context/>"
+        budget_remaining = token_budget
+        packed = []
+        used_ids = set()
+        source_counts = {}
+        cluster_counts = {}
+
+        # Sort: current before historical, higher confidence first
+        sorted_claims = sorted(claims, key=lambda x: (
+            0 if x.get("temporal_status") == "current" else 1,
+            -(float(x.get("confidence", 0.5) or 0.5))
+        ))
+
+        sections = {"current_facts": [], "relevant_decisions": [], "known_failures": [], "uncertainties": [], "other": []}
+        for c in sorted_claims[:max_claims * 2]:  # inspect up to 2x limit for filtering
+            cid = str(c.get("id", ""))
+            if cid in used_ids: continue
+            src = str(c.get("source", "") or c.get("topic", ""))
+            cl = str(c.get("topic", "general"))
+            if source_counts.get(src, 0) >= max_per_source: continue
+            if cluster_counts.get(cl, 0) >= max_per_cluster: continue
+
+            text = short(str(c.get("claim", "")), 600)
+            tokens_est = len(text) // 3
+            if budget_remaining - tokens_est < 200: break
+
+            claim_type = str(c.get("type", "") or c.get("claim_type", "fact"))
+            temporal = str(c.get("temporal_status", "current"))
+            conf = float(c.get("confidence", 0.5) or 0.5)
+            entry = f'<claim id="{cid[:12]}" type="{claim_type}" temporal="{temporal}" confidence="{conf:.2f}">{text}</claim>'
+
+            if claim_type in ("decision", "patch_outcome"):
+                sections["relevant_decisions"].append(entry)
+            elif claim_type in ("known_regression", "security_finding"):
+                sections["known_failures"].append(entry)
+            elif conf < 0.6 or temporal == "historical":
+                sections["uncertainties"].append(entry)
+            elif temporal == "current":
+                sections["current_facts"].append(entry)
+            else:
+                sections["other"].append(entry)
+
+            used_ids.add(cid)
+            source_counts[src] = source_counts.get(src, 0) + 1
+            cluster_counts[cl] = cluster_counts.get(cl, 0) + 1
+            budget_remaining -= tokens_est
+            if len(used_ids) >= max_claims: break
+
+        xml = ["<memory_context>"]
+        for section, entries in sections.items():
+            if entries:
+                xml.append(f"  <{section}>")
+                xml.extend(f"    {e}" for e in entries)
+                xml.append(f"  </{section}>")
+        xml.append("</memory_context>")
+        return "\n".join(xml)
 
 
     def _rerank_status(self) -> Dict[str, Any]:
