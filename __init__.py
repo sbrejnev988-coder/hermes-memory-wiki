@@ -1,4 +1,4 @@
-"""memory-wiki v1.14.0: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.15.0: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -2604,6 +2604,85 @@ class MemoryWikiProvider(MemoryProvider):
             c.execute("CREATE INDEX IF NOT EXISTS idx_sync_bundles_created ON sync_bundles(created_at)")
             c.execute("""CREATE TABLE IF NOT EXISTS audit_log(id TEXT PRIMARY KEY, op TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL)""")
             c.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(created_at)")
+            # ═══ v1.15.0: Embedding metadata migration ═══
+            c.execute("""CREATE TABLE IF NOT EXISTS reindex_jobs(
+                id TEXT PRIMARY KEY,
+                source_collection TEXT NOT NULL,
+                target_collection TEXT NOT NULL,
+                manifest_json TEXT NOT NULL,
+                total_count INTEGER NOT NULL DEFAULT 0,
+                processed_count INTEGER NOT NULL DEFAULT 0,
+                failed_count INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'running',
+                started_at INTEGER NOT NULL,
+                completed_at INTEGER,
+                CHECK(status IN ('running','completed','failed','rolled_back'))
+            )""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_reindex_status ON reindex_jobs(status)")
+
+            # Fix embedding metadata — deepseek-v4-pro → pplx-embed-v1-4b
+            try:
+                c.execute("ALTER TABLE semantic_vectors ADD COLUMN provider TEXT NOT NULL DEFAULT 'openrouter'")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            try:
+                c.execute("ALTER TABLE semantic_vectors ADD COLUMN model TEXT NOT NULL DEFAULT 'perplexity/pplx-embed-v1-4b'")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                c.execute("ALTER TABLE semantic_vectors ADD COLUMN instruction_hash TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                c.execute("ALTER TABLE semantic_vectors ADD COLUMN manifest_hash TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass
+
+            # ═══ v1.15.0: Enhanced recall feedback ═══
+            # Upgrade recall_events with full lifecycle tracking
+            c.execute("""CREATE TABLE IF NOT EXISTS recall_feedback(
+                id TEXT PRIMARY KEY,
+                recall_event_id TEXT NOT NULL,
+                claim_id TEXT NOT NULL,
+                query TEXT NOT NULL DEFAULT '',
+                retrieved INTEGER NOT NULL DEFAULT 1,
+                injected INTEGER NOT NULL DEFAULT 0,
+                used INTEGER NOT NULL DEFAULT 0,
+                helpful REAL NOT NULL DEFAULT 0,
+                irrelevant INTEGER NOT NULL DEFAULT 0,
+                contradicted INTEGER NOT NULL DEFAULT 0,
+                harmful INTEGER NOT NULL DEFAULT 0,
+                answer_id TEXT NOT NULL DEFAULT '',
+                feedback_source TEXT NOT NULL DEFAULT 'auto',
+                notes TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY(claim_id) REFERENCES claims(id) ON DELETE CASCADE
+            )""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_recall_feedback_claim ON recall_feedback(claim_id, created_at)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_recall_feedback_answer ON recall_feedback(answer_id)")
+
+            # Add aggregated recall stats to claims
+            try:
+                c.execute("ALTER TABLE claims ADD COLUMN successful_recall_count INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                c.execute("ALTER TABLE claims ADD COLUMN irrelevant_recall_count INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                c.execute("ALTER TABLE claims ADD COLUMN harmful_recall_count INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                c.execute("ALTER TABLE claims ADD COLUMN last_successful_recall_at INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                c.execute("ALTER TABLE claims ADD COLUMN contradicted_count INTEGER NOT NULL DEFAULT 0")
+            except sqlite3.OperationalError:
+                pass
+
             c.execute("""CREATE TABLE IF NOT EXISTS recall_events(
                 id TEXT PRIMARY KEY, claim_id TEXT NOT NULL, query TEXT NOT NULL DEFAULT '', score REAL NOT NULL DEFAULT 0, used REAL NOT NULL DEFAULT -1, created_at INTEGER NOT NULL)""")
             c.execute("CREATE INDEX IF NOT EXISTS idx_recall_events_claim ON recall_events(claim_id, created_at)")
@@ -3356,6 +3435,49 @@ class MemoryWikiProvider(MemoryProvider):
             else:
                 filtered.append({**c, "scope_match": "fallback", "scope_score": 0.4})
         return sorted(filtered, key=lambda x: -x.get("scope_score", 0))
+
+
+    def _record_recall_feedback(self, claim_id: str, retrieved: bool = True, injected: bool = False,
+                                  used: bool = False, helpful: float = 0, contradicted: bool = False,
+                                  harmful: bool = False, answer_id: str = "", source: str = "auto") -> str:
+        """Record recall feedback: retrieved → injected → used → helpful/irrelevant/harmful."""
+        import uuid as _uuid
+        fid = _uuid.uuid4().hex[:16]
+        now = int(time.time())
+        c = self._connect()
+        c.execute(
+            """INSERT INTO recall_feedback(id, recall_event_id, claim_id, query, retrieved, injected, used,
+               helpful, irrelevant, contradicted, harmful, answer_id, feedback_source, created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (fid, "", claim_id, "", 1 if retrieved else 0, 1 if injected else 0,
+             1 if used else 0, helpful, 1 if (retrieved and not used and helpful < 0.3) else 0,
+             1 if contradicted else 0, 1 if harmful else 0, answer_id, source, now)
+        )
+        # Update aggregated stats on claim
+        if helpful > 0.5:
+            c.execute("UPDATE claims SET successful_recall_count=successful_recall_count+1, last_successful_recall_at=? WHERE id=?", (now, claim_id))
+        if contradicted:
+            c.execute("UPDATE claims SET contradicted_count=contradicted_count+1 WHERE id=?", (claim_id,))
+        if harmful:
+            c.execute("UPDATE claims SET harmful_recall_count=harmful_recall_count+1 WHERE id=?", (claim_id,))
+        if retrieved and not used and helpful < 0.3:
+            c.execute("UPDATE claims SET irrelevant_recall_count=irrelevant_recall_count+1 WHERE id=?", (claim_id,))
+        # Update usefulness score
+        usefulness = 0.5 + (helpful * 0.3) - (0.1 if contradicted else 0) - (0.3 if harmful else 0) - (0.1 if (retrieved and not used) else 0)
+        c.execute("UPDATE claims SET usefulness=MAX(0.1, MIN(0.95, usefulness)), last_recalled=? WHERE id=?",
+                  (now, claim_id))
+        c.commit()
+        return fid
+
+    def _recall_feedback_stats(self, claim_id: str = "") -> Dict[str, Any]:
+        """Get feedback stats for a claim or all claims."""
+        c = self._connect()
+        if claim_id:
+            row = c.execute("SELECT successful_recall_count, irrelevant_recall_count, harmful_recall_count, contradicted_count, usefulness FROM claims WHERE id=?", (claim_id,)).fetchone()
+            if not row: return {}
+            return dict(row)
+        rows = c.execute("SELECT COUNT(*) as total, SUM(successful_recall_count) as ok, SUM(irrelevant_recall_count) as irr, SUM(harmful_recall_count) as harm FROM claims").fetchone()
+        return dict(rows) if rows else {}
 
 
     def _add_claim(self, claim: str, topic="general", evidence="", source="tool", confidence=.7, salience=.7) -> str:
@@ -5490,6 +5612,91 @@ class MemoryWikiProvider(MemoryProvider):
         return {"embedding_ok": embed_ok, "qdrant_points": pts, "semantic_enabled": SEMANTIC_ENABLED, "rerank": self._rerank_status()}
 
     def _reindex(self, limit: int = 0, force: bool = False) -> Dict[str,Any]:
+        """Resumable reindex with checkpointing and atomic alias switching."""
+        if not SEMANTIC_ENABLED: return {"ok": False, "error": "semantic disabled"}
+        c = self._connect()
+
+        # Create target collection
+        target_coll = _active_collection_name()
+        manifest = _embedding_manifest()
+        manifest_hash = _manifest_hash(manifest)
+
+        # Check if target already exists and has full count
+        existing_count = _qdrant_count(target_coll)
+        total_active = c.execute("SELECT COUNT(*) FROM claims WHERE status='active' AND normalized_claim IS NOT NULL AND normalized_claim != ''").fetchone()[0]
+        if existing_count and existing_count >= total_active * 0.99 and not force:
+            _switch_alias(target_coll)
+            return {"ok": True, "collection": target_coll, "count": existing_count, "total": total_active, "status": "already_complete"}
+
+        # Create target collection
+        _ensure_collection()
+
+        # Find or create reindex job
+        job_id = f"reindex_{manifest_hash[:12]}"
+        job_row = c.execute("SELECT * FROM reindex_jobs WHERE id=? AND status='running'", (job_id,)).fetchone()
+
+        if not job_row:
+            c.execute(
+                "INSERT INTO reindex_jobs(id,source_collection,target_collection,manifest_json,total_count,started_at) VALUES(?,?,?,?,?,?)",
+                (job_id, QDRANT_COLLECTION, target_coll, json.dumps(manifest, ensure_ascii=False), total_active, int(time.time()))
+            )
+            c.commit()
+            processed = 0
+            failed = 0
+        else:
+            processed = int(job_row["processed_count"])
+            failed = int(job_row["failed_count"])
+
+        # Resume from last processed ID
+        sql = "SELECT id, normalized_claim, topic FROM claims WHERE status='active' AND normalized_claim IS NOT NULL AND normalized_claim != ''"
+        if limit > 0:
+            sql += " LIMIT ?"
+            params = (limit,)
+        else:
+            params = ()
+
+        rows = c.execute(sql + " ORDER BY id", params).fetchall()
+        batch_size = 20
+        ok = 0
+
+        for i in range(processed, len(rows), batch_size):
+            batch = rows[i:i+batch_size]
+            for row in batch:
+                cid = row["id"]
+                try:
+                    emb = _embed_document(row["normalized_claim"])
+                    if emb and len(emb) == QDRANT_VECTOR_SIZE:
+                        _qdrant_upsert(cid, emb, {"id": cid, "topic": row["topic"] or "", "claim": short(row["normalized_claim"], 300)}, collection=target_coll)
+                        ok += 1
+                    else:
+                        failed += 1
+                except Exception:
+                    failed += 1
+
+            # Checkpoint
+            processed_now = i + len(batch)
+            c.execute("UPDATE reindex_jobs SET processed_count=?, failed_count=?, updated_at=? WHERE id=?",
+                      (processed_now, failed, int(time.time()), job_id))
+            c.commit()
+            _debug_log(f"reindex checkpoint: {processed_now}/{total_active} (+{ok} ok, {failed} fail)")
+
+        # Verify and cut over
+        target_count = _qdrant_count(target_coll)
+        if target_count and target_count >= total_active * 0.95:
+            _switch_alias(target_coll)
+            c.execute("UPDATE reindex_jobs SET status='completed', completed_at=? WHERE id=?",
+                      (int(time.time()), job_id))
+            c.commit()
+            return {"ok": True, "collection": target_coll, "count": target_count, "total": total_active,
+                    "ok_count": ok, "failed": failed, "status": "completed", "alias_switched": True}
+
+        c.execute("UPDATE reindex_jobs SET status='completed', completed_at=? WHERE id=?",
+                  (int(time.time()), job_id))
+        c.commit()
+        return {"ok": True, "collection": target_coll, "count": target_count or 0, "total": total_active,
+                "ok_count": ok, "failed": failed, "status": "partial", "alias_switched": False}
+
+
         if not SEMANTIC_ENABLED: return {"ok": False, "error": "semantic disabled"}
         if force:
             deleted = _qdrant_req("DELETE", f"/collections/{QDRANT_COLLECTION}")
