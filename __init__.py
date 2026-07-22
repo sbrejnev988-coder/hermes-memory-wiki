@@ -668,7 +668,7 @@ def _qdrant_ensure_collection() -> bool:
         return True
     result = _qdrant_req(
         "PUT",
-        f"/collections/{QDRANT_COLLECTION}",
+        f"/collections/{coll}",
         {"vectors": {"size": QDRANT_VECTOR_SIZE, "distance": "Cosine"}},
     )
     return bool(result and result.get("status") == "ok" and result.get("result") is True)
@@ -4128,13 +4128,7 @@ class MemoryWikiProvider(MemoryProvider):
                 ts=now(); c.executemany("UPDATE claims SET access_count=access_count+1, recall_count=recall_count+1, last_accessed=?, last_recalled=? WHERE id=?", [(ts, ts, i) for i in ids])
                 c.executemany("INSERT OR IGNORE INTO recall_events(id,claim_id,query,score,used,created_at) VALUES(?,?,?,?,?,?)", [("re_"+sha(f"{i}:{q}:{ts}")[:12], i, short(q,500), next((float(x.get("score",0)) for x in scored if x["id"]==i),0.0), -1, ts) for i in ids])
         # Record recall feedback
-        try:
-            for item in scored[:5] if isinstance(scored, list) else []:
-                cid = str(item.get("id",""))
-                if cid:
-                    self._record_recall_feedback(cid, retrieved=True, injected=False, used=False,
-                        helpful=0.0, contradicted=False, harmful=False, answer_id="", source="retrieval_auto")
-        except Exception: pass
+
         return scored[:limit]
 
     def _upsert_fts(self, cid: str) -> None:
@@ -5733,7 +5727,7 @@ class MemoryWikiProvider(MemoryProvider):
         else:
             params = ()
 
-        rows = c.execute(sql + " ORDER BY id", params).fetchall()
+        rows = c.execute(sql, params).fetchall()
         batch_size = 20
         ok = 0
 
@@ -5744,7 +5738,7 @@ class MemoryWikiProvider(MemoryProvider):
                 try:
                     emb = _embed_document(row["normalized_claim"])
                     if emb and len(emb) == QDRANT_VECTOR_SIZE:
-                        _outbox_enqueue("embed_and_upsert","claim",cid,{"text":normalized,"topic":topic,"collection":_active_collection_name()}); result = _qdrant_upsert(cid, emb, {"id": cid, "topic": row["topic"] or "", "claim": short(row["normalized_claim"], 300)}, collection=target_coll)
+                        result = _qdrant_upsert(cid, emb, {"id": cid, "topic": row["topic"] or "", "claim": short(row["normalized_claim"], 300)}, collection=target_coll)
                         if result:
                             ok += 1
                         else:
