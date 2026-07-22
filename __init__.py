@@ -663,13 +663,9 @@ _OPENROUTER_HEALTH_CACHE = {"checked_at": 0.0, "available": False}
 
 def _qdrant_count(collection: str = None) -> int | None:
     coll = collection or _active_collection_name()
-    try:
-        req = urllib.request.Request(f"{QDRANT_URL}/collections/{coll}", method="GET",
-            headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=5) as r:
-            data = json.loads(r.read().decode())
-            return data.get("result", {}).get("points_count", data.get("points_count", 0))
-    except Exception: return None
+    result = _qdrant_req("GET", f"/collections/{coll}")
+    if not result: return None
+    return int(result.get("result", {}).get("points_count", result.get("points_count", 0)))
 
 def _switch_alias(new_collection: str) -> bool:
     alias = "memory_wiki_claims_active"
@@ -1524,6 +1520,9 @@ class MemoryWikiProvider(MemoryProvider):
             except Exception:
                 pass
         self._connect(); self._migrate(); self._rebuild_fts(); self._sync_env_metadata(); self._render_all()
+        old_collection = _check_manifest_change()
+        if old_collection:
+            _debug_log(f"Embedding manifest changed. Old collection: {old_collection}. Run memory_wiki_reindex to migrate.")
         # --- F2/F3: Build TF-IDF vocabulary from existing claims ---
         try:
             c = self._connect()
@@ -3421,20 +3420,23 @@ class MemoryWikiProvider(MemoryProvider):
             (f" | source_event:{source_event_id} content_hash:{content_hash}", claim_id))
         c.commit()
 
-    def _resolve_temporal(self, topic: str, claim_text: str) -> Dict[str, Any]:
+    def _resolve_temporal(self, topic: str, claim_text: str, new_claim_id: str = "") -> Dict[str, Any]:
         """Check if new claim supersedes existing active claims on same topic."""
         c = self._connect()
-        rows = c.execute("SELECT id,claim,temporal_status FROM claims WHERE topic=? AND status IN ('active','current') ORDER BY created_at DESC LIMIT 20", (topic,)).fetchall()
+        rows = c.execute("SELECT id,claim,temporal_status FROM claims WHERE topic=? AND id!=? AND status IN ('active','current') ORDER BY created_at DESC LIMIT 20", (topic, new_claim_id)).fetchall()
         superseded = []
+        n_lower = claim_text.lower()
         for r in rows:
             if r["temporal_status"] == "superseded": continue
-            n = slug(claim_text.lower()); o = slug(str(r["claim"] or "").lower())
+            o_lower = str(r["claim"] or "").lower()
+            # Check contradiction signals in raw text (not slugified)
             for sig in ["no longer","replaced","changed to","now uses","instead of","rather than","заменён","перешёл на","больше не"]:
-                if sig in n:
+                if sig in n_lower:
                     superseded.append(r["id"]); break
             if not superseded:
-                vals_n = set(re.findall(r'\d+\.\d+|port\s+\d+|model[\s:]+\S+', n))
-                vals_o = set(re.findall(r'\d+\.\d+|port\s+\d+|model[\s:]+\S+', o))
+                # Entity match: same ports/models/versions → same subject
+                vals_n = set(re.findall(r'\d+\.\d+|port\s+\d+|model[\s:]+\S+', n_lower))
+                vals_o = set(re.findall(r'\d+\.\d+|port\s+\d+|model[\s:]+\S+', o_lower))
                 if vals_n and vals_o and vals_n != vals_o:
                     superseded.append(r["id"])
         return {"action": "insert_and_supersede" if superseded else "insert", "supersedes": superseded}
@@ -3619,7 +3621,7 @@ class MemoryWikiProvider(MemoryProvider):
                     # Qdrant upsert deferred to outbox worker — no direct call here
         except Exception:
             pass
-        temporal_result = self._resolve_temporal(topic, claim)
+        temporal_result = self._resolve_temporal(topic, claim, cid)
         if temporal_result.get("supersedes"):
             self._apply_supersession(temporal_result["supersedes"], cid)
         return cid
@@ -5342,6 +5344,7 @@ class MemoryWikiProvider(MemoryProvider):
         return ''
 
     def _pack_context(self, query:str, max_chars:int=MAX_PREFETCH_CHARS)->Dict[str,Any]:
+        """Budget-aware context packer. Uses _pack_selected_claims for XML output."""
         max_chars=max(800, min(int(max_chars or MAX_PREFETCH_CHARS), 60000))
         plan=self._recall_plan(query, 12); rows=self._search(query, 60, False); graph=self._graph_query(query, 12)
         secrets=self._query_secrets(query, 8, False) if plan.get('secrets_recommended') else []
