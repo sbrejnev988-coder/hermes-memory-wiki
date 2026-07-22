@@ -208,10 +208,21 @@ def _outbox_process(batch_size=50) -> dict:
         for r in rows:
             try:
                 pl=json.loads(r["payload_json"] or"{}")
-                if r["operation"]=="upsert" and pl.get("vector"):
+                op = r["operation"]
+                if op == "upsert" and pl.get("vector"):
                     result = _qdrant_upsert(r["object_id"],pl["vector"],pl.get("qdrant_payload",{}), collection=pl.get("collection"))
                     if not result:
                         raise RuntimeError("Qdrant upsert returned False")
+                elif op == "embed_and_upsert":
+                    text = str(pl.get("text","")).strip()
+                    if not text:
+                        raise RuntimeError("embed_and_upsert text is empty")
+                    vector = _embed_document(text)
+                    if not vector:
+                        raise RuntimeError("embedding generation failed")
+                    result = _qdrant_upsert(r["object_id"], vector, {"claim_id": r["object_id"], "topic": pl.get("topic",""), "claim": short(text, 300)}, collection=pl.get("collection"))
+                    if not result:
+                        raise RuntimeError("Qdrant upsert failed")
                 db.execute("UPDATE index_outbox SET status='completed',updated_at=? WHERE id=?",(now,r["id"]));ok+=1
             except Exception as e:
                 a=int(r["attempts"])+1;st="failed" if a>=5 else"pending"
@@ -580,6 +591,7 @@ def _qdrant_upsert(claim_id: str, vector: List[float], payload: dict, collection
     if len(vector) != QDRANT_VECTOR_SIZE:
         _debug_log(f"qdrant vector size mismatch: expected={QDRANT_VECTOR_SIZE}, actual={len(vector)}")
         return False
+    coll = collection or _active_collection_name()
     stored_payload = dict(payload or {})
     stored_payload["claim_id"] = str(claim_id)
     result = _qdrant_req(
@@ -602,7 +614,7 @@ def _qdrant_search(vector: List[float], limit: int = 20) -> List[Tuple[str, floa
         return []
     result = _qdrant_req(
         "POST",
-        f"/collections/{_active_collection_name()}/points/query",
+        f"/collections/memory_wiki_claims_active/points/query",
         {
             "query": vector,
             "limit": max(1, int(limit)),
@@ -1896,9 +1908,10 @@ class MemoryWikiProvider(MemoryProvider):
             if tool_name == "memory_wiki_apply_user_correction": return tool_result(success=True, **self._apply_user_correction(a))
             if tool_name == "memory_wiki_pack_context":
                 result = self._pack_context(a.get("query") or "", int(a.get("max_chars",MAX_PREFETCH_CHARS)))
-                if result.get("results"):
-                    claims_for_pack = [dict(r, id=r.get("id",""), claim=r.get("text",r.get("claim","")), confidence=float(r.get("confidence",0.5) or 0.5), temporal_status="current") for r in result["results"]]
-                    result["structured_pack"] = self._pack_selected_claims(claims_for_pack, token_budget=min(int(a.get("max_chars",3800)),6000))
+                rows = self._search(str(a.get("query","")), limit=min(60,int(a.get("max_chars",3800))//100), include_stale=False)
+                if rows:
+                    result["results"] = [{"id":str(r.get("id","")),"text":str(r.get("text",r.get("claim","")))[:600],"confidence":float(r.get("confidence",0.5) or 0.5),"temporal_status":str(r.get("temporal_status","current"))} for r in rows[:16]]
+                    result["structured_pack"] = self._pack_selected_claims(rows[:16], token_budget=min(int(a.get("max_chars",3800)),6000))
                 return tool_result(success=True, **result)
             if tool_name == "memory_wiki_memory_diff": return tool_result(success=True, **self._memory_diff(a.get("query") or "", a.get("verified_facts") or [], a.get("current_context") or "", int(a.get("limit",12))))
             if tool_name == "memory_wiki_preference_layer": return tool_result(success=True, **self._preference_layer(a.get("query") or "", int(a.get("limit",20)), bool(a.get("include_policy", True))))
@@ -5712,6 +5725,7 @@ class MemoryWikiProvider(MemoryProvider):
 
         # Resume from last processed ID
         sql = "SELECT id, normalized_claim, topic FROM claims WHERE status='active' AND normalized_claim IS NOT NULL AND normalized_claim != ''"
+        sql += " ORDER BY id"
         if limit > 0:
             sql += " LIMIT ?"
             params = (limit,)
