@@ -2807,6 +2807,24 @@ class MemoryWikiProvider(MemoryProvider):
                 FOREIGN KEY(id) REFERENCES claims(id) ON DELETE CASCADE)""")
             c.execute("CREATE INDEX IF NOT EXISTS idx_claims_simhash_val ON claims_simhash(simhash)")
             c.execute("""CREATE TABLE IF NOT EXISTS semantic_vectors(id TEXT PRIMARY KEY, vec BLOB NOT NULL, dims INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(id) REFERENCES claims(id) ON DELETE CASCADE)""")
+            # Fix embedding metadata — deepseek-v4-pro → pplx-embed-v1-4b
+            try:
+                c.execute("ALTER TABLE semantic_vectors ADD COLUMN provider TEXT NOT NULL DEFAULT 'openrouter'")
+            except sqlite3.OperationalError:
+                pass  # Column already exists
+            try:
+                c.execute("ALTER TABLE semantic_vectors ADD COLUMN model TEXT NOT NULL DEFAULT 'perplexity/pplx-embed-v1-4b'")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                c.execute("ALTER TABLE semantic_vectors ADD COLUMN instruction_hash TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                c.execute("ALTER TABLE semantic_vectors ADD COLUMN manifest_hash TEXT NOT NULL DEFAULT ''")
+            except sqlite3.OperationalError:
+                pass
+
             c.execute("CREATE INDEX IF NOT EXISTS idx_semantic_vectors_id ON semantic_vectors(id)")
             # --- F6: Placeholder cleanup + input length guard ---
             try:
@@ -2978,23 +2996,6 @@ class MemoryWikiProvider(MemoryProvider):
         with self._connect() as c:
 
 
-            # Fix embedding metadata — deepseek-v4-pro → pplx-embed-v1-4b
-            try:
-                c.execute("ALTER TABLE semantic_vectors ADD COLUMN provider TEXT NOT NULL DEFAULT 'openrouter'")
-            except sqlite3.OperationalError:
-                pass  # Column already exists
-            try:
-                c.execute("ALTER TABLE semantic_vectors ADD COLUMN model TEXT NOT NULL DEFAULT 'perplexity/pplx-embed-v1-4b'")
-            except sqlite3.OperationalError:
-                pass
-            try:
-                c.execute("ALTER TABLE semantic_vectors ADD COLUMN instruction_hash TEXT NOT NULL DEFAULT ''")
-            except sqlite3.OperationalError:
-                pass
-            try:
-                c.execute("ALTER TABLE semantic_vectors ADD COLUMN manifest_hash TEXT NOT NULL DEFAULT ''")
-            except sqlite3.OperationalError:
-                pass
             c.execute("""INSERT INTO preference_rules(id,rule,priority,scope,source,status,created_at,updated_at,hash)
                          VALUES(?,?,?,?,?,?,?,?,?)
                          ON CONFLICT(id) DO UPDATE SET rule=excluded.rule,priority=excluded.priority,scope=excluded.scope,source=excluded.source,status=excluded.status,updated_at=excluded.updated_at""",
@@ -5722,20 +5723,21 @@ class MemoryWikiProvider(MemoryProvider):
             processed = int(job_row["processed_count"])
             failed = int(job_row["failed_count"])
 
-        # Resume from last processed ID
+        # Resume from last processed offset
         sql = "SELECT id, normalized_claim, topic FROM claims WHERE status='active' AND normalized_claim IS NOT NULL AND normalized_claim != ''"
         sql += " ORDER BY id"
         if limit > 0:
-            sql += " LIMIT ?"
-            params = (limit,)
+            sql += " LIMIT ? OFFSET ?"
+            params = (limit, processed)
         else:
             params = ()
 
         rows = c.execute(sql, params).fetchall()
         batch_size = 20
         ok = 0
+        base_processed = processed
 
-        for i in range(processed, len(rows), batch_size):
+        for i in range(0, len(rows), batch_size):
             batch = rows[i:i+batch_size]
             for row in batch:
                 cid = row["id"]
@@ -5753,7 +5755,7 @@ class MemoryWikiProvider(MemoryProvider):
                     failed += 1
 
             # Checkpoint
-            processed_now = i + len(batch)
+            processed_now = base_processed + i + len(batch)
             c.execute("UPDATE reindex_jobs SET processed_count=?, failed_count=?, updated_at=? WHERE id=?",
                       (processed_now, failed, int(time.time()), job_id))
             c.commit()
@@ -5769,7 +5771,7 @@ class MemoryWikiProvider(MemoryProvider):
             return {"ok": True, "collection": target_coll, "count": target_count, "total": total_active,
                     "ok_count": ok, "failed": failed, "status": "completed", "alias_switched": True}
 
-        c.execute("UPDATE reindex_jobs SET status='running', completed_at=? WHERE id=?",
+        c.execute("UPDATE reindex_jobs SET status='running', completed_at=NULL WHERE id=?",
                   (int(time.time()), job_id))
         c.commit()
         return {"ok": True, "collection": target_coll, "count": target_count or 0, "total": total_active,
