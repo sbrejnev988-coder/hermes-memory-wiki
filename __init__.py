@@ -3615,7 +3615,7 @@ class MemoryWikiProvider(MemoryProvider):
             if SEMANTIC_ENABLED:
                 emb = _embed_document(normalized)
                 if emb is not None:
-                    _outbox_enqueue("upsert","claim",cid,{"vector":emb,"qdrant_payload":{"id":cid,"topic":topic,"claim":short(normalized,300)}})
+                    _outbox_enqueue("embed_and_upsert","claim",cid,{"text":normalized,"topic":topic,"collection":_active_collection_name()})
                     # Qdrant upsert deferred to outbox worker — no direct call here
         except Exception:
             pass
@@ -5713,7 +5713,7 @@ class MemoryWikiProvider(MemoryProvider):
                 try:
                     emb = _embed_document(row["normalized_claim"])
                     if emb and len(emb) == QDRANT_VECTOR_SIZE:
-                        _outbox_enqueue("upsert","claim",cid,{"vector":emb,"qdrant_payload":{"id":cid,"topic":topic,"claim":short(normalized,300)}}); _qdrant_upsert(cid, emb, {"id": cid, "topic": row["topic"] or "", "claim": short(row["normalized_claim"], 300)}, collection=target_coll)
+                        _outbox_enqueue("embed_and_upsert","claim",cid,{"text":normalized,"topic":topic,"collection":_active_collection_name()}); _qdrant_upsert(cid, emb, {"id": cid, "topic": row["topic"] or "", "claim": short(row["normalized_claim"], 300)}, collection=target_coll)
                         ok += 1
                     else:
                         failed += 1
