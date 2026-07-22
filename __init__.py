@@ -1,4 +1,4 @@
-"""memory-wiki v1.10.0: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.11.0: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -1230,8 +1230,17 @@ def infer_claim_type(text: str, topic: str = "") -> str:
     if any(x in low for x in ("step ", "шаг", "procedure", "инструкция", "to update", "как обнов")): return "procedure"
     if PATH_RE.search(low) or any(x in low for x in ("installed", "установ", "port", "service", "systemd", "конфиг", "config", ".env")): return "environment"
     if any(x in low for x in ("decided", "решил", "решение", "выбрали")): return "decision"
+    if any(x in low for x in ("repository_id", "commit_sha", "symbol_id", "codebase")):
+        return "code_claim"
+    if any(x in low for x in ("architecture", "диаграмма компонентов")):
+        return "architecture_claim"
+    if any(x in low for x in ("vulnerability", "cve", "auth bypass")):
+        return "security_finding"
+    if any(x in low for x in ("patch applied", "patch failed")):
+        return "patch_outcome"
+    if any(x in low for x in ("regression", "broke after")):
+        return "known_regression"
     return "fact"
-
 
 
 def canonical_topic(topic: str, claim: str = "") -> str:
@@ -1823,6 +1832,12 @@ class MemoryWikiProvider(MemoryProvider):
             if tool_name == "memory_wiki_semantic_status": return tool_result(success=True, **self._semantic_status())
             if tool_name == "memory_wiki_reindex": return tool_result(success=True, **self._reindex(int(a.get("limit",0) or 0), bool(a.get("force", False))))
             if tool_name == "memory_wiki_debug_search": return tool_result(success=True, **self._debug_search(a.get("query",""), int(a.get("limit",10)), a.get("topic")))
+            if tool_name == "memory_wiki_code_claim_add": return tool_result(success=True, **self._code_claim_add(a))
+            if tool_name == "memory_wiki_code_claim_query": return tool_result(success=True, **self._code_claim_query(a))
+            if tool_name == "memory_wiki_symbol_history": return tool_result(success=True, **self._symbol_history(a))
+            if tool_name == "memory_wiki_repository_context": return tool_result(success=True, **self._repository_context(a))
+            if tool_name == "memory_wiki_invalidate_revision": return tool_result(success=True, **self._invalidate_revision(a))
+            if tool_name == "memory_wiki_patch_outcome_add": return tool_result(success=True, **self._patch_outcome_add(a))
             if tool_name == "memory_wiki_compare_search": return tool_result(success=True, **self._compare_search(a.get("query",""), int(a.get("limit",10)), a.get("topic")))
             if tool_name == "memory_wiki_query_mode": return tool_result(success=True, **self._query_mode_tool(a.get("query","")))
             # ── Collapse & decay tools ──
@@ -3110,6 +3125,77 @@ class MemoryWikiProvider(MemoryProvider):
         return self._resolve_contradiction({"contradiction_id":contradiction_id,"resolution":f"policy {policy} selected {winner['id']}","winner_claim_id":winner['id'],"loser_status":"uncertain"})
 
     # ----- claims --------------------------------------------------------
+
+    def _code_claim_add(self, a: Dict[str, Any]) -> Dict[str, Any]:
+        claim = a.get("claim", ""); topic = a.get("topic", "code-shrinker")
+        repo_id = a.get("repository_id", ""); commit_sha = a.get("commit_sha", "")
+        file_path = a.get("file_path", ""); symbol_id = a.get("symbol_id", "")
+        symbol_rev = a.get("symbol_revision", ""); claim_type = a.get("claim_type", "code_claim")
+        meta = []
+        if repo_id: meta.append(f"repository: {repo_id}")
+        if commit_sha: meta.append(f"commit: {commit_sha[:12]}")
+        if file_path: meta.append(f"file: {file_path}")
+        if symbol_id: meta.append(f"symbol: {symbol_id}")
+        if symbol_rev: meta.append(f"revision: {symbol_rev[:12]}")
+        evidence = "; ".join(meta)
+        if a.get("evidence"): evidence = f"{evidence} | {a['evidence']}"
+        cid = self._add_claim(claim=claim, topic=topic, evidence=evidence,
+                              source=f"tool:code_claim:{claim_type}",
+                              confidence=float(a.get("confidence", 0.75)),
+                              salience=float(a.get("salience", 0.7)))
+        return {"id": cid, "type": claim_type, "repository_id": repo_id}
+
+    def _code_claim_query(self, a: Dict[str, Any]) -> Dict[str, Any]:
+        repo_id = a.get("repository_id", ""); symbol_id = a.get("symbol_id", "")
+        file_path = a.get("file_path", ""); query = a.get("query", "")
+        limit = int(a.get("limit", 10))
+        c = self._connect()
+        conds = ["status='active'"]; params = []
+        if repo_id: conds.append("evidence LIKE ?"); params.append(f"%repository: {repo_id}%")
+        if file_path: conds.append("evidence LIKE ?"); params.append(f"%file: {file_path}%")
+        if symbol_id: conds.append("evidence LIKE ?"); params.append(f"%symbol: {symbol_id}%")
+        if query: conds.append("(claim LIKE ? OR topic LIKE ?)"); params.extend([f"%{query}%", f"%{query}%"])
+        sql = f"SELECT id, claim, topic, confidence, salience, evidence, updated_at FROM claims WHERE {' AND '.join(conds)} ORDER BY updated_at DESC LIMIT ?"
+        params.append(limit)
+        return {"claims": [dict(r) for r in c.execute(sql, params).fetchall()]}
+
+    def _symbol_history(self, a: Dict[str, Any]) -> Dict[str, Any]:
+        symbol_id = a.get("symbol_id", ""); limit = int(a.get("limit", 20))
+        rows = self._connect().execute(
+            "SELECT id, claim, topic, evidence, updated_at, status FROM claims WHERE evidence LIKE ? ORDER BY updated_at DESC LIMIT ?",
+            (f"%symbol: {symbol_id}%", limit)).fetchall()
+        return {"symbol_id": symbol_id, "history": [dict(r) for r in rows]}
+
+    def _repository_context(self, a: Dict[str, Any]) -> Dict[str, Any]:
+        repo_id = a.get("repository_id", ""); limit = int(a.get("limit", 30))
+        rows = self._connect().execute(
+            "SELECT id, claim, topic, evidence, confidence, salience, updated_at FROM claims WHERE status='active' AND evidence LIKE ? ORDER BY salience DESC LIMIT ?",
+            (f"%repository: {repo_id}%", limit)).fetchall()
+        return {"repository_id": repo_id, "claims": [dict(r) for r in rows]}
+
+    def _invalidate_revision(self, a: Dict[str, Any]) -> Dict[str, Any]:
+        symbol_id = a.get("symbol_id", ""); file_path = a.get("file_path", "")
+        new_sha = a.get("new_commit_sha", "")
+        c = self._connect(); conds = ["status='active'"]; params = []
+        if symbol_id: conds.append("evidence LIKE ?"); params.append(f"%symbol: {symbol_id}%")
+        if file_path: conds.append("evidence LIKE ?"); params.append(f"%file: {file_path}%")
+        rows = c.execute(f"SELECT id FROM claims WHERE {' AND '.join(conds)}", params).fetchall()
+        for r in rows:
+            c.execute("UPDATE claims SET status='stale', evidence=evidence || ? WHERE id=?",
+                      (f" | invalidated at {new_sha[:12] if new_sha else 'revision_change'}", r["id"]))
+        c.commit()
+        return {"invalidated": len(rows), "ids": [r["id"] for r in rows]}
+
+    def _patch_outcome_add(self, a: Dict[str, Any]) -> Dict[str, Any]:
+        patch_id = a.get("patch_id", ""); outcome = a.get("outcome", "")
+        repo_id = a.get("repository_id", ""); changed_files = a.get("changed_files", [])
+        changed_symbols = a.get("changed_symbols", [])
+        claim = f"Patch {patch_id}: {outcome}. Files: {', '.join(changed_files[:5])}. Symbols: {', '.join(changed_symbols[:5])}"
+        meta = f"repository: {repo_id}" if repo_id else ""
+        if a.get("rollback_steps"): meta += f" | rollback: {a['rollback_steps'][:200]}"
+        cid = self._add_claim(claim=claim, topic="patch-outcomes", evidence=meta,
+                              source="tool:patch_outcome_add", confidence=0.9, salience=0.8)
+        return {"id": cid, "patch_id": patch_id, "outcome": outcome}
 
     def _add_claim(self, claim: str, topic="general", evidence="", source="tool", confidence=.7, salience=.7) -> str:
         raw_claim=scrub_memory_artifacts(str(claim or "")); raw_evidence=scrub_memory_artifacts(str(evidence or ""))
