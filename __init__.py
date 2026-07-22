@@ -1,4 +1,4 @@
-"""memory-wiki v1.18.0: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.18.1: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -1543,14 +1543,20 @@ class MemoryWikiProvider(MemoryProvider):
         # Alias bootstrap: ensure memory_wiki_claims_active points to active collection
         if SEMANTIC_ENABLED:
             try:
-                alias_check = _qdrant_req("GET", "/collections/memory_wiki_claims_active")
-                if not alias_check or alias_check.get("status") != "ok":
+                alias_check = _qdrant_req("GET", "/collections/memory_wiki_claims_active/aliases")
+                alias_exists = alias_check and alias_check.get("status") == "ok"
+                if not alias_exists:
                     coll = _active_collection_name()
-                    _ensure_collection()
-                    _switch_alias(coll)
-                    _debug_log(f"Bootstrap: alias memory_wiki_claims_active → {coll}")
+                    if not _ensure_collection():
+                        _debug_log("Bootstrap FAILED: could not create Qdrant collection")
+                    else:
+                        created = _qdrant_req("POST", "/collections/aliases", {"actions": [{"create_alias": {"collection_name": coll, "alias_name": "memory_wiki_claims_active"}}]})
+                        if created and created.get("status") == "ok":
+                            _debug_log(f"Bootstrap OK: alias memory_wiki_claims_active → {coll}")
+                        else:
+                            _debug_log(f"Bootstrap FAILED: could not create alias → {coll}")
             except Exception as e:
-                _debug_log(f"Alias bootstrap skipped: {e}")
+                _debug_log(f"Alias bootstrap error: {e}")
         # --- F2/F3: Build TF-IDF vocabulary from existing claims ---
         try:
             c = self._connect()
@@ -3458,9 +3464,9 @@ class MemoryWikiProvider(MemoryProvider):
             (f" | source_event:{source_event_id} content_hash:{content_hash}", claim_id))
         c.commit()
 
-    def _resolve_temporal(self, topic: str, claim_text: str, new_claim_id: str = "") -> Dict[str, Any]:
+    def _resolve_temporal(self, topic: str, claim_text: str, new_claim_id: str = "", conn=None) -> Dict[str, Any]:
         """Check if new claim supersedes existing active claims on same topic."""
-        c = self._connect()
+        c = conn or self._connect()
         rows = c.execute("SELECT id,claim,temporal_status FROM claims WHERE topic=? AND id!=? AND status IN ('active','current') ORDER BY created_at DESC LIMIT 20", (topic, new_claim_id)).fetchall()
         superseded = []
         n_lower = claim_text.lower()
@@ -3650,13 +3656,13 @@ class MemoryWikiProvider(MemoryProvider):
                 if evidence: self._add_evidence(cid, evidence, "support", source, commit=False)
                 after_row = self._table_row("claims", cid)
                 self._record_mutation("upsert_claim", "claims", cid, {} if not ex else {"id": cid, "note": "pre-existing claim updated"}, after_row, source)
+                # Outbox + temporal — inside same transaction as claim
+                if SEMANTIC_ENABLED:
+                    _outbox_enqueue("embed_and_upsert","claim",cid,{"text":normalized,"topic":topic,"collection":_active_collection_name()}, conn=c)
+                temporal_result = self._resolve_temporal(topic, claim, cid, conn=c)
+                if temporal_result.get("supersedes"):
+                    self._apply_supersession(temporal_result["supersedes"], cid, conn=c)
             self._upsert_fts(cid); self._detect_contradictions_for(cid); self._add_change("upsert_claim", cid, claim); self._render_topic(topic); self._render_dashboards()
-            # Transactional outbox + temporal — inside same SQLite transaction as claim
-            if SEMANTIC_ENABLED:
-                _outbox_enqueue("embed_and_upsert","claim",cid,{"text":normalized,"topic":topic,"collection":_active_collection_name()}, conn=c)
-            temporal_result = self._resolve_temporal(topic, claim, cid)
-            if temporal_result.get("supersedes"):
-                self._apply_supersession(temporal_result["supersedes"], cid, conn=c)
         return cid
 
 
@@ -5759,10 +5765,13 @@ class MemoryWikiProvider(MemoryProvider):
                             ok += 1
                         else:
                             failed += 1
+                            failed_ids.append(cid)
                     else:
                         failed += 1
+                        failed_ids.append(cid)
                 except Exception:
                     failed += 1
+                    failed_ids.append(cid)
 
             # Checkpoint
             processed_now = base_processed + i + len(batch)
