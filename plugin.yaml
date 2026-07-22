@@ -1,5 +1,5 @@
 name: memory-wiki
-version: 1.16.1
+version: 1.17.0
 description: "Hermes Memory OS — 88 tools, FTS5 + OpenRouter ML embeddings/Qdrant + RRF + optional conditional Cohere reranking, structured claims, evidence, graph memory, write firewall, secret wrapping, journal recovery and self-healing."
 
 provides_tools:

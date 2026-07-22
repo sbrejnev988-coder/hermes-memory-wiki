@@ -1894,7 +1894,12 @@ class MemoryWikiProvider(MemoryProvider):
             if tool_name == "memory_wiki_add_relation": return tool_result(success=True, **self._add_relation(a))
             if tool_name == "memory_wiki_graph_query": return tool_result(success=True, **self._graph_query(a.get("query") or "", int(a.get("limit",20))))
             if tool_name == "memory_wiki_apply_user_correction": return tool_result(success=True, **self._apply_user_correction(a))
-            if tool_name == "memory_wiki_pack_context": return tool_result(success=True, **self._pack_context(a.get("query") or "", int(a.get("max_chars",MAX_PREFETCH_CHARS))))
+            if tool_name == "memory_wiki_pack_context":
+                result = self._pack_context(a.get("query") or "", int(a.get("max_chars",MAX_PREFETCH_CHARS)))
+                if result.get("results"):
+                    claims_for_pack = [dict(r, id=r.get("id",""), claim=r.get("text",r.get("claim","")), confidence=float(r.get("confidence",0.5) or 0.5), temporal_status="current") for r in result["results"]]
+                    result["structured_pack"] = self._pack_selected_claims(claims_for_pack, token_budget=min(int(a.get("max_chars",3800)),6000))
+                return tool_result(success=True, **result)
             if tool_name == "memory_wiki_memory_diff": return tool_result(success=True, **self._memory_diff(a.get("query") or "", a.get("verified_facts") or [], a.get("current_context") or "", int(a.get("limit",12))))
             if tool_name == "memory_wiki_preference_layer": return tool_result(success=True, **self._preference_layer(a.get("query") or "", int(a.get("limit",20)), bool(a.get("include_policy", True))))
             if tool_name == "memory_wiki_add_preference_rule": return tool_result(success=True, **self._add_preference_rule(a))
@@ -4108,6 +4113,14 @@ class MemoryWikiProvider(MemoryProvider):
             with c:
                 ts=now(); c.executemany("UPDATE claims SET access_count=access_count+1, recall_count=recall_count+1, last_accessed=?, last_recalled=? WHERE id=?", [(ts, ts, i) for i in ids])
                 c.executemany("INSERT OR IGNORE INTO recall_events(id,claim_id,query,score,used,created_at) VALUES(?,?,?,?,?,?)", [("re_"+sha(f"{i}:{q}:{ts}")[:12], i, short(q,500), next((float(x.get("score",0)) for x in scored if x["id"]==i),0.0), -1, ts) for i in ids])
+        # Record recall feedback
+        try:
+            for item in scored[:5] if isinstance(scored, list) else []:
+                cid = str(item.get("id",""))
+                if cid:
+                    self._record_recall_feedback(cid, retrieved=True, injected=False, used=False,
+                        helpful=0.0, contradicted=False, harmful=False, answer_id="", source="retrieval_auto")
+        except Exception: pass
         return scored[:limit]
 
     def _upsert_fts(self, cid: str) -> None:
