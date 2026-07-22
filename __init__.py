@@ -145,7 +145,7 @@ def _manifest_hash(manifest: dict) -> str:
     return hashlib.sha256(json.dumps(manifest,sort_keys=True,ensure_ascii=True).encode()).hexdigest()[:12]
 
 def _active_collection_name() -> str:
-    return f"memory_wiki_claims_{_manifest_hash(_embedding_manifest())}"
+    return QDRANT_COLLECTION  # pinned — no hash suffix, uses env var directly
 
 def _ensure_collection() -> bool:
     coll = _active_collection_name()
