@@ -1,4 +1,4 @@
-"""memory-wiki v1.11.0: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.12.0: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -128,6 +128,93 @@ QDRANT_API_KEY = os.environ.get(
 QDRANT_VECTOR_SIZE = int(
     os.environ.get("MEMORY_WIKI_VECTOR_SIZE", "768")
 )
+
+# ═══ Embedding Manifest v1.0 + Transactional Outbox ═══
+def _embedding_manifest() -> dict:
+    q_inst = QWEN_QUERY_INSTRUCTION if QWEN_QUERY_INSTRUCTION else ""
+    return {"manifest_version":1,"provider":EMBED_PROVIDER,"model":EMBED_MODEL,
+            "dimensions":EMBED_DIMENSIONS,"vector_size":QDRANT_VECTOR_SIZE,
+            "query_instruction_hash":hashlib.sha256(q_inst.encode()).hexdigest()[:16] if q_inst else "none",
+            "document_template_version":2,"normalization_version":1}
+
+def _manifest_hash(manifest: dict) -> str:
+    return hashlib.sha256(json.dumps(manifest,sort_keys=True,ensure_ascii=True).encode()).hexdigest()[:12]
+
+def _active_collection_name() -> str:
+    return f"memory_wiki_claims_{_manifest_hash(_embedding_manifest())}"
+
+def _ensure_collection() -> bool:
+    coll = _active_collection_name()
+    try:
+        req = urllib.request.Request(f"{QDRANT_URL}/collections/{coll}",method="GET",
+            headers={"Content-Type":"application/json"})
+        with urllib.request.urlopen(req,timeout=5) as r:
+            if r.status==200: return True
+    except urllib.error.HTTPError as e:
+        if e.code!=404: _debug_log(f"Qdrant collection check error: {e}"); return False
+    except: return False
+    try:
+        body = json.dumps({"vectors":{"size":QDRANT_VECTOR_SIZE,"distance":"Cosine"}}).encode()
+        req = urllib.request.Request(f"{QDRANT_URL}/collections/{coll}",data=body,method="PUT",
+            headers={"Content-Type":"application/json"})
+        with urllib.request.urlopen(req,timeout=10) as r:
+            _debug_log(f"Created Qdrant collection: {coll}"); return True
+    except Exception as e:
+        _debug_log(f"Failed to create collection {coll}: {e}"); return False
+
+def _check_manifest_change() -> str | None:
+    mpath = Path(os.environ.get("HERMES_HOME",str(Path.home()/".hermes")))/"memory-wiki"/"embedding_manifest.json"
+    manifest = _embedding_manifest()
+    if mpath.exists():
+        try:
+            stored = json.loads(mpath.read_text())
+            if _manifest_hash(stored) != _manifest_hash(manifest):
+                old = f"memory_wiki_claims_{_manifest_hash(stored)}"
+                _debug_log(f"Manifest changed: {_manifest_hash(stored)} → {_manifest_hash(manifest)}")
+                return old
+        except: pass
+    mpath.parent.mkdir(parents=True,exist_ok=True)
+    mpath.write_text(json.dumps(manifest,indent=2))
+    return None
+
+# Transactional Outbox SQLite → Qdrant
+_OUTBOX_TABLE = """CREATE TABLE IF NOT EXISTS index_outbox(
+    id TEXT PRIMARY KEY,operation TEXT DEFAULT 'upsert',object_type TEXT DEFAULT 'claim',
+    object_id TEXT NOT NULL,payload_json TEXT,payload_hash TEXT,attempts INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'pending',last_error TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
+    CREATE INDEX IF NOT EXISTS idx_outbox_status ON index_outbox(status,created_at);"""
+
+def _ensure_outbox() -> None:
+    try:
+        db=sqlite3.connect(str(_DB_PATH));db.executescript(_OUTBOX_TABLE);db.commit();db.close()
+    except Exception as e: _debug_log(f"outbox init failed: {e}")
+
+def _outbox_enqueue(operation: str, object_type: str, object_id: str, payload: dict) -> str:
+    import uuid; oid=uuid.uuid4().hex[:16]; now=int(time.time())
+    try:
+        db=sqlite3.connect(str(_DB_PATH))
+        db.execute("INSERT INTO index_outbox(id,operation,object_type,object_id,payload_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
+            (oid,operation,object_type,object_id,json.dumps(payload,ensure_ascii=False) if payload else"{}",now,now))
+        db.commit();db.close();return oid
+    except Exception as e: _debug_log(f"outbox enqueue failed: {e}"); return ""
+
+def _outbox_process(batch_size=50) -> dict:
+    try:
+        db=sqlite3.connect(str(_DB_PATH));now=int(time.time())
+        rows=db.execute("SELECT*FROM index_outbox WHERE status='pending' ORDER BY created_at LIMIT ?",(batch_size,)).fetchall()
+        ok=0;fail=0
+        for r in rows:
+            try:
+                pl=json.loads(r["payload_json"] or"{}")
+                if r["operation"]=="upsert" and pl.get("vector"):
+                    _qdrant_upsert(r["object_id"],pl["vector"],pl.get("qdrant_payload",{}))
+                db.execute("UPDATE index_outbox SET status='completed',updated_at=? WHERE id=?",(now,r["id"]));ok+=1
+            except Exception as e:
+                a=int(r["attempts"])+1;st="failed" if a>=5 else"pending"
+                db.execute("UPDATE index_outbox SET attempts=?,status=?,last_error=?,updated_at=? WHERE id=?",(a,st,str(e)[:500],now,r["id"]));fail+=1
+        db.commit();db.close();return {"processed":ok+fail,"ok":ok,"fail":fail}
+    except Exception as e: return {"processed":0,"ok":0,"fail":0,"error":str(e)}
+
 
 # --- Consistency guard: EMBED_DIMENSIONS must match QDRANT_VECTOR_SIZE ---
 if EMBED_PROVIDER == "openrouter" and EMBED_DIMENSIONS != QDRANT_VECTOR_SIZE:
