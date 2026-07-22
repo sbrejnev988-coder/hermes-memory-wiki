@@ -1,4 +1,4 @@
-"""memory-wiki v1.18.1: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.18.2: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -1543,7 +1543,7 @@ class MemoryWikiProvider(MemoryProvider):
         # Alias bootstrap: ensure memory_wiki_claims_active points to active collection
         if SEMANTIC_ENABLED:
             try:
-                alias_check = _qdrant_req("GET", "/collections/memory_wiki_claims_active/aliases")
+                alias_check = _qdrant_req("GET", "/aliases")
                 alias_exists = alias_check and alias_check.get("status") == "ok"
                 if not alias_exists:
                     coll = _active_collection_name()
@@ -2881,24 +2881,27 @@ class MemoryWikiProvider(MemoryProvider):
             with c: c.execute("INSERT OR IGNORE INTO memory_changes(id,action,claim_id,detail,created_at) VALUES(?,?,?,?,?)", (cid, action, claim_id or "", short(redact_secrets(detail),1200), ts))
         except Exception: pass
 
-    def _audit(self, op: str, status: str = "ok", detail: str = "") -> None:
+    def _audit(self, op: str, status: str = "ok", detail: str = "", conn=None) -> None:
+        """Audit log entry. If conn is provided, executes within existing transaction."""
         try:
-            c=self._connect(); ts=now(); aid="aud_"+sha(f"{op}:{status}:{detail}:{ts}")[:14]
-            with c: c.execute("INSERT OR IGNORE INTO audit_log(id,op,status,detail,created_at) VALUES(?,?,?,?,?)", (aid, short(op,120), short(status,40), short(redact_secrets(detail),1600), ts))
+            c = conn or self._connect(); ts=now(); aid="aud_"+sha(f"{op}:{status}:{detail}:{ts}")[:14]
+            c.execute("INSERT OR IGNORE INTO audit_log(id,op,status,detail,created_at) VALUES(?,?,?,?,?)", (aid, short(op,120), short(status,40), short(redact_secrets(detail),1600), ts))
+            if conn is None: c.commit()
         except Exception: pass
 
-    def _record_mutation(self, operation: str, target_table: str = "", target_id: str = "", before: Any = None, after: Any = None, reason: str = "", batch_id: str = "", reversible: bool = True) -> str:
-        """Append-only mutation ledger. Values are redacted before storage; raw secrets never enter the ledger."""
+    def _record_mutation(self, operation: str, target_table: str = "", target_id: str = "", before: Any = None, after: Any = None, reason: str = "", batch_id: str = "", reversible: bool = True, conn=None) -> str:
+        """Append-only mutation ledger. If conn is provided, executes within existing transaction."""
         ts = now()
         before_json = redact_secrets(json.dumps(before or {}, ensure_ascii=False, sort_keys=True, default=str))
         after_json = redact_secrets(json.dumps(after or {}, ensure_ascii=False, sort_keys=True, default=str))
         mid = "mut_" + sha(f"{operation}:{target_table}:{target_id}:{before_json}:{after_json}:{ts}")[:14]
-        with self._connect() as c:
-            c.execute(
-                """INSERT OR IGNORE INTO memory_mutations(id,batch_id,actor,operation,target_table,target_id,before_json,after_json,reason,reversible,undone_at,created_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (mid, short(batch_id,80), "memory-wiki", short(operation,120), short(target_table,80), short(target_id,160), short(before_json,9000), short(after_json,9000), short(redact_secrets(reason),1200), 1 if reversible else 0, 0, ts),
-            )
+        c = conn or self._connect()
+        c.execute(
+            """INSERT OR IGNORE INTO memory_mutations(id,batch_id,actor,operation,target_table,target_id,before_json,after_json,reason,reversible,undone_at,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (mid, short(batch_id,80), "memory-wiki", short(operation,120), short(target_table,80), short(target_id,160), short(before_json,9000), short(after_json,9000), short(redact_secrets(reason),1200), 1 if reversible else 0, 0, ts),
+        )
+        if conn is None: c.commit()
         return mid
 
     def _table_row(self, table: str, row_id: str, pk: str = "id") -> Dict[str, Any]:
@@ -3638,7 +3641,7 @@ class MemoryWikiProvider(MemoryProvider):
                                     best_dist = dist
                                     near_merge_id = nr["id"] if dist <= 12 else None
                             if near_merge_id:
-                                self._audit('dedup', 'simhash_near_merge', f'{cid} near-duplicate of {near_merge_id} (hamming={best_dist})')
+                                self._audit('dedup', 'simhash_near_merge', f'{cid} near-duplicate of {near_merge_id} (hamming={best_dist})', conn=c)
                                 c.execute(
                                     "UPDATE claims SET confidence=max(confidence,?), salience=max(salience,?), quality=max(quality,?), derived_from=CASE WHEN derived_from='' THEN ? ELSE derived_from END, updated_at=? WHERE id=?",
                                     (clamp(confidence), clamp(salience), quality, near_merge_id, ts, near_merge_id)
@@ -3655,7 +3658,7 @@ class MemoryWikiProvider(MemoryProvider):
                         except Exception: pass
                 if evidence: self._add_evidence(cid, evidence, "support", source, commit=False)
                 after_row = self._table_row("claims", cid)
-                self._record_mutation("upsert_claim", "claims", cid, {} if not ex else {"id": cid, "note": "pre-existing claim updated"}, after_row, source)
+                self._record_mutation("upsert_claim", "claims", cid, {} if not ex else {"id": cid, "note": "pre-existing claim updated"}, after_row, source, conn=c)
                 # Outbox + temporal — inside same transaction as claim
                 if SEMANTIC_ENABLED:
                     _outbox_enqueue("embed_and_upsert","claim",cid,{"text":normalized,"topic":topic,"collection":_active_collection_name()}, conn=c)
