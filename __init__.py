@@ -1,4 +1,4 @@
-"""memory-wiki v1.15.3: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.17.5: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -5772,7 +5772,7 @@ class MemoryWikiProvider(MemoryProvider):
                     "ok_count": ok, "failed": failed, "status": "completed", "alias_switched": True}
 
         c.execute("UPDATE reindex_jobs SET status='running', completed_at=NULL WHERE id=?",
-                  (int(time.time()), job_id))
+                  (job_id,))
         c.commit()
         return {"ok": True, "collection": target_coll, "count": target_count or 0, "total": total_active,
                 "ok_count": ok, "failed": failed, "status": "partial", "alias_switched": False}
