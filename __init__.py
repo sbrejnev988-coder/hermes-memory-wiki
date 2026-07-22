@@ -5716,8 +5716,11 @@ class MemoryWikiProvider(MemoryProvider):
                 try:
                     emb = _embed_document(row["normalized_claim"])
                     if emb and len(emb) == QDRANT_VECTOR_SIZE:
-                        _outbox_enqueue("embed_and_upsert","claim",cid,{"text":normalized,"topic":topic,"collection":_active_collection_name()}); _qdrant_upsert(cid, emb, {"id": cid, "topic": row["topic"] or "", "claim": short(row["normalized_claim"], 300)}, collection=target_coll)
-                        ok += 1
+                        _outbox_enqueue("embed_and_upsert","claim",cid,{"text":normalized,"topic":topic,"collection":_active_collection_name()}); result = _qdrant_upsert(cid, emb, {"id": cid, "topic": row["topic"] or "", "claim": short(row["normalized_claim"], 300)}, collection=target_coll)
+                        if result:
+                            ok += 1
+                        else:
+                            failed += 1
                     else:
                         failed += 1
                 except Exception:
