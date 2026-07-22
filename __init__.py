@@ -1,4 +1,4 @@
-"""memory-wiki v1.15.0: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.15.1: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -184,15 +184,19 @@ _OUTBOX_TABLE = """CREATE TABLE IF NOT EXISTS index_outbox(
     status TEXT DEFAULT 'pending',last_error TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
     CREATE INDEX IF NOT EXISTS idx_outbox_status ON index_outbox(status,created_at);"""
 
+def _mk_db_path() -> str:
+    hh = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+    return str(Path(hh) / "memory-wiki" / "memory_wiki.sqlite3")
+
 def _ensure_outbox() -> None:
     try:
-        db=sqlite3.connect(str(_DB_PATH));db.executescript(_OUTBOX_TABLE);db.commit();db.close()
+        db=sqlite3.connect(str(_mk_db_path()));db.executescript(_OUTBOX_TABLE);db.commit();db.close()
     except Exception as e: _debug_log(f"outbox init failed: {e}")
 
 def _outbox_enqueue(operation: str, object_type: str, object_id: str, payload: dict) -> str:
     import uuid; oid=uuid.uuid4().hex[:16]; now=int(time.time())
     try:
-        db=sqlite3.connect(str(_DB_PATH))
+        db=sqlite3.connect(str(_mk_db_path()))
         db.execute("INSERT INTO index_outbox(id,operation,object_type,object_id,payload_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
             (oid,operation,object_type,object_id,json.dumps(payload,ensure_ascii=False) if payload else"{}",now,now))
         db.commit();db.close();return oid
@@ -200,7 +204,7 @@ def _outbox_enqueue(operation: str, object_type: str, object_id: str, payload: d
 
 def _outbox_process(batch_size=50) -> dict:
     try:
-        db=sqlite3.connect(str(_DB_PATH));now=int(time.time())
+        db=sqlite3.connect(str(_mk_db_path()));now=int(time.time())
         rows=db.execute("SELECT*FROM index_outbox WHERE status='pending' ORDER BY created_at LIMIT ?",(batch_size,)).fetchall()
         ok=0;fail=0
         for r in rows:
@@ -571,7 +575,7 @@ def _openrouter_embed(text: str, *, input_type: str, timeout: float = 30.0) -> O
         return None
 
     return [float(value) for value in vector]
-def _qdrant_upsert(claim_id: str, vector: List[float], payload: dict) -> bool:
+def _qdrant_upsert(claim_id: str, vector: List[float], payload: dict, collection: str = None) -> bool:
     """Сохранить вектор в настоящем Qdrant."""
     if len(vector) != QDRANT_VECTOR_SIZE:
         _debug_log(f"qdrant vector size mismatch: expected={QDRANT_VECTOR_SIZE}, actual={len(vector)}")
@@ -656,6 +660,31 @@ def _qdrant_ensure_collection() -> bool:
 # NOTE: "Semantic" here = n-gram TF-IDF + Qdrant stub (fuzzy lexical, not ML embeddings).
 # For true semantic retrieval, replace embed_stub with a real embedding model.
 _OPENROUTER_HEALTH_CACHE = {"checked_at": 0.0, "available": False}
+
+def _qdrant_count(collection: str = None) -> int | None:
+    coll = collection or QDRANT_COLLECTION
+    try:
+        req = urllib.request.Request(f"{QDRANT_URL}/collections/{coll}", method="GET",
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            data = json.loads(r.read().decode())
+            return data.get("result", {}).get("points_count", data.get("points_count", 0))
+    except Exception: return None
+
+def _switch_alias(new_collection: str) -> bool:
+    alias = "memory_wiki_claims_active"
+    try:
+        body = json.dumps({"actions": [{"create_alias": {"collection_name": new_collection, "alias_name": alias}}]}).encode()
+        req = urllib.request.Request(f"{QDRANT_URL}/collections/aliases", data=body, method="POST",
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r: return True
+    except Exception:
+        try:
+            body2 = json.dumps({"actions": [{"delete_alias": {"alias_name": alias}}, {"create_alias": {"collection_name": new_collection, "alias_name": alias}}]}).encode()
+            req2 = urllib.request.Request(f"{QDRANT_URL}/collections/aliases", data=body2, method="POST",
+                headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req2, timeout=10) as r: return True
+        except Exception: return False
 
 def _semantic_available() -> bool:
     """Проверить embedding-сервис (stub или OpenRouter) и Qdrant."""
@@ -3347,7 +3376,7 @@ class MemoryWikiProvider(MemoryProvider):
         if file_path: conds.append("evidence LIKE ?"); params.append(f"%file: {file_path}%")
         rows = c.execute(f"SELECT id FROM claims WHERE {' AND '.join(conds)}", params).fetchall()
         for r in rows:
-            c.execute("UPDATE claims SET status='stale', evidence=evidence || ? WHERE id=?",
+            c.execute("UPDATE claims SET status='archived', evidence=evidence || ? WHERE id=?",
                       (f" | invalidated at {new_sha[:12] if new_sha else 'revision_change'}", r["id"]))
         c.commit()
         return {"invalidated": len(rows), "ids": [r["id"] for r in rows]}
@@ -3400,7 +3429,7 @@ class MemoryWikiProvider(MemoryProvider):
         """Mark superseded claims as historical."""
         c = self._connect()
         for sid in superseded_ids:
-            c.execute("UPDATE claims SET temporal_status='superseded', superseded_by_id=?, status='historical' WHERE id=?",
+            c.execute("UPDATE claims SET temporal_status='superseded', superseded_by_id=?, status='archived' WHERE id=?",
                       (new_claim_id, sid))
         c.commit()
         return len(superseded_ids)
@@ -3464,8 +3493,7 @@ class MemoryWikiProvider(MemoryProvider):
             c.execute("UPDATE claims SET irrelevant_recall_count=irrelevant_recall_count+1 WHERE id=?", (claim_id,))
         # Update usefulness score
         usefulness = 0.5 + (helpful * 0.3) - (0.1 if contradicted else 0) - (0.3 if harmful else 0) - (0.1 if (retrieved and not used) else 0)
-        c.execute("UPDATE claims SET usefulness=MAX(0.1, MIN(0.95, usefulness)), last_recalled=? WHERE id=?",
-                  (now, claim_id))
+        c.execute("UPDATE claims SET usefulness=?, last_recalled=? WHERE id=?", (max(0.1, min(0.95, usefulness)), now, claim_id))
         c.commit()
         return fid
 
@@ -3573,6 +3601,7 @@ class MemoryWikiProvider(MemoryProvider):
             if SEMANTIC_ENABLED:
                 emb = _embed_document(normalized)
                 if emb is not None:
+                    _outbox_enqueue("upsert","claim",cid,{"vector":emb,"qdrant_payload":{"id":cid,"topic":topic,"claim":short(normalized,300)}})
                     _qdrant_upsert(cid, emb, {"id": cid, "topic": topic, "claim": short(normalized, 300)})
         except Exception:
             pass
@@ -3739,7 +3768,7 @@ class MemoryWikiProvider(MemoryProvider):
         return selected
 
 
-    def _pack_context(self, claims: List[Dict[str, Any]], token_budget: int = 4000, max_claims: int = 16, max_per_cluster: int = 3, max_per_source: int = 5) -> str:
+    def _pack_selected_claims(self, claims: List[Dict[str, Any]], token_budget: int = 4000, max_claims: int = 16, max_per_cluster: int = 3, max_per_source: int = 5) -> str:
         """Pack claims into structured XML context blocks respecting token budget."""
         if not claims: return "<memory_context/>"
         budget_remaining = token_budget
@@ -5648,7 +5677,7 @@ class MemoryWikiProvider(MemoryProvider):
             failed = int(job_row["failed_count"])
 
         # Resume from last processed ID
-        sql = "SELECT id, normalized_claim, topic FROM claims WHERE status='active' AND normalized_claim IS NOT NULL AND normalized_claim != ''"
+        sql = "SELECT id, normalized_claim, topic FROM claims WHERE status='active' AND normalized_claim IS NOT NULL AND normalized_claim != '' ORDER BY id"
         if limit > 0:
             sql += " LIMIT ?"
             params = (limit,)
@@ -5666,7 +5695,7 @@ class MemoryWikiProvider(MemoryProvider):
                 try:
                     emb = _embed_document(row["normalized_claim"])
                     if emb and len(emb) == QDRANT_VECTOR_SIZE:
-                        _qdrant_upsert(cid, emb, {"id": cid, "topic": row["topic"] or "", "claim": short(row["normalized_claim"], 300)}, collection=target_coll)
+                        _outbox_enqueue("upsert","claim",cid,{"vector":emb,"qdrant_payload":{"id":cid,"topic":topic,"claim":short(normalized,300)}}); _qdrant_upsert(cid, emb, {"id": cid, "topic": row["topic"] or "", "claim": short(row["normalized_claim"], 300)}, collection=target_coll)
                         ok += 1
                     else:
                         failed += 1
@@ -5709,7 +5738,7 @@ class MemoryWikiProvider(MemoryProvider):
         if not _semantic_available(): return {"ok": False, "error": "embedding/qdrant unavailable"}
         if not _qdrant_ensure_collection(): return {"ok": False, "error": "qdrant collection unavailable"}
         c = self._connect()
-        sql = "SELECT id, normalized_claim, topic FROM claims WHERE status='active' AND normalized_claim IS NOT NULL AND normalized_claim != ''"
+        sql = "SELECT id, normalized_claim, topic FROM claims WHERE status='active' AND normalized_claim IS NOT NULL AND normalized_claim != '' ORDER BY id"
         rows = c.execute(sql + (" LIMIT ?" if limit > 0 else ""), (limit,) if limit > 0 else ()).fetchall()
         ok = skip = fail = 0; t0 = time.time()
         for r in rows:
@@ -5718,7 +5747,7 @@ class MemoryWikiProvider(MemoryProvider):
             try:
                 emb = _embed_document(claim)
                 if emb is not None:
-                    if _qdrant_upsert(cid, emb, {"id": cid, "topic": topic or "", "claim": short(claim, 300)}):
+                    if _qdrant_upsert(cid, emb, {"id": cid, "topic": topic or "", "claim": short(claim, 300)}, collection=target_coll):
                         ok += 1
                     else:
                         fail += 1

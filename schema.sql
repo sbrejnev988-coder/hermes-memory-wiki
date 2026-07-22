@@ -118,3 +118,49 @@ CREATE TABLE entity_embeddings (
         created_at INTEGER,
         FOREIGN KEY (entity_id) REFERENCES entities(id)
     );
+
+-- v1.15.0: Transactional outbox
+CREATE TABLE IF NOT EXISTS index_outbox(
+    id TEXT PRIMARY KEY,
+    operation TEXT DEFAULT 'upsert',
+    object_type TEXT DEFAULT 'claim',
+    object_id TEXT NOT NULL,
+    payload_json TEXT,
+    attempts INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'pending',
+    last_error TEXT,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+-- v1.15.0: Resumable reindex
+CREATE TABLE IF NOT EXISTS reindex_jobs(
+    id TEXT PRIMARY KEY,
+    source_collection TEXT NOT NULL,
+    target_collection TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    total_count INTEGER DEFAULT 0,
+    processed_count INTEGER DEFAULT 0,
+    failed_count INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'running',
+    started_at INTEGER NOT NULL,
+    completed_at INTEGER
+);
+
+-- v1.15.0: Recall feedback loop
+CREATE TABLE IF NOT EXISTS recall_feedback(
+    id TEXT PRIMARY KEY,
+    recall_event_id TEXT NOT NULL,
+    claim_id TEXT NOT NULL,
+    retrieved INTEGER DEFAULT 1,
+    injected INTEGER DEFAULT 0,
+    used INTEGER DEFAULT 0,
+    helpful REAL DEFAULT 0,
+    irrelevant INTEGER DEFAULT 0,
+    contradicted INTEGER DEFAULT 0,
+    harmful INTEGER DEFAULT 0,
+    answer_id TEXT DEFAULT '',
+    feedback_source TEXT DEFAULT 'auto',
+    created_at INTEGER NOT NULL,
+    FOREIGN KEY(claim_id) REFERENCES claims(id) ON DELETE CASCADE
+);
