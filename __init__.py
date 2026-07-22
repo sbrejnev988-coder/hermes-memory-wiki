@@ -1,4 +1,4 @@
-"""memory-wiki v1.9.7: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.10.0: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -139,6 +139,48 @@ if EMBED_PROVIDER == "openrouter" and EMBED_DIMENSIONS != QDRANT_VECTOR_SIZE:
     )
 
 SEMANTIC_ENABLED = os.environ.get("MEMORY_WIKI_SEMANTIC", "1") not in ("0", "no", "false", "off")
+
+
+# OpenRouter Cohere smart reranker. This is a second-stage ranker only:
+# FTS5 + embedding/Qdrant + RRF remain the fail-open source ranking.
+def _rerank_env_int(name: str, default: int, low: int, high: int) -> int:
+    """Parse one bounded integer without allowing a bad env value to break plugin import."""
+    try:
+        return max(low, min(int(os.environ.get(name, str(default))), high))
+    except (TypeError, ValueError):
+        return default
+
+
+def _rerank_env_float(name: str, default: float, low: float, high: float) -> float:
+    """Parse one bounded float without allowing NaN/invalid text into timeout settings."""
+    try:
+        value = float(os.environ.get(name, str(default)))
+        return default if not math.isfinite(value) else max(low, min(value, high))
+    except (TypeError, ValueError):
+        return default
+
+
+RERANK_ENABLED = os.environ.get("MEMORY_WIKI_RERANK_ENABLED", "0").lower() not in ("0", "no", "false", "off")
+RERANK_URL = (os.environ.get("MEMORY_WIKI_RERANK_URL") or "https://openrouter.ai/api/v1/rerank").rstrip("/")
+RERANK_MODEL = os.environ.get("MEMORY_WIKI_RERANK_MODEL") or "cohere/rerank-4-pro"
+RERANK_API_KEY = os.environ.get("MEMORY_WIKI_RERANK_API_KEY", "") or os.environ.get("OPENROUTER_API_KEY", "")
+# 50 × 1400 characters remains safely below the model's 32K-token context.
+RERANK_TOP_K = _rerank_env_int("MEMORY_WIKI_RERANK_TOP_K", 30, 5, 50)
+RERANK_MIN_CANDIDATES = _rerank_env_int("MEMORY_WIKI_RERANK_MIN_CANDIDATES", 10, 3, RERANK_TOP_K)
+RERANK_TIMEOUT = _rerank_env_float("MEMORY_WIKI_RERANK_TIMEOUT", 4.0, 1.0, 15.0)
+RERANK_CACHE_TTL = _rerank_env_int("MEMORY_WIKI_RERANK_CACHE_TTL", 1800, 0, 86400)
+RERANK_CACHE_MAX = _rerank_env_int("MEMORY_WIKI_RERANK_CACHE_MAX", 256, 16, 4096)
+RERANK_CIRCUIT_FAILURES = _rerank_env_int("MEMORY_WIKI_RERANK_CIRCUIT_FAILURES", 3, 1, 20)
+RERANK_CIRCUIT_SECONDS = _rerank_env_int("MEMORY_WIKI_RERANK_CIRCUIT_SECONDS", 300, 15, 3600)
+_RERANK_LOCK = threading.RLock()
+_RERANK_CACHE: Dict[str, Tuple[float, List[Tuple[str, float, int]]]] = {}
+_RERANK_FAILURE_COUNT = 0
+_RERANK_CIRCUIT_UNTIL = 0.0
+_RERANK_STATS: Dict[str, Any] = {
+    "requests": 0, "successes": 0, "failures": 0, "cache_hits": 0,
+    "skipped": 0, "search_units": 0, "cost_usd": 0.0,
+    "last_latency_ms": 0, "last_error": "",
+}
 # --- P6: Fault injection hooks for automated testing (DEBUG only) ---
 _FAULT_INJECT_FTS_CORRUPT = os.environ.get("MW_FAULT_INJECT_FTS_CORRUPT", "0") == "1"
 _FAULT_INJECT_STALE = os.environ.get("MW_FAULT_INJECT_STALE", "0") == "1"
@@ -3310,6 +3352,133 @@ class MemoryWikiProvider(MemoryProvider):
 
     # ----- search/scoring -----------------------------------------------
 
+    def _rerank_status(self) -> Dict[str, Any]:
+        with _RERANK_LOCK:
+            status = dict(_RERANK_STATS)
+            status.update({
+                "enabled": RERANK_ENABLED,
+                "model": RERANK_MODEL,
+                "top_k": RERANK_TOP_K,
+                "min_candidates": RERANK_MIN_CANDIDATES,
+                "timeout_s": RERANK_TIMEOUT,
+                "cache_entries": len(_RERANK_CACHE),
+                "circuit_open_s": round(max(0.0, _RERANK_CIRCUIT_UNTIL - time.monotonic()), 3),
+            })
+            status["cost_usd"] = round(float(status.get("cost_usd", 0.0)), 6)
+            return status
+
+    def _rerank_rows(self, query: str, scored: List[Dict[str, Any]], query_mode: str) -> List[Dict[str, Any]]:
+        """Conditionally rerank a safe top-K with Cohere and fuse it with the existing RRF order."""
+        global _RERANK_FAILURE_COUNT, _RERANK_CIRCUIT_UNTIL
+        original = list(scored or [])
+        q = str(query or "").strip()
+        if not RERANK_ENABLED or not RERANK_API_KEY or len(q) < 12 or len(q) > 1500 or len(original) < RERANK_MIN_CANDIDATES:
+            with _RERANK_LOCK: _RERANK_STATS["skipped"] += 1
+            return original
+
+        top_parts = dict(original[0].get("score_parts") or {}) if original else {}
+        if query_mode == "technical" and (float(top_parts.get("exact", 0.0)) > 0.0 or float(top_parts.get("bm25", 0.0)) >= 0.85):
+            with _RERANK_LOCK: _RERANK_STATS["skipped"] += 1
+            _debug_log("RERANK skip exact-dominant technical query")
+            return original
+
+        now_mono = time.monotonic()
+        with _RERANK_LOCK:
+            if _RERANK_CIRCUIT_UNTIL > now_mono:
+                _RERANK_STATS["skipped"] += 1
+                return original
+
+        prefix: List[Dict[str, Any]] = []
+        documents: List[str] = []
+        for row in original[:RERANK_TOP_K]:
+            if str(row.get("status") or "active") != "active": continue
+            if str(row.get("risk") or "low") == "secret" or int(row.get("quarantined_at") or 0) > 0: continue
+            if str(row.get("trust_class") or "") in ("tool_log", "raw_blob", "secret"): continue
+            text = redact_secrets(str(row.get("claim") or "")).strip()
+            if not text or is_ephemeral_fragment(text) or secret_scan(text).get("raw_secret"): continue
+            prefix.append(row)
+            documents.append(short(f"topic={row.get('topic','')} type={row.get('type','fact')} claim={text}", 1400))
+        if len(prefix) < RERANK_MIN_CANDIDATES:
+            with _RERANK_LOCK: _RERANK_STATS["skipped"] += 1
+            return original
+
+        cache_seed = q + "\n" + "\n".join(sorted(f"{r.get('id','')}:{r.get('updated_at',0)}" for r in prefix))
+        cache_key = sha(cache_seed)
+        if RERANK_CACHE_TTL > 0:
+            with _RERANK_LOCK:
+                cached = _RERANK_CACHE.get(cache_key)
+                if cached and cached[0] > now_mono:
+                    _RERANK_STATS["cache_hits"] += 1
+                    row_by_id = {str(r.get("id")): r for r in original}
+                    ordered: List[Dict[str, Any]] = []
+                    for cid, score, rank in cached[1]:
+                        if cid in row_by_id:
+                            item = dict(row_by_id[cid]); item["rerank_score"] = score; item["rerank_rank"] = rank; ordered.append(item)
+                    used = {str(r.get("id")) for r in ordered}
+                    ordered.extend(r for r in original if str(r.get("id")) not in used)
+                    return ordered
+                for key in [k for k, value in _RERANK_CACHE.items() if value[0] <= now_mono]:
+                    _RERANK_CACHE.pop(key, None)
+
+        headers = {"Authorization": f"Bearer {RERANK_API_KEY}", "Content-Type": "application/json", "X-OpenRouter-Title": OPENROUTER_TITLE}
+        if OPENROUTER_REFERER: headers["HTTP-Referer"] = OPENROUTER_REFERER
+        payload = {"model": RERANK_MODEL, "query": q, "documents": documents, "top_n": len(documents)}
+        started = time.monotonic()
+        try:
+            req = urllib.request.Request(RERANK_URL, data=json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=RERANK_TIMEOUT) as response:
+                obj = json.loads(response.read().decode("utf-8", "replace"))
+            api_results = obj.get("results") or []
+            ranked: List[Tuple[str, float, int]] = []
+            seen_indexes = set()
+            for rank, result in enumerate(api_results, 1):
+                idx = int(result.get("index", -1))
+                if idx < 0 or idx >= len(prefix) or idx in seen_indexes: continue
+                seen_indexes.add(idx)
+                ranked.append((str(prefix[idx].get("id")), float(result.get("relevance_score", 0.0)), rank))
+            if len(ranked) < RERANK_MIN_CANDIDATES:
+                raise ValueError(f"rerank returned only {len(ranked)} valid results")
+
+            cohere_weight = 0.35 if query_mode == "technical" else (0.75 if query_mode == "semantic" else 0.60)
+            base_weight = 1.0 - cohere_weight
+            orig_rank = {str(r.get("id")): i for i, r in enumerate(prefix, 1)}
+            cohere_rank = {cid: rank for cid, _score, rank in ranked}
+            relevance = {cid: score for cid, score, _rank in ranked}
+            fused_prefix = sorted(prefix, key=lambda r: base_weight / (RRF_K + orig_rank[str(r.get("id"))]) + cohere_weight / (RRF_K + cohere_rank.get(str(r.get("id")), len(prefix) + 1)), reverse=True)
+            ordered: List[Dict[str, Any]] = []
+            cached_meta: List[Tuple[str, float, int]] = []
+            for row in fused_prefix:
+                cid = str(row.get("id")); item = dict(row)
+                item["rerank_score"] = round(float(relevance.get(cid, 0.0)), 6)
+                item["rerank_rank"] = int(cohere_rank.get(cid, len(prefix) + 1))
+                ordered.append(item); cached_meta.append((cid, item["rerank_score"], item["rerank_rank"]))
+            used = {str(r.get("id")) for r in ordered}
+            ordered.extend(r for r in original if str(r.get("id")) not in used)
+
+            latency_ms = int((time.monotonic() - started) * 1000)
+            usage = obj.get("usage") or {}
+            with _RERANK_LOCK:
+                _RERANK_FAILURE_COUNT = 0; _RERANK_CIRCUIT_UNTIL = 0.0
+                _RERANK_STATS["requests"] += 1; _RERANK_STATS["successes"] += 1
+                _RERANK_STATS["search_units"] += int(usage.get("search_units") or 0)
+                _RERANK_STATS["cost_usd"] += float(usage.get("cost") or 0.0)
+                _RERANK_STATS["last_latency_ms"] = latency_ms; _RERANK_STATS["last_error"] = ""
+                if RERANK_CACHE_TTL > 0:
+                    if len(_RERANK_CACHE) >= RERANK_CACHE_MAX:
+                        oldest = min(_RERANK_CACHE, key=lambda k: _RERANK_CACHE[k][0]); _RERANK_CACHE.pop(oldest, None)
+                    _RERANK_CACHE[cache_key] = (time.monotonic() + RERANK_CACHE_TTL, cached_meta)
+            return ordered
+        except Exception as exc:
+            latency_ms = int((time.monotonic() - started) * 1000)
+            with _RERANK_LOCK:
+                _RERANK_FAILURE_COUNT += 1
+                _RERANK_STATS["requests"] += 1; _RERANK_STATS["failures"] += 1
+                _RERANK_STATS["last_latency_ms"] = latency_ms; _RERANK_STATS["last_error"] = short(str(exc), 180)
+                if _RERANK_FAILURE_COUNT >= RERANK_CIRCUIT_FAILURES:
+                    _RERANK_CIRCUIT_UNTIL = time.monotonic() + RERANK_CIRCUIT_SECONDS
+                    _RERANK_FAILURE_COUNT = 0
+            return original
+
     def _search_fallback(self, query: str, limit=10, include_stale=True, topic: Optional[str]=None) -> List[Dict[str, Any]]:
         """Fallback search without FTS5 — direct SQL LIKE with scoring."""
         c=self._connect(); params=[]; limit=max(1,min(limit,500))
@@ -3436,6 +3605,7 @@ class MemoryWikiProvider(MemoryProvider):
             score = sum(parts.values())
             d = self._sanitize_row(r); d["score"] = round(score, 4); d["score_parts"] = {k: round(v,4) for k,v in parts.items() if abs(v) > 0.0001}; scored.append(d)
         scored.sort(key=lambda x: x["score"], reverse=True)
+        scored = self._rerank_rows(q, scored, query_mode)
         ids = [x["id"] for x in scored[:limit]]
         if ids:
             with c:
@@ -4991,7 +5161,7 @@ class MemoryWikiProvider(MemoryProvider):
             r = _qdrant_req("GET", f"/collections/{QDRANT_COLLECTION}")
             pts = r.get("result", {}).get("points_count", 0) if r else 0
         except Exception: pass
-        return {"embedding_ok": embed_ok, "qdrant_points": pts, "semantic_enabled": SEMANTIC_ENABLED}
+        return {"embedding_ok": embed_ok, "qdrant_points": pts, "semantic_enabled": SEMANTIC_ENABLED, "rerank": self._rerank_status()}
 
     def _reindex(self, limit: int = 0, force: bool = False) -> Dict[str,Any]:
         if not SEMANTIC_ENABLED: return {"ok": False, "error": "semantic disabled"}
@@ -5032,6 +5202,7 @@ class MemoryWikiProvider(MemoryProvider):
                   "rrf": round(d.get("score_parts", {}).get("rrf", 0), 4),
                   "verified": round(d.get("score_parts", {}).get("verified", 0), 4),
                   "final_score": round(d.get("score", 0), 4),
+                  "rerank_score": round(d.get("rerank_score", 0), 6), "rerank_rank": int(d.get("rerank_rank", 0) or 0),
                   "claim": short(d.get("claim", ""), 120)} for d in rows]
         return {"query": q, "query_mode": qm, "results": items}
 
