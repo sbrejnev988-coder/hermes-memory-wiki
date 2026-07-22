@@ -1,4 +1,4 @@
-# Hermes Memory Wiki v1.10.0
+# Hermes Memory Wiki v1.15.1
 
 Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes.
 

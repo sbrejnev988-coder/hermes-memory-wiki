@@ -1837,7 +1837,13 @@ class MemoryWikiProvider(MemoryProvider):
             {"name":"memory_wiki_secrecy_report","description":"Report on secrecy_level distribution across active claims and secret index entries.","parameters":P({})},
             {"name":"memory_wiki_context_sanitize","description":"Sanitize text for safe context injection: strips injection patterns, normalizes whitespace, truncates.","parameters":P({"text":{"type":"string"},"max_len":{"type":"integer","default":400}}, ["text"])},
             {"name":"memory_wiki_is_social_close","description":"Check if text is a social closer (ok, thanks, 👍) that should skip memory search.","parameters":P({"text":{"type":"string"}}, ["text"])},
-        ]
+        
+            {"name":"memory_wiki_code_claim_add","description":"Add/update a code-linked claim with repository/symbol/revision metadata.","parameters":{"type":"object","properties":{"claim":{"type":"string"},"topic":{"type":"string","default":"code-shrinker"},"repository_id":{"type":"string"},"commit_sha":{"type":"string","default":""},"file_path":{"type":"string","default":""},"symbol_id":{"type":"string","default":""},"symbol_revision":{"type":"string","default":""},"claim_type":{"type":"string","default":"code_claim"},"confidence":{"type":"number","default":0.75},"salience":{"type":"number","default":0.7},"evidence":{"type":"string","default":""}},"required":["claim"]}},
+            {"name":"memory_wiki_code_claim_query","description":"Query code-linked claims by repository/symbol/file criteria.","parameters":{"type":"object","properties":{"repository_id":{"type":"string","default":""},"file_path":{"type":"string","default":""},"symbol_id":{"type":"string","default":""},"query":{"type":"string","default":""},"limit":{"type":"integer","default":10}}}},
+            {"name":"memory_wiki_symbol_history","description":"Get revision history for a specific symbol across claims.","parameters":{"type":"object","properties":{"symbol_id":{"type":"string"},"limit":{"type":"integer","default":20}},"required":["symbol_id"]}},
+            {"name":"memory_wiki_repository_context","description":"Return all code-linked claims for a repository.","parameters":{"type":"object","properties":{"repository_id":{"type":"string"},"limit":{"type":"integer","default":30}},"required":["repository_id"]}},
+            {"name":"memory_wiki_invalidate_revision","description":"Mark code claims stale after symbol/file change.","parameters":{"type":"object","properties":{"symbol_id":{"type":"string","default":""},"file_path":{"type":"string","default":""},"new_commit_sha":{"type":"string","default":""}}}},
+            {"name":"memory_wiki_patch_outcome_add","description":"Record the outcome of a patch application with validation results.","parameters":{"type":"object","properties":{"patch_id":{"type":"string"},"outcome":{"type":"string"},"repository_id":{"type":"string","default":""},"validation_report":{"type":"object"},"changed_files":{"type":"array","items":{"type":"string"}},"changed_symbols":{"type":"array","items":{"type":"string"}},"rollback_steps":{"type":"string","default":""}},"required":["patch_id","outcome"]}},]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         a = dict(args or {})
@@ -3605,7 +3611,11 @@ class MemoryWikiProvider(MemoryProvider):
                     _qdrant_upsert(cid, emb, {"id": cid, "topic": topic, "claim": short(normalized, 300)})
         except Exception:
             pass
+        temporal_result = self._resolve_temporal(topic, claim)
+        if temporal_result.get("supersedes"):
+            self._apply_supersession(temporal_result["supersedes"], cid)
         return cid
+
 
     # ----- env/config metadata -------------------------------------------
     def _env_files(self) -> List[Path]:
