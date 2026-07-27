@@ -31,6 +31,11 @@ import stat
 import uuid
 import urllib.request
 import urllib.error
+from datetime import datetime, timezone
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # Python < 3.9 fallback
+    ZoneInfo = None
 
 def _xml_escape(s: str) -> str:
     """Escape XML special chars."""
@@ -123,6 +128,10 @@ QDRANT_COLLECTION = os.environ.get(
     "MEMORY_WIKI_QDRANT_COLLECTION",
     "memory_wiki_claims",
 )
+QDRANT_ALIAS = os.environ.get(
+    "MEMORY_WIKI_QDRANT_ALIAS",
+    "memory_wiki_claims_active",
+).strip() or "memory_wiki_claims_active"
 
 QDRANT_API_KEY = os.environ.get(
     "MEMORY_WIKI_QDRANT_API_KEY",
@@ -144,99 +153,333 @@ def _embedding_manifest() -> dict:
 def _manifest_hash(manifest: dict) -> str:
     return hashlib.sha256(json.dumps(manifest,sort_keys=True,ensure_ascii=True).encode()).hexdigest()[:12]
 
-def _active_collection_name() -> str:
-    return QDRANT_COLLECTION  # pinned — no hash suffix, uses env var directly
+def _physical_collection_name(manifest: Optional[dict] = None) -> str:
+    """Return the immutable collection name for one embedding manifest."""
+    current = manifest or _embedding_manifest()
+    return f"{QDRANT_COLLECTION}_{_manifest_hash(current)}"
 
-def _ensure_collection() -> bool:
-    coll = _active_collection_name()
-    existing = _qdrant_req("GET", f"/collections/{coll}")
+
+def _active_collection_name() -> str:
+    """Stable alias used by all online reads and outbox writes."""
+    return QDRANT_ALIAS
+
+
+def _collection_config(collection: str) -> Optional[dict]:
+    result = _qdrant_req("GET", f"/collections/{collection}")
+    if not result or result.get("status") != "ok":
+        return None
+    return (
+        result.get("result", {})
+        .get("config", {})
+        .get("params", {})
+        .get("vectors", {})
+    ) or {}
+
+
+def _ensure_collection(collection: Optional[str] = None) -> bool:
+    """Create a physical collection or verify its vector contract."""
+    coll = collection or _physical_collection_name()
+    existing = _collection_config(coll)
     if existing is not None:
+        actual_size = existing.get("size")
+        actual_distance = str(existing.get("distance") or "").lower()
+        if actual_size is not None and int(actual_size) != QDRANT_VECTOR_SIZE:
+            _debug_log(
+                f"Qdrant collection {coll} size mismatch: "
+                f"{actual_size} != {QDRANT_VECTOR_SIZE}"
+            )
+            return False
+        if actual_distance and actual_distance != "cosine":
+            _debug_log(
+                f"Qdrant collection {coll} distance mismatch: "
+                f"{actual_distance} != cosine"
+            )
+            return False
         return True
-    result = _qdrant_req("PUT", f"/collections/{coll}", {"vectors":{"size":QDRANT_VECTOR_SIZE,"distance":"Cosine"}})
+    result = _qdrant_req(
+        "PUT",
+        f"/collections/{coll}",
+        {"vectors": {"size": QDRANT_VECTOR_SIZE, "distance": "Cosine"}},
+    )
     if result is not None:
-        _debug_log(f"Created Qdrant collection: {coll}")
+        _debug_log(f"Created Qdrant physical collection: {coll}")
         return True
     return False
 
-def _check_manifest_change() -> str | None:
-    mpath = Path(os.environ.get("HERMES_HOME",str(Path.home()/".hermes")))/"memory-wiki"/"embedding_manifest.json"
+def _check_manifest_change() -> dict | None:
+    """Persist the embedding manifest and report physical-collection drift.
+
+    Every incompatible manifest receives a new immutable collection. Online reads
+    continue through QDRANT_ALIAS until reindex completes and atomically switches it.
+    """
+    mpath = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))) / "memory-wiki" / "embedding_manifest.json"
     manifest = _embedding_manifest()
+    old_manifest = None
     if mpath.exists():
         try:
-            stored = json.loads(mpath.read_text())
-            if _manifest_hash(stored) != _manifest_hash(manifest):
-                old = f"memory_wiki_claims_{_manifest_hash(stored)}"
-                _debug_log(f"Manifest changed: {_manifest_hash(stored)} → {_manifest_hash(manifest)}")
-                return old
-        except: pass
-    mpath.parent.mkdir(parents=True,exist_ok=True)
-    mpath.write_text(json.dumps(manifest,indent=2))
+            old_manifest = json.loads(mpath.read_text(encoding="utf-8"))
+        except Exception as exc:
+            _debug_log(f"Embedding manifest read failed: {type(exc).__name__}: {exc}")
+    old_hash = _manifest_hash(old_manifest) if isinstance(old_manifest, dict) else ""
+    new_hash = _manifest_hash(manifest)
+    mpath.parent.mkdir(parents=True, exist_ok=True)
+    tmp = mpath.with_name(mpath.name + f".tmp.{os.getpid()}")
+    tmp.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, mpath)
+    if old_hash and old_hash != new_hash:
+        _debug_log(f"Manifest changed: {old_hash} → {new_hash}")
+        return {
+            "old_hash": old_hash,
+            "new_hash": new_hash,
+            "collection": _physical_collection_name(manifest),
+        }
     return None
 
+# Transactional Outbox SQLite → Qdrant
 # Transactional Outbox SQLite → Qdrant
 _OUTBOX_TABLE = """CREATE TABLE IF NOT EXISTS index_outbox(
     id TEXT PRIMARY KEY,operation TEXT DEFAULT 'upsert',object_type TEXT DEFAULT 'claim',
     object_id TEXT NOT NULL,payload_json TEXT,payload_hash TEXT,attempts INTEGER DEFAULT 0,
-    status TEXT DEFAULT 'pending',last_error TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL);
-    CREATE INDEX IF NOT EXISTS idx_outbox_status ON index_outbox(status,created_at);"""
+    status TEXT DEFAULT 'pending',last_error TEXT,created_at INTEGER NOT NULL,updated_at INTEGER NOT NULL,
+    worker_id TEXT NOT NULL DEFAULT '',lease_until INTEGER NOT NULL DEFAULT 0,
+    next_retry_at INTEGER NOT NULL DEFAULT 0);"""
+_OUTBOX_INDEXES = """CREATE INDEX IF NOT EXISTS idx_outbox_status
+    ON index_outbox(status,next_retry_at,created_at);
+    CREATE INDEX IF NOT EXISTS idx_outbox_lease ON index_outbox(status,lease_until);"""
+
+_OUTBOX_WORKERS: Dict[str, Dict[str, Any]] = {}
+_OUTBOX_WORKERS_LOCK = threading.RLock()
+OUTBOX_POLL_SECONDS = max(0.5, float(os.environ.get("MEMORY_WIKI_OUTBOX_POLL_SECONDS", "2.0")))
+OUTBOX_LEASE_SECONDS = max(15, int(os.environ.get("MEMORY_WIKI_OUTBOX_LEASE_SECONDS", "90")))
+OUTBOX_BATCH_SIZE = max(1, min(int(os.environ.get("MEMORY_WIKI_OUTBOX_BATCH_SIZE", "32")), 200))
+
 
 def _mk_db_path() -> str:
     hh = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
     return str(Path(hh) / "memory-wiki" / "memory_wiki.sqlite3")
 
-def _ensure_outbox() -> None:
+
+def _outbox_db_path(db_path: Optional[str] = None) -> str:
+    return str(Path(db_path or _mk_db_path()).expanduser().resolve())
+
+
+def _ensure_outbox(db_path: Optional[str] = None) -> None:
+    db = None
     try:
-        db=sqlite3.connect(str(_mk_db_path()));db.executescript(_OUTBOX_TABLE);db.commit();db.close()
-    except Exception as e: _debug_log(f"outbox init failed: {e}")
+        path = _outbox_db_path(db_path)
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        db = sqlite3.connect(path, timeout=30.0)
+        db.execute("PRAGMA busy_timeout=30000")
+        db.executescript(_OUTBOX_TABLE)
+        cols = {row[1] for row in db.execute("PRAGMA table_info(index_outbox)").fetchall()}
+        for name, ddl in (
+            ("worker_id", "TEXT NOT NULL DEFAULT ''"),
+            ("lease_until", "INTEGER NOT NULL DEFAULT 0"),
+            ("next_retry_at", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if name not in cols:
+                db.execute(f"ALTER TABLE index_outbox ADD COLUMN {name} {ddl}")
+        db.executescript(_OUTBOX_INDEXES)
+        db.commit()
+    except Exception as exc:
+        _debug_log(f"outbox init failed: {exc}")
+        raise
+    finally:
+        if db is not None:
+            db.close()
+
 
 def _outbox_enqueue(operation: str, object_type: str, object_id: str, payload: dict, conn=None) -> str:
-    import uuid; oid=uuid.uuid4().hex[:16]; now=int(time.time())
+    oid = uuid.uuid4().hex[:16]
+    ts = int(time.time())
+    payload_json = json.dumps(payload, ensure_ascii=False) if payload else "{}"
     try:
-        if conn:
-            conn.execute("INSERT INTO index_outbox(id,operation,object_type,object_id,payload_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-                (oid,operation,object_type,object_id,json.dumps(payload,ensure_ascii=False) if payload else"{}",now,now))
+        if conn is not None:
+            conn.execute(
+                "INSERT INTO index_outbox(id,operation,object_type,object_id,payload_json,created_at,updated_at,next_retry_at) VALUES(?,?,?,?,?,?,?,?)",
+                (oid, operation, object_type, object_id, payload_json, ts, ts, ts),
+            )
             return oid
-        db=sqlite3.connect(str(_mk_db_path()))
-        db.execute("INSERT INTO index_outbox(id,operation,object_type,object_id,payload_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)",
-            (oid,operation,object_type,object_id,json.dumps(payload,ensure_ascii=False) if payload else"{}",now,now))
-        db.commit();db.close();return oid
-    except Exception as e:
-        _debug_log(f"outbox enqueue failed: {e}")
+        path = _outbox_db_path()
+        _ensure_outbox(path)
+        db = sqlite3.connect(path, timeout=30.0)
+        try:
+            db.execute(
+                "INSERT INTO index_outbox(id,operation,object_type,object_id,payload_json,created_at,updated_at,next_retry_at) VALUES(?,?,?,?,?,?,?,?)",
+                (oid, operation, object_type, object_id, payload_json, ts, ts, ts),
+            )
+            db.commit()
+        finally:
+            db.close()
+        _wake_outbox_worker(path)
+        return oid
+    except Exception as exc:
+        _debug_log(f"outbox enqueue failed: {exc}")
         if conn is not None:
             raise
         return ""
 
-def _outbox_process(batch_size=50) -> dict:
+
+def _meta_set_max(db: sqlite3.Connection, key: str, value: int) -> None:
+    value = max(0, int(value or 0))
+    db.execute(
+        """INSERT INTO meta(key,value) VALUES(?,?)
+           ON CONFLICT(key) DO UPDATE SET value=CAST(
+             max(CAST(meta.value AS INTEGER), CAST(excluded.value AS INTEGER)) AS TEXT
+           )""",
+        (key, str(value)),
+    )
+
+
+def _outbox_process(batch_size=50, *, db_path: Optional[str] = None, worker_id: str = "") -> dict:
+    path = _outbox_db_path(db_path)
+    worker_id = worker_id or f"pid-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    lease_seconds = OUTBOX_LEASE_SECONDS
+    db = None
+    claimed: List[sqlite3.Row] = []
     try:
-        db=sqlite3.connect(str(_mk_db_path()))
+        _ensure_outbox(path)
+        db = sqlite3.connect(path, timeout=30.0)
         db.row_factory = sqlite3.Row
-        now=int(time.time())
-        rows=db.execute("SELECT*FROM index_outbox WHERE status='pending' ORDER BY created_at LIMIT ?",(batch_size,)).fetchall()
-        ok=0;fail=0
-        for r in rows:
+        db.execute("PRAGMA busy_timeout=30000")
+        ts = int(time.time())
+        db.execute("BEGIN IMMEDIATE")
+        claimed = db.execute(
+            """SELECT * FROM index_outbox
+               WHERE ((status='pending' AND next_retry_at<=?)
+                   OR (status='processing' AND lease_until<=?))
+               ORDER BY created_at,id LIMIT ?""",
+            (ts, ts, max(1, min(int(batch_size or 50), 200))),
+        ).fetchall()
+        for row in claimed:
+            db.execute(
+                """UPDATE index_outbox
+                   SET status='processing',worker_id=?,lease_until=?,updated_at=?
+                   WHERE id=?""",
+                (worker_id, ts + lease_seconds, ts, row["id"]),
+            )
+        db.commit()
+        db.close()
+        db = None
+
+        ok = fail = 0
+        for row in claimed:
+            completed_at = int(time.time())
             try:
-                pl=json.loads(r["payload_json"] or"{}")
-                op = r["operation"]
-                if op == "upsert" and pl.get("vector"):
-                    result = _qdrant_upsert(r["object_id"],pl["vector"],pl.get("qdrant_payload",{}), collection=pl.get("collection"))
+                payload = json.loads(row["payload_json"] or "{}")
+                operation = row["operation"]
+                if operation == "upsert" and payload.get("vector"):
+                    result = _qdrant_upsert(
+                        row["object_id"], payload["vector"], payload.get("qdrant_payload", {}),
+                        collection=payload.get("collection"),
+                    )
                     if not result:
                         raise RuntimeError("Qdrant upsert returned False")
-                elif op == "embed_and_upsert":
-                    text = str(pl.get("text","")).strip()
-                    if not text:
+                elif operation == "embed_and_upsert":
+                    document = str(payload.get("text", "")).strip()
+                    if not document:
                         raise RuntimeError("embed_and_upsert text is empty")
-                    vector = _embed_document(text)
+                    vector = _embed_document(document)
                     if not vector:
                         raise RuntimeError("embedding generation failed")
-                    result = _qdrant_upsert(r["object_id"], vector, {"claim_id": r["object_id"], "topic": pl.get("topic",""), "claim": short(text, 300)}, collection=pl.get("collection"))
+                    qpayload = {
+                        "claim_id": row["object_id"],
+                        "topic": payload.get("topic", ""),
+                        "claim": short(document, 300),
+                        "memory_revision": int(payload.get("memory_revision") or 0),
+                        "visibility_scope": payload.get("visibility_scope", "global"),
+                        "origin_bot_id": payload.get("origin_bot_id", ""),
+                        "origin_chat_hash": payload.get("origin_chat_hash", ""),
+                        "project_id": payload.get("project_id", ""),
+                        "event_at": int(payload.get("event_at") or 0),
+                    }
+                    result = _qdrant_upsert(
+                        row["object_id"], vector, qpayload,
+                        collection=payload.get("collection"),
+                    )
                     if not result:
                         raise RuntimeError("Qdrant upsert failed")
-                db.execute("UPDATE index_outbox SET status='completed',updated_at=? WHERE id=?",(now,r["id"]));ok+=1
-            except Exception as e:
-                a=int(r["attempts"])+1;st="failed" if a>=5 else"pending"
-                db.execute("UPDATE index_outbox SET attempts=?,status=?,last_error=?,updated_at=? WHERE id=?",(a,st,str(e)[:500],now,r["id"]));fail+=1
-        db.commit();db.close();return {"processed":ok+fail,"ok":ok,"fail":fail}
-    except Exception as e: return {"processed":0,"ok":0,"fail":0,"error":str(e)[:500]}
+                elif operation == "delete":
+                    if not _qdrant_delete(row["object_id"], collection=payload.get("collection")):
+                        raise RuntimeError("Qdrant delete failed")
+                else:
+                    raise RuntimeError(f"unsupported outbox operation: {operation}")
+
+                with sqlite3.connect(path, timeout=30.0) as done_db:
+                    done_db.execute("PRAGMA busy_timeout=30000")
+                    done_db.execute(
+                        """UPDATE index_outbox SET status='completed',worker_id='',lease_until=0,
+                           last_error='',updated_at=? WHERE id=? AND worker_id=?""",
+                        (completed_at, row["id"], worker_id),
+                    )
+                    if operation in ("upsert", "embed_and_upsert"):
+                        _meta_set_max(done_db, "qdrant_latest_revision", int(payload.get("memory_revision") or 0))
+                ok += 1
+            except Exception as exc:
+                attempts = int(row["attempts"] or 0) + 1
+                status = "failed" if attempts >= 5 else "pending"
+                backoff = 0 if status == "failed" else min(300, 2 ** min(attempts, 8))
+                with sqlite3.connect(path, timeout=30.0) as fail_db:
+                    fail_db.execute("PRAGMA busy_timeout=30000")
+                    fail_db.execute(
+                        """UPDATE index_outbox SET attempts=?,status=?,last_error=?,updated_at=?,
+                           worker_id='',lease_until=0,next_retry_at=? WHERE id=? AND worker_id=?""",
+                        (attempts, status, str(exc)[:500], completed_at, completed_at + backoff, row["id"], worker_id),
+                    )
+                fail += 1
+        return {"processed": ok + fail, "ok": ok, "fail": fail, "worker_id": worker_id}
+    except Exception as exc:
+        if db is not None:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+        return {"processed": 0, "ok": 0, "fail": 0, "error": str(exc)[:500], "worker_id": worker_id}
+    finally:
+        if db is not None:
+            db.close()
+
+
+def _outbox_worker_loop(path: str, wake: threading.Event, worker_id: str) -> None:
+    while True:
+        try:
+            result = _outbox_process(OUTBOX_BATCH_SIZE, db_path=path, worker_id=worker_id)
+            if result.get("processed", 0) >= OUTBOX_BATCH_SIZE:
+                continue
+        except Exception as exc:
+            _debug_log(f"outbox worker failed: {exc}")
+        wake.wait(OUTBOX_POLL_SECONDS)
+        wake.clear()
+
+
+def _start_outbox_worker(db_path: str) -> None:
+    if not SEMANTIC_ENABLED:
+        return
+    path = _outbox_db_path(db_path)
+    with _OUTBOX_WORKERS_LOCK:
+        current = _OUTBOX_WORKERS.get(path)
+        if current and current.get("thread") and current["thread"].is_alive():
+            return
+        _ensure_outbox(path)
+        wake = threading.Event()
+        worker_id = f"pid-{os.getpid()}-{hashlib.sha256(path.encode()).hexdigest()[:8]}"
+        thread = threading.Thread(
+            target=_outbox_worker_loop,
+            args=(path, wake, worker_id),
+            name=f"memory-wiki-outbox-{worker_id[-8:]}",
+            daemon=True,
+        )
+        _OUTBOX_WORKERS[path] = {"thread": thread, "wake": wake, "worker_id": worker_id}
+        thread.start()
+        wake.set()
+
+
+def _wake_outbox_worker(db_path: Optional[str] = None) -> None:
+    path = _outbox_db_path(db_path)
+    with _OUTBOX_WORKERS_LOCK:
+        worker = _OUTBOX_WORKERS.get(path)
+        if worker and worker.get("wake"):
+            worker["wake"].set()
 
 
 # --- Consistency guard: EMBED_DIMENSIONS must match QDRANT_VECTOR_SIZE ---
@@ -616,13 +859,25 @@ def _qdrant_upsert(claim_id: str, vector: List[float], payload: dict, collection
     operation_status = (result or {}).get("result", {}).get("status")
     return operation_status in {"completed", "acknowledged"}
 
+def _qdrant_delete(claim_id: str, collection: str = None) -> bool:
+    """Delete one claim vector from Qdrant by its stable point ID."""
+    coll = collection or _active_collection_name()
+    result = _qdrant_req(
+        "POST",
+        f"/collections/{coll}/points/delete?wait=true",
+        {"points": [_qdrant_point_id(claim_id)]},
+    )
+    status = (result or {}).get("result", {}).get("status")
+    # Qdrant versions differ: some return an operation object without status.
+    return result is not None and status in (None, "completed", "acknowledged")
+
 def _qdrant_search(vector: List[float], limit: int = 20) -> List[Tuple[str, float]]:
     """Векторный поиск через настоящий Qdrant."""
     if len(vector) != QDRANT_VECTOR_SIZE:
         return []
     result = _qdrant_req(
         "POST",
-        f"/collections/memory_wiki_claims_active/points/query",
+        f"/collections/{QDRANT_ALIAS}/points/query",
         {
             "query": vector,
             "limit": max(1, int(limit)),
@@ -640,63 +895,49 @@ def _qdrant_search(vector: List[float], limit: int = 20) -> List[Tuple[str, floa
         matches.append((str(cid), float(point.get("score", 0.0))))
     return matches
 
-def _qdrant_ensure_collection() -> bool:
-    """Проверить или создать коллекцию настоящего Qdrant.
-    
-    Проверяет совместимость существующей коллекции: размерность, метрика.
-    При несовпадении возвращает False (требуется ручной reindex с force=True).
-    """
-    coll = _active_collection_name()
-    result = _qdrant_req("GET", f"/collections/{coll}")
-    if result and result.get("status") == "ok":
-        # Проверить конфигурацию существующей коллекции
-        vectors = (
-            result.get("result", {})
-            .get("config", {})
-            .get("params", {})
-            .get("vectors", {})
-        )
-        if vectors:
-            actual_size = vectors.get("size")
-            actual_distance = vectors.get("distance", "")
-            if actual_size is not None and actual_size != QDRANT_VECTOR_SIZE:
-                _debug_log(
-                    f"Qdrant collection size mismatch: "
-                    f"{actual_size} != {QDRANT_VECTOR_SIZE}"
-                )
-                return False
-            if actual_distance and str(actual_distance).lower() != "cosine":
-                _debug_log(
-                    f"Qdrant distance mismatch: {actual_distance} != Cosine"
-                )
-                return False
-        return True
-    result = _qdrant_req(
-        "PUT",
-        f"/collections/{coll}",
-        {"vectors": {"size": QDRANT_VECTOR_SIZE, "distance": "Cosine"}},
-    )
-    return bool(result and result.get("status") == "ok" and result.get("result") is True)
+def _qdrant_ensure_collection(collection: Optional[str] = None) -> bool:
+    """Compatibility wrapper used by health checks and reindex."""
+    return _ensure_collection(collection or _physical_collection_name())
+
 
 # NOTE: "Semantic" here = n-gram TF-IDF + Qdrant stub (fuzzy lexical, not ML embeddings).
 # For true semantic retrieval, replace embed_stub with a real embedding model.
 _OPENROUTER_HEALTH_CACHE = {"checked_at": 0.0, "available": False}
 
-def _qdrant_count(collection: str = None) -> int | None:
+def _qdrant_count(collection: Optional[str] = None) -> Optional[int]:
     coll = collection or _active_collection_name()
     result = _qdrant_req("GET", f"/collections/{coll}")
-    if not result: return None
+    if not result:
+        return None
     return int(result.get("result", {}).get("points_count", result.get("points_count", 0)))
 
+
+def _qdrant_alias_target(alias: str = QDRANT_ALIAS) -> str:
+    result = _qdrant_req("GET", "/aliases")
+    aliases = (((result or {}).get("result") or {}).get("aliases") or [])
+    for item in aliases:
+        if str(item.get("alias_name") or "") == alias:
+            return str(item.get("collection_name") or "")
+    return ""
+
+
 def _switch_alias(new_collection: str) -> bool:
-    alias = "memory_wiki_claims_active"
-    result = _qdrant_req("POST", "/collections/aliases", {
-        "actions": [
-            {"delete_alias": {"alias_name": alias}},
-            {"create_alias": {"collection_name": new_collection, "alias_name": alias}}
-        ]
+    """Atomically move the stable alias without deleting a missing alias."""
+    current = _qdrant_alias_target(QDRANT_ALIAS)
+    if current == new_collection:
+        return True
+    actions = []
+    if current:
+        actions.append({"delete_alias": {"alias_name": QDRANT_ALIAS}})
+    actions.append({
+        "create_alias": {
+            "collection_name": new_collection,
+            "alias_name": QDRANT_ALIAS,
+        }
     })
-    return result is not None
+    result = _qdrant_req("POST", "/collections/aliases", {"actions": actions})
+    return result is not None and str(result.get("status") or "ok") == "ok"
+
 
 def _semantic_available() -> bool:
     """Проверить embedding-сервис (stub или OpenRouter) и Qdrant."""
@@ -851,7 +1092,7 @@ BAD_TOPICS = {
     "general", "root", "example", "начал", "рамках", "19000", "пользователь", "assistant", "user",
     "500", "523", "256000", "9000", "192", "127", "места", *FORBIDDEN_AUTO_TOPICS,
 }
-VALID_CLAIM_STATUSES = {"active", "retired", "superseded", "uncertain"}
+VALID_CLAIM_STATUSES = {"active", "retired", "superseded", "uncertain", "archived"}
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 # Topic hierarchy: child→parent mapping for recall expansion
 TOPIC_HIERARCHY = {
@@ -1497,6 +1738,12 @@ class MemoryWikiProvider(MemoryProvider):
         self.session_id = "default"
         self.platform = ""
         self.agent_context = "primary"
+        self.bot_id = os.environ.get("MEMORY_WIKI_BOT_ID", "")
+        self.project_scope = os.environ.get("MEMORY_WIKI_PROJECT_ID", "")
+        self.default_visibility = os.environ.get("MEMORY_WIKI_DEFAULT_VISIBILITY", "global").lower()
+        self.database_instance_id = ""
+        self.origin_chat_hash = ""
+        self._consumer_id = ""
         self.turn = 0
         self._conn: Optional[sqlite3.Connection] = None
         self._degraded = False
@@ -1513,6 +1760,17 @@ class MemoryWikiProvider(MemoryProvider):
         self.session_id = session_id or "default"
         self.platform = kwargs.get("platform") or ""
         self.agent_context = kwargs.get("agent_context") or "primary"
+        self.bot_id = str(
+            kwargs.get("bot_id") or kwargs.get("gateway_profile") or kwargs.get("profile")
+            or kwargs.get("account_id") or os.environ.get("MEMORY_WIKI_BOT_ID")
+            or self.platform or "default"
+        )
+        self.project_scope = str(
+            kwargs.get("project_id") or os.environ.get("MEMORY_WIKI_PROJECT_ID") or current_project_id() or ""
+        )
+        self.default_visibility = str(
+            kwargs.get("visibility_scope") or os.environ.get("MEMORY_WIKI_DEFAULT_VISIBILITY") or "global"
+        ).lower()
         if kwargs.get("hermes_home"):
             self.home = Path(kwargs["hermes_home"]).expanduser()
             self.root = self.home / "memory-wiki"
@@ -1534,32 +1792,55 @@ class MemoryWikiProvider(MemoryProvider):
         self.spool_dir.mkdir(parents=True, exist_ok=True)
         self.recovery_dir.mkdir(parents=True, exist_ok=True)
         self.journal_dir.mkdir(parents=True, exist_ok=True)
+        coordination_root = self.home / "context-coordination"
+        for rel in (
+            "inbox/code-shrinker",
+            "done/code-shrinker",
+            "dead-letter/code-shrinker",
+        ):
+            (coordination_root / rel).mkdir(parents=True, exist_ok=True)
         self.journal_checkpoints_dir.mkdir(parents=True, exist_ok=True)
         if not self.journal_path.exists():
             try:
                 self.journal_path.touch(exist_ok=True)
             except Exception:
                 pass
-        self._connect(); self._migrate(); self._rebuild_fts(); self._sync_env_metadata(); self._render_all()
-        old_collection = _check_manifest_change()
-        if old_collection:
-            _debug_log(f"Embedding manifest changed. Old collection: {old_collection}. Run memory_wiki_reindex to migrate.")
+        self._connect(); self._migrate()
+        self.database_instance_id = self._meta_text("database_instance_id")
+        self.origin_chat_hash = self._chat_hash(self.session_id)
+        self._register_consumer(self.session_id)
+        self._rebuild_fts()
+        self._sync_env_metadata()
+        try:
+            self._drain_code_shrinker_events(limit=100)
+        except Exception as exc:
+            _debug_log(f"Code Shrinker event drain failed during initialize: {type(exc).__name__}: {exc}")
+        self._render_all()
+        if SEMANTIC_ENABLED:
+            _start_outbox_worker(str(self.db_path))
+            _wake_outbox_worker(str(self.db_path))
+        manifest_change = _check_manifest_change()
+        if manifest_change:
+            _debug_log(
+                "Embedding manifest changed; a new physical collection is required for "
+                f"{manifest_change['collection']}: {manifest_change['old_hash']} → "
+                f"{manifest_change['new_hash']}. Run memory_wiki_reindex before "
+                "treating semantic results as fully compatible."
+            )
         # Alias bootstrap: ensure memory_wiki_claims_active points to active collection
         if SEMANTIC_ENABLED:
             try:
                 alias_check = _qdrant_req("GET", "/aliases")
                 aliases = (((alias_check or {}).get("result") or {}).get("aliases") or [])
-                alias_exists = any(str(item.get("alias_name") or "") == "memory_wiki_claims_active" for item in aliases)
+                alias_exists = any(str(item.get("alias_name") or "") == QDRANT_ALIAS for item in aliases)
                 if not alias_exists:
-                    coll = _active_collection_name()
-                    if not _ensure_collection():
-                        _debug_log("Bootstrap FAILED: could not create Qdrant collection")
+                    coll = _physical_collection_name()
+                    if not _ensure_collection(coll):
+                        _debug_log("Bootstrap FAILED: could not create Qdrant physical collection")
+                    elif _switch_alias(coll):
+                        _debug_log(f"Bootstrap OK: alias {QDRANT_ALIAS} → {coll}")
                     else:
-                        created = _qdrant_req("POST", "/collections/aliases", {"actions": [{"create_alias": {"collection_name": coll, "alias_name": "memory_wiki_claims_active"}}]})
-                        if created and created.get("status") == "ok":
-                            _debug_log(f"Bootstrap OK: alias memory_wiki_claims_active → {coll}")
-                        else:
-                            _debug_log(f"Bootstrap FAILED: could not create alias → {coll}")
+                        _debug_log(f"Bootstrap FAILED: could not create alias {QDRANT_ALIAS} → {coll}")
             except Exception as e:
                 _debug_log(f"Alias bootstrap error: {e}")
         # --- F2/F3: Build TF-IDF vocabulary from existing claims ---
@@ -1570,6 +1851,180 @@ class MemoryWikiProvider(MemoryProvider):
                 _tfidf_build_vocab(texts, max_features=6000)
                 self._audit('tfidf', 'vocab_built', f'TF-IDF vocabulary built from {len(texts)} claims, {_TFIDF_VOCAB_SIZE} features')
         except Exception: pass
+
+    # ----- shared-memory coordination -----------------------------------
+    def _meta_text(self, key: str, default: str = "") -> str:
+        try:
+            row = self._connect().execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+            return str(row["value"] if row else default)
+        except Exception:
+            return default
+
+    def _meta_int(self, key: str, default: int = 0) -> int:
+        try:
+            return int(self._meta_text(key, str(default)) or default)
+        except (TypeError, ValueError):
+            return int(default)
+
+    def _set_meta_max(self, key: str, value: int, conn=None) -> None:
+        c = conn or self._connect()
+        _meta_set_max(c, key, value)
+
+    def _chat_hash(self, session_id: str = "") -> str:
+        sid = str(session_id or self.session_id or "default")
+        salt = self.database_instance_id or self._meta_text("database_instance_id", "uninitialized")
+        return hashlib.sha256(f"{salt}\0{sid}".encode("utf-8", "ignore")).hexdigest()[:32]
+
+    def _consumer_identity(self, session_id: str = "") -> Tuple[str, str, str]:
+        sid = str(session_id or self.session_id or "default")
+        chat_hash = self._chat_hash(sid)
+        consumer_id = hashlib.sha256(
+            f"{self.bot_id}\0{sid}\0{chat_hash}".encode("utf-8", "ignore")
+        ).hexdigest()[:24]
+        return consumer_id, sid, chat_hash
+
+    def _register_consumer(self, session_id: str = "") -> str:
+        consumer_id, sid, chat_hash = self._consumer_identity(session_id)
+        c = self._connect()
+        journal_mode = str(c.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        with c:
+            c.execute(
+                """INSERT INTO memory_consumers(
+                       consumer_id,bot_id,session_id,chat_hash,project_id,last_seen_revision,
+                       database_instance_id,absolute_db_path,journal_mode,updated_at)
+                   VALUES(?,?,?,?,?,0,?,?,?,?)
+                   ON CONFLICT(consumer_id) DO UPDATE SET
+                       bot_id=excluded.bot_id,session_id=excluded.session_id,
+                       chat_hash=excluded.chat_hash,project_id=excluded.project_id,
+                       database_instance_id=excluded.database_instance_id,
+                       absolute_db_path=excluded.absolute_db_path,
+                       journal_mode=excluded.journal_mode,updated_at=excluded.updated_at""",
+                (
+                    consumer_id, self.bot_id, sid, chat_hash, self.project_scope,
+                    self.database_instance_id, str(self.db_path.expanduser().resolve()),
+                    journal_mode, now(),
+                ),
+            )
+        self._consumer_id = consumer_id
+        self.origin_chat_hash = chat_hash
+        return consumer_id
+
+    def _last_seen_revision(self, session_id: str = "") -> int:
+        consumer_id = self._register_consumer(session_id)
+        row = self._connect().execute(
+            "SELECT last_seen_revision FROM memory_consumers WHERE consumer_id=?", (consumer_id,)
+        ).fetchone()
+        return int(row["last_seen_revision"] or 0) if row else 0
+
+    def _mark_seen_revision(self, revision: int, session_id: str = "") -> None:
+        revision = max(0, int(revision or 0))
+        if not revision:
+            return
+        consumer_id = self._register_consumer(session_id)
+        with self._connect() as c:
+            c.execute(
+                """UPDATE memory_consumers
+                   SET last_seen_revision=max(last_seen_revision,?),updated_at=?
+                   WHERE consumer_id=?""",
+                (revision, now(), consumer_id),
+            )
+
+    def _source_kind(self, source: str) -> str:
+        value = str(source or "").lower()
+        if value.startswith("turn:user:"):
+            return "user_turn"
+        if value.startswith("turn:assistant:"):
+            return "assistant_turn"
+        if "code_claim" in value:
+            return "code_claim"
+        if value.startswith("memory_tool:") or value.startswith("tool"):
+            return "tool"
+        if value.startswith("post_task") or value.startswith("task_capsule"):
+            return "task_result"
+        if value.startswith("curated") or value.startswith("phase6_curated"):
+            return "curated"
+        return "other"
+
+    def _default_visibility_for(self, source: str, project_id: str = "") -> str:
+        kind = self._source_kind(source)
+        if kind in ("user_turn", "assistant_turn"):
+            return "chat"
+        if kind == "code_claim" or project_id:
+            return "project"
+        value = self.default_visibility if self.default_visibility in {"global","bot","chat","project","private"} else "global"
+        return value
+
+    def _claim_visible(self, row: Any, session_id: str = "") -> bool:
+        keys = set(row.keys()) if hasattr(row, "keys") else set(row)
+        visibility = str(row["visibility_scope"] if "visibility_scope" in keys else "global" or "global").lower()
+        sid = str(session_id or self.session_id or "default")
+        if visibility == "global":
+            return True
+        if visibility == "bot":
+            return str(row["origin_bot_id"] if "origin_bot_id" in keys else "") == self.bot_id
+        if visibility == "chat":
+            return str(row["origin_chat_hash"] if "origin_chat_hash" in keys else "") == self._chat_hash(sid)
+        if visibility == "private":
+            return str(row["origin_session_id"] if "origin_session_id" in keys else "") == sid
+        if visibility == "project":
+            row_project = str(row["project_id"] if "project_id" in keys else "")
+            return bool(row_project and self.project_scope and row_project == self.project_scope)
+        return False  # unknown visibility fails closed
+
+    def _format_claim_time(self, row: Any) -> str:
+        keys = set(row.keys()) if hasattr(row, "keys") else set(row)
+        ts = int((row["event_at"] if "event_at" in keys else 0) or (row["created_at"] if "created_at" in keys else 0) or 0)
+        tz_name = str((row["event_timezone"] if "event_timezone" in keys else "UTC") or "UTC")
+        if not ts:
+            return "unknown"
+        try:
+            zone = ZoneInfo(tz_name) if ZoneInfo is not None else timezone.utc
+        except Exception:
+            zone = timezone.utc
+            tz_name = "UTC"
+        return datetime.fromtimestamp(ts, timezone.utc).astimezone(zone).isoformat(timespec="seconds")
+
+    def _revision_delta(self, query: str, *, session_id: str = "", limit: int = 4) -> Dict[str, Any]:
+        limit = max(0, min(int(limit or 0), 4))
+        last_seen = self._last_seen_revision(session_id)
+        if not limit:
+            return {"rows": [], "watermark": last_seen}
+        rows = self._connect().execute(
+            """SELECT * FROM claims
+               WHERE status='active' AND memory_revision>?
+               ORDER BY memory_revision ASC LIMIT 1024""",
+            (last_seen,),
+        ).fetchall()
+        visible: List[Dict[str, Any]] = []
+        watermark = last_seen
+        qtokens = tokens(query or "")
+        for raw in rows:
+            if len(visible) >= limit:
+                break
+            revision = int(raw["memory_revision"] or 0)
+            if not self._claim_visible(raw, session_id):
+                # This consumer can never read the row, so it is safe to advance over it.
+                watermark = max(watermark, revision)
+                continue
+            row = self._sanitize_row(raw)
+            row["delta_overlap"] = len(qtokens & tokens(claim_search_text(
+                row.get("claim", ""), row.get("normalized_claim", ""),
+                row.get("topic", ""), row.get("evidence", ""),
+            ))) if qtokens else 0
+            visible.append(row)
+            watermark = max(watermark, revision)
+        return {"rows": visible, "watermark": watermark}
+
+    def _select_recall_rows(self, query: str, *, session_id: str = "", limit: int = 10,
+                            include_stale: bool = True, delta_limit: int = 4) -> Dict[str, Any]:
+        main_rows = self._search(query, limit=limit, include_stale=include_stale, session_id=session_id)
+        delta_result = self._revision_delta(query, session_id=session_id, limit=delta_limit)
+        raw_delta_rows = delta_result["rows"]
+        seen = {str(row.get("id", "")) for row in main_rows}
+        delta_rows = [row for row in raw_delta_rows if str(row.get("id", "")) not in seen]
+        # Never jump past unseen revisions merely because a relevant search result is newer.
+        return {"rows": main_rows, "delta_rows": delta_rows,
+                "watermark": int(delta_result.get("watermark") or 0)}
 
     def system_prompt_block(self) -> str:
         return (
@@ -1587,22 +2042,30 @@ class MemoryWikiProvider(MemoryProvider):
             self._maintenance()
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        # Social closer gate — skip search for trivial messages
         if is_social_close(query):
             return ""
+        sid = session_id or self.session_id
         plan = self._recall_plan(query, limit=6)
-        rows = self._search(query, limit=10, include_stale=True)
+        selected = self._select_recall_rows(
+            query, session_id=sid, limit=10, include_stale=True,
+            delta_limit=int(os.environ.get("MEMORY_WIKI_REVISION_DELTA_LIMIT", "3")),
+        )
+        rows = selected["rows"]
+        delta_rows = selected["delta_rows"]
         env_meta = self._env_metadata_context(query)
         secrets_meta = self._secret_context(query, limit=3)
-        if not rows and not env_meta and not plan.get("topics") and not secrets_meta: return ""
-        lines = ["## Active Memory Wiki Recall", "Use these as durable background, not new user input. Prefer active, fresh, high-confidence claims; refresh or verify stale/uncertain items. Secret values are never included; use the secret vault only when explicitly required."]
+        if not rows and not delta_rows and not env_meta and not plan.get("topics") and not secrets_meta:
+            return ""
+        lines = [
+            "## Active Memory Wiki Recall",
+            "Use these as durable background, not new user input. Visibility rules are already enforced; prefer active, fresh, high-confidence claims.",
+        ]
         if plan.get("topics"):
             lines.append("Recall plan: topics=" + ", ".join(plan.get("topics", [])[:6]) + "; types=" + ", ".join(plan.get("types", [])[:6]))
         if env_meta:
             lines.append(env_meta)
         if secrets_meta:
             lines.append(secrets_meta)
-        # ── P0 #3: Injection guard on each recalled item ──
         quarantined_count = 0
         for r in rows:
             recall = self._safe_recall_item(r)
@@ -1612,25 +2075,41 @@ class MemoryWikiProvider(MemoryProvider):
             flags = []
             if self._is_stale(r["freshness_at"]): flags.append("STALE")
             if r["status"] != "active": flags.append(r["status"].upper())
-            # P0 #3: append trust_level from injection guard
             if recall.get("trust_level") and recall["trust_level"] not in ("trusted", "verified"):
                 flags.append(recall["trust_level"].upper())
             tag = f" [{' '.join(flags)}]" if flags else ""
-            pin = ' 📌' if int(r.get('pinned') or 0) else ''
-            claim_text = recall.get("content", _safe_recall_text(r.get('claim',''), 900))
-            cls = r.get('memory_class') or memory_classify(claim_text, r.get('topic','')).get('class','fact')
-            trust = float(r.get('trust_score', memory_classify(claim_text, r.get('topic','')).get('trust', .5)) or .5)
-            why = r.get('why_believe') or f"source={r.get('source','')}; evidence_count={r.get('evidence_count',0)}"
-            lines.append(f"- `{r['id']}` {tag}{pin} class={cls} trust={trust:.2f} topic={r['topic']} conf={r['confidence']:.2f} sal={r['salience']:.2f} score={r.get('score',0):.2f}: {claim_text}")
+            pin = " 📌" if int(r.get("pinned") or 0) else ""
+            claim_text = recall.get("content", _safe_recall_text(r.get("claim", ""), 900))
+            cls = r.get("memory_class") or memory_classify(claim_text, r.get("topic", "")).get("class", "fact")
+            trust = float(r.get("trust_score", memory_classify(claim_text, r.get("topic", "")).get("trust", .5)) or .5)
+            why = r.get("why_believe") or f"source={r.get('source','')}; evidence_count={r.get('evidence_count',0)}"
+            lines.append(
+                f"- `{r['id']}`{tag}{pin} rev={int(r.get('memory_revision') or 0)} "
+                f"visibility={r.get('visibility_scope','global')} time={self._format_claim_time(r)} "
+                f"class={cls} trust={trust:.2f} topic={r['topic']} conf={r['confidence']:.2f} "
+                f"sal={r['salience']:.2f} score={r.get('score',0):.2f}: {claim_text}"
+            )
             lines.append(f"  why_believe: {short(redact_secrets(why), 180)}")
             ev = self._top_evidence(r["id"], 1)
-            if ev: lines.append(f"  evidence: {_safe_recall_text(ev[0]['text'], 500)}")
+            if ev:
+                lines.append(f"  evidence: {_safe_recall_text(ev[0]['text'], 500)}")
+        if delta_rows:
+            lines.append("\n## Newly committed shared memory")
+            for r in delta_rows:
+                lines.append(
+                    f"- `{r['id']}` rev={int(r.get('memory_revision') or 0)} "
+                    f"visibility={r.get('visibility_scope','global')} time={self._format_claim_time(r)} "
+                    f"topic={r.get('topic','')}: {_safe_recall_text(r.get('claim',''), 700)}"
+                )
         cons = self._related_contradictions([r["id"] for r in rows], limit=4)
         if cons:
             lines.append("\nContradictions to handle explicitly:")
-            for c in cons: lines.append(f"- `{c['id']}` {redact_secrets(c['claim_a'])} ↔ {redact_secrets(c['claim_b'])}: {redact_secrets(c['reason'])} [{c['status']}]")
-        out = "\n".join(lines)
-        return out[:MAX_PREFETCH_CHARS]
+            for c in cons:
+                lines.append(f"- `{c['id']}` {redact_secrets(c['claim_a'])} ↔ {redact_secrets(c['claim_b'])}: {redact_secrets(c['reason'])} [{c['status']}]")
+        out = "\n".join(lines)[:MAX_PREFETCH_CHARS]
+        if out:
+            self._mark_seen_revision(selected["watermark"], sid)
+        return out
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None: return None
 
@@ -1787,7 +2266,7 @@ class MemoryWikiProvider(MemoryProvider):
         P = lambda props, req=(): {"type":"object","properties":props,"required":list(req)}
         return [
             {"name":"memory_wiki_query","description":"Search memory-wiki claims with FTS + salience/freshness scoring.","parameters":P({"query":{"type":"string"},"limit":{"type":"integer","default":10},"include_stale":{"type":"boolean","default":True},"topic":{"type":"string"}}, ["query"])},
-            {"name":"memory_wiki_add_claim","description":"Add/update a structured durable claim.","parameters":P({"claim":{"type":"string"},"topic":{"type":"string","default":"general"},"evidence":{"type":"string","default":""},"source":{"type":"string","default":"tool"},"confidence":{"type":"number","default":0.75},"salience":{"type":"number","default":0.7}}, ["claim"])},
+            {"name":"memory_wiki_add_claim","description":"Add/update a structured durable claim with visibility and event time.","parameters":P({"claim":{"type":"string"},"topic":{"type":"string","default":"general"},"evidence":{"type":"string","default":""},"source":{"type":"string","default":"tool"},"confidence":{"type":"number","default":0.75},"salience":{"type":"number","default":0.7},"visibility_scope":{"type":"string","enum":["global","bot","chat","project","private"]},"project_id":{"type":"string","default":""},"event_at":{"type":"integer","default":0},"event_timezone":{"type":"string","default":"UTC"}}, ["claim"])},
             {"name":"memory_wiki_add_secret","description":"Add/update a structured credential/secret index entry. Values are stored locally with redacted recall summaries.","parameters":P({"subject":{"type":"string"},"scope":{"type":"string"},"secret_type":{"type":"string","default":"credential"},"locator":{"type":"string","default":""},"value":{"type":"string","default":""},"purpose":{"type":"string","default":""},"source":{"type":"string","default":"tool"},"confidence":{"type":"number","default":0.85},"salience":{"type":"number","default":0.85}}, ["subject","scope"])},
             {"name":"memory_wiki_query_secrets","description":"Query secret vault index. By default returns redacted values. Set reveal=true + confirm_reveal=true to decrypt. Secrets wrapped at rest (key-obfuscation).","parameters":P({"query":{"type":"string"},"limit":{"type":"integer","default":10},"reveal":{"type":"boolean","default":False},"confirm_reveal":{"type":"boolean","default":False}}, ["query"])},
             {"name":"memory_wiki_recall_plan","description":"Plan which topics/types/secrets should be recalled for a query.","parameters":P({"query":{"type":"string"},"limit":{"type":"integer","default":8}}, ["query"])},
@@ -1805,7 +2284,7 @@ class MemoryWikiProvider(MemoryProvider):
             {"name":"memory_wiki_add_relation","description":"Add a typed relation edge between entities. Valid predicates: owns, owned_by, runs_on, hosts, depends_on, required_by, uses_provider, authenticated_by, replaces, replaced_by, valid_until, supports, contradicts, related_to. Prefer specific over generic.","parameters":P({"subject":{"type":"string"},"predicate":{"type":"string"},"object":{"type":"string"},"confidence":{"type":"number","default":0.8},"evidence":{"type":"string","default":""}}, ["subject","predicate","object"])},
             {"name":"memory_wiki_graph_query","description":"Query lightweight entity graph around an entity/text.","parameters":P({"query":{"type":"string"},"limit":{"type":"integer","default":20}}, ["query"])},
             {"name":"memory_wiki_apply_user_correction","description":"Capture user correction, supersede/uncertain matching old claims, and add corrected claim.","parameters":P({"correction":{"type":"string"},"target_claim_id":{"type":"string","default":""},"topic":{"type":"string","default":"corrections"}}, ["correction"])},
-            {"name":"memory_wiki_pack_context","description":"Budget-aware recall/context packing for a query.","parameters":P({"query":{"type":"string"},"max_chars":{"type":"integer","default":3800}}, ["query"])},
+            {"name":"memory_wiki_pack_context","description":"Budget-aware recall/context packing with optional Code Shrinker coverage deduplication.","parameters":P({"query":{"type":"string"},"max_tokens":{"type":"integer","default":4000},"max_chars":{"type":"integer","default":12000,"description":"Deprecated — use max_tokens"},"output_mode":{"type":"string","enum":["canonical","debug"],"default":"canonical"},"repository_id":{"type":"string","default":"","description":"Expected repository for coverage_manifest validation"},"coverage_manifest":{"type":"object"}}, ["query"])},
             {"name":"memory_wiki_memory_diff","description":"Compare recalled memory against supplied verified/current facts before answering; returns confirmed, changed/conflicting and stale/unverified memory.","parameters":P({"query":{"type":"string"},"verified_facts":{"type":"array","items":{"type":"string"}},"current_context":{"type":"string","default":""},"limit":{"type":"integer","default":12}}, ["query"])},
             {"name":"memory_wiki_preference_layer","description":"Return prioritized durable user preferences/constraints plus the precedence policy for fresh instructions vs memory.","parameters":P({"query":{"type":"string","default":""},"limit":{"type":"integer","default":20},"include_policy":{"type":"boolean","default":True}}, [])},
             {"name":"memory_wiki_add_preference_rule","description":"Add/update a first-class preference priority rule used by the preference layer.","parameters":P({"rule":{"type":"string"},"priority":{"type":"integer","default":100},"scope":{"type":"string","default":"global"},"source":{"type":"string","default":"explicit"},"status":{"type":"string","enum":["active","retired"],"default":"active"}}, ["rule"])},
@@ -1871,14 +2350,20 @@ class MemoryWikiProvider(MemoryProvider):
             {"name":"memory_wiki_context_sanitize","description":"Sanitize text for safe context injection: strips injection patterns, normalizes whitespace, truncates.","parameters":P({"text":{"type":"string"},"max_len":{"type":"integer","default":400}}, ["text"])},
             {"name":"memory_wiki_is_social_close","description":"Check if text is a social closer (ok, thanks, 👍) that should skip memory search.","parameters":P({"text":{"type":"string"}}, ["text"])},
         
-            {"name":"memory_wiki_code_claim_add","description":"Add/update a code-linked claim with repository/symbol/revision metadata.","parameters":{"type":"object","properties":{"claim":{"type":"string"},"topic":{"type":"string","default":"code-shrinker"},"repository_id":{"type":"string"},"commit_sha":{"type":"string","default":""},"file_path":{"type":"string","default":""},"symbol_id":{"type":"string","default":""},"symbol_revision":{"type":"string","default":""},"claim_type":{"type":"string","default":"code_claim"},"confidence":{"type":"number","default":0.75},"salience":{"type":"number","default":0.7},"evidence":{"type":"string","default":""}},"required":["claim"]}},
-            {"name":"memory_wiki_code_claim_query","description":"Query code-linked claims by repository/symbol/file criteria.","parameters":{"type":"object","properties":{"repository_id":{"type":"string","default":""},"file_path":{"type":"string","default":""},"symbol_id":{"type":"string","default":""},"query":{"type":"string","default":""},"limit":{"type":"integer","default":10}}}},
-            {"name":"memory_wiki_symbol_history","description":"Get revision history for a specific symbol across claims.","parameters":{"type":"object","properties":{"symbol_id":{"type":"string"},"limit":{"type":"integer","default":20}},"required":["symbol_id"]}},
+            {"name":"memory_wiki_code_claim_add","description":"Add/update a code-linked claim with repository/symbol/revision metadata. Repository, file_path, and content_hash required.","parameters":{"type":"object","properties":{"claim":{"type":"string","maxLength":12000},"topic":{"type":"string","default":"code-shrinker","maxLength":200},"repository_id":{"type":"string","minLength":1,"maxLength":300},"commit_sha":{"type":"string","default":"","maxLength":64},"file_path":{"type":"string","minLength":1,"maxLength":1024},"symbol_id":{"type":"string","default":"","maxLength":512},"symbol_revision":{"type":"string","default":"","maxLength":128},"content_hash":{"type":"string","description":"SHA-256 of symbol or file content","pattern":"^(?:sha256:)?[0-9a-fA-F]{64}$"},"claim_type":{"type":"string","default":"code_claim","maxLength":100},"confidence":{"type":"number","default":0.75,"minimum":0,"maximum":1},"salience":{"type":"number","default":0.7,"minimum":0,"maximum":1},"evidence":{"type":"string","default":"","maxLength":20000},"source_event_id":{"type":"string","default":"","maxLength":512,"description":"Durable producer event identifier for exactly-once ingestion"},"producer":{"type":"string","default":"code-shrinker","maxLength":100},"phase_sep_version":{"type":"string","default":"2","maxLength":32}},"required":["claim","repository_id","file_path","content_hash"],"additionalProperties":false}},
+            {"name":"memory_wiki_code_claim_query","description":"Query code-linked claims by repository/symbol/file criteria.","parameters":{"type":"object","properties":{"repository_id":{"type":"string","default":""},"file_path":{"type":"string","default":""},"symbol_id":{"type":"string","default":""},"query":{"type":"string","default":""},"limit":{"type":"integer","default":10}},
+    "required": ["repository_id"]
+}},
+            {"name":"memory_wiki_symbol_history","description":"Get repository-scoped revision history for a code symbol.","parameters":{"type":"object","properties":{"repository_id":{"type":"string"},"symbol_id":{"type":"string"},"limit":{"type":"integer","default":20}},"required":["repository_id","symbol_id"]}},
             {"name":"memory_wiki_repository_context","description":"Return all code-linked claims for a repository.","parameters":{"type":"object","properties":{"repository_id":{"type":"string"},"limit":{"type":"integer","default":30}},"required":["repository_id"]}},
-            {"name":"memory_wiki_invalidate_revision","description":"Mark code claims stale after symbol/file change.","parameters":{"type":"object","properties":{"symbol_id":{"type":"string","default":""},"file_path":{"type":"string","default":""},"new_commit_sha":{"type":"string","default":""}}}},
-            {"name":"memory_wiki_patch_outcome_add","description":"Record the outcome of a patch application with validation results.","parameters":{"type":"object","properties":{"patch_id":{"type":"string"},"outcome":{"type":"string"},"repository_id":{"type":"string","default":""},"validation_report":{"type":"object"},"changed_files":{"type":"array","items":{"type":"string"}},"changed_symbols":{"type":"array","items":{"type":"string"}},"rollback_steps":{"type":"string","default":""}},"required":["patch_id","outcome"]}},]
+            {"name":"memory_wiki_invalidate_revision","description":"Mark code claims stale after symbol/file change — scoped by repository. Requires symbol_id or file_path.","parameters":{"type":"object","properties":{"repository_id":{"type":"string","default":"","description":"Repository identifier"},"symbol_id":{"type":"string","default":""},"file_path":{"type":"string","default":""},"new_commit_sha":{"type":"string","default":"","description":"Git commit SHA after the change"},"new_content_hash":{"type":"string","default":"","pattern":"^(?:sha256:)?[0-9a-fA-F]{64}$","description":"SHA-256 of the new file or symbol content"}},"required":["repository_id"]}},
+            {"name":"memory_wiki_patch_outcome_add","description":"Record the outcome of a patch application with structured validation and revision metadata.","parameters":{"type":"object","properties":{"patch_id":{"type":"string","minLength":1,"maxLength":256},"outcome":{"type":"string","minLength":1,"maxLength":128},"repository_id":{"type":"string","minLength":1,"maxLength":300},"commit_sha":{"type":"string","default":"","maxLength":64},"old_content_hash":{"type":"string","default":"","pattern":"^(?:sha256:)?[0-9a-fA-F]{64}$"},"new_content_hash":{"type":"string","default":"","pattern":"^(?:sha256:)?[0-9a-fA-F]{64}$"},"validation_report":{"type":"object"},"changed_files":{"type":"array","maxItems":200,"items":{"type":"string","maxLength":1024}},"changed_symbols":{"type":"array","maxItems":500,"items":{"type":"string","maxLength":512}},"rollback_steps":{"type":"string","default":"","maxLength":20000},"source_event_id":{"type":"string","default":"","maxLength":512},"producer":{"type":"string","default":"mcp-code-shrinker","maxLength":100},"phase_sep_version":{"type":"string","default":"2","maxLength":32}},"required":["patch_id","outcome","repository_id"],"additionalProperties":false}},]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        try:
+            self._drain_code_shrinker_events(limit=25)
+        except Exception as exc:
+            _debug_log(f"Code Shrinker event drain failed before {tool_name}: {type(exc).__name__}: {exc}")
         a = dict(args or {})
         
         # ── Namespace enforcement (P0 #2 fix) ──
@@ -1905,7 +2390,7 @@ class MemoryWikiProvider(MemoryProvider):
                 rows = self._search(a.get("query",""), int(a.get("limit",10)), bool(a.get("include_stale",True)), a.get("topic"))
                 return tool_result(success=True, claims=[self._rowdict(r) for r in rows])
             if tool_name == "memory_wiki_add_claim":
-                cid = self._add_claim(a.get("claim",""), a.get("topic") or "general", a.get("evidence") or "", a.get("source") or "tool", float(a.get("confidence",.75)), float(a.get("salience",.7)))
+                cid = self._add_claim(a.get("claim",""), a.get("topic") or "general", a.get("evidence") or "", a.get("source") or "tool", float(a.get("confidence",.75)), float(a.get("salience",.7)), visibility_scope=a.get("visibility_scope") or "", project_id=a.get("project_id") or "", event_at=int(a.get("event_at") or 0), event_timezone=a.get("event_timezone") or "UTC")
                 # P0 fix: differentiate queued vs stored claims
                 queued = cid.startswith("rq_")
                 topic = a.get("topic") or "general"
@@ -1934,11 +2419,219 @@ class MemoryWikiProvider(MemoryProvider):
             if tool_name == "memory_wiki_graph_query": return tool_result(success=True, **self._graph_query(a.get("query") or "", int(a.get("limit",20))))
             if tool_name == "memory_wiki_apply_user_correction": return tool_result(success=True, **self._apply_user_correction(a))
             if tool_name == "memory_wiki_pack_context":
-                result = self._pack_context(a.get("query") or "", int(a.get("max_chars",MAX_PREFETCH_CHARS)))
-                rows = self._search(str(a.get("query","")), limit=min(60,int(a.get("max_chars",3800))//100), include_stale=False)
-                if rows:
+                # max_tokens is the canonical public budget. Keep max_chars only
+                # as an explicit backwards-compatible override.
+                if "max_chars" in a and a.get("max_chars") is not None:
+                    max_chars = int(a.get("max_chars"))
+                else:
+                    max_tokens = max(200, min(int(a.get("max_tokens", 4000)), 15000))
+                    max_chars = max_tokens * 4
+                output_mode = str(a.get("output_mode", "canonical")).strip().lower()
+                coverage = a.get("coverage_manifest")
+                # Search once for both canonical rows and the memory-diff guard.
+                # Coverage suppression is applied to every claim-derived output path,
+                # not only the main rows rendered below.
+                all_rows = self._search(
+                    str(a.get("query", "")),
+                    limit=min(60, max_chars // 100),
+                    include_stale=True,
+                )
+                rows = [
+                    row for row in all_rows
+                    if not self._is_stale(int(row.get("freshness_at") or 0))
+                ]
+                classification = None
+                suppressed_ids = set()
+                suppression_status = "not_requested"
+                suppression_error = ""
+
+                def _is_code_linked_row(row: Dict[str, Any]) -> bool:
+                    """Conservatively identify code-linked claims for fail-closed suppression."""
+                    claim_type = str(row.get("claim_type") or row.get("type") or "").lower()
+                    source = str(row.get("source") or "").lower()
+                    evidence = str(row.get("evidence") or "").lower()
+                    topic = str(row.get("topic") or "").lower()
+                    return bool(
+                        row.get("repository_id")
+                        or row.get("symbol_id")
+                        or row.get("symbol_revision")
+                        or row.get("file_path")
+                        or row.get("content_hash")
+                        or claim_type in {
+                            "code_claim", "code_symbol", "code_contract",
+                            "code_behavior", "patch_outcome",
+                        }
+                        or any(marker in evidence for marker in (
+                            "repository:", "symbol:", "revision:",
+                            "content_hash:", "file:",
+                        ))
+                        or any(marker in source for marker in (
+                            "code_claim", "code-shrinker", "code_shrinker",
+                            "patch_outcome",
+                        ))
+                        or topic in {"code-shrinker", "code_claims", "code-intelligence"}
+                    )
+
+                if coverage and all_rows:
+                    try:
+                        from pathlib import Path as _P
+                        _coord = str(_P(__file__).resolve().parent / "context-coordination")
+                        import sys as _sys
+                        if _coord not in _sys.path: _sys.path.insert(0, _coord)
+                        from manifest_protocol import CoverageManifest, ClassificationEngine
+                        cm = CoverageManifest.from_dict(coverage)
+                        expected_repository_id = str(a.get("repository_id") or cm.repository_id or "").strip()
+                        if expected_repository_id and cm.repository_id and cm.repository_id != expected_repository_id:
+                            raise ValueError(
+                                "coverage_manifest repository_id mismatch: "
+                                f"{cm.repository_id} != {expected_repository_id}"
+                            )
+                        engine = ClassificationEngine()
+                        # Bulk metadata enrichment. A metadata read failure is
+                        # part of suppression and must fail closed.
+                        metadata_enrichment_failed = False
+                        try:
+                            c2 = self._connect()
+                            row_ids = [
+                                str(r2.get("id", "")).strip()
+                                for r2 in all_rows
+                                if str(r2.get("id", "")).strip()
+                            ]
+                            meta_by_id = {}
+                            if row_ids:
+                                placeholders = ",".join("?" for _ in row_ids)
+                                meta_rows = c2.execute(
+                                    "SELECT claim_id,repository_id,symbol_id,"
+                                    "symbol_revision,content_hash,claim_type "
+                                    "FROM code_claim_metadata "
+                                    f"WHERE claim_id IN ({placeholders})",
+                                    tuple(row_ids),
+                                ).fetchall()
+                                meta_by_id = {
+                                    str(meta["claim_id"]): meta
+                                    for meta in meta_rows
+                                }
+                            for r2 in all_rows:
+                                meta = meta_by_id.get(str(r2.get("id", "")))
+                                if meta:
+                                    for key in (
+                                        "repository_id",
+                                        "symbol_id",
+                                        "symbol_revision",
+                                        "content_hash",
+                                        "claim_type",
+                                    ):
+                                        if not r2.get(key) and meta[key]:
+                                            r2[key] = meta[key]
+                        except Exception as meta_exc:
+                            metadata_enrichment_failed = True
+                            _debug_log(
+                                "pack_context metadata enrichment failed: "
+                                f"{type(meta_exc).__name__}: {meta_exc}"
+                            )
+
+                        # Legacy markers are independent: patch outcomes can carry
+                        # repository/file metadata without a symbol marker.
+                        import re as _re
+                        legacy_patterns = (
+                            (r"symbol:(\S+)", "symbol_id"),
+                            (r"revision:(\S+)", "symbol_revision"),
+                            (r"repository:(\S+)", "repository_id"),
+                            (r"file:(\S+)", "file_path"),
+                            (r"content_hash:(\S+)", "content_hash"),
+                        )
+                        for r2 in all_rows:
+                            ev = str(r2.get("evidence", ""))
+                            for pattern, destination in legacy_patterns:
+                                match = _re.search(pattern, ev)
+                                if match and not r2.get(destination):
+                                    r2[destination] = match.group(1)
+                            if not r2.get("claim_type"):
+                                source_text = str(r2.get("source", ""))
+                                for claim_kind in (
+                                    "decision",
+                                    "constraint",
+                                    "known_failure",
+                                    "patch_outcome",
+                                    "security",
+                                    "code_claim",
+                                ):
+                                    if claim_kind in source_text:
+                                        r2["claim_type"] = claim_kind
+                                        break
+
+                        if metadata_enrichment_failed:
+                            raise RuntimeError(
+                                "code_claim_metadata enrichment unavailable"
+                            )
+                        classification = engine.classify_claims(
+                            [{"id":str(r2.get("id","")),"claim":str(r2.get("text",r2.get("claim",""))),
+                              "claim_type":str(r2.get("claim_type","")),
+                              "symbol_id":str(r2.get("symbol_id","")),
+                              "symbol_revision":str(r2.get("symbol_revision","")),
+                              "file_path":str(r2.get("file_path","")),
+                              "repository_id":str(r2.get("repository_id","")),
+                              "content_hash":str(r2.get("content_hash",""))}
+                             for r2 in all_rows], cm, repository_id=expected_repository_id)
+                        allowed_ids = set(classification.included_claim_ids)
+                        suppressed_ids = {
+                            str(item.claim_id)
+                            for item in classification.suppressed
+                            if str(item.claim_id)
+                        }
+                        all_rows = [
+                            row for row in all_rows
+                            if str(row.get("id", "")) in allowed_ids
+                        ]
+                        rows = [
+                            row for row in rows
+                            if str(row.get("id", "")) in allowed_ids
+                        ]
+                        suppression_status = "applied"
+                    except Exception as exc:
+                        classification = None
+                        suppression_error = f"{type(exc).__name__}: {exc}"[:500]
+                        fail_closed = os.environ.get(
+                            "MEMORY_WIKI_SUPPRESSION_FAIL_CLOSED", "1"
+                        ).strip().lower() not in {"0", "false", "no", "off"}
+                        if fail_closed:
+                            failed_closed_ids = {
+                                str(row.get("id", ""))
+                                for row in all_rows
+                                if str(row.get("id", "")) and _is_code_linked_row(row)
+                            }
+                            suppressed_ids.update(failed_closed_ids)
+                            all_rows = [
+                                row for row in all_rows
+                                if str(row.get("id", "")) not in suppressed_ids
+                            ]
+                            rows = [
+                                row for row in rows
+                                if str(row.get("id", "")) not in suppressed_ids
+                            ]
+                            suppression_status = "failed_closed"
+                        else:
+                            suppression_status = "failed_open"
+                        _debug_log(
+                            "pack_context coverage classification "
+                            f"{suppression_status}: {suppression_error}"
+                        )
+                result = self._pack_context(
+                    a.get("query") or "",
+                    max_chars,
+                    preselected_rows=rows,
+                    diff_rows=all_rows,
+                    suppressed_claim_ids=suppressed_ids,
+                )
+                result["suppression_status"] = suppression_status
+                if suppression_error:
+                    result["suppression_error"] = suppression_error
+                if output_mode == "debug":
                     result["results"] = [{"id":str(r.get("id","")),"text":str(r.get("text",r.get("claim","")))[:600],"confidence":float(r.get("confidence",0.5) or 0.5),"temporal_status":str(r.get("temporal_status","current"))} for r in rows[:16]]
-                    result["structured_pack"] = self._pack_selected_claims(rows[:16], token_budget=min(int(a.get("max_chars",3800)),6000))
+                    result["structured_pack"] = self._pack_selected_claims(rows[:16], token_budget=min(max_chars, 6000))
+                if classification:
+                    result["suppression_manifest"] = classification.to_dict()
+                    result["dedup_saved_tokens"] = classification.total_saved_tokens
                 return tool_result(success=True, **result)
             if tool_name == "memory_wiki_memory_diff": return tool_result(success=True, **self._memory_diff(a.get("query") or "", a.get("verified_facts") or [], a.get("current_context") or "", int(a.get("limit",12))))
             if tool_name == "memory_wiki_preference_layer": return tool_result(success=True, **self._preference_layer(a.get("query") or "", int(a.get("limit",20)), bool(a.get("include_policy", True))))
@@ -2614,8 +3307,75 @@ class MemoryWikiProvider(MemoryProvider):
                 ("irrelevant_recall_count","INTEGER","0"),
                 ("harmful_recall_count","INTEGER","0"),
                 ("contradicted_count","INTEGER","0"),
-                ("last_successful_recall_at","INTEGER","0")]:
+                ("last_successful_recall_at","INTEGER","0"),
+                ("origin_bot_id","TEXT","''"),
+                ("origin_session_id","TEXT","''"),
+                ("origin_chat_hash","TEXT","''"),
+                ("source_kind","TEXT","'other'"),
+                ("visibility_scope","TEXT","'global'"),
+                ("memory_revision","INTEGER","0"),
+                ("event_at","INTEGER","0"),
+                ("event_timezone","TEXT","'UTC'")]:
                 if col not in self._cols("claims"): c.execute(f"ALTER TABLE claims ADD COLUMN {col} {typ} NOT NULL DEFAULT {default}")
+            # Shared-memory identity, revision clock, consumer watermarks and leased outbox.
+            c.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('database_instance_id',?)", (uuid.uuid4().hex,))
+            c.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('memory_revision','0')")
+            c.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('fts_latest_revision','0')")
+            c.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('qdrant_latest_revision','0')")
+            c.executescript(_OUTBOX_TABLE)
+            outbox_cols = set(self._cols("index_outbox"))
+            for outbox_name, outbox_ddl in (("worker_id","TEXT NOT NULL DEFAULT ''"),("lease_until","INTEGER NOT NULL DEFAULT 0"),("next_retry_at","INTEGER NOT NULL DEFAULT 0")):
+                if outbox_name not in outbox_cols:
+                    c.execute(f"ALTER TABLE index_outbox ADD COLUMN {outbox_name} {outbox_ddl}")
+            c.executescript(_OUTBOX_INDEXES)
+            c.execute("""CREATE TABLE IF NOT EXISTS memory_consumers(
+                consumer_id TEXT PRIMARY KEY,
+                bot_id TEXT NOT NULL DEFAULT '',
+                session_id TEXT NOT NULL DEFAULT '',
+                chat_hash TEXT NOT NULL DEFAULT '',
+                project_id TEXT NOT NULL DEFAULT '',
+                last_seen_revision INTEGER NOT NULL DEFAULT 0,
+                database_instance_id TEXT NOT NULL DEFAULT '',
+                absolute_db_path TEXT NOT NULL DEFAULT '',
+                journal_mode TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL DEFAULT 0)""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_memory_consumers_bot ON memory_consumers(bot_id,updated_at)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_claims_visibility_revision ON claims(visibility_scope,memory_revision,status)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_claims_origin_chat ON claims(origin_chat_hash,status,memory_revision)")
+            # Backfill a stable monotonic baseline before installing triggers.
+            current_revision = int((c.execute("SELECT value FROM meta WHERE key='memory_revision'").fetchone() or ['0'])[0] or 0)
+            for revision_row in c.execute("SELECT id FROM claims WHERE memory_revision=0 ORDER BY created_at,id").fetchall():
+                current_revision += 1
+                c.execute("UPDATE claims SET memory_revision=?,event_at=CASE WHEN event_at=0 THEN created_at ELSE event_at END WHERE id=?", (current_revision, revision_row['id']))
+            c.execute("UPDATE meta SET value=? WHERE key='memory_revision'", (str(current_revision),))
+            c.execute("DROP TRIGGER IF EXISTS trg_claims_revision_insert")
+            c.execute("""CREATE TRIGGER trg_claims_revision_insert AFTER INSERT ON claims
+                WHEN NEW.memory_revision=0
+                BEGIN
+                    UPDATE meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='memory_revision';
+                    UPDATE claims SET memory_revision=CAST((SELECT value FROM meta WHERE key='memory_revision') AS INTEGER),
+                                      event_at=CASE WHEN NEW.event_at=0 THEN NEW.created_at ELSE NEW.event_at END
+                    WHERE id=NEW.id;
+                END""")
+            c.execute("DROP TRIGGER IF EXISTS trg_claims_revision_update")
+            c.execute("""CREATE TRIGGER trg_claims_revision_update
+                AFTER UPDATE OF claim,topic,status,confidence,salience,source,evidence,freshness_at,
+                                quality,pinned,normalized_claim,type,source_type,verification_status,
+                                last_verified_at,scope,project_id,risk,custody,quality_flags,source_ref,
+                                derived_from,review_state,secrecy_level,temporal_status,valid_from,valid_to,
+                                superseded_by_id,memory_class,decay_policy,expires_at
+                ON claims
+                WHEN NEW.memory_revision=OLD.memory_revision
+                BEGIN
+                    UPDATE meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='memory_revision';
+                    UPDATE claims SET memory_revision=CAST((SELECT value FROM meta WHERE key='memory_revision') AS INTEGER)
+                    WHERE id=NEW.id;
+                END""")
+            c.execute("DROP TRIGGER IF EXISTS trg_claims_revision_delete")
+            c.execute("""CREATE TRIGGER trg_claims_revision_delete AFTER DELETE ON claims
+                BEGIN
+                    UPDATE meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='memory_revision';
+                END""")
             if "normalized_claim" in self._cols("claims"):
                 c.execute("UPDATE claims SET normalized_claim=claim WHERE normalized_claim='' OR normalized_claim IS NULL")
             if {"quality","type","source_type"}.issubset(self._cols("claims")):
@@ -2690,6 +3450,29 @@ class MemoryWikiProvider(MemoryProvider):
             c.execute("CREATE INDEX IF NOT EXISTS idx_sync_bundles_created ON sync_bundles(created_at)")
             c.execute("""CREATE TABLE IF NOT EXISTS audit_log(id TEXT PRIMARY KEY, op TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL)""")
             c.execute("CREATE INDEX IF NOT EXISTS idx_audit_log_created ON audit_log(created_at)")
+            c.execute("""CREATE TABLE IF NOT EXISTS integration_events(
+                producer TEXT NOT NULL, event_id TEXT NOT NULL, payload_hash TEXT NOT NULL,
+                result_claim_id TEXT NOT NULL DEFAULT '', processed_at INTEGER NOT NULL,
+                PRIMARY KEY(producer,event_id))""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_integration_events_claim ON integration_events(result_claim_id)")
+            c.execute("""CREATE TABLE IF NOT EXISTS patch_outcomes(
+                repository_id TEXT NOT NULL, patch_id TEXT NOT NULL,
+                claim_id TEXT NOT NULL REFERENCES claims(id) ON DELETE CASCADE,
+                outcome TEXT NOT NULL, commit_sha TEXT NOT NULL DEFAULT '',
+                old_content_hash TEXT NOT NULL DEFAULT '', new_content_hash TEXT NOT NULL DEFAULT '',
+                changed_files_json TEXT NOT NULL DEFAULT '[]',
+                changed_symbols_json TEXT NOT NULL DEFAULT '[]',
+                validation_report_json TEXT NOT NULL DEFAULT '{}',
+                rollback_steps TEXT NOT NULL DEFAULT '', source_event_id TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                PRIMARY KEY(repository_id,patch_id))""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_patch_outcomes_claim ON patch_outcomes(claim_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_patch_outcomes_event ON patch_outcomes(source_event_id)")
+            c.execute("""CREATE TABLE IF NOT EXISTS post_commit_failures(
+                id TEXT PRIMARY KEY, claim_id TEXT NOT NULL, operation TEXT NOT NULL,
+                error TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL,
+                resolved_at INTEGER NOT NULL DEFAULT 0)""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_post_commit_failures_claim ON post_commit_failures(claim_id,created_at)")
             # ═══ v1.15.0: Embedding metadata migration ═══
             c.executescript(_OUTBOX_TABLE)
             c.execute("""CREATE TABLE IF NOT EXISTS reindex_jobs(
@@ -2875,6 +3658,17 @@ class MemoryWikiProvider(MemoryProvider):
             except Exception:
                 pass
 
+            c.execute("""CREATE TABLE IF NOT EXISTS code_claim_metadata(
+                claim_id TEXT PRIMARY KEY, repository_id TEXT NOT NULL DEFAULT '',
+                commit_sha TEXT DEFAULT '', file_path TEXT DEFAULT '',
+                symbol_id TEXT DEFAULT '', symbol_revision TEXT DEFAULT '',
+                content_hash TEXT DEFAULT '', claim_type TEXT DEFAULT 'code_claim',
+                FOREIGN KEY (claim_id) REFERENCES claims(id) ON DELETE CASCADE)""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_ccm_repo ON code_claim_metadata(repository_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_ccm_symbol ON code_claim_metadata(repository_id, symbol_id)")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_ccm_hash ON code_claim_metadata(repository_id, content_hash)")
+            self._connect().commit()
+
     def _cols(self, table: str) -> set[str]: return {r[1] for r in self._connect().execute(f"PRAGMA table_info({table})").fetchall()}
     def _rowdict(self, r: sqlite3.Row) -> Dict[str, Any]:
         """Public row serialization: always apply the same redaction guard as why/export paths."""
@@ -3033,7 +3827,14 @@ class MemoryWikiProvider(MemoryProvider):
         cid = self._add_claim(f'Preference priority rule ({priority}, {scope}): {rule}', 'preferences', 'First-class preference priority rule', 'curated', .94, min(.98, .76 + priority/5000.0))
         return {'id': rid, 'claim_id': cid, 'priority': priority, 'scope': scope, 'status': status}
 
-    def _preference_layer(self, query: str = '', limit: int = 20, include_policy: bool = True) -> Dict[str,Any]:
+    def _preference_layer(
+        self,
+        query: str = '',
+        limit: int = 20,
+        include_policy: bool = True,
+        *,
+        exclude_claim_ids: Optional[Iterable[str]] = None,
+    ) -> Dict[str,Any]:
         """Return durable preference/constraint memory in precedence order.
 
         This is the explicit Preference Priority Layer: the current user turn is
@@ -3041,6 +3842,7 @@ class MemoryWikiProvider(MemoryProvider):
         this durable layer.
         """
         lim = max(1, min(int(limit or 20), 100))
+        excluded = {str(value) for value in (exclude_claim_ids or ()) if str(value)}
         qtok = tokens(query)
         c = self._connect()
         rules = [self._sanitize_row(r) for r in c.execute("SELECT * FROM preference_rules WHERE status='active' ORDER BY priority DESC, updated_at DESC LIMIT 100").fetchall()]
@@ -3055,6 +3857,8 @@ class MemoryWikiProvider(MemoryProvider):
                             ORDER BY pinned DESC, salience DESC, confidence DESC, trust_score DESC, updated_at DESC LIMIT 250""").fetchall()
         items=[]
         for r in rows:
+            if str(r['id']) in excluded:
+                continue
             claim=str(r['claim'] or '')
             if is_ephemeral_fragment(claim) or secret_scan(claim + ' ' + str(r['evidence'] or '')).get('raw_secret'):
                 continue
@@ -3094,7 +3898,16 @@ class MemoryWikiProvider(MemoryProvider):
         ] if include_policy else []
         return {'query':query, 'policy_order':policy_order, 'rules':rules, 'items':items[:lim], 'count':len(items), 'fresh_instruction_note':'Current-turn instructions are intentionally not persisted here; callers must apply them above this durable layer.'}
 
-    def _memory_diff(self, query: str, verified_facts: Any = None, current_context: str = '', limit: int = 12) -> Dict[str,Any]:
+    def _memory_diff(
+        self,
+        query: str,
+        verified_facts: Any = None,
+        current_context: str = '',
+        limit: int = 12,
+        *,
+        preselected_rows: Optional[List[Dict[str, Any]]] = None,
+        exclude_claim_ids: Optional[Iterable[str]] = None,
+    ) -> Dict[str,Any]:
         """Memory Diff Before Answer: compare recall against provided current facts.
 
         The tool does not probe the world itself; callers pass verified/current
@@ -3125,7 +3938,16 @@ class MemoryWikiProvider(MemoryProvider):
             if key not in seen:
                 seen.add(key); dedup.append(f)
         facts=dedup
-        rows=self._search(query, lim, True)
+        excluded = {str(value) for value in (exclude_claim_ids or ()) if str(value)}
+        row_source = (
+            list(preselected_rows)
+            if preselected_rows is not None
+            else self._search(query, lim, True)
+        )
+        rows = [
+            row for row in row_source
+            if str(row.get('id', '')) not in excluded
+        ][:lim]
         remembered=[]; confirmed=[]; changed=[]; stale_unverified=[]
         neg_re=re.compile(r"(?i)\b(?:not|never|no|without|disable|disabled|obsolete|deprecated|do not|does not|don't|не|нет|никогда|без|отключ|устарел|не использовать)\b")
         def neg(s: str) -> bool:
@@ -3389,11 +4211,65 @@ class MemoryWikiProvider(MemoryProvider):
 
     # ----- claims --------------------------------------------------------
 
+    def _canonical_code_path(self, value: Any, *, allow_empty: bool = False) -> str:
+        """Canonical repository-relative path shared by add/query/invalidate."""
+        import posixpath
+        import unicodedata
+        raw = unicodedata.normalize("NFC", str(value or "").strip()).replace("\\", "/")
+        if not raw and allow_empty:
+            return ""
+        normalized = posixpath.normpath(raw)
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        if (
+            not normalized
+            or normalized in (".", "..")
+            or normalized.startswith("../")
+            or normalized.startswith("/")
+            or re.match(r"^[A-Za-z]:/", normalized)
+        ):
+            raise ValueError("file_path must be repository-relative, got: " + str(value or ""))
+        return normalized
+
+    @staticmethod
+    def _escape_like(value: Any) -> str:
+        text = str(value or "")
+        return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
     def _code_claim_add(self, a: Dict[str, Any]) -> Dict[str, Any]:
         claim = a.get("claim", ""); topic = a.get("topic", "code-shrinker")
-        repo_id = a.get("repository_id", ""); commit_sha = a.get("commit_sha", "")
-        file_path = a.get("file_path", ""); symbol_id = a.get("symbol_id", "")
-        symbol_rev = a.get("symbol_revision", ""); claim_type = a.get("claim_type", "code_claim")
+        source_event_id = str(a.get("source_event_id", "")).strip()
+        producer = str(a.get("producer", "code-shrinker") or "code-shrinker").strip()
+        phase_sep_version = str(a.get("phase_sep_version", "2") or "2").strip()
+        existing_claim_id = self._ingest_idempotent(
+            str(claim or ""), source_event_id, phase_sep_version, producer
+        )
+        if existing_claim_id:
+            return {
+                "id": existing_claim_id,
+                "status": "deduplicated",
+                "deduplicated": True,
+                "source_event_id": source_event_id,
+            }
+        repo_id = str(a.get("repository_id", "")).strip()
+        if not repo_id:
+            raise ValueError("repository_id is required for code claims")
+        file_path_raw = str(a.get("file_path", "")).strip()
+        if not file_path_raw:
+            raise ValueError("file_path is required for code claims")
+        file_path_val = self._canonical_code_path(file_path_raw)
+        commit_sha = a.get("commit_sha", "")
+        file_path = file_path_val; symbol_id = a.get("symbol_id", "")
+        symbol_rev = a.get("symbol_revision", ""); content_hash_f = str(a.get("content_hash", "")).strip()
+        if not content_hash_f:
+            raise ValueError("content_hash is required for code claims")
+        import re as _hash_re
+        if not _hash_re.fullmatch(r"^(?:sha256:)?[0-9a-fA-F]{64}$", content_hash_f):
+            raise ValueError("content_hash must be a SHA-256 hex value, got: " + content_hash_f[:32])
+        if content_hash_f.lower().startswith("sha256:"):
+            content_hash_f = content_hash_f[7:]
+        content_hash_f = content_hash_f.lower()
+        claim_type = a.get("claim_type", "code_claim")
         meta = []
         if repo_id: meta.append(f"repository: {repo_id}")
         if commit_sha: meta.append(f"commit: {commit_sha[:12]}")
@@ -3402,99 +4278,632 @@ class MemoryWikiProvider(MemoryProvider):
         if symbol_rev: meta.append(f"revision: {symbol_rev[:12]}")
         evidence = "; ".join(meta)
         if a.get("evidence"): evidence = f"{evidence} | {a['evidence']}"
-        cid = self._add_claim(claim=claim, topic=topic, evidence=evidence,
-                              source=f"tool:code_claim:{claim_type}",
-                              confidence=float(a.get("confidence", 0.75)),
-                              salience=float(a.get("salience", 0.7)))
-        return {"id": cid, "type": claim_type, "repository_id": repo_id}
+        scope = "\0".join(filter(None, ["code_claim", repo_id, file_path, symbol_id, symbol_rev or content_hash_f or commit_sha]))
+        prepared = self._prepare_claim(
+            claim=claim, topic=topic, evidence=evidence,
+            source=f"tool:code_claim:{claim_type}",
+            confidence=float(a.get("confidence", 0.75)),
+            salience=float(a.get("salience", 0.70)),
+            identity_scope=scope,
+            visibility_scope=str(a.get("visibility_scope") or "project"),
+            project_id=repo_id,
+            event_at=int(a.get("event_at") or 0),
+            event_timezone=str(a.get("event_timezone") or "UTC"),
+        )
+        if isinstance(prepared, str) and prepared.startswith("rq_"):
+            return {"status": "need_review", "review_id": prepared, "type": claim_type, "repository_id": repo_id}
+        # Temporal resolution happens inside _add_claim_tx, before metadata is
+        # inserted. Carry the canonical identity through the prepared object so
+        # supersession can still be repository/symbol scoped atomically.
+        prepared.update({
+            "repository_id": repo_id,
+            "file_path": file_path,
+            "symbol_id": str(symbol_id or ""),
+            "symbol_revision": str(symbol_rev or ""),
+            "content_hash": content_hash_f,
+            "code_claim_type": str(claim_type or "code_claim"),
+        })
+        with self._connect() as conn:
+            cid = self._add_claim_tx(conn, prepared,
+                                     float(a.get("confidence", 0.75)),
+                                     float(a.get("salience", 0.70)))
+            content_hash = content_hash_f
+            conn.execute(
+                """INSERT INTO code_claim_metadata(claim_id,repository_id,commit_sha,file_path,symbol_id,symbol_revision,content_hash,claim_type)
+                   VALUES(?,?,?,?,?,?,?,?)
+                   ON CONFLICT(claim_id) DO UPDATE SET
+                   repository_id=excluded.repository_id, commit_sha=excluded.commit_sha,
+                   file_path=excluded.file_path, symbol_id=excluded.symbol_id,
+                   symbol_revision=excluded.symbol_revision, content_hash=excluded.content_hash,
+                   claim_type=excluded.claim_type""",
+                (cid, repo_id, commit_sha[:64], file_path[:512], symbol_id[:256], symbol_rev[:64], content_hash[:256], claim_type[:64])
+            )
+            self._mark_ingested(
+                cid,
+                source_event_id,
+                content_hash=content_hash_f,
+                producer=producer,
+                claim_text=str(claim or ""),
+                phase_sep_version=phase_sep_version,
+                conn=conn,
+            )
+        post_commit_failures = self._after_claim_commit(cid, prepared["topic"], prepared["claim"])
+        result = {"id": cid, "type": claim_type, "repository_id": repo_id,
+                  "source_event_id": source_event_id, "deduplicated": False}
+        if post_commit_failures:
+            result["status"] = "committed_with_deferred_failures"
+            result["post_commit_failures"] = post_commit_failures
+        return result
 
     def _code_claim_query(self, a: Dict[str, Any]) -> Dict[str, Any]:
-        repo_id = a.get("repository_id", ""); symbol_id = a.get("symbol_id", "")
-        file_path = a.get("file_path", ""); query = a.get("query", "")
-        limit = int(a.get("limit", 10))
+        repo_id = str(a.get("repository_id", "")).strip()
+        if not repo_id:
+            raise ValueError("repository_id is required for code claim queries")
+        symbol_id = str(a.get("symbol_id", "")).strip()
+        file_path_raw = str(a.get("file_path", "")).strip()
+        file_path = self._canonical_code_path(file_path_raw) if file_path_raw else ""
+        query = str(a.get("query", "") or "")
+        limit = max(1, min(int(a.get("limit", 10)), 200))
         c = self._connect()
-        conds = ["status='active'"]; params = []
-        if repo_id: conds.append("evidence LIKE ?"); params.append(f"%repository: {repo_id}%")
-        if file_path: conds.append("evidence LIKE ?"); params.append(f"%file: {file_path}%")
-        if symbol_id: conds.append("evidence LIKE ?"); params.append(f"%symbol: {symbol_id}%")
-        if query: conds.append("(claim LIKE ? OR topic LIKE ?)"); params.extend([f"%{query}%", f"%{query}%"])
-        sql = f"SELECT id, claim, topic, confidence, salience, evidence, updated_at FROM claims WHERE {' AND '.join(conds)} ORDER BY updated_at DESC LIMIT ?"
+        joins = ["c.status='active'", "m.repository_id=?"]
+        params: list = [repo_id]
+        if file_path:
+            joins.append("m.file_path=?")
+            params.append(file_path)
+        if symbol_id:
+            joins.append("m.symbol_id=?")
+            params.append(symbol_id)
+        if query:
+            escaped = self._escape_like(query)
+            joins.append("(c.claim LIKE ? ESCAPE '\\' OR c.topic LIKE ? ESCAPE '\\')")
+            params.extend([f"%{escaped}%", f"%{escaped}%"])
+        sql = (
+            "SELECT c.id,c.claim,c.topic,c.confidence,c.salience,c.evidence,c.updated_at,"
+            "m.repository_id,m.file_path,m.symbol_id,m.symbol_revision,m.content_hash,m.claim_type "
+            "FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id "
+            "WHERE " + " AND ".join(joins) +
+            " ORDER BY c.updated_at DESC LIMIT ?"
+        )
         params.append(limit)
         return {"claims": [dict(r) for r in c.execute(sql, params).fetchall()]}
 
     def _symbol_history(self, a: Dict[str, Any]) -> Dict[str, Any]:
-        symbol_id = a.get("symbol_id", ""); limit = int(a.get("limit", 20))
+        repo_id = str(a.get("repository_id", "")).strip()
+        symbol_id = str(a.get("symbol_id", "")).strip()
+        limit = int(a.get("limit", 20))
+        if not repo_id:
+            raise ValueError("repository_id is required for symbol history")
+        if not symbol_id:
+            raise ValueError("symbol_id is required for symbol history")
+        joins = ["m.repository_id=?", "m.symbol_id=?"]
         rows = self._connect().execute(
-            "SELECT id, claim, topic, evidence, updated_at, status FROM claims WHERE evidence LIKE ? ORDER BY updated_at DESC LIMIT ?",
-            (f"%symbol: {symbol_id}%", limit)).fetchall()
-        return {"symbol_id": symbol_id, "history": [dict(r) for r in rows]}
+            "SELECT c.id, c.claim, c.topic, c.evidence, c.updated_at, c.status,"
+            " m.repository_id, m.file_path, m.symbol_id, m.symbol_revision, m.content_hash"
+            " FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id"
+            " WHERE " + " AND ".join(joins) + " ORDER BY c.updated_at DESC LIMIT ?",
+            (repo_id, symbol_id, limit)).fetchall()
+        return {"repository_id": repo_id, "symbol_id": symbol_id, "history": [dict(r) for r in rows]}
 
     def _repository_context(self, a: Dict[str, Any]) -> Dict[str, Any]:
-        repo_id = a.get("repository_id", ""); limit = int(a.get("limit", 30))
+        repo_id = str(a.get("repository_id", "")).strip()
+        limit = int(a.get("limit", 30))
+        if not repo_id:
+            raise ValueError("repository_id is required for repository context")
         rows = self._connect().execute(
-            "SELECT id, claim, topic, evidence, confidence, salience, updated_at FROM claims WHERE status='active' AND evidence LIKE ? ORDER BY salience DESC LIMIT ?",
-            (f"%repository: {repo_id}%", limit)).fetchall()
+            "SELECT c.id, c.claim, c.topic, c.evidence, c.confidence, c.salience, c.updated_at,"
+            " m.repository_id, m.file_path, m.symbol_id, m.symbol_revision, m.content_hash"
+            " FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id"
+            " WHERE c.status='active' AND m.repository_id=? ORDER BY salience DESC LIMIT ?",
+            (repo_id, limit)).fetchall()
         return {"repository_id": repo_id, "claims": [dict(r) for r in rows]}
 
     def _invalidate_revision(self, a: Dict[str, Any]) -> Dict[str, Any]:
-        symbol_id = a.get("symbol_id", ""); file_path = a.get("file_path", "")
-        new_sha = a.get("new_commit_sha", "")
-        c = self._connect(); conds = ["status='active'"]; params = []
-        if symbol_id: conds.append("evidence LIKE ?"); params.append(f"%symbol: {symbol_id}%")
-        if file_path: conds.append("evidence LIKE ?"); params.append(f"%file: {file_path}%")
-        rows = c.execute(f"SELECT id FROM claims WHERE {' AND '.join(conds)}", params).fetchall()
-        for r in rows:
-            c.execute("UPDATE claims SET status='archived', evidence=evidence || ? WHERE id=?",
-                      (f" | invalidated at {new_sha[:12] if new_sha else 'revision_change'}", r["id"]))
-        c.commit()
-        return {"invalidated": len(rows), "ids": [r["id"] for r in rows]}
+        repo_id = str(a.get("repository_id", "")).strip()
+        symbol_id = str(a.get("symbol_id", "")).strip()
+        file_path_raw = str(a.get("file_path", "")).strip()
+        file_path = self._canonical_code_path(file_path_raw) if file_path_raw else ""
+        new_commit_sha = str(a.get("new_commit_sha", "")).strip()
+        new_content_hash = str(a.get("new_content_hash", "")).strip().lower()
+        if new_content_hash.startswith("sha256:"):
+            new_content_hash = new_content_hash[7:]
+        if new_content_hash and not re.fullmatch(r"[0-9a-f]{64}", new_content_hash):
+            raise ValueError("new_content_hash must be SHA-256")
+        if not repo_id:
+            raise ValueError("repository_id is required for revision invalidation")
+        if not symbol_id and not file_path:
+            raise ValueError("symbol_id or file_path is required — bare repository invalidation is too broad")
+
+        revision_label = new_commit_sha[:12] or new_content_hash[:12] or "revision_change"
+        labels = [f" | invalidated at {revision_label}"]
+        where = ["c.status='active'", "m.repository_id=?"]
+        params: list = [repo_id]
+        if symbol_id:
+            where.append("m.symbol_id=?")
+            params.append(symbol_id)
+            labels.insert(0, f"symbol:{symbol_id}")
+        if file_path:
+            where.append("m.file_path=?")
+            params.append(file_path)
+            labels.insert(0, f"file:{file_path}")
+        if new_content_hash:
+            # Never archive a claim that already describes the new exact content.
+            where.append("m.content_hash<>?")
+            params.append(new_content_hash)
+        suffix = "".join(labels)
+
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT c.*,m.file_path,m.symbol_id,m.content_hash "
+                "FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id "
+                "WHERE " + " AND ".join(where),
+                params,
+            ).fetchall()
+            for row in rows:
+                cid = str(row["id"])
+                before = dict(row)
+                conn.execute(
+                    "UPDATE claims SET status='archived', temporal_status='historical', "
+                    "evidence=evidence || ?, updated_at=? WHERE id=?",
+                    (suffix, now(), cid),
+                )
+                conn.execute("DELETE FROM claims_fts WHERE id=?", (cid,))
+                after_row = conn.execute("SELECT * FROM claims WHERE id=?", (cid,)).fetchone()
+                reason = (
+                    f"repository_id={repo_id}; new_commit_sha={new_commit_sha[:64]}; "
+                    f"new_content_hash={new_content_hash}"
+                )
+                self._record_mutation(
+                    "invalidate_revision", "claims", cid, before,
+                    dict(after_row) if after_row else {"id": cid, "status": "archived"},
+                    reason,
+                    conn=conn,
+                )
+                self._audit("revision_invalidation", "ok", f"claim_id={cid}; {reason}", conn=conn)
+                if SEMANTIC_ENABLED:
+                    _outbox_enqueue(
+                        "delete", "claim", cid,
+                        {"collection": _active_collection_name(), "reason": "revision_invalidation"},
+                        conn=conn,
+                    )
+        return {
+            "invalidated": len(rows),
+            "ids": [str(r["id"]) for r in rows],
+            "repository_id": repo_id,
+            "file_path": file_path,
+            "symbol_id": symbol_id,
+            "new_commit_sha": new_commit_sha,
+            "new_content_hash": new_content_hash,
+        }
 
     def _patch_outcome_add(self, a: Dict[str, Any]) -> Dict[str, Any]:
-        patch_id = a.get("patch_id", ""); outcome = a.get("outcome", "")
-        repo_id = a.get("repository_id", ""); changed_files = a.get("changed_files", [])
-        changed_symbols = a.get("changed_symbols", [])
-        claim = f"Patch {patch_id}: {outcome}. Files: {', '.join(changed_files[:5])}. Symbols: {', '.join(changed_symbols[:5])}"
-        meta = f"repository: {repo_id}" if repo_id else ""
-        if a.get("rollback_steps"): meta += f" | rollback: {a['rollback_steps'][:200]}"
-        cid = self._add_claim(claim=claim, topic="patch-outcomes", evidence=meta,
-                              source="tool:patch_outcome_add", confidence=0.9, salience=0.8)
-        return {"id": cid, "patch_id": patch_id, "outcome": outcome}
+        repository_id = str(a.get("repository_id", "")).strip()
+        source_event_id = str(a.get("source_event_id", "")).strip()
+        producer = str(a.get("producer", "mcp-code-shrinker") or "mcp-code-shrinker").strip()
+        phase_sep_version = str(a.get("phase_sep_version", "2") or "2").strip()
+        patch_id = str(a.get("patch_id", "")).strip()
+        outcome = str(a.get("outcome", "")).strip()
+        commit_sha = str(a.get("commit_sha", "")).strip()
+        if not repository_id:
+            raise ValueError("repository_id is required for patch outcomes")
+        if not patch_id:
+            raise ValueError("patch_id is required for patch outcomes")
+        if not outcome:
+            raise ValueError("outcome is required for patch outcomes")
 
-    def _ingest_idempotent(self, claim_text: str, source_event_id: str = "", phase_sep_version: str = "1") -> str | None:
-        """Check dedup: same source_event_id + content_hash → already ingested."""
-        if not source_event_id: return None
-        content_hash = hashlib.sha256(claim_text.encode()).hexdigest()[:16]
-        c = self._connect()
-        row = c.execute("SELECT id FROM claims WHERE evidence LIKE ? AND evidence LIKE ? LIMIT 1",
-            (f"%source_event:{source_event_id}%", f"%content_hash:{content_hash}%")).fetchone()
-        return row["id"] if row else None
+        def normalized_hash(value: Any) -> str:
+            raw = str(value or "").strip().lower()
+            if raw.startswith("sha256:"):
+                raw = raw[7:]
+            if raw and not re.fullmatch(r"[0-9a-f]{64}", raw):
+                raise ValueError("content hashes must be SHA-256")
+            return raw
 
-    def _mark_ingested(self, claim_id: str, source_event_id: str, content_hash: str) -> None:
-        c = self._connect()
-        c.execute("UPDATE claims SET evidence = evidence || ? WHERE id=?",
-            (f" | source_event:{source_event_id} content_hash:{content_hash}", claim_id))
-        c.commit()
+        old_content_hash = normalized_hash(a.get("old_content_hash"))
+        new_content_hash = normalized_hash(a.get("new_content_hash"))
+        changed_files = list(dict.fromkeys(
+            self._canonical_code_path(v)
+            for v in (a.get("changed_files") or [])
+            if str(v or "").strip()
+        ))
+        changed_symbols = list(dict.fromkeys(
+            str(v).strip() for v in (a.get("changed_symbols") or []) if str(v).strip()
+        ))
+        validation_report = a.get("validation_report") or {}
+        if not isinstance(validation_report, dict):
+            raise ValueError("validation_report must be an object")
+        rollback_steps = str(a.get("rollback_steps", ""))[:20000]
+        claim = (
+            f"Patch {patch_id}: {outcome}. "
+            f"Files: {', '.join(changed_files[:5]) or 'none'}. "
+            f"Symbols: {', '.join(changed_symbols[:5]) or 'none'}"
+        )
+        existing_claim_id = self._ingest_idempotent(
+            claim, source_event_id, phase_sep_version, producer
+        )
+        if existing_claim_id:
+            return {
+                "id": existing_claim_id,
+                "patch_id": patch_id,
+                "outcome": outcome,
+                "repository_id": repository_id,
+                "status": "deduplicated",
+                "deduplicated": True,
+                "source_event_id": source_event_id,
+            }
 
-    def _resolve_temporal(self, topic: str, claim_text: str, new_claim_id: str = "", conn=None) -> Dict[str, Any]:
-        """Check if new claim supersedes existing active claims on same topic."""
+        evidence_parts = [f"repository: {repository_id}"]
+        if commit_sha:
+            evidence_parts.append(f"commit: {commit_sha}")
+        if new_content_hash:
+            evidence_parts.append(f"new_content_hash: {new_content_hash}")
+        if rollback_steps:
+            evidence_parts.append(f"rollback: {rollback_steps[:500]}")
+        prepared = self._prepare_claim(
+            claim=claim,
+            topic="patch-outcomes",
+            evidence=" | ".join(evidence_parts),
+            source="tool:patch_outcome_add",
+            confidence=0.9,
+            salience=0.8,
+            identity_scope="\0".join(("patch_outcome", repository_id, patch_id)),
+        )
+        if isinstance(prepared, str) and prepared.startswith("rq_"):
+            return {
+                "status": "need_review",
+                "review_id": prepared,
+                "patch_id": patch_id,
+                "repository_id": repository_id,
+            }
+        metadata_hash = new_content_hash or hashlib.sha256(
+            prepared["normalized"].encode("utf-8")
+        ).hexdigest()
+        prepared.update({
+            "repository_id": repository_id,
+            "file_path": changed_files[0] if len(changed_files) == 1 else "",
+            "symbol_id": changed_symbols[0] if len(changed_symbols) == 1 else "",
+            "symbol_revision": "",
+            "content_hash": metadata_hash,
+            "code_claim_type": "patch_outcome",
+        })
+        ts = now()
+        with self._connect() as conn:
+            cid = self._add_claim_tx(conn, prepared, 0.9, 0.8)
+            conn.execute(
+                """INSERT INTO code_claim_metadata(
+                       claim_id,repository_id,commit_sha,file_path,symbol_id,
+                       symbol_revision,content_hash,claim_type)
+                   VALUES(?,?,?,?,?,?,?,?)
+                   ON CONFLICT(claim_id) DO UPDATE SET
+                       repository_id=excluded.repository_id,
+                       commit_sha=excluded.commit_sha,
+                       file_path=excluded.file_path,
+                       symbol_id=excluded.symbol_id,
+                       symbol_revision=excluded.symbol_revision,
+                       content_hash=excluded.content_hash,
+                       claim_type=excluded.claim_type""",
+                (
+                    cid, repository_id, commit_sha,
+                    changed_files[0] if len(changed_files) == 1 else "",
+                    changed_symbols[0] if len(changed_symbols) == 1 else "",
+                    "", metadata_hash, "patch_outcome",
+                ),
+            )
+            conn.execute(
+                """INSERT INTO patch_outcomes(
+                       repository_id,patch_id,claim_id,outcome,commit_sha,
+                       old_content_hash,new_content_hash,changed_files_json,
+                       changed_symbols_json,validation_report_json,rollback_steps,
+                       source_event_id,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                   ON CONFLICT(repository_id,patch_id) DO UPDATE SET
+                       claim_id=excluded.claim_id,
+                       outcome=excluded.outcome,
+                       commit_sha=excluded.commit_sha,
+                       old_content_hash=excluded.old_content_hash,
+                       new_content_hash=excluded.new_content_hash,
+                       changed_files_json=excluded.changed_files_json,
+                       changed_symbols_json=excluded.changed_symbols_json,
+                       validation_report_json=excluded.validation_report_json,
+                       rollback_steps=excluded.rollback_steps,
+                       source_event_id=excluded.source_event_id,
+                       updated_at=excluded.updated_at""",
+                (
+                    repository_id, patch_id, cid, outcome, commit_sha,
+                    old_content_hash, new_content_hash,
+                    json.dumps(changed_files, ensure_ascii=False),
+                    json.dumps(changed_symbols, ensure_ascii=False),
+                    json.dumps(validation_report, ensure_ascii=False, sort_keys=True),
+                    rollback_steps, source_event_id, ts, ts,
+                ),
+            )
+            self._mark_ingested(
+                cid, source_event_id, content_hash=metadata_hash,
+                producer=producer, claim_text=claim,
+                phase_sep_version=phase_sep_version, conn=conn,
+            )
+        post_commit_failures = self._after_claim_commit(
+            cid, prepared["topic"], prepared["claim"]
+        )
+        result = {
+            "id": cid,
+            "patch_id": patch_id,
+            "outcome": outcome,
+            "repository_id": repository_id,
+            "source_event_id": source_event_id,
+            "deduplicated": False,
+            "structured": True,
+        }
+        if post_commit_failures:
+            result["status"] = "committed_with_deferred_failures"
+            result["post_commit_failures"] = post_commit_failures
+        return result
+
+    def _drain_code_shrinker_events(self, limit: int = 100) -> Dict[str, Any]:
+        """Consume atomic patch events produced by mcp-code-shrinker.
+
+        Files are claimed by rename, processed idempotently through integration_events,
+        then moved to done/ or dead-letter/. No init.py split is required.
+        """
+        base = self.home / "context-coordination"
+        inbox = base / "inbox" / "code-shrinker"
+        done = base / "done" / "code-shrinker"
+        dead = base / "dead-letter" / "code-shrinker"
+        for path in (inbox, done, dead):
+            path.mkdir(parents=True, exist_ok=True)
+        processed = deduplicated = failed = 0
+        for event_path in sorted(inbox.glob("*.json"))[:max(1, min(int(limit), 1000))]:
+            claimed = event_path.with_name(
+                f".{event_path.name}.processing.{os.getpid()}.{threading.get_ident()}"
+            )
+            try:
+                os.replace(event_path, claimed)
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                _debug_log(f"Could not claim integration event {event_path}: {exc}")
+                continue
+            try:
+                raw = claimed.read_text(encoding="utf-8")
+                event = json.loads(raw)
+                if not isinstance(event, dict):
+                    raise ValueError("event must be an object")
+                if int(event.get("event_version", 0)) != 1:
+                    raise ValueError("unsupported event_version")
+                producer = str(event.get("producer") or "")
+                if producer not in {"mcp-code-shrinker", "code-shrinker"}:
+                    raise ValueError("unexpected producer")
+                if str(event.get("type") or "") != "patch_applied":
+                    raise ValueError("unsupported event type")
+                event_id = str(event.get("event_id") or "").strip()
+                repository_id = str(event.get("repository_id") or "").strip()
+                patch_id = str(event.get("patch_id") or "").strip()
+                if not event_id or not repository_id or not patch_id:
+                    raise ValueError("event_id, repository_id and patch_id are required")
+
+                per_file = event.get("per_file") or []
+                if not isinstance(per_file, list):
+                    raise ValueError("per_file must be an array")
+                changed_files = event.get("changed_files") or [
+                    item.get("file_path") for item in per_file if isinstance(item, dict)
+                ]
+                changed_symbols = event.get("changed_symbols") or []
+                old_hash = str(event.get("old_content_hash") or "")
+                new_hash = str(event.get("new_content_hash") or "")
+                if len(per_file) == 1 and isinstance(per_file[0], dict):
+                    old_hash = old_hash or str(per_file[0].get("old_content_hash") or "")
+                    new_hash = new_hash or str(per_file[0].get("new_content_hash") or "")
+
+                outcome_result = self._patch_outcome_add({
+                    "patch_id": patch_id,
+                    "outcome": str(event.get("outcome") or "applied"),
+                    "repository_id": repository_id,
+                    "commit_sha": str(event.get("commit_sha") or ""),
+                    "old_content_hash": old_hash,
+                    "new_content_hash": new_hash,
+                    "validation_report": event.get("validation_report") or {},
+                    "changed_files": changed_files,
+                    "changed_symbols": changed_symbols,
+                    "rollback_steps": str(event.get("rollback_steps") or ""),
+                    "source_event_id": event_id,
+                    "producer": "mcp-code-shrinker",
+                    "phase_sep_version": "2",
+                })
+                if outcome_result.get("deduplicated"):
+                    deduplicated += 1
+
+                invalidations = []
+                for item in per_file:
+                    if not isinstance(item, dict):
+                        continue
+                    file_path = str(item.get("file_path") or "").strip()
+                    if not file_path:
+                        continue
+                    invalidations.append(self._invalidate_revision({
+                        "repository_id": repository_id,
+                        "file_path": file_path,
+                        "new_commit_sha": str(event.get("commit_sha") or ""),
+                        "new_content_hash": str(item.get("new_content_hash") or ""),
+                    }))
+                if not per_file:
+                    for file_path in changed_files:
+                        if str(file_path or "").strip():
+                            invalidations.append(self._invalidate_revision({
+                                "repository_id": repository_id,
+                                "file_path": file_path,
+                                "new_commit_sha": str(event.get("commit_sha") or ""),
+                                "new_content_hash": new_hash,
+                            }))
+                destination = done / event_path.name
+                os.replace(claimed, destination)
+                processed += 1
+            except Exception as exc:
+                failed += 1
+                try:
+                    error_path = dead / event_path.name
+                    os.replace(claimed, error_path)
+                    error_meta = error_path.with_suffix(error_path.suffix + ".error.json")
+                    atomic_write(error_meta, json.dumps({
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "failed_at": now(),
+                    }, ensure_ascii=False, indent=2) + "\n")
+                except Exception as move_exc:
+                    _debug_log(
+                        f"Failed to dead-letter integration event {event_path}: {move_exc}"
+                    )
+        return {
+            "processed": processed,
+            "deduplicated": deduplicated,
+            "failed": failed,
+        }
+
+    @staticmethod
+    def _integration_payload_hash(claim_text: str, phase_sep_version: str = "2") -> str:
+        return hashlib.sha256(
+            (str(phase_sep_version or "2") + "\0" + str(claim_text or "")).encode("utf-8")
+        ).hexdigest()
+
+    def _ingest_idempotent(
+        self,
+        claim_text: str,
+        source_event_id: str = "",
+        phase_sep_version: str = "2",
+        producer: str = "code-shrinker",
+    ) -> str | None:
+        """Return the previous claim for an identical producer event.
+
+        Reusing an event ID with a different canonical payload is rejected.
+        """
+        event_id = str(source_event_id or "").strip()
+        if not event_id:
+            return None
+        payload_hash = self._integration_payload_hash(claim_text, phase_sep_version)
+        row = self._connect().execute(
+            "SELECT result_claim_id,payload_hash FROM integration_events "
+            "WHERE producer=? AND event_id=?",
+            (str(producer or "code-shrinker"), event_id),
+        ).fetchone()
+        if not row:
+            return None
+        if str(row["payload_hash"]) != payload_hash:
+            raise ValueError("source_event_id was already used with a different payload")
+        return str(row["result_claim_id"] or "") or None
+
+    def _mark_ingested(
+        self,
+        claim_id: str,
+        source_event_id: str,
+        content_hash: str = "",
+        *,
+        producer: str = "code-shrinker",
+        claim_text: str = "",
+        phase_sep_version: str = "2",
+        conn=None,
+    ) -> None:
+        event_id = str(source_event_id or "").strip()
+        if not event_id:
+            return
+        producer_id = str(producer or "code-shrinker")
+        payload_hash = self._integration_payload_hash(claim_text, phase_sep_version)
+        code_content_hash = str(content_hash or "").strip().lower()
+        owns = conn is None
         c = conn or self._connect()
-        rows = c.execute("SELECT id,claim,temporal_status FROM claims WHERE topic=? AND id!=? AND status IN ('active','current') ORDER BY created_at DESC LIMIT 20", (topic, new_claim_id)).fetchall()
-        superseded = []
+        existing = c.execute(
+            "SELECT payload_hash,result_claim_id FROM integration_events "
+            "WHERE producer=? AND event_id=?",
+            (producer_id, event_id),
+        ).fetchone()
+        if existing and str(existing["payload_hash"]) != payload_hash:
+            raise ValueError("source_event_id was already used with a different payload")
+        c.execute(
+            """INSERT INTO integration_events(producer,event_id,payload_hash,result_claim_id,processed_at)
+               VALUES(?,?,?,?,?)
+               ON CONFLICT(producer,event_id) DO UPDATE SET
+                   result_claim_id=excluded.result_claim_id,
+                   processed_at=excluded.processed_at""",
+            (producer_id, event_id, payload_hash, claim_id, now()),
+        )
+        marker = f" | source_event:{event_id} event_payload_hash:{payload_hash}"
+        if re.fullmatch(r"[0-9a-f]{64}", code_content_hash):
+            marker += f" content_hash:{code_content_hash}"
+        c.execute(
+            "UPDATE claims SET evidence=evidence || ? WHERE id=?",
+            (marker, claim_id),
+        )
+        if owns:
+            c.commit()
+
+    def _resolve_temporal(
+        self,
+        topic: str,
+        claim_text: str,
+        new_claim_id: str = "",
+        conn=None,
+        *,
+        repository_id: str = "",
+        file_path: str = "",
+        symbol_id: str = "",
+    ) -> Dict[str, Any]:
+        """Resolve supersession without crossing code-repository boundaries.
+
+        Ordinary personal memories keep the historical topic-level behavior.
+        Code-linked claims are restricted to the same repository and, where
+        available, the same symbol (or at least the same canonical file).
+        """
+        c = conn or self._connect()
+        repository_id = str(repository_id or "").strip()
+        file_path = str(file_path or "").strip()
+        symbol_id = str(symbol_id or "").strip()
+        if repository_id:
+            where = [
+                "c.topic=?", "c.id!=?", "c.status IN ('active','current')",
+                "m.repository_id=?",
+            ]
+            params: List[Any] = [topic, new_claim_id, repository_id]
+            if symbol_id:
+                where.append("m.symbol_id=?")
+                params.append(symbol_id)
+            elif file_path:
+                where.append("m.file_path=?")
+                params.append(file_path)
+            rows = c.execute(
+                "SELECT c.id,c.claim,c.temporal_status "
+                "FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id "
+                "WHERE " + " AND ".join(where) +
+                " ORDER BY c.created_at DESC LIMIT 20",
+                params,
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT id,claim,temporal_status FROM claims "
+                "WHERE topic=? AND id!=? AND status IN ('active','current') "
+                "ORDER BY created_at DESC LIMIT 20",
+                (topic, new_claim_id),
+            ).fetchall()
+        superseded: List[str] = []
         n_lower = claim_text.lower()
+        temporal_signal = any(sig in n_lower for sig in (
+            "no longer", "replaced", "changed to", "now uses", "instead of",
+            "rather than", "заменён", "перешёл на", "больше не",
+        ))
         for r in rows:
-            if r["temporal_status"] == "superseded": continue
+            if r["temporal_status"] == "superseded":
+                continue
             o_lower = str(r["claim"] or "").lower()
-            # Check contradiction signals in raw text (not slugified)
-            for sig in ["no longer","replaced","changed to","now uses","instead of","rather than","заменён","перешёл на","больше не"]:
-                if sig in n_lower:
-                    superseded.append(r["id"]); break
-            if not superseded:
-                # Entity match: same ports/models/versions → same subject
-                vals_n = set(re.findall(r'\d+\.\d+|port\s+\d+|model[\s:]+\S+', n_lower))
-                vals_o = set(re.findall(r'\d+\.\d+|port\s+\d+|model[\s:]+\S+', o_lower))
-                if vals_n and vals_o and vals_n != vals_o:
-                    superseded.append(r["id"])
-        return {"action": "insert_and_supersede" if superseded else "insert", "supersedes": superseded}
+            should_supersede = temporal_signal
+            if not should_supersede:
+                vals_n = set(re.findall(
+                    r'\d+\.\d+|port\s+\d+|model[\s:]+\S+', n_lower
+                ))
+                vals_o = set(re.findall(
+                    r'\d+\.\d+|port\s+\d+|model[\s:]+\S+', o_lower
+                ))
+                should_supersede = bool(vals_n and vals_o and vals_n != vals_o)
+            if should_supersede:
+                superseded.append(str(r["id"]))
+        return {
+            "action": "insert_and_supersede" if superseded else "insert",
+            "supersedes": superseded,
+        }
 
     def _apply_supersession(self, superseded_ids: list, new_claim_id: str, conn=None) -> int:
         """Mark superseded claims as historical."""
@@ -3580,33 +4989,53 @@ class MemoryWikiProvider(MemoryProvider):
         return dict(rows) if rows else {}
 
 
-    def _add_claim(self, claim: str, topic="general", evidence="", source="tool", confidence=.7, salience=.7) -> str:
+    def _prepare_claim(self, claim: str, topic="general", evidence="", source="tool", confidence=.7, salience=.7, identity_scope="", *, visibility_scope="", project_id="", event_at=0, event_timezone="UTC"):
         raw_claim=scrub_memory_artifacts(str(claim or "")); raw_evidence=scrub_memory_artifacts(str(evidence or ""))
         raw_secret=bool(secret_scan(raw_claim + " " + raw_evidence).get("raw_secret"))
         if raw_secret:
             self._quarantine_secret("claims", "pending", "claim/evidence", raw_claim + "\n" + raw_evidence, "add_claim_raw_secret")
-        claim = normalize_claim(redact_secrets(raw_claim)); evidence = short(redact_secrets(raw_evidence), 2000)
+        claim = normalize_claim(redact_secrets(raw_claim)); evidence_full = short(redact_secrets(raw_evidence), 2000)
         if raw_secret:
             claim = REDACTION_TOKEN_RE.sub("[REDACTED_SECRET]", claim)
-            evidence = REDACTION_TOKEN_RE.sub("[REDACTED_SECRET]", evidence)
+            evidence_full = REDACTION_TOKEN_RE.sub("[REDACTED_SECRET]", evidence_full)
         if not claim or is_ephemeral_fragment(claim):
             raise ValueError("empty or ephemeral claim")
         # --- Context Capsule Ban ---
         if claim.lower().startswith("context capsule (memory_index/") or "context capsule (memory_index/" in claim.lower():
             raise ValueError("context capsule claims are banned — use memory_wiki_add_relation instead")
-        # --- Evidence truncation: 200 chars max in claim, full text → evidence_full ---
-        evidence = short(evidence, 200)
+        # Keep a compact summary in claims.evidence and the bounded full text in evidence rows.
+        evidence = short(evidence_full, 200)
         gate = memory_gate_decision(claim, topic, source)
         if gate.get("action") == "reject":
             raise ValueError("claim rejected by memory quality gate: " + str(gate.get("reason")))
         if gate.get("action") == "queue" and not str(source or "").startswith("phase6_curated_summary"):
             return self._enqueue_review(claim, topic or self._infer_topic(claim), evidence, source, str(gate.get("reason") or "quality gate"), confidence, salience)
-        topic = self._topic_alias(topic or self._infer_topic(claim), claim); normalized = normalize_claim(claim); h = sha(normalized.lower()); cid = "c_" + h[:12]
+        topic = self._topic_alias(topic or self._infer_topic(claim), claim); normalized = normalize_claim(claim)
+        scope = infer_scope(normalized, source, topic)
+        project_id = str(project_id or (self.project_scope if scope=="project" else "") or (current_project_id() if scope=="project" else ""))
+        visibility_scope = str(visibility_scope or self._default_visibility_for(source, project_id)).lower()
+        if visibility_scope not in {"global","bot","chat","project","private"}:
+            raise ValueError("visibility_scope must be one of: global, bot, chat, project, private")
+        if visibility_scope == "project" and not project_id:
+            raise ValueError("project visibility requires project_id or MEMORY_WIKI_PROJECT_ID")
+        visibility_identity = {
+            "global": "visibility:global",
+            "bot": f"visibility:bot:{self.bot_id}",
+            "chat": f"visibility:chat:{self._chat_hash(self.session_id)}",
+            "private": f"visibility:private:{self.session_id}",
+            "project": f"visibility:project:{project_id}",
+        }[visibility_scope]
+        effective_identity_scope = identity_scope or visibility_identity
+        hash_input = effective_identity_scope + "\0" + normalized.lower(); h = sha(hash_input); cid = "c_" + h[:12]
         if raw_secret:
             sid = self._make_secret_index_from_raw("claims", cid, "claim/evidence", raw_claim + "\n" + raw_evidence, claim + "\n" + evidence)
             if sid and "[REDACTED_SECRET]" not in evidence:
-                evidence = short(((evidence + "\n") if evidence else "") + "[REDACTED_SECRET]", 2000)
-        ts = now(); quality = claim_quality(normalized, topic); pinned = 1 if PIN_MARKER in normalized.lower() or PIN_MARKER in str(evidence).lower() else 0; ctype = infer_claim_type(normalized, topic); stype = infer_source_type(source); scope=infer_scope(normalized, source, topic); project_id=current_project_id() if scope=="project" else ""; tm=self._trust_meta(normalized, topic, source, evidence)
+                evidence_full = short(((evidence_full + "\n") if evidence_full else "") + "[REDACTED_SECRET]", 2000)
+                evidence = short(evidence_full, 200)
+        ts = now(); quality = claim_quality(normalized, topic); pinned = 1 if PIN_MARKER in normalized.lower() or PIN_MARKER in str(evidence).lower() else 0; ctype = infer_claim_type(normalized, topic); stype = infer_source_type(source)
+        event_at = int(event_at or ts)
+        event_timezone = short(str(event_timezone or "UTC"), 80)
+        tm=self._trust_meta(normalized, topic, source, evidence)
         # --- Verification pipeline ---
         # Curated sources (post_task, task_capsule, decision, etc.) → auto-verified.
         # Conversation/tool sources → unverified, flagged for review.
@@ -3620,64 +5049,182 @@ class MemoryWikiProvider(MemoryProvider):
         if quality < 0.35: flags.append("low_quality")
         source_ref = f"source:{short(source,120)}#sha256:{sha(raw_claim + raw_evidence)[:16]}"
         review_state = "queued" if flags and not pinned else "accepted"
+        return {
+            "claim": claim, "raw_claim": raw_claim, "evidence": evidence,
+            "evidence_full": evidence_full, "raw_evidence": raw_evidence,
+            "topic": topic, "normalized": normalized, "hash": h, "cid": cid,
+            "timestamp": ts, "quality": quality, "pinned": pinned,
+            "claim_type": ctype, "source_type": stype, "scope": scope, "project_id": project_id,
+            "trust_meta": tm, "verification_status": vfy_status, "verified_at": vfy_at,
+            "quality_flags": flags, "source_ref": source_ref, "review_state": review_state,
+            "source": source, "identity_scope": effective_identity_scope, "raw_secret": raw_secret,
+            "origin_bot_id": self.bot_id, "origin_session_id": self.session_id,
+            "origin_chat_hash": self._chat_hash(self.session_id), "source_kind": self._source_kind(source),
+            "visibility_scope": visibility_scope, "event_at": event_at, "event_timezone": event_timezone,
+            "project_id": project_id
+        }
+
+    def _add_claim_tx(self, conn, prepared: dict, confidence: float, salience: float) -> str:
+        p = prepared
+        claim = p["claim"]; evidence = p["evidence"]; evidence_full = p.get("evidence_full", evidence); source = p["source"]; topic = p["topic"]
+        normalized = p["normalized"]; h = p["hash"]; cid = p["cid"]; ts = p["timestamp"]
+        quality = p["quality"]; pinned = p["pinned"]; ctype = p["claim_type"]; stype = p["source_type"]
+        scope = p["scope"]; project_id = p["project_id"]; tm = p["trust_meta"]
+        vfy_status = p["verification_status"]; vfy_at = p["verified_at"]
+        flags = p["quality_flags"]; source_ref = p["source_ref"]; review_state = p["review_state"]
+        raw_secret = p["raw_secret"]
+        c = conn
         with self._lock:
-            c = self._connect()
-            with c:
-                ex = c.execute("SELECT id FROM claims WHERE hash=?", (h,)).fetchone()
-                if ex:
-                    cid = ex["id"]
-                    c.execute("UPDATE claims SET topic=?, source=?, source_type=?, type=?, normalized_claim=?, scope=?, project_id=?, evidence=CASE WHEN ?!='' THEN ? ELSE evidence END, confidence=max(confidence,?), salience=max(salience,?), quality=max(quality,?), pinned=max(pinned,?), trust_class=?, trust_score=max(trust_score,?), risk=?, custody=?, quality_flags=?, source_ref=CASE WHEN source_ref='' THEN ? ELSE source_ref END, review_state=?, quarantined_at=CASE WHEN ? THEN ? ELSE quarantined_at END, verification_status=CASE WHEN ? THEN ? ELSE verification_status END, last_verified_at=CASE WHEN ? THEN ? ELSE last_verified_at END, updated_at=?, freshness_at=? WHERE id=?", (topic, source, stype, ctype, normalized, scope, project_id, evidence, evidence, clamp(confidence), clamp(salience), quality, pinned, tm["trust_class"], tm["trust_score"], str(tm["risk"]), tm["custody"], json.dumps(flags,ensure_ascii=False), source_ref, review_state, 1 if str(tm["risk"])=="secret" else 0, ts, ts, ts, cid))
-                    # --- P2: Update SimHash on hash match ---
+            ex = c.execute("SELECT id FROM claims WHERE hash=?", (h,)).fetchone()
+            if ex:
+                cid = ex["id"]
+                c.execute("UPDATE claims SET topic=?, source=?, source_type=?, type=?, normalized_claim=?, scope=?, project_id=?, evidence=CASE WHEN ?!='' THEN ? ELSE evidence END, confidence=max(confidence,?), salience=max(salience,?), quality=max(quality,?), pinned=max(pinned,?), trust_class=?, trust_score=max(trust_score,?), risk=?, custody=?, quality_flags=?, source_ref=CASE WHEN source_ref='' THEN ? ELSE source_ref END, review_state=?, quarantined_at=CASE WHEN ? THEN ? ELSE quarantined_at END, verification_status=CASE WHEN ? THEN ? ELSE verification_status END, last_verified_at=CASE WHEN ? THEN ? ELSE last_verified_at END, updated_at=?, freshness_at=? WHERE id=?", (topic, source, stype, ctype, normalized, scope, project_id,
+ evidence, evidence, clamp(confidence), clamp(salience), quality, pinned,
+ tm["trust_class"], tm["trust_score"], str(tm["risk"]), tm["custody"],
+ json.dumps(flags,ensure_ascii=False),
+ source_ref,
+ review_state,
+ 1 if str(tm["risk"])=="secret" else 0, ts,
+ 1 if vfy_status == "verified" else 0, vfy_status,
+ 1 if vfy_at else 0, vfy_at,
+ ts, ts, cid))
+                # --- P2: Update SimHash on hash match ---
+                try:
+                    sh = _hash_to_signed(_compute_simhash(normalized))
+                    c.execute("INSERT OR REPLACE INTO claims_simhash(id,simhash) VALUES(?,?)", (cid, sh))
+                except Exception: pass
+            else:
+                # --- P2: Near-duplicate detection via SimHash before insert ---
+                identity_scope = str(p.get("identity_scope") or "")
+                near_merge_id = None
+                if not identity_scope and len(normalized) >= 50:  # Skip short + scoped claims
+                    try:
+                        sh = _hash_to_signed(_compute_simhash(normalized))
+                        # Hamming distance ≤ 3 бит — кандидаты в near-duplicate
+                        near_rows = c.execute(
+                            "SELECT cs.id, cs.simhash FROM claims_simhash cs JOIN claims cl ON cs.id=cl.id WHERE cl.status='active' ORDER BY cl.updated_at DESC LIMIT 200"
+                        ).fetchall()
+                        best_dist = 999
+                        for nr in near_rows:
+                            dist = (sh ^ int(nr["simhash"])).bit_count()
+                            if dist < best_dist:
+                                best_dist = dist
+                                near_merge_id = nr["id"] if dist <= 12 else None
+                        if near_merge_id:
+                            self._audit('dedup', 'simhash_near_merge', f'{cid} near-duplicate of {near_merge_id} (hamming={best_dist})', conn=c)
+                            c.execute(
+                                "UPDATE claims SET confidence=max(confidence,?), salience=max(salience,?), quality=max(quality,?), derived_from=CASE WHEN derived_from='' THEN ? ELSE derived_from END, updated_at=? WHERE id=?",
+                                (clamp(confidence), clamp(salience), quality, near_merge_id, ts, near_merge_id)
+                            )
+                            cid = near_merge_id
+                    except Exception: pass
+
+                if not near_merge_id:
+                    c.execute("INSERT INTO claims(id,claim,topic,status,confidence,salience,source,evidence,created_at,updated_at,freshness_at,hash,quality,pinned,normalized_claim,type,source_type,verification_status,last_verified_at,scope,project_id,usefulness,recall_count,last_recalled,trust_class,trust_score,risk,custody,quarantined_at,quality_flags,source_ref,derived_from,review_state,secrecy_level) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (cid, claim, topic, "active", clamp(confidence), clamp(salience), redact_secrets(source), short(evidence,2000), ts, ts, ts, h, quality, pinned, normalized, ctype, stype, vfy_status, vfy_at, scope, project_id, .5, 0, 0, tm["trust_class"], tm["trust_score"], str(tm["risk"]), tm["custody"], ts if str(tm["risk"])=="secret" else 0, json.dumps(flags,ensure_ascii=False), source_ref, "", review_state, "secret" if str(tm["risk"])=="secret" else ("internal" if bool(raw_secret) else "public")))
+                    # --- P2: Store SimHash for new claim ---
                     try:
                         sh = _hash_to_signed(_compute_simhash(normalized))
                         c.execute("INSERT OR REPLACE INTO claims_simhash(id,simhash) VALUES(?,?)", (cid, sh))
                     except Exception: pass
-                else:
-                    # --- P2: Near-duplicate detection via SimHash before insert ---
-                    near_merge_id = None
-                    if len(normalized) >= 50:  # Skip short claims (too noisy for SimHash)
-                        try:
-                            sh = _hash_to_signed(_compute_simhash(normalized))
-                            # Hamming distance ≤ 3 бит — кандидаты в near-duplicate
-                            near_rows = c.execute(
-                                "SELECT cs.id, cs.simhash FROM claims_simhash cs JOIN claims cl ON cs.id=cl.id WHERE cl.status='active' ORDER BY cl.updated_at DESC LIMIT 200"
-                            ).fetchall()
-                            best_dist = 999
-                            for nr in near_rows:
-                                dist = (sh ^ int(nr["simhash"])).bit_count()
-                                if dist < best_dist:
-                                    best_dist = dist
-                                    near_merge_id = nr["id"] if dist <= 12 else None
-                            if near_merge_id:
-                                self._audit('dedup', 'simhash_near_merge', f'{cid} near-duplicate of {near_merge_id} (hamming={best_dist})', conn=c)
-                                c.execute(
-                                    "UPDATE claims SET confidence=max(confidence,?), salience=max(salience,?), quality=max(quality,?), derived_from=CASE WHEN derived_from='' THEN ? ELSE derived_from END, updated_at=? WHERE id=?",
-                                    (clamp(confidence), clamp(salience), quality, near_merge_id, ts, near_merge_id)
-                                )
-                                cid = near_merge_id
-                        except Exception: pass
-
-                    if not near_merge_id:
-                        c.execute("INSERT INTO claims(id,claim,topic,status,confidence,salience,source,evidence,created_at,updated_at,freshness_at,hash,quality,pinned,normalized_claim,type,source_type,verification_status,last_verified_at,scope,project_id,usefulness,recall_count,last_recalled,trust_class,trust_score,risk,custody,quarantined_at,quality_flags,source_ref,derived_from,review_state,secrecy_level) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (cid, claim, topic, "active", clamp(confidence), clamp(salience), redact_secrets(source), short(evidence,2000), ts, ts, ts, h, quality, pinned, normalized, ctype, stype, vfy_status, vfy_at, scope, project_id, .5, 0, 0, tm["trust_class"], tm["trust_score"], str(tm["risk"]), tm["custody"], ts if str(tm["risk"])=="secret" else 0, json.dumps(flags,ensure_ascii=False), source_ref, "", review_state, "secret" if str(tm["risk"])=="secret" else ("internal" if bool(raw_secret) else "public")))
-                        # --- P2: Store SimHash for new claim ---
-                        try:
-                            sh = _hash_to_signed(_compute_simhash(normalized))
-                            c.execute("INSERT OR REPLACE INTO claims_simhash(id,simhash) VALUES(?,?)", (cid, sh))
-                        except Exception: pass
-                if evidence: self._add_evidence(cid, evidence, "support", source, commit=False)
-                after_row = self._table_row("claims", cid)
-                self._record_mutation("upsert_claim", "claims", cid, {} if not ex else {"id": cid, "note": "pre-existing claim updated"}, after_row, source, conn=c)
-                # Outbox + temporal — inside same transaction as claim
-                if SEMANTIC_ENABLED:
-                    _outbox_enqueue("embed_and_upsert","claim",cid,{"text":normalized,"topic":topic,"collection":_active_collection_name()}, conn=c)
-                temporal_result = self._resolve_temporal(topic, claim, cid, conn=c)
-                if temporal_result.get("supersedes"):
-                    self._apply_supersession(temporal_result["supersedes"], cid, conn=c)
-            self._upsert_fts(cid); self._detect_contradictions_for(cid); self._add_change("upsert_claim", cid, claim); self._render_topic(topic); self._render_dashboards()
+            c.execute(
+                """UPDATE claims SET origin_bot_id=?,origin_session_id=?,origin_chat_hash=?,
+                   source_kind=?,visibility_scope=?,event_at=?,event_timezone=?,
+                   project_id=CASE WHEN ?!='' THEN ? ELSE project_id END WHERE id=?""",
+                (p.get("origin_bot_id", ""), p.get("origin_session_id", ""),
+                 p.get("origin_chat_hash", ""), p.get("source_kind", "other"),
+                 p.get("visibility_scope", "global"), int(p.get("event_at") or ts),
+                 p.get("event_timezone", "UTC"), p.get("project_id", ""),
+                 p.get("project_id", ""), cid),
+            )
+            if evidence_full: self._add_evidence(cid, evidence_full, "support", source, commit=False)
+            after_row = self._table_row("claims", cid)
+            self._record_mutation("upsert_claim", "claims", cid, {} if not ex else {"id": cid, "note": "pre-existing claim updated"}, after_row, source, conn=c)
+            self._audit(
+                "claim_upsert",
+                "ok",
+                json.dumps({
+                    "claim_id": cid,
+                    "topic": topic,
+                    "repository_id": str(p.get("repository_id") or ""),
+                    "file_path": str(p.get("file_path") or ""),
+                    "symbol_id": str(p.get("symbol_id") or ""),
+                }, ensure_ascii=False, sort_keys=True),
+                conn=c,
+            )
+            # Outbox + temporal — inside same transaction as claim
+            if SEMANTIC_ENABLED:
+                revision_row = c.execute("SELECT memory_revision,visibility_scope,origin_bot_id,origin_chat_hash,project_id,event_at FROM claims WHERE id=?", (cid,)).fetchone()
+                _outbox_enqueue("embed_and_upsert", "claim", cid, {
+                    "text": normalized, "topic": topic, "collection": _active_collection_name(),
+                    "memory_revision": int(revision_row["memory_revision"] or 0) if revision_row else 0,
+                    "visibility_scope": str(revision_row["visibility_scope"] or "global") if revision_row else "global",
+                    "origin_bot_id": str(revision_row["origin_bot_id"] or "") if revision_row else "",
+                    "origin_chat_hash": str(revision_row["origin_chat_hash"] or "") if revision_row else "",
+                    "project_id": str(revision_row["project_id"] or "") if revision_row else "",
+                    "event_at": int(revision_row["event_at"] or 0) if revision_row else 0,
+                }, conn=c)
+            temporal_result = self._resolve_temporal(
+                topic,
+                claim,
+                cid,
+                conn=c,
+                repository_id=str(p.get("repository_id") or ""),
+                file_path=str(p.get("file_path") or ""),
+                symbol_id=str(p.get("symbol_id") or ""),
+            )
+            if temporal_result.get("supersedes"):
+                self._apply_supersession(temporal_result["supersedes"], cid, conn=c)
         return cid
 
+    def _add_claim(self, claim: str, topic="general", evidence="", source="tool", confidence=.7, salience=.7, conn=None, *, visibility_scope="", project_id="", event_at=0, event_timezone="UTC") -> str:
+        prepared = self._prepare_claim(claim, topic, evidence, source, confidence, salience, visibility_scope=visibility_scope, project_id=project_id, event_at=event_at, event_timezone=event_timezone)
+        if isinstance(prepared, str) and prepared.startswith("rq_"):
+            return prepared
+        if conn is not None:
+            return self._add_claim_tx(conn, prepared, confidence, salience)
+        with self._connect() as own_conn:
+            cid = self._add_claim_tx(own_conn, prepared, confidence, salience)
+        self._after_claim_commit(cid, prepared["topic"], prepared["claim"])
+        return cid
 
-    # ----- env/config metadata -------------------------------------------
+    def _after_claim_commit(self, cid: str, topic: str, claim: str):
+        failures = []
+        for name, fn in [
+            ("fts", lambda: self._upsert_fts(cid)),
+            ("contradictions", lambda: self._detect_contradictions_for(cid)),
+            ("change_log", lambda: self._add_change("upsert_claim", cid, claim)),
+            ("render_topic", lambda: self._render_topic(topic)),
+            ("render_dashboards", self._render_dashboards),
+        ]:
+            try:
+                fn()
+            except Exception as exc:
+                failures.append({"operation": name, "error": str(exc)})
+        if failures:
+            try:
+                with self._connect() as conn:
+                    for failure in failures:
+                        fid = "pcf_" + sha(
+                            f"{cid}:{failure['operation']}:{failure['error']}:{now()}"
+                        )[:16]
+                        conn.execute(
+                            """INSERT OR IGNORE INTO post_commit_failures(
+                                   id,claim_id,operation,error,created_at,resolved_at)
+                               VALUES(?,?,?,?,?,0)""",
+                            (fid, cid, failure["operation"], short(failure["error"], 1600), now()),
+                        )
+                    self._audit(
+                        "post_commit",
+                        "deferred_failure",
+                        json.dumps({"claim_id": cid, "failures": failures}, ensure_ascii=False),
+                        conn=conn,
+                    )
+            except Exception as log_exc:
+                _debug_log(f"post-commit failure logging failed for {cid}: {log_exc}")
+        if SEMANTIC_ENABLED:
+            _start_outbox_worker(str(self.db_path))
+            _wake_outbox_worker(str(self.db_path))
+        return failures
     def _env_files(self) -> List[Path]:
         paths = [self.home / ".env", self.home / "proxy" / ".env"]
         return [p for p in paths if p.exists() and p.is_file()]
@@ -4039,7 +5586,7 @@ class MemoryWikiProvider(MemoryProvider):
         params.append(limit)
         return [self._sanitize_row(r) for r in c.execute(sql, params).fetchall()]
 
-    def _search(self, query: str, limit=10, include_stale=True, topic: Optional[str]=None) -> List[Dict[str, Any]]:
+    def _search(self, query: str, limit=10, include_stale=True, topic: Optional[str]=None, session_id: str="") -> List[Dict[str, Any]]:
         limit = max(1, min(int(limit or 10), 50)); q = query or ""; qt = tokens(q); c = self._connect()
         # --- v1.6: Auto-repair FTS on corruption ---
         try:
@@ -4052,7 +5599,7 @@ class MemoryWikiProvider(MemoryProvider):
                 except Exception:
                     return self._search_fallback(query, limit, include_stale, topic)
         candidates: Dict[str, sqlite3.Row] = {}; bm25: Dict[str, float] = {}
-        topic_slug = self._topic_alias(topic, "") if topic else ""; pid=current_project_id()
+        topic_slug = self._topic_alias(topic, "") if topic else ""; pid=self.project_scope or current_project_id()
         # --- Topic hierarchy: expand to parent topics for broader recall ---
         topic_parent_slugs = topic_parents(topic_slug) if topic_slug else []
         strict = os.environ.get("MEMORY_WIKI_STRICT_RECALL", "1").lower() not in ("0", "false", "no")
@@ -4127,6 +5674,7 @@ class MemoryWikiProvider(MemoryProvider):
         scored=[]
         for r in candidates.values():
             if r["status"] != "active": continue
+            if not self._claim_visible(r, session_id): continue
             if str(r["risk"] if "risk" in r.keys() else "low") == "secret": continue
             if int(r["quarantined_at"] if "quarantined_at" in r.keys() else 0) > 0: continue
             quality = float(r["quality"] if "quality" in r.keys() else claim_quality(r["claim"], r["topic"]))
@@ -4163,30 +5711,68 @@ class MemoryWikiProvider(MemoryProvider):
         return scored[:limit]
 
     def _upsert_fts(self, cid: str) -> None:
-        c = self._connect(); r = c.execute("SELECT * FROM claims WHERE id=?", (cid,)).fetchone()
-        if not r: return
-        normalized = r["normalized_claim"] if "normalized_claim" in r.keys() else r["claim"]
-        doc = claim_search_text(r["claim"], normalized, r["topic"], r["evidence"])
+        c = self._connect()
+        r = c.execute("SELECT * FROM claims WHERE id=?", (cid,)).fetchone()
         try:
             with c:
-                c.execute("DELETE FROM claims_fts WHERE id=?", (cid,)); c.execute("INSERT INTO claims_fts(id,claim,normalized,topic,evidence,search_text) VALUES(?,?,?,?,?,?)", (cid, r["claim"], normalized, r["topic"], r["evidence"], doc))
-        except Exception:
-            try:
-                with c:
-                    c.execute("DROP TABLE IF EXISTS claims_fts")
-                    c.execute("CREATE VIRTUAL TABLE claims_fts USING fts5(id UNINDEXED, claim, normalized, topic, evidence, search_text, tokenize='unicode61')")
-            except Exception: pass
+                c.execute("DELETE FROM claims_fts WHERE id=?", (cid,))
+                if not r or str(r["status"] or "") != "active":
+                    return
+                normalized = r["normalized_claim"] if "normalized_claim" in r.keys() else r["claim"]
+                doc = claim_search_text(r["claim"], normalized, r["topic"], r["evidence"])
+                c.execute(
+                    "INSERT INTO claims_fts(id,claim,normalized,topic,evidence,search_text) VALUES(?,?,?,?,?,?)",
+                    (cid, r["claim"], normalized, r["topic"], r["evidence"], doc),
+                )
+                self._set_meta_max(
+                    "fts_latest_revision",
+                    int(r["memory_revision"] if "memory_revision" in r.keys() else 0),
+                    conn=c,
+                )
+        except Exception as exc:
+            _debug_log(f"FTS upsert failed for {cid}; rebuilding: {type(exc).__name__}: {exc}")
+            self._rebuild_fts()
+            if r and str(r["status"] or "") == "active":
+                verify = c.execute("SELECT 1 FROM claims_fts WHERE id=? LIMIT 1", (cid,)).fetchone()
+                if not verify:
+                    raise RuntimeError(f"FTS rebuild completed without active claim {cid}") from exc
 
     def _rebuild_fts(self) -> None:
         c = self._connect()
+        shadow = "claims_fts_rebuild"
         try:
             with c:
-                c.execute("DROP TABLE IF EXISTS claims_fts")
-                c.execute("CREATE VIRTUAL TABLE claims_fts USING fts5(id UNINDEXED, claim, normalized, topic, evidence, search_text, tokenize='unicode61')")
-                for r in c.execute("SELECT id,claim,normalized_claim,topic,evidence FROM claims").fetchall():
+                c.execute(f"DROP TABLE IF EXISTS {shadow}")
+                c.execute(
+                    f"CREATE VIRTUAL TABLE {shadow} USING "
+                    "fts5(id UNINDEXED, claim, normalized, topic, evidence, search_text, tokenize='unicode61')"
+                )
+                rows = c.execute(
+                    "SELECT id,claim,normalized_claim,topic,evidence FROM claims WHERE status='active'"
+                ).fetchall()
+                for r in rows:
                     normalized = r["normalized_claim"] or r["claim"]
-                    c.execute("INSERT INTO claims_fts(id,claim,normalized,topic,evidence,search_text) VALUES(?,?,?,?,?,?)", (r["id"],r["claim"],normalized,r["topic"],r["evidence"],claim_search_text(r["claim"], normalized, r["topic"], r["evidence"])))
-        except Exception: pass
+                    c.execute(
+                        f"INSERT INTO {shadow}(id,claim,normalized,topic,evidence,search_text) "
+                        "VALUES(?,?,?,?,?,?)",
+                        (
+                            r["id"], r["claim"], normalized, r["topic"], r["evidence"],
+                            claim_search_text(r["claim"], normalized, r["topic"], r["evidence"]),
+                        ),
+                    )
+                c.execute("DROP TABLE IF EXISTS claims_fts")
+                c.execute(f"ALTER TABLE {shadow} RENAME TO claims_fts")
+                self._set_meta_max(
+                    "fts_latest_revision", self._meta_int("memory_revision"), conn=c
+                )
+        except Exception as exc:
+            _debug_log(f"FTS rebuild failed: {type(exc).__name__}: {exc}")
+            try:
+                c.execute(f"DROP TABLE IF EXISTS {shadow}")
+                c.commit()
+            except Exception:
+                pass
+            raise
 
     # ----- extraction ----------------------------------------------------
     def _ingest_text(self, text: str, *, source: str, max_claims=8) -> None:
@@ -4371,16 +5957,16 @@ class MemoryWikiProvider(MemoryProvider):
             self._rebuild_fts(); self._render_all()
         return {"mode":mode, "suggested":len(actions), "applied":len(applied), "actions":actions}
 
-    def _maintenance(self, prune_retired_days: int = 0) -> Dict[str, Any]:
-        self._rebuild_fts(); c=self._connect(); n=0
-        for r in c.execute("SELECT id FROM claims WHERE status='active' ORDER BY updated_at DESC LIMIT 500").fetchall(): self._detect_contradictions_for(r["id"]); n+=1
-        pruned=0
-        if prune_retired_days > 0:
-            cutoff=now()-prune_retired_days*86400
-            with c:
-                ids=[r["id"] for r in c.execute("SELECT id FROM claims WHERE status!='active' AND updated_at<? AND salience<0.3",(cutoff,)).fetchall()]
-                for i in ids: c.execute("DELETE FROM claims WHERE id=?",(i,)); pruned+=1
-        self._render_all(); return {"checked":n,"pruned":pruned,"dashboard":str(self.dashboard_dir/"index.md")}
+    def _maintenance(self) -> Dict[str,Any]:
+        self._rebuild_fts()
+        self._detect_all_contradictions()
+        self._render_all()
+        outbox = {"processed": 0, "ok": 0, "fail": 0}
+        if SEMANTIC_ENABLED:
+            _start_outbox_worker(str(self.db_path))
+            _wake_outbox_worker(str(self.db_path))
+            outbox = _outbox_process(min(8, OUTBOX_BATCH_SIZE), db_path=str(self.db_path))
+        return {"fts":"rebuilt","contradictions":"scanned","rendered":True,"outbox":outbox}
 
     def _sim(self, a: Iterable[str], b: Iterable[str]) -> float:
         sa=set(a); sb=set(b)
@@ -4623,7 +6209,54 @@ class MemoryWikiProvider(MemoryProvider):
         }
         metrics.update({'top_artifacts':top_artifacts,'health_components':components})
         score = sum(components.values()) / max(1, len(components))
-        return {"version":"1.3.0-collapse","health_score":round(score,3),"metrics":metrics,"issues":issues,"schema_anomalies":schema_anomalies,"low_quality":bad,"bad_topics":topics,"raw_blobs":blobs,"secret_hits":secrets}
+        db_path = str(self.db_path.expanduser().resolve())
+        db_instance = self._meta_text("database_instance_id")
+        journal_mode = str(c.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        sqlite_revision = self._meta_int("memory_revision")
+        fts_revision = self._meta_int("fts_latest_revision")
+        qdrant_revision = self._meta_int("qdrant_latest_revision")
+        outbox_metrics = c.execute("""SELECT
+            sum(CASE WHEN status='pending' THEN 1 ELSE 0 END) pending,
+            sum(CASE WHEN status='processing' THEN 1 ELSE 0 END) processing,
+            sum(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed,
+            min(CASE WHEN status IN ('pending','processing') THEN created_at END) oldest
+            FROM index_outbox""").fetchone()
+        oldest = int(outbox_metrics["oldest"] or 0)
+        consumer_count = int(c.execute("SELECT count(*) n FROM memory_consumers WHERE updated_at>=?", (now()-86400,)).fetchone()["n"] or 0)
+        expected_path = os.environ.get("MEMORY_WIKI_SHARED_DB_PATH", "").strip()
+        expected_instance = os.environ.get("MEMORY_WIKI_EXPECTED_DATABASE_INSTANCE_ID", "").strip()
+        expected_bots = max(0, int(os.environ.get("MEMORY_WIKI_EXPECTED_BOT_COUNT", "0") or 0))
+        path_matches = not expected_path or str(Path(expected_path).expanduser().resolve()) == db_path
+        instance_matches = not expected_instance or expected_instance == db_instance
+        coordination_status = "shared" if path_matches and instance_matches else "isolated"
+        if not expected_path and not expected_instance:
+            coordination_status = "unverified"
+        if expected_bots and consumer_count < expected_bots:
+            issues.append(f"only {consumer_count}/{expected_bots} memory consumers reported in the last 24h")
+        if coordination_status == "isolated":
+            issues.append("database path or database_instance_id differs from the configured shared-memory identity")
+        metrics.update({
+            "sqlite_latest_revision": sqlite_revision,
+            "fts_latest_revision": fts_revision,
+            "qdrant_latest_revision": qdrant_revision,
+            "outbox_pending_count": int(outbox_metrics["pending"] or 0),
+            "outbox_processing_count": int(outbox_metrics["processing"] or 0),
+            "outbox_failed_count": int(outbox_metrics["failed"] or 0),
+            "outbox_oldest_age_seconds": max(0, now()-oldest) if oldest else 0,
+            "active_consumer_count_24h": consumer_count,
+        })
+        shared_memory = {
+            "status": coordination_status, "bot_id": self.bot_id,
+            "absolute_db_path": db_path, "database_instance_id": db_instance,
+            "sqlite_journal_mode": journal_mode,
+            "latest_memory_revision": sqlite_revision,
+            "latest_fts_revision": fts_revision,
+            "latest_qdrant_revision": qdrant_revision,
+            "bot_last_seen_revision": self._last_seen_revision(self.session_id),
+            "origin_chat_hash": self._chat_hash(self.session_id),
+            "project_id": self.project_scope,
+        }
+        return {"version":"1.19.0-shared-memory-overlay","health_score":round(score,3),"metrics":metrics,"shared_memory":shared_memory,"issues":issues,"schema_anomalies":schema_anomalies,"low_quality":bad,"bad_topics":topics,"raw_blobs":blobs,"secret_hits":secrets}
 
     def _explain_recall(self, query: str, limit: int = 10, topic: Optional[str]=None) -> List[Dict[str, Any]]:
         rows = self._search(query, limit, True, topic); qt=tokens(query); out=[]
@@ -4686,7 +6319,13 @@ class MemoryWikiProvider(MemoryProvider):
         for r in rows: lines.append(f"- `{r['id']}` {r['subject']} / {r['scope']} type={r['secret_type']} locator={r['locator'] or 'n/a'} purpose={short(r['purpose'],120)}")
         return "\n".join(lines)
 
-    def _recall_plan(self, query: str, limit: int = 8) -> Dict[str, Any]:
+    def _recall_plan(
+        self,
+        query: str,
+        limit: int = 8,
+        *,
+        preselected_rows: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
         q=(query or "").lower(); topics=[]; types=[]
         mapping=[
             (('memory-wiki','memory_wiki','memory wiki','wiki','claim','claims','recall','pack_context','качест','памят'), 'memory-wiki'),
@@ -4701,8 +6340,15 @@ class MemoryWikiProvider(MemoryProvider):
         for keys,t in mapping:
             if any(k in q for k in keys) and t not in topics: topics.append(t)
         if not topics:
-            for r in self._search(query, min(limit,5), False):
-                if r['topic'] not in topics: topics.append(r['topic'])
+            topic_rows = (
+                list(preselected_rows)[:min(limit, 5)]
+                if preselected_rows is not None
+                else self._search(query, min(limit, 5), False)
+            )
+            for r in topic_rows:
+                topic = str(r.get('topic') or '')
+                if topic and topic not in topics:
+                    topics.append(topic)
         if any(k in q for k in ('как','инструкция','procedure','установ','deploy','restore','восстанов','патч','patch')): types.append('procedure')
         if any(k in q for k in ('secret','секрет','token','password','пароль','доступ','ssh','credential')): types.append('credential')
         if any(k in q for k in ('ошибка','bug','слом','fix','почини')): types.append('bug')
@@ -5395,12 +7041,57 @@ class MemoryWikiProvider(MemoryProvider):
             return ''
         return ''
 
-    def _pack_context(self, query:str, max_chars:int=MAX_PREFETCH_CHARS)->Dict[str,Any]:
-        """Budget-aware context packer. Uses _pack_selected_claims for XML output."""
+    def _pack_context(
+        self,
+        query: str,
+        max_chars: int = MAX_PREFETCH_CHARS,
+        *,
+        preselected_rows: Optional[List[Dict[str, Any]]] = None,
+        diff_rows: Optional[List[Dict[str, Any]]] = None,
+        suppressed_claim_ids: Optional[Iterable[str]] = None,
+    ) -> Dict[str,Any]:
+        """Budget-aware context packer with global claim/content deduplication.
+
+        ``suppressed_claim_ids`` is a hard deny-list produced by the coverage
+        classifier. It is enforced across the main rows, preference layer and
+        memory-diff sections so an auxiliary lookup cannot re-inject a claim
+        already covered by Code Shrinker.
+        """
         max_chars=max(800, min(int(max_chars or MAX_PREFETCH_CHARS), 60000))
-        plan=self._recall_plan(query, 12); rows=self._search(query, 60, False); graph=self._graph_query(query, 12)
+        suppressed_ids = {
+            str(value) for value in (suppressed_claim_ids or ()) if str(value)
+        }
+        pack_watermark = 0
+        if preselected_rows is None:
+            selected = self._select_recall_rows(
+                query, session_id=self.session_id, limit=50, include_stale=True,
+                delta_limit=int(os.environ.get("MEMORY_WIKI_REVISION_DELTA_LIMIT", "3")),
+            )
+            searched_rows = selected["rows"] + selected["delta_rows"]
+            pack_watermark = int(selected["watermark"] or 0)
+            rows = [
+                row for row in searched_rows
+                if not self._is_stale(int(row.get('freshness_at') or 0))
+            ]
+            if diff_rows is None:
+                diff_rows = searched_rows
+        else:
+            rows = [row for row in preselected_rows if self._claim_visible(row, self.session_id)]
+            if diff_rows is None:
+                diff_rows = rows
+            pack_watermark = max([int(row.get("memory_revision") or 0) for row in rows] or [0])
+        rows = [
+            row for row in rows
+            if str(row.get('id', '')) not in suppressed_ids
+        ]
+        diff_rows = [
+            row for row in (diff_rows or [])
+            if str(row.get('id', '')) not in suppressed_ids
+        ]
+        plan=self._recall_plan(query, 12, preselected_rows=rows)
+        graph=self._graph_query(query, 12)
         secrets=self._query_secrets(query, 8, False) if plan.get('secrets_recommended') else []
-        qtok=set(tokens(query)); omitted={'secret_or_quarantined':0,'low_relevance':0,'artifact_or_low_quality':0,'secrets_not_requested':0}; sources={'claims':len(rows),'secrets':len(secrets),'relations':len(graph.get('relations',[])),'task_capsules':0,'sessions':0,'preference_rules':0,'memory_diff':0,'llm_refined':False,'sectioned':True}
+        qtok=set(tokens(query)); omitted={'secret_or_quarantined':0,'low_relevance':0,'artifact_or_low_quality':0,'secrets_not_requested':0,'suppressed_by_coverage':0,'duplicate_claim_id':0,'duplicate_content':0}; sources={'claims':len(rows),'secrets':len(secrets),'relations':len(graph.get('relations',[])),'task_capsules':0,'sessions':0,'preference_rules':0,'memory_diff':0,'suppressed_claims':len(suppressed_ids),'llm_refined':False,'sectioned':True}
         if not plan.get('secrets_recommended'):
             omitted['secrets_not_requested']=1
         sections=[
@@ -5420,36 +7111,98 @@ class MemoryWikiProvider(MemoryProvider):
             ('sessions','## Relevant recent sessions',720),
             ('other','## Other relevant facts',650),
         ]
-        buckets={k:[] for k,_,_ in sections}; seen=set(); plan_topics=set(plan.get('topics') or [])
-        def add(bucket,label,text,prio):
+        buckets={k:[] for k,_,_ in sections}
+        seen_claim_ids=set()
+        seen_content=set()
+        seen_rendered_content=set()
+        plan_topics=set(plan.get('topics') or [])
+        def add(bucket, label, text, prio, *, claim_id='', fingerprint_text=''):
             text=redact_secrets(str(text or '')).strip()
+            cid=str(claim_id or '').strip()
+            if cid and cid in suppressed_ids:
+                omitted['suppressed_by_coverage']+=1
+                return
+            if cid and cid in seen_claim_ids:
+                omitted['duplicate_claim_id']+=1
+                return
             if not text:
                 return
             if secret_scan(text).get('raw_secret'):
                 omitted['secret_or_quarantined']+=1; return
             if is_ephemeral_fragment(text):
                 omitted['artifact_or_low_quality']+=1; return
-            key=sha(f"{bucket}:{label}:{text}")[:16]
-            if key not in seen:
-                seen.add(key); buckets.setdefault(bucket,[]).append((prio,label,short(text,700)))
+            fingerprint_source = redact_secrets(str(fingerprint_text or text))
+            canonical = normalize_claim(fingerprint_source).lower()
+            rendered = short(text, 700)
+            rendered_canonical = normalize_claim(
+                short(fingerprint_source, 700)
+            ).lower()
+            content_key = sha(canonical)[:20] if canonical else ''
+            rendered_key = sha(rendered_canonical)[:20] if rendered_canonical else ''
+            if content_key and content_key in seen_content:
+                omitted['duplicate_content']+=1
+                return
+            if rendered_key and rendered_key in seen_rendered_content:
+                omitted['duplicate_content']+=1
+                return
+            if cid:
+                seen_claim_ids.add(cid)
+            if content_key:
+                seen_content.add(content_key)
+            if rendered_key:
+                seen_rendered_content.add(rendered_key)
+            buckets.setdefault(bucket,[]).append((prio,label,rendered))
         add('recall_plan','plan',_safe_recall_text(json.dumps(plan,ensure_ascii=False),900),1000)
         try:
-            pref_layer = self._preference_layer(query, 8, True)
+            pref_layer = self._preference_layer(
+                query,
+                8,
+                True,
+                exclude_claim_ids=suppressed_ids,
+            )
             sources['preference_rules'] = len(pref_layer.get('rules', []))
             for rule in pref_layer.get('policy_order', [])[:8]:
                 add('preference_priority','policy', rule, 980)
             for item in pref_layer.get('items', [])[:8]:
-                add('preference_priority','preference', f"`{item.get('id','')}` priority={item.get('priority')} topic={item.get('topic')} reason={item.get('reason')}: {item.get('claim')}", int(item.get('priority') or 0))
+                add(
+                    'preference_priority',
+                    'preference',
+                    f"`{item.get('id','')}` priority={item.get('priority')} topic={item.get('topic')} reason={item.get('reason')}: {item.get('claim')}",
+                    int(item.get('priority') or 0),
+                    claim_id=item.get('id', ''),
+                    fingerprint_text=item.get('claim', ''),
+                )
         except Exception as e:
             add('preference_priority','error', str(e), 100)
         try:
-            diff = self._memory_diff(query, [], '', 8)
+            diff = self._memory_diff(
+                query,
+                [],
+                '',
+                8,
+                preselected_rows=diff_rows,
+                exclude_claim_ids=suppressed_ids,
+            )
             sources['memory_diff'] = len(diff.get('remembered', []))
             add('memory_diff','answer_basis', diff.get('answer_basis',''), 990)
             for item in diff.get('changed_or_conflicting', [])[:5]:
-                add('memory_diff','conflict_or_change', json.dumps(item, ensure_ascii=False), 940)
+                add(
+                    'memory_diff',
+                    'conflict_or_change',
+                    json.dumps(item, ensure_ascii=False),
+                    940,
+                    claim_id=item.get('claim_id', ''),
+                    fingerprint_text=item.get('claim', ''),
+                )
             for item in diff.get('stale_or_unverified', [])[:5]:
-                add('memory_diff','verify_before_use', json.dumps(item, ensure_ascii=False), 760)
+                add(
+                    'memory_diff',
+                    'verify_before_use',
+                    json.dumps(item, ensure_ascii=False),
+                    760,
+                    claim_id=item.get('claim_id', ''),
+                    fingerprint_text=item.get('claim', ''),
+                )
         except Exception as e:
             add('memory_diff','error', str(e), 100)
         add('source_policy','current_query', json.dumps(source_policy_for('tool'), ensure_ascii=False), 850)
@@ -5466,7 +7219,7 @@ class MemoryWikiProvider(MemoryProvider):
             if is_ephemeral_fragment(r.get('claim','')) or trust_class in ('tool_log','raw_blob','secret') or typ == 'source_artifact' or (float(r.get('quality') or 0) < 0.38 and typ not in ('procedure','preference','task_result')):
                 omitted['artifact_or_low_quality']+=1; continue
             freshness = 'fresh' if not self._is_stale(r['freshness_at']) else 'stale'
-            line=f"`{r['id']}` topic={topic} type={typ} score={float(r.get('score',0)):.2f} conf={r['confidence']:.2f} sal={r['salience']:.2f} trust={float(r.get('trust_score',.55)):.2f} {freshness}: {r['claim']}"
+            line=f"`{r['id']}` rev={int(r.get('memory_revision') or 0)} visibility={r.get('visibility_scope','global')} time={self._format_claim_time(r)} topic={topic} type={typ} score={float(r.get('score',0)):.2f} conf={r['confidence']:.2f} sal={r['salience']:.2f} trust={float(r.get('trust_score',.55)):.2f} {freshness}: {r['claim']}"
             bucket='other'
             if topic == 'secrets' and plan.get('secrets_recommended'):
                 bucket='secrets_policy'
@@ -5478,7 +7231,14 @@ class MemoryWikiProvider(MemoryProvider):
                 bucket='environment'
             if topic == 'secrets' and not plan.get('secrets_recommended'):
                 omitted['secrets_not_requested']+=1; continue
-            add(bucket,'claim',line,int(float(r.get('score',0))*100))
+            add(
+                bucket,
+                'claim',
+                line,
+                int(float(r.get('score',0))*100),
+                claim_id=r.get('id', ''),
+                fingerprint_text=r.get('claim', ''),
+            )
         for rel in graph.get('relations',[]): add('relations','relation', f"{rel['subject']} -[{rel['predicate']}]-> {rel['object']} conf={rel['confidence']}", 700)
         try:
             c=self._connect()
@@ -5523,7 +7283,9 @@ class MemoryWikiProvider(MemoryProvider):
             context=refined; used=len(context); sources['llm_refined']=True
         elif refined:
             omitted['artifact_or_low_quality']+=1
-        return {'query':query,'max_chars':max_chars,'used_chars':used,'context':context,'plan':plan,'omitted':omitted,'chunk_count':chunk_count,'sources':sources}
+        if context:
+            self._mark_seen_revision(pack_watermark, self.session_id)
+        return {'query':query,'max_chars':max_chars,'used_chars':used,'context':context,'plan':plan,'omitted':omitted,'chunk_count':chunk_count,'sources':sources,'memory_revision_watermark':pack_watermark}
 
 
     def _archive_source_artifact(self, claim_id: str, artifact_type: str, text: str, source_ref: str = "") -> str:
@@ -5706,136 +7468,185 @@ class MemoryWikiProvider(MemoryProvider):
     # ═══════════════════════════════════════════════════════════
 
     def _semantic_status(self) -> Dict[str,Any]:
-        embed_ok = bool(_semantic_available()); pts = 0
+        embed_ok = bool(_semantic_available())
+        pts = 0
+        active_target = _qdrant_alias_target(QDRANT_ALIAS)
         try:
-            r = _qdrant_req("GET", f"/collections/{QDRANT_COLLECTION}")
+            r = _qdrant_req("GET", f"/collections/{QDRANT_ALIAS}")
             pts = r.get("result", {}).get("points_count", 0) if r else 0
-        except Exception: pass
-        return {"embedding_ok": embed_ok, "qdrant_points": pts, "semantic_enabled": SEMANTIC_ENABLED, "rerank": self._rerank_status()}
+        except Exception:
+            pass
+        return {
+            "embedding_ok": embed_ok,
+            "qdrant_points": pts,
+            "semantic_enabled": SEMANTIC_ENABLED,
+            "alias": QDRANT_ALIAS,
+            "active_collection": active_target,
+            "expected_collection": _physical_collection_name(),
+            "rerank": self._rerank_status(),
+        }
 
     def _reindex(self, limit: int = 0, force: bool = False) -> Dict[str,Any]:
-        """Resumable reindex with checkpointing and atomic alias switching."""
-        if not SEMANTIC_ENABLED: return {"ok": False, "error": "semantic disabled"}
-        c = self._connect()
+        """Build an immutable physical collection and switch the read alias only on success."""
+        if not SEMANTIC_ENABLED:
+            return {"ok": False, "error": "semantic disabled"}
+        if not _semantic_available():
+            return {"ok": False, "error": "embedding/qdrant unavailable"}
 
-        # Create target collection
-        target_coll = _active_collection_name()
         manifest = _embedding_manifest()
         manifest_hash = _manifest_hash(manifest)
+        base_target = _physical_collection_name(manifest)
+        target_coll = (
+            f"{base_target}_force_{int(time.time())}"
+            if force else base_target
+        )
+        if not _ensure_collection(target_coll):
+            return {
+                "ok": False,
+                "error": "target collection unavailable or incompatible",
+                "collection": target_coll,
+            }
 
-        # Check if target already exists and has full count
-        existing_count = _qdrant_count(target_coll)
-        total_active = c.execute("SELECT COUNT(*) FROM claims WHERE status='active' AND normalized_claim IS NOT NULL AND normalized_claim != ''").fetchone()[0]
-        if existing_count and existing_count >= total_active * 0.99 and not force:
-            _switch_alias(target_coll)
-            return {"ok": True, "collection": target_coll, "count": existing_count, "total": total_active, "status": "already_complete"}
+        c = self._connect()
+        total_active = int(c.execute(
+            "SELECT COUNT(*) FROM claims "
+            "WHERE status='active' AND normalized_claim IS NOT NULL "
+            "AND normalized_claim != ''"
+        ).fetchone()[0])
+        existing_count = _qdrant_count(target_coll) or 0
+        if total_active == 0:
+            if not _switch_alias(target_coll):
+                return {"ok": False, "error": "alias switch failed", "collection": target_coll}
+            return {
+                "ok": True, "collection": target_coll, "count": 0, "total": 0,
+                "status": "completed", "alias_switched": True,
+            }
+        if existing_count >= total_active and not force:
+            switched = _switch_alias(target_coll)
+            return {
+                "ok": switched,
+                "collection": target_coll,
+                "count": existing_count,
+                "total": total_active,
+                "status": "already_complete" if switched else "alias_switch_failed",
+                "alias_switched": switched,
+            }
 
-        # Create target collection
-        _ensure_collection()
-
-        # Find or create reindex job
-        job_id = f"reindex_{manifest_hash[:12]}"
-        job_row = c.execute("SELECT * FROM reindex_jobs WHERE id=? AND status='running'", (job_id,)).fetchone()
-
+        job_id = f"reindex_{manifest_hash}_{hashlib.sha256(target_coll.encode()).hexdigest()[:8]}"
+        job_row = c.execute(
+            "SELECT * FROM reindex_jobs WHERE id=? AND status='running'",
+            (job_id,),
+        ).fetchone()
         if not job_row:
             c.execute(
-                "INSERT INTO reindex_jobs(id,source_collection,target_collection,manifest_json,total_count,started_at) VALUES(?,?,?,?,?,?)",
-                (job_id, QDRANT_COLLECTION, target_coll, json.dumps(manifest, ensure_ascii=False), total_active, int(time.time()))
+                "INSERT OR REPLACE INTO reindex_jobs("
+                "id,source_collection,target_collection,manifest_json,total_count,"
+                "processed_count,failed_count,status,started_at,updated_at) "
+                "VALUES(?,?,?,?,?,0,0,'running',?,?)",
+                (
+                    job_id, _qdrant_alias_target(QDRANT_ALIAS), target_coll,
+                    json.dumps(manifest, ensure_ascii=False, sort_keys=True),
+                    total_active, int(time.time()), int(time.time()),
+                ),
             )
             c.commit()
             processed = 0
-            failed = 0
+            failed_total = 0
         else:
-            processed = int(job_row["processed_count"])
-            failed = int(job_row["failed_count"])
+            processed = int(job_row["processed_count"] or 0)
+            failed_total = int(job_row["failed_count"] or 0)
 
-        # Resume from last processed offset
-        sql = "SELECT id, normalized_claim, topic FROM claims WHERE status='active' AND normalized_claim IS NOT NULL AND normalized_claim != ''"
-        sql += " ORDER BY id"
+        sql = (
+            "SELECT id, normalized_claim, topic FROM claims "
+            "WHERE status='active' AND normalized_claim IS NOT NULL "
+            "AND normalized_claim != '' ORDER BY id"
+        )
         if limit > 0:
             sql += " LIMIT ? OFFSET ?"
-            params = (limit, processed)
+            params = (max(1, int(limit)), processed)
         else:
-            params = ()
-
+            sql += " LIMIT -1 OFFSET ?"
+            params = (processed,)
         rows = c.execute(sql, params).fetchall()
+
+        ok_count = 0
+        failed_ids: list[str] = []
         batch_size = 20
-        ok = 0
-        failed_ids = []
-        base_processed = processed
-
-        for i in range(0, len(rows), batch_size):
-            batch = rows[i:i+batch_size]
+        for offset in range(0, len(rows), batch_size):
+            batch = rows[offset:offset + batch_size]
             for row in batch:
-                cid = row["id"]
+                cid = str(row["id"])
                 try:
-                    emb = _embed_document(row["normalized_claim"])
-                    if emb and len(emb) == QDRANT_VECTOR_SIZE:
-                        result = _qdrant_upsert(cid, emb, {"id": cid, "topic": row["topic"] or "", "claim": short(row["normalized_claim"], 300)}, collection=target_coll)
-                        if result:
-                            ok += 1
-                        else:
-                            failed += 1
-                            failed_ids.append(cid)
+                    vector = _embed_document(row["normalized_claim"])
+                    if vector and len(vector) == QDRANT_VECTOR_SIZE and _qdrant_upsert(
+                        cid, vector,
+                        {
+                            "id": cid,
+                            "topic": row["topic"] or "",
+                            "claim": short(row["normalized_claim"], 300),
+                            "manifest_hash": manifest_hash,
+                        },
+                        collection=target_coll,
+                    ):
+                        ok_count += 1
                     else:
-                        failed += 1
+                        failed_total += 1
                         failed_ids.append(cid)
-                except Exception:
-                    failed += 1
+                except Exception as exc:
+                    failed_total += 1
                     failed_ids.append(cid)
-
-            # Checkpoint
-            processed_now = base_processed + i + len(batch)
-            c.execute("UPDATE reindex_jobs SET processed_count=?, failed_count=?, updated_at=? WHERE id=?",
-                      (processed_now, failed, int(time.time()), job_id))
+                    _debug_log(f"reindex {target_coll} {cid} failed: {type(exc).__name__}: {exc}")
+            processed_now = processed + offset + len(batch)
+            c.execute(
+                "UPDATE reindex_jobs SET processed_count=?,failed_count=?,updated_at=? WHERE id=?",
+                (processed_now, failed_total, int(time.time()), job_id),
+            )
             c.commit()
-            _debug_log(f"reindex checkpoint: {processed_now}/{total_active} (+{ok} ok, {failed} fail)")
 
-        # Verify and cut over
-        target_count = _qdrant_count(target_coll)
-        if target_count and target_count >= total_active * 0.95:
-            _switch_alias(target_coll)
-            c.execute("UPDATE reindex_jobs SET status='completed', completed_at=? WHERE id=?",
-                      (int(time.time()), job_id))
-            c.commit()
-            return {"ok": True, "collection": target_coll, "count": target_count, "total": total_active,
-                    "ok_count": ok, "failed": failed, "failed_ids": failed_ids[:20], "status": "completed", "alias_switched": True}
+        target_count = _qdrant_count(target_coll) or 0
+        consumed_all = (processed + len(rows)) >= total_active
+        complete = consumed_all and target_count >= total_active and failed_total == 0
+        if complete:
+            switched = _switch_alias(target_coll)
+            if switched:
+                c.execute(
+                    "UPDATE reindex_jobs SET status='completed',completed_at=?,updated_at=? WHERE id=?",
+                    (int(time.time()), int(time.time()), job_id),
+                )
+                c.commit()
+                return {
+                    "ok": True,
+                    "collection": target_coll,
+                    "count": target_count,
+                    "total": total_active,
+                    "ok_count": ok_count,
+                    "failed": failed_total,
+                    "failed_ids": failed_ids[:20],
+                    "status": "completed",
+                    "alias_switched": True,
+                }
+            return {
+                "ok": False,
+                "error": "alias switch failed",
+                "collection": target_coll,
+                "count": target_count,
+                "total": total_active,
+                "status": "alias_switch_failed",
+                "alias_switched": False,
+            }
 
-        c.execute("UPDATE reindex_jobs SET status='running', completed_at=NULL WHERE id=?",
-                  (job_id,))
-        c.commit()
-        return {"ok": True, "collection": target_coll, "count": target_count or 0, "total": total_active,
-                "ok_count": ok, "failed": failed, "failed_ids": failed_ids[:20], "status": "partial", "alias_switched": False}
-
-
-        if not SEMANTIC_ENABLED: return {"ok": False, "error": "semantic disabled"}
-        if force:
-            deleted = _qdrant_req("DELETE", f"/collections/{QDRANT_COLLECTION}")
-            if deleted is None:
-                _debug_log("reindex force: collection deletion failed")
-                return {"ok": False, "error": "collection deletion failed", "count": 0}
-            if not _qdrant_ensure_collection():
-                _debug_log("reindex force: failed to recreate collection")
-                return {"ok": False, "error": "collection recreate failed", "count": 0}
-        if not _semantic_available(): return {"ok": False, "error": "embedding/qdrant unavailable"}
-        if not _qdrant_ensure_collection(): return {"ok": False, "error": "qdrant collection unavailable"}
-        c = self._connect()
-        sql = "SELECT id, normalized_claim, topic FROM claims WHERE status='active' AND normalized_claim IS NOT NULL AND normalized_claim != ''"
-        rows = c.execute(sql + (" LIMIT ?" if limit > 0 else ""), (limit,) if limit > 0 else ()).fetchall()
-        ok = skip = fail = 0; t0 = time.time()
-        for r in rows:
-            cid, claim, topic = r["id"], r["normalized_claim"], r["topic"]
-            if not claim or len(claim.strip()) < 10: skip += 1; continue
-            try:
-                emb = _embed_document(claim)
-                if emb is not None:
-                    if _qdrant_upsert(cid, emb, {"id": cid, "topic": topic or "", "claim": short(claim, 300)}, collection=target_coll):
-                        ok += 1
-                    else:
-                        fail += 1
-                else: skip += 1
-            except Exception: fail += 1
-        return {"total": len(rows), "ok": ok, "skip": skip, "fail": fail, "elapsed_s": round(time.time() - t0, 1)}
+        return {
+            "ok": True,
+            "collection": target_coll,
+            "count": target_count,
+            "total": total_active,
+            "processed": processed + len(rows),
+            "ok_count": ok_count,
+            "failed": failed_total,
+            "failed_ids": failed_ids[:20],
+            "status": "partial",
+            "alias_switched": False,
+        }
 
     def _debug_search(self, query: str, limit: int = 10, topic: str = "") -> Dict[str,Any]:
         q = query or ""; qm = _detect_query_mode(q)
