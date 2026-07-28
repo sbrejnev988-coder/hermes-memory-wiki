@@ -15,6 +15,11 @@ Vault v3 — стандартный AEAD вместо самописного XOR
 
 from __future__ import annotations
 
+# HERMES-SECURITY-INTEGRATION-20260728-LEGACY-VAULT-DISABLED
+import os as _hsi_legacy_os
+if _hsi_legacy_os.environ.get("HERMES_ALLOW_LEGACY_VAULT", "0").lower() not in {"1", "true", "yes"}:
+    raise RuntimeError("Legacy vault backend disabled. Use pinned hermes_secret_core; set HERMES_ALLOW_LEGACY_VAULT=1 only for an offline migration process.")
+
 import hashlib
 import hmac
 import os

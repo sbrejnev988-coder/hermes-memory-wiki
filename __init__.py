@@ -33,15 +33,21 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timezone
 
-# Hermes Secret Integration v2.1: one shared core, external ciphertext store.
+# HERMES-SECURITY-INTEGRATION-20260728: verified, pinned secret-core loader.
 _SECRET_CORE_AVAILABLE = False
 _SECRET_CORE_ERROR = ""
 try:
     _secret_home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
-    _secret_lib = Path(os.environ.get("HERMES_SECRET_CORE_PATH", str(_secret_home / "lib"))).expanduser()
+    _secret_lib = _secret_home / "lib"
     if str(_secret_lib) not in __import__("sys").path:
         __import__("sys").path.insert(0, str(_secret_lib))
-    from hermes_secret_core import VaultStore as _BrokerVaultStore, safe_aliases as _safe_secret_aliases, safe_locator as _secret_safe_locator, redact_text as _secret_redact_text, secret_fingerprint as _secret_fingerprint
+    from hermes_core_loader import load_secret_core as _load_verified_secret_core
+    _secret_core = _load_verified_secret_core(("VaultStore", "safe_aliases", "safe_locator", "redact_text", "secret_fingerprint"))
+    _BrokerVaultStore = _secret_core.VaultStore
+    _safe_secret_aliases = _secret_core.safe_aliases
+    _secret_safe_locator = _secret_core.safe_locator
+    _secret_redact_text = _secret_core.redact_text
+    _secret_fingerprint = _secret_core.secret_fingerprint
     _SECRET_CORE_AVAILABLE = True
 except Exception as _secret_core_exc:
     _SECRET_CORE_ERROR = f"{type(_secret_core_exc).__name__}: {_secret_core_exc}"
@@ -61,11 +67,12 @@ except ImportError:
     try:
         from guard import is_social_close, sanitize_context_text, sanitize_context_batch
     except ImportError:
-        # degraded-noop fallbacks (module absent or load failure)
+        # Fail closed: a missing local guard must never become a no-op sanitizer.
         def is_social_close(text: str) -> bool: return False
-        def sanitize_context_text(text: str, max_len: int = 600) -> str: return str(text)[:max_len]
+        def sanitize_context_text(text: str, max_len: int = 600) -> str:
+            return "[QUARANTINED: memory guard unavailable]"
         def sanitize_context_batch(items, text_key: str = "text", max_len: int = 400, label: str = "") -> list:
-            return [f"{label} {item.get(text_key,'')[:max_len]}" for item in (items or []) if isinstance(item, dict) and item.get(text_key)]
+            return ["[QUARANTINED: memory guard unavailable]"] if items else []
 
 try:
     from .collapse import memory_context_collapse, tokenize as collapse_tokenize
@@ -96,17 +103,17 @@ except ImportError:
         def archive_stale_claims(db_path=None, threshold=0.05, dry_run=True): return {"error": "module absent"}
         def get_decay_stats(db_path=None): return {"error": "module absent"}
 
-# ── P0 #3: Injection guard import from omnicouncil (graceful) ──
+# HERMES-SECURITY-INTEGRATION-20260728: shared trust core; no reverse dependency on OmniCouncil.
 _INJECTION_GUARD_AVAILABLE = False
 try:
-    import sys as _sys_mw, os as _os_mw
-    _omni_path = _os_mw.path.join(_os_mw.path.dirname(_os_mw.path.dirname(__file__)), "hermes-omnicouncil")
-    if _omni_path not in _sys_mw.path:
-        _sys_mw.path.insert(0, _omni_path)
-    from council_context import sanitize_recalled as _sanitize_recalled, RecalledItem as _RecalledItem
+    _trust_home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser() / "lib"
+    if str(_trust_home) not in __import__("sys").path:
+        __import__("sys").path.insert(0, str(_trust_home))
+    from hermes_trust_core import sanitize_recalled as _sanitize_recalled, RecalledItem as _RecalledItem
     _INJECTION_GUARD_AVAILABLE = True
-except ImportError:
-    pass
+except Exception as _trust_exc:
+    if os.environ.get("HERMES_SECURITY_STRICT", "1").lower() not in {"0", "false", "no", "off"}:
+        raise RuntimeError(f"hermes_trust_core unavailable: {_trust_exc}") from _trust_exc
 
 # ═════════════════════════════════════════════════════════════
 # Embedding + Qdrant clients (stdlib-only, ноль зависимостей)
