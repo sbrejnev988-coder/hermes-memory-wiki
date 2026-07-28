@@ -7183,6 +7183,16 @@ class MemoryWikiProvider(MemoryProvider):
     def _transaction(self, operations: List[Dict[str,Any]], mode: str = "suggest", reason: str = "", stop_on_error: bool = True) -> Dict[str,Any]:
         mode=(mode or 'suggest').lower(); ops=list(operations or [])[:50]; batch_id='batch_'+sha(json.dumps(ops, ensure_ascii=False, sort_keys=True, default=str)+str(now()))[:12]
         backup=None; results=[]
+        # HERMES-AUDIT-20260729: the current implementation invokes handlers that open
+        # independent SQLite connections, so a multi-operation apply cannot be atomic.
+        # Refuse it rather than advertising a transaction that can leave partial state.
+        if mode in {'apply', 'apply_with_backup'} and len(ops) > 1:
+            return {
+                'batch_id': batch_id, 'mode': mode, 'atomic': False,
+                'partial_commit_possible': False, 'results': [],
+                'errors': [{'error': 'multi_operation_apply_refused_non_atomic',
+                            'fix': 'apply one operation at a time or implement a shared SQLite connection/savepoint'}],
+            }
         if mode == 'apply_with_backup':
             backup=self._backup('transaction_'+batch_id)
             mode='apply'
