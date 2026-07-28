@@ -1,72 +1,125 @@
 #!/usr/bin/env python3
-"""memory-wiki collapse — cross-source claim collapse/deduplication."""
-from __future__ import annotations
-import re, hashlib
-from collections import Counter
-from typing import Any, Dict, List, Optional, Set
+"""Cross-source context collapse for Hermes Memory Wiki.
 
-_STOP = frozenset(["a","an","the","is","are","was","were","be","been","being",
-    "have","has","had","do","does","did","will","would","shall","should",
-    "may","might","must","can","could","of","in","to","for","on","with",
-    "at","by","from","as","into","through","during","before","after",
-    "above","below","between","under","and","but","or","not","no","nor",
-    "so","if","then","else","when","where","why","how","all","each",
-    "every","both","few","more","most","other","some","such","only",
-    "own","same","very","just","than","too","also","now","here","there"])
-_WORD_RE = re.compile(r'[a-z0-9]+')
+The public API intentionally returns the original item dictionaries so callers
+can consume the result without understanding this module's internal wrappers.
+"""
+from __future__ import annotations
+
+import hashlib
+import re
+from typing import Any, Dict, Iterable, List, Set, Tuple
+
+_WORD_RE = re.compile(r"[\w-]+", re.UNICODE)
+
 
 def collapse_tokenize(text: str) -> Set[str]:
-    """Tokenize text to a set of lowercase words."""
-    return {w.group(0) for w in _WORD_RE.finditer(text.lower()) if len(w.group(0))>5}
+    """Return normalized content tokens suitable for overlap scoring."""
+    return {
+        match.group(0).casefold()
+        for match in _WORD_RE.finditer(str(text or ""))
+        if len(match.group(0)) >= 4
+    }
 
-def _simhash(text: str, bits: int = 64) -> int:
-    """SimHash fingerprint for near-duplicate detection."""
-    tokens = list(_WORD_RE.findall(text.lower()))
-    if not tokens: return 0
-    v = [0] * bits
-    for tok in tokens:
-        h = int(hashlib.md5(tok.encode()).hexdigest()[:16], 16)
-        for i in range(bits):
-            if h & (1 << i): v[i] += 1
-            else: v[i] -= 1
-    result = 0
-    for i in range(bits):
-        if v[i] > 0: result |= (1 << i)
-    return result
 
-def _load_claims(cursor, topic: Optional[str] = None, limit: int = 500, exclude_id: Optional[str] = None):
-    """Load active claims for comparison."""
-    sql = "SELECT id, normalized_claim, claim, topic, source FROM claims WHERE status='active' AND normalized_claim IS NOT NULL"
-    params = []
-    if topic:
-        sql += " AND topic=?"
-        params.append(topic)
-    if exclude_id:
-        sql += " AND id!=?"
-        params.append(exclude_id)
-    sql += " ORDER BY updated_at DESC LIMIT ?"
-    params.append(limit)
-    return cursor.execute(sql, params).fetchall()
+def _item_text(item: Any) -> str:
+    if isinstance(item, dict):
+        return " ".join(
+            str(item.get(key) or "")
+            for key in ("claim", "content", "text", "summary", "topic")
+        ).strip()
+    return str(item or "").strip()
 
-def memory_context_collapse(query: str, memory_wiki_hits=None, knowledge_hits=None, distill_hits=None, budget=6, **kw):
-    """Cross-source collapse: deduplicate and rank items for context injection."""
-    all_items: List[Dict[str, Any]] = []
-    for source, items in [("mw",memory_wiki_hits or []),("kb",knowledge_hits or []),("dt",distill_hits or [])]:
+
+def _stable_key(item: Any) -> str:
+    if isinstance(item, dict) and item.get("id"):
+        return f"id:{item['id']}"
+    normalized = " ".join(_item_text(item).casefold().split())
+    return "text:" + hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def _jaccard(left: Set[str], right: Set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    union = left | right
+    return len(left & right) / len(union) if union else 0.0
+
+
+def memory_context_collapse(
+    query: str,
+    memory_wiki_hits=None,
+    knowledge_hits=None,
+    distill_hits=None,
+    budget: int = 6,
+    **_: Any,
+) -> List[Any]:
+    """Deduplicate and rank context from independent sources.
+
+    Cross-source corroboration is awarded only when the content actually
+    overlaps. The old implementation boosted every item merely because other
+    sources had unrelated items in the candidate set.
+    """
+    budget = max(0, int(budget or 0))
+    if budget == 0:
+        return []
+
+    entries: List[Dict[str, Any]] = []
+    for source, items in (
+        ("memory_wiki", memory_wiki_hits or []),
+        ("knowledge", knowledge_hits or []),
+        ("distill", distill_hits or []),
+    ):
         for item in items:
-            all_items.append({"source":source,"item":item,"id":item.get("id","") if isinstance(item,dict) else str(item)})
-    seen = set()
-    unique = []
-    for entry in all_items:
-        key = entry["id"] or hashlib.md5(str(entry["item"]).encode()).hexdigest()[:12]
-        if key not in seen:
-            seen.add(key)
-            unique.append(entry)
-    scored = []
-    for entry in unique:
-        source_count = sum(1 for e in unique if e["source"]==entry["source"])
-        cross_source = sum(1 for e in unique if e["source"]!=entry["source"])
-        salience = float(entry["item"].get("salience",0.5)) if isinstance(entry["item"],dict) else 0.5
-        score = salience * (1.0 + 0.3 * min(cross_source,3))
-        scored.append((score, entry))
-    scored.sort(key=lambda x: -x[0])
-    return [entry for _,entry in scored[:budget]]
+            text = _item_text(item)
+            entries.append(
+                {
+                    "source": source,
+                    "item": item,
+                    "key": _stable_key(item),
+                    "tokens": collapse_tokenize(text),
+                    "text": text,
+                }
+            )
+
+    unique: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+    for entry in entries:
+        if entry["key"] in seen:
+            continue
+        seen.add(entry["key"])
+        unique.append(entry)
+
+    query_tokens = collapse_tokenize(query)
+    scored: List[Tuple[float, int, Any]] = []
+    for index, entry in enumerate(unique):
+        item = entry["item"]
+        salience = 0.5
+        confidence = 0.5
+        if isinstance(item, dict):
+            try:
+                salience = max(0.0, min(1.0, float(item.get("salience", 0.5))))
+            except (TypeError, ValueError):
+                salience = 0.5
+            try:
+                confidence = max(0.0, min(1.0, float(item.get("confidence", 0.5))))
+            except (TypeError, ValueError):
+                confidence = 0.5
+
+        query_overlap = _jaccard(query_tokens, entry["tokens"])
+        corroborating_sources = set()
+        for other in unique:
+            if other is entry or other["source"] == entry["source"]:
+                continue
+            if _jaccard(entry["tokens"], other["tokens"]) >= 0.45:
+                corroborating_sources.add(other["source"])
+
+        score = (
+            0.50 * salience
+            + 0.25 * confidence
+            + 0.20 * query_overlap
+            + 0.05 * min(len(corroborating_sources), 2)
+        )
+        scored.append((score, -index, item))
+
+    scored.sort(key=lambda row: (row[0], row[1]), reverse=True)
+    return [item for _, _, item in scored[:budget]]

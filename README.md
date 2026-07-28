@@ -29,23 +29,27 @@ Retrieval pipeline:
 - Python 3.11+
 - SQLite 3.35+ (FTS5)
 - Qdrant (optional, for semantic search)
-- OpenRouter API key (for embeddings + Cohere rerank)
+- OpenRouter API key (only when embeddings or rerank are enabled)
+- `hermes_trust_core` and `hermes_core_loader` in `{HERMES_HOME}/lib` for the strict security-integrated build
 
 ## Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `MEMORY_WIKI_EMBED_PROVIDER` | `openrouter` | `openrouter` or `stub` |
-| `MEMORY_WIKI_EMBED_MODEL` | `perplexity/pplx-embed-v1-4b` | Embedding model |
-| `MEMORY_WIKI_EMBED_DIMENSIONS` | `2560` | Vector dimensions |
+| `MEMORY_WIKI_EMBED_PROVIDER` | `stub` | `openrouter` or local `stub` fallback |
+| `MEMORY_WIKI_EMBED_URL` | provider-dependent | `https://openrouter.ai/api/v1` for `openrouter`, otherwise `http://127.0.0.1:4000` |
+| `MEMORY_WIKI_EMBED_MODEL` | `qwen/qwen3-embedding-8b` | Embedding model |
+| `MEMORY_WIKI_EMBED_DIMENSIONS` | `768` | Embedding response dimensions |
 | `MEMORY_WIKI_QDRANT_COLLECTION` | `memory_wiki_claims` | Collection name prefix |
-| `MEMORY_WIKI_VECTOR_SIZE` | `2560` | Must match EMBED_DIMENSIONS |
-| `MEMORY_WIKI_RERANK_ENABLED` | `true` | Enable Cohere rerank |
+| `MEMORY_WIKI_VECTOR_SIZE` | `768` | Must match stored vector dimensions |
+| `MEMORY_WIKI_RERANK_ENABLED` | `false` | Enable Cohere/OpenRouter rerank |
 | `MEMORY_WIKI_RERANK_MODEL` | `cohere/rerank-4-pro` | Reranker model ID |
 | `MEMORY_WIKI_RERANK_API_KEY` | (uses `OPENROUTER_API_KEY`) | API key for reranker |
 | `MEMORY_WIKI_QDRANT_API_KEY` | (empty) | Qdrant API key if auth enabled |
 | `MEMORY_WIKI_CONTEXT_MAX_TOKENS` | `4000` | Token budget for context packer |
 | `MEMORY_WIKI_CONTEXT_MAX_CLAIMS` | `16` | Max claims in packed context |
+| `MEMORY_WIKI_SIMHASH_MAX_DISTANCE` | `3` | Conservative 64-bit near-duplicate threshold |
+| `HERMES_SECURITY_STRICT` | `1` | Quarantine recalled content if the shared trust core fails |
 | `HERMES_HOME` | `~/.hermes` | Hermes data directory (DB at `{HERMES_HOME}/memory-wiki/memory_wiki.sqlite3`) |
 
 ## Installation
@@ -55,9 +59,16 @@ Retrieval pipeline:
 cd ~/.hermes/plugins
 git clone https://github.com/sbrejnev988-coder/hermes-memory-wiki.git memory-wiki
 
+# The security-integrated build also requires these files:
+#   ~/.hermes/lib/hermes_core_loader.py
+#   ~/.hermes/lib/hermes_trust_core.py
+#   ~/.hermes/lib/hermes_secret_core.py (pinned by the loader)
+
 # Restart Hermes gateway
 glinomes restart
 ```
+
+Before restart, run `python3 -m py_compile __init__.py collapse.py extractor.py decay.py`.
 
 On first init the plugin creates:
 - `{HERMES_HOME}/memory-wiki/memory_wiki.sqlite3` — SQLite database (source of truth)

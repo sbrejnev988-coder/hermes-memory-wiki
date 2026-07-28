@@ -80,20 +80,20 @@ except ImportError:
             return ["[QUARANTINED: memory guard unavailable]"] if items else []
 
 try:
-    from .collapse import memory_context_collapse, tokenize as collapse_tokenize
+    from .collapse import memory_context_collapse, collapse_tokenize
 except ImportError:
     try:
-        from collapse import memory_context_collapse, tokenize as collapse_tokenize
+        from collapse import memory_context_collapse, collapse_tokenize
     except ImportError:
         def memory_context_collapse(query, memory_wiki_hits=None, knowledge_hits=None, distill_hits=None, budget=6, **kw):
             return (memory_wiki_hits or [])
         def collapse_tokenize(text: str) -> set: return set()
 
 try:
-    from .extractor import extract_session_claims, score_session as extractor_score_session
+    from .extractor import extract_session_claims, extractor_score_session
 except ImportError:
     try:
-        from extractor import extract_session_claims, score_session as extractor_score_session
+        from extractor import extract_session_claims, extractor_score_session
     except ImportError:
         def extract_session_claims(exchanges, session_id="", **kw): return {"extracted": 0, "entries": [], "error": "module absent"}
         def extractor_score_session(exchanges): return {"total": 0.0}
@@ -126,7 +126,12 @@ except Exception as _trust_exc:
 # ═════════════════════════════════════════════════════════════
 EMBED_PROVIDER = os.environ.get("MEMORY_WIKI_EMBED_PROVIDER", "stub").lower()
 
-EMBED_URL = os.environ.get("MEMORY_WIKI_EMBED_URL", "http://127.0.0.1:4000").rstrip("/")
+_DEFAULT_EMBED_URL = (
+    "https://openrouter.ai/api/v1"
+    if EMBED_PROVIDER == "openrouter"
+    else "http://127.0.0.1:4000"
+)
+EMBED_URL = os.environ.get("MEMORY_WIKI_EMBED_URL", _DEFAULT_EMBED_URL).rstrip("/")
 
 EMBED_API_KEY = os.environ.get("MEMORY_WIKI_EMBED_API_KEY", "")
 
@@ -315,29 +320,56 @@ def _ensure_outbox(db_path: Optional[str] = None) -> None:
 
 
 def _outbox_enqueue(operation: str, object_type: str, object_id: str, payload: dict, conn=None) -> str:
+    """Enqueue the latest desired index state and coalesce obsolete pending work."""
     oid = uuid.uuid4().hex[:16]
     ts = int(time.time())
     payload_json = json.dumps(payload, ensure_ascii=False) if payload else "{}"
+
+    def enqueue(db) -> str:
+        if operation in {"upsert", "embed_and_upsert"}:
+            # A newer active-state upsert supersedes older pending upserts and
+            # pending deletes produced by a short-lived status transition.
+            db.execute(
+                """DELETE FROM index_outbox
+                    WHERE object_type=? AND object_id=? AND status='pending'
+                      AND operation IN ('upsert','embed_and_upsert','delete')""",
+                (object_type, object_id),
+            )
+        elif operation == "delete":
+            db.execute(
+                """DELETE FROM index_outbox
+                    WHERE object_type=? AND object_id=? AND status='pending'
+                      AND operation IN ('upsert','embed_and_upsert')""",
+                (object_type, object_id),
+            )
+            existing = db.execute(
+                """SELECT id FROM index_outbox
+                    WHERE object_type=? AND object_id=? AND status='pending'
+                      AND operation='delete'
+                    ORDER BY created_at DESC LIMIT 1""",
+                (object_type, object_id),
+            ).fetchone()
+            if existing:
+                return str(existing[0])
+        db.execute(
+            "INSERT INTO index_outbox(id,operation,object_type,object_id,payload_json,created_at,updated_at,next_retry_at) VALUES(?,?,?,?,?,?,?,?)",
+            (oid, operation, object_type, object_id, payload_json, ts, ts, ts),
+        )
+        return oid
+
     try:
         if conn is not None:
-            conn.execute(
-                "INSERT INTO index_outbox(id,operation,object_type,object_id,payload_json,created_at,updated_at,next_retry_at) VALUES(?,?,?,?,?,?,?,?)",
-                (oid, operation, object_type, object_id, payload_json, ts, ts, ts),
-            )
-            return oid
+            return enqueue(conn)
         path = _outbox_db_path()
         _ensure_outbox(path)
         db = sqlite3.connect(path, timeout=30.0)
         try:
-            db.execute(
-                "INSERT INTO index_outbox(id,operation,object_type,object_id,payload_json,created_at,updated_at,next_retry_at) VALUES(?,?,?,?,?,?,?,?)",
-                (oid, operation, object_type, object_id, payload_json, ts, ts, ts),
-            )
+            result = enqueue(db)
             db.commit()
         finally:
             db.close()
         _wake_outbox_worker(path)
-        return oid
+        return result
     except Exception as exc:
         _debug_log(f"outbox enqueue failed: {exc}")
         if conn is not None:
@@ -1005,6 +1037,7 @@ def _tfidf_build_vocab(texts: List[str], max_features: int = 3000) -> None:
     """Строит словарь из списка текстов (вызывается при старте плагина)."""
     global _TFIDF_VOCAB, _TFIDF_IDF, _TFIDF_VOCAB_SIZE, _TFIDF_BUILT
     if _TFIDF_BUILT: return
+    max_features = max(1, min(int(max_features or 1), int(QDRANT_VECTOR_SIZE)))
     from collections import Counter
     doc_count = len(texts)
     if doc_count < 10:
@@ -1050,15 +1083,15 @@ def _tfidf_vectorize(tokens: list) -> List[float]:
             tf[idx] = tf.get(idx, 0.0) + 1.0
             total += 1
     if total == 0: return []
-    # TF-IDF = TF * IDF
-    vec = [0.0] * _TFIDF_VOCAB_SIZE
-    if _TFIDF_VOCAB_SIZE < 768:
-        vec.extend([0.0] * (768 - _TFIDF_VOCAB_SIZE))
-    elif _TFIDF_VOCAB_SIZE > 768:
-        vec = vec[:768]
+    # TF-IDF = TF * IDF. The fallback must always match the configured
+    # Qdrant vector size and must not index beyond the dense vector.
+    vector_size = max(1, int(QDRANT_VECTOR_SIZE))
+    vec = [0.0] * vector_size
     for idx, count in tf.items():
+        if not 0 <= int(idx) < vector_size:
+            continue
         tf_norm = count / total
-        vec[idx] = tf_norm * _TFIDF_IDF.get(idx, 1.0)
+        vec[int(idx)] = tf_norm * _TFIDF_IDF.get(int(idx), 1.0)
     return vec
 try:
     import fcntl  # POSIX advisory locks; unavailable on some non-Unix runtimes.
@@ -1379,9 +1412,16 @@ def _compute_simhash(text: str) -> int:
             result |= (1 << bit)
     return result
 
+_HASH64_MASK = (1 << 64) - 1
+SIMHASH_MAX_DISTANCE = max(0, min(16, int(os.environ.get("MEMORY_WIKI_SIMHASH_MAX_DISTANCE", "3"))))
+
+def _hash_to_unsigned(h: int) -> int:
+    """Normalize SQLite signed integers to their 64-bit bit pattern."""
+    return int(h) & _HASH64_MASK
+
 def _hamming_distance(a: int, b: int) -> int:
-    """Hamming distance между двумя 64-bit целыми."""
-    return (a ^ b).bit_count()
+    """Hamming distance between two stored 64-bit fingerprints."""
+    return (_hash_to_unsigned(a) ^ _hash_to_unsigned(b)).bit_count()
 
 def _hash_to_signed(h: int) -> int:
     """Преобразует unsigned Python int в signed 64-bit для SQLite."""
@@ -1755,7 +1795,18 @@ class MemoryWikiProvider(MemoryProvider):
         __main__._memory_wiki_instance = self
 
     # ----- lifecycle -----------------------------------------------------
-    def is_available(self) -> bool: return True
+    def is_available(self) -> bool:
+        """Report actual provider health instead of an unconditional True."""
+        try:
+            if bool(getattr(self, "_degraded", False)):
+                return False
+            conn = getattr(self, "_conn", None)
+            if conn is not None:
+                row = conn.execute("PRAGMA quick_check").fetchone()
+                return bool(row and str(row[0]).lower() == "ok")
+            return True
+        except Exception:
+            return False
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self.session_id = session_id or "default"
@@ -2191,10 +2242,17 @@ class MemoryWikiProvider(MemoryProvider):
                     "trust_level": item.trust_level,
                     "injection_signals": item.injection_signals,
                 }
-            except Exception:
-                pass
+            except Exception as exc:
+                if os.environ.get("HERMES_SECURITY_STRICT", "1").lower() not in {"0", "false", "no", "off"}:
+                    self._audit(
+                        "injection_guard",
+                        "runtime_failure_quarantined",
+                        f"Claim {r.get('id','?')} quarantined after trust-core failure: {type(exc).__name__}: {exc}",
+                    )
+                    return None
         
-        # Fallback: базовый regex-based sanitize
+        # Fallback is allowed only when strict mode is explicitly disabled or
+        # the optional shared guard was not loaded during a non-strict start.
         safe_text = _safe_recall_text(raw_claim, 900)
         return {
             "content": safe_text,
@@ -2224,20 +2282,15 @@ class MemoryWikiProvider(MemoryProvider):
 
     # ── LLM session extraction ─────────────────────────────────
     def _extract_session_claims(self, messages: List[Dict[str, Any]]) -> None:
-        """Auto-extract structured claims from session via LLM.
-        Fail-open: silently returns on any error (never breaks session end)."""
+        """Extract and persist structured claims without breaking session end."""
         try:
             exchanges = []
-            for m in messages[-32:]:
-                role = str(m.get("role", "")).lower()
-                content = str(m.get("content", "") or "")
-                if role == "user":
-                    exchanges.append({"user": content, "assistant": ""})
-                elif role == "assistant" and exchanges:
-                    exchanges[-1]["assistant"] = content
-                elif role == "assistant":
-                    exchanges.append({"user": "", "assistant": content})
-            if len(exchanges) < 3:
+            for message in messages[-32:]:
+                role = str(message.get("role", "")).lower()
+                content = str(message.get("content", "") or "").strip()
+                if role in {"user", "assistant"} and content:
+                    exchanges.append({"role": role, "content": content})
+            if len(exchanges) < 2:
                 return
 
             result = extract_session_claims(
@@ -2245,14 +2298,26 @@ class MemoryWikiProvider(MemoryProvider):
                 session_id=self.session_id,
                 add_claim_callback=self._add_claim,
             )
-            if result.get("extracted", 0) > 0:
+            if result.get("extracted", 0) > 0 or result.get("errors"):
                 self._audit(
                     "extraction",
-                    f"session:{self.session_id}",
-                    f"LLM extracted {result['extracted']} claims (score={result.get('score',0)})",
+                    "ok" if not result.get("errors") else "partial",
+                    json.dumps(
+                        {
+                            "session_id": self.session_id,
+                            "extracted": int(result.get("extracted", 0)),
+                            "persisted": int(result.get("persisted", 0)),
+                            "errors": result.get("errors", [])[:5],
+                        },
+                        ensure_ascii=False,
+                    ),
                 )
-        except Exception:
-            pass  # fail-open: never break session end
+        except Exception as exc:
+            self._audit(
+                "extraction",
+                "failed",
+                f"session={self.session_id}: {type(exc).__name__}: {exc}",
+            )
 
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False, **kwargs) -> None:
         self.session_id = new_session_id or self.session_id
@@ -2320,7 +2385,7 @@ class MemoryWikiProvider(MemoryProvider):
             {"name":"memory_wiki_write_firewall","description":"Dry-run or queue a candidate memory through source policy, quality lint, artifact detection and secret firewall before durable write.","parameters":P({"claim":{"type":"string"},"topic":{"type":"string","default":"general"},"evidence":{"type":"string","default":""},"source":{"type":"string","default":"tool"},"mode":{"type":"string","enum":["check","queue","apply"],"default":"check"},"confidence":{"type":"number","default":0.75},"salience":{"type":"number","default":0.7}}, ["claim"])},
             {"name":"memory_wiki_mutation_log","description":"Return transactional mutation log entries with before/after metadata for undo/audit.","parameters":P({"limit":{"type":"integer","default":50},"target_table":{"type":"string","default":""},"target_id":{"type":"string","default":""},"since_seconds":{"type":"integer","default":0}}, [])},
             {"name":"memory_wiki_undo_last","description":"Undo the last reversible memory mutation or a specific mutation id.","parameters":P({"mutation_id":{"type":"string","default":""},"dry_run":{"type":"boolean","default":True}}, [])},
-            {"name":"memory_wiki_transaction","description":"Dry-run/apply a bounded batch of memory operations with optional pre-apply backup and rollback ids.","parameters":P({"operations":{"type":"array","items":{"type":"object"}},"mode":{"type":"string","enum":["suggest","apply","apply_with_backup"],"default":"suggest"},"reason":{"type":"string","default":""}}, ["operations"])},
+            {"name":"memory_wiki_transaction","description":"Dry-run/apply a bounded non-atomic batch. Each operation may commit independently; use apply_with_backup and stop_on_error for safer rollback.","parameters":P({"operations":{"type":"array","items":{"type":"object"}},"mode":{"type":"string","enum":["suggest","apply","apply_with_backup"],"default":"suggest"},"reason":{"type":"string","default":""},"stop_on_error":{"type":"boolean","default":True}}, ["operations"])},
             {"name":"memory_wiki_compile_topic","description":"Compile micro-claims in a topic into a curated structured summary; suggest or apply with superseding of older low-priority claims.","parameters":P({"topic":{"type":"string"},"mode":{"type":"string","enum":["suggest","apply"],"default":"suggest"},"limit":{"type":"integer","default":50},"summary_type":{"type":"string","enum":["summary","runbook","profile","timeline","decision"],"default":"summary"}}, ["topic"])},
             {"name":"memory_wiki_get_project_context","description":"Return first-class project profile plus related claims/task capsules/graph context.","parameters":P({"project_id":{"type":"string"},"query":{"type":"string","default":""},"limit":{"type":"integer","default":20}}, ["project_id"])},
             {"name":"memory_wiki_source_policy","description":"Show ingestion policy and write-firewall decision for a source/candidate.","parameters":P({"source":{"type":"string","default":"tool"},"claim":{"type":"string","default":""},"topic":{"type":"string","default":"general"}}, [])},
@@ -2685,7 +2750,7 @@ class MemoryWikiProvider(MemoryProvider):
             if tool_name == "memory_wiki_write_firewall": return tool_result(success=True, **self._write_firewall(a))
             if tool_name == "memory_wiki_mutation_log": return tool_result(success=True, **self._mutation_log(int(a.get("limit",50)), a.get("target_table") or "", a.get("target_id") or "", int(a.get("since_seconds",0) or 0)))
             if tool_name == "memory_wiki_undo_last": return tool_result(success=True, **self._undo_last(a.get("mutation_id") or "", bool(a.get("dry_run", True))))
-            if tool_name == "memory_wiki_transaction": return tool_result(success=True, **self._transaction(a.get("operations") or [], a.get("mode") or "suggest", a.get("reason") or ""))
+            if tool_name == "memory_wiki_transaction": return tool_result(success=True, **self._transaction(a.get("operations") or [], a.get("mode") or "suggest", a.get("reason") or "", bool(a.get("stop_on_error", True))))
             if tool_name == "memory_wiki_compile_topic": return tool_result(success=True, **self._compile_topic(a.get("topic") or "general", a.get("mode") or "suggest", int(a.get("limit",50)), a.get("summary_type") or "summary"))
             if tool_name == "memory_wiki_get_project_context": return tool_result(success=True, **self._get_project_context(a.get("project_id") or "", a.get("query") or "", int(a.get("limit",20))))
             if tool_name == "memory_wiki_source_policy": return tool_result(success=True, **self._source_policy_tool(a.get("source") or "tool", a.get("claim") or "", a.get("topic") or "general"))
@@ -2720,6 +2785,7 @@ class MemoryWikiProvider(MemoryProvider):
                     db_path=str(self.db_path),
                     threshold=float(a.get("threshold", 0.05)),
                     dry_run=not bool(a.get("apply", False)),
+                    archive_callback=self._archive_claim_ids,
                 )
                 return tool_result(success=True, **res)
             if tool_name == "memory_wiki_context_sanitize":
@@ -3333,6 +3399,10 @@ class MemoryWikiProvider(MemoryProvider):
             c.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('memory_revision','0')")
             c.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('fts_latest_revision','0')")
             c.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('qdrant_latest_revision','0')")
+            c.execute(
+                "INSERT OR REPLACE INTO meta(key,value) VALUES('semantic_enabled',?)",
+                ("1" if SEMANTIC_ENABLED else "0",),
+            )
             c.executescript(_OUTBOX_TABLE)
             outbox_cols = set(self._cols("index_outbox"))
             for outbox_name, outbox_ddl in (("worker_id","TEXT NOT NULL DEFAULT ''"),("lease_until","INTEGER NOT NULL DEFAULT 0"),("next_retry_at","INTEGER NOT NULL DEFAULT 0")):
@@ -3672,6 +3742,8 @@ class MemoryWikiProvider(MemoryProvider):
                     c.execute("CREATE VIRTUAL TABLE claims_fts USING fts5(id UNINDEXED, claim, normalized, topic, evidence, search_text, tokenize='unicode61')")
             except Exception:
                 pass
+
+            self._install_index_sync_triggers(c)
 
             c.execute("""CREATE TABLE IF NOT EXISTS code_claim_metadata(
                 claim_id TEXT PRIMARY KEY, repository_id TEXT NOT NULL DEFAULT '',
@@ -4922,15 +4994,88 @@ class MemoryWikiProvider(MemoryProvider):
             "supersedes": superseded,
         }
 
-    def _apply_supersession(self, superseded_ids: list, new_claim_id: str, conn=None) -> int:
-        """Mark superseded claims as historical."""
+    def _archive_claim_ids(
+        self,
+        claim_ids: list,
+        reason: str = "archive",
+        change_type: str = "archive",
+        superseded_by_id: str = "",
+        conn=None,
+    ) -> int:
+        """Archive claims and update all rebuildable indexes atomically."""
+        ids = list(dict.fromkeys(str(cid) for cid in (claim_ids or []) if str(cid)))
+        if not ids:
+            return 0
         c = conn or self._connect()
-        for sid in superseded_ids:
-            c.execute("UPDATE claims SET temporal_status='superseded', superseded_by_id=?, status='archived' WHERE id=?",
-                      (new_claim_id, sid))
-        if not conn:
-            c.commit()
-        return len(superseded_ids)
+
+        def apply() -> int:
+            placeholders = ",".join("?" for _ in ids)
+            rows = c.execute(
+                f"SELECT id,status,temporal_status,superseded_by_id,memory_revision FROM claims WHERE id IN ({placeholders})",
+                ids,
+            ).fetchall()
+            archived = 0
+            ts = now()
+            for row in rows:
+                if str(row["status"] or "") != "active":
+                    continue
+                cid = str(row["id"])
+                before = dict(row)
+                temporal_status = "superseded" if superseded_by_id else "historical"
+                c.execute(
+                    """UPDATE claims
+                          SET status='archived', temporal_status=?, superseded_by_id=?, updated_at=?
+                        WHERE id=? AND status='active'""",
+                    (temporal_status, superseded_by_id or "", ts, cid),
+                )
+                if c.execute("SELECT changes()").fetchone()[0] != 1:
+                    continue
+                # Deactivation trigger removes FTS and enqueues a coalesced
+                # Qdrant delete for every status-changing code path.
+                c.execute("DELETE FROM claims_fts WHERE id=?", (cid,))
+                after = {
+                    "id": cid,
+                    "status": "archived",
+                    "temporal_status": temporal_status,
+                    "superseded_by_id": superseded_by_id or "",
+                    "updated_at": ts,
+                }
+                self._record_mutation(
+                    change_type,
+                    "claims",
+                    cid,
+                    before,
+                    after,
+                    reason,
+                    conn=c,
+                )
+                self._audit(
+                    change_type,
+                    "ok",
+                    json.dumps({"claim_id": cid, "reason": reason}, ensure_ascii=False),
+                    conn=c,
+                )
+                archived += 1
+            return archived
+
+        if conn is not None:
+            return apply()
+        with c:
+            archived = apply()
+        if archived and SEMANTIC_ENABLED:
+            _start_outbox_worker(str(self.db_path))
+            _wake_outbox_worker(str(self.db_path))
+        return archived
+
+    def _apply_supersession(self, superseded_ids: list, new_claim_id: str, conn=None) -> int:
+        """Mark superseded claims and remove stale FTS/Qdrant entries."""
+        return self._archive_claim_ids(
+            superseded_ids,
+            reason=f"superseded_by:{new_claim_id}",
+            change_type="temporal_supersession",
+            superseded_by_id=new_claim_id,
+            conn=conn,
+        )
 
 
     def _resolve_scope(self, scope_type: str = "global", scope_id: str = "") -> Dict[str, Any]:
@@ -5074,7 +5219,8 @@ class MemoryWikiProvider(MemoryProvider):
             "claim_type": ctype, "source_type": stype, "scope": scope, "project_id": project_id,
             "trust_meta": tm, "verification_status": vfy_status, "verified_at": vfy_at,
             "quality_flags": flags, "source_ref": source_ref, "review_state": review_state,
-            "source": source, "identity_scope": effective_identity_scope, "raw_secret": raw_secret,
+            "source": source, "identity_scope": effective_identity_scope,
+            "explicit_identity_scope": bool(identity_scope), "raw_secret": raw_secret,
             "origin_bot_id": self.bot_id, "origin_session_id": self.session_id,
             "origin_chat_hash": self._chat_hash(self.session_id), "source_kind": self._source_kind(source),
             "visibility_scope": visibility_scope, "event_at": event_at, "event_timezone": event_timezone,
@@ -5112,26 +5258,47 @@ class MemoryWikiProvider(MemoryProvider):
                 except Exception: pass
             else:
                 # --- P2: Near-duplicate detection via SimHash before insert ---
-                identity_scope = str(p.get("identity_scope") or "")
+                has_explicit_identity_scope = bool(p.get("explicit_identity_scope"))
                 near_merge_id = None
-                if not identity_scope and len(normalized) >= 50:  # Skip short + scoped claims
+                if not has_explicit_identity_scope and len(normalized) >= 50:  # Skip short + explicitly scoped claims
                     try:
                         sh = _hash_to_signed(_compute_simhash(normalized))
-                        # Hamming distance ≤ 3 бит — кандидаты в near-duplicate
+                        # Compare only inside the same visibility boundary and topic.
+                        # A global SimHash scan could merge similar private/project facts
+                        # and then overwrite their origin metadata.
+                        visibility_scope = str(p.get("visibility_scope") or "global")
+                        boundary_sql = ""
+                        boundary_params: list = []
+                        if visibility_scope == "bot":
+                            boundary_sql = " AND cl.origin_bot_id=?"
+                            boundary_params.append(str(p.get("origin_bot_id") or ""))
+                        elif visibility_scope == "chat":
+                            boundary_sql = " AND cl.origin_chat_hash=?"
+                            boundary_params.append(str(p.get("origin_chat_hash") or ""))
+                        elif visibility_scope == "private":
+                            boundary_sql = " AND cl.origin_session_id=?"
+                            boundary_params.append(str(p.get("origin_session_id") or ""))
+                        elif visibility_scope == "project":
+                            boundary_sql = " AND cl.project_id=?"
+                            boundary_params.append(str(p.get("project_id") or ""))
                         near_rows = c.execute(
-                            "SELECT cs.id, cs.simhash FROM claims_simhash cs JOIN claims cl ON cs.id=cl.id WHERE cl.status='active' ORDER BY cl.updated_at DESC LIMIT 200"
+                            "SELECT cs.id, cs.simhash FROM claims_simhash cs "
+                            "JOIN claims cl ON cs.id=cl.id "
+                            "WHERE cl.status='active' AND cl.topic=? AND cl.visibility_scope=?" +
+                            boundary_sql + " ORDER BY cl.updated_at DESC LIMIT 200",
+                            [topic, visibility_scope, *boundary_params],
                         ).fetchall()
-                        best_dist = 999
+                        best_dist = 65
                         for nr in near_rows:
-                            dist = (sh ^ int(nr["simhash"])).bit_count()
+                            dist = _hamming_distance(sh, int(nr["simhash"]))
                             if dist < best_dist:
                                 best_dist = dist
-                                near_merge_id = nr["id"] if dist <= 12 else None
+                                near_merge_id = nr["id"] if dist <= SIMHASH_MAX_DISTANCE else None
                         if near_merge_id:
                             self._audit('dedup', 'simhash_near_merge', f'{cid} near-duplicate of {near_merge_id} (hamming={best_dist})', conn=c)
                             c.execute(
-                                "UPDATE claims SET confidence=max(confidence,?), salience=max(salience,?), quality=max(quality,?), derived_from=CASE WHEN derived_from='' THEN ? ELSE derived_from END, updated_at=? WHERE id=?",
-                                (clamp(confidence), clamp(salience), quality, near_merge_id, ts, near_merge_id)
+                                "UPDATE claims SET confidence=max(confidence,?), salience=max(salience,?), quality=max(quality,?), updated_at=? WHERE id=?",
+                                (clamp(confidence), clamp(salience), quality, ts, near_merge_id)
                             )
                             cid = near_merge_id
                     except Exception: pass
@@ -5170,9 +5337,16 @@ class MemoryWikiProvider(MemoryProvider):
             )
             # Outbox + temporal — inside same transaction as claim
             if SEMANTIC_ENABLED:
-                revision_row = c.execute("SELECT memory_revision,visibility_scope,origin_bot_id,origin_chat_hash,project_id,event_at FROM claims WHERE id=?", (cid,)).fetchone()
+                revision_row = c.execute(
+                    """SELECT normalized_claim,topic,memory_revision,visibility_scope,
+                              origin_bot_id,origin_chat_hash,project_id,event_at
+                         FROM claims WHERE id=?""",
+                    (cid,),
+                ).fetchone()
+                canonical_text = str(revision_row["normalized_claim"] or "") if revision_row else normalized
+                canonical_topic = str(revision_row["topic"] or topic) if revision_row else topic
                 _outbox_enqueue("embed_and_upsert", "claim", cid, {
-                    "text": normalized, "topic": topic, "collection": _active_collection_name(),
+                    "text": canonical_text, "topic": canonical_topic, "collection": _active_collection_name(),
                     "memory_revision": int(revision_row["memory_revision"] or 0) if revision_row else 0,
                     "visibility_scope": str(revision_row["visibility_scope"] or "global") if revision_row else "global",
                     "origin_bot_id": str(revision_row["origin_bot_id"] or "") if revision_row else "",
@@ -5303,13 +5477,20 @@ class MemoryWikiProvider(MemoryProvider):
         try:
             cid = self._add_claim(claim, "config", evidence, "memory-wiki:env-metadata:v2", 0.90, 0.84)
             with self._connect() as c:
-                c.execute(
-                    """UPDATE claims SET status='superseded', updated_at=?
-                       WHERE status='active' AND id!=? AND (
-                         source IN ('memory-wiki:env-metadata','memory-wiki:env-metadata:v2')
-                         OR claim LIKE 'Hermes env/config metadata lists configured variables%'
-                       )""",
-                    (now(), cid),
+                old_rows = c.execute(
+                    """SELECT id FROM claims
+                        WHERE status='active' AND id!=? AND (
+                          source IN ('memory-wiki:env-metadata','memory-wiki:env-metadata:v2')
+                          OR claim LIKE 'Hermes env/config metadata lists configured variables%'
+                        )""",
+                    (cid,),
+                ).fetchall()
+                self._archive_claim_ids(
+                    [row["id"] for row in old_rows],
+                    reason=f"env_metadata_replaced_by:{cid}",
+                    change_type="env_metadata_supersession",
+                    superseded_by_id=cid,
+                    conn=c,
                 )
         except Exception:
             pass
@@ -5754,11 +5935,126 @@ class MemoryWikiProvider(MemoryProvider):
                 if not verify:
                     raise RuntimeError(f"FTS rebuild completed without active claim {cid}") from exc
 
+    def _drop_index_sync_triggers(self, conn) -> None:
+        for trigger_name in (
+            "trg_claims_deactivate_indexes",
+            "trg_claims_reactivate_indexes",
+            "trg_claims_active_content_indexes",
+        ):
+            conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+
+    def _install_index_sync_triggers(self, conn) -> None:
+        """Install status/content triggers after the FTS table is available."""
+        try:
+            self._drop_index_sync_triggers(conn)
+            conn.execute("""CREATE TRIGGER trg_claims_deactivate_indexes
+                AFTER UPDATE OF status ON claims
+                WHEN OLD.status='active' AND NEW.status<>'active'
+                BEGIN
+                    DELETE FROM claims_fts WHERE id=NEW.id;
+                    DELETE FROM index_outbox
+                     WHERE object_type='claim' AND object_id=NEW.id
+                       AND status='pending'
+                       AND operation IN ('upsert','embed_and_upsert');
+                    INSERT INTO index_outbox(
+                        id,operation,object_type,object_id,payload_json,
+                        created_at,updated_at,next_retry_at
+                    )
+                    SELECT lower(hex(randomblob(8))),'delete','claim',NEW.id,'{}',
+                           CAST(strftime('%s','now') AS INTEGER),
+                           CAST(strftime('%s','now') AS INTEGER),
+                           CAST(strftime('%s','now') AS INTEGER)
+                     WHERE EXISTS (
+                        SELECT 1 FROM meta WHERE key='semantic_enabled' AND value='1'
+                     ) AND NOT EXISTS (
+                        SELECT 1 FROM index_outbox
+                         WHERE object_type='claim' AND object_id=NEW.id
+                           AND status='pending' AND operation='delete'
+                     );
+                END""")
+            conn.execute("""CREATE TRIGGER trg_claims_reactivate_indexes
+                AFTER UPDATE OF status ON claims
+                WHEN OLD.status<>'active' AND NEW.status='active'
+                BEGIN
+                    DELETE FROM claims_fts WHERE id=NEW.id;
+                    INSERT INTO claims_fts(id,claim,normalized,topic,evidence,search_text)
+                    VALUES(
+                        NEW.id,NEW.claim,COALESCE(NULLIF(NEW.normalized_claim,''),NEW.claim),
+                        NEW.topic,NEW.evidence,
+                        NEW.claim || ' ' || COALESCE(NEW.normalized_claim,'') || ' ' || NEW.topic || ' ' || NEW.evidence
+                    );
+                    DELETE FROM index_outbox
+                     WHERE object_type='claim' AND object_id=NEW.id
+                       AND status='pending'
+                       AND operation IN ('upsert','embed_and_upsert','delete');
+                    INSERT INTO index_outbox(
+                        id,operation,object_type,object_id,payload_json,
+                        created_at,updated_at,next_retry_at
+                    )
+                    SELECT lower(hex(randomblob(8))),'embed_and_upsert','claim',NEW.id,
+                           json_object(
+                               'text',COALESCE(NULLIF(NEW.normalized_claim,''),NEW.claim),
+                               'topic',NEW.topic,
+                               'memory_revision',NEW.memory_revision,
+                               'visibility_scope',NEW.visibility_scope,
+                               'origin_bot_id',NEW.origin_bot_id,
+                               'origin_chat_hash',NEW.origin_chat_hash,
+                               'project_id',NEW.project_id,
+                               'event_at',NEW.event_at
+                           ),
+                           CAST(strftime('%s','now') AS INTEGER),
+                           CAST(strftime('%s','now') AS INTEGER),
+                           CAST(strftime('%s','now') AS INTEGER)
+                     WHERE EXISTS (
+                        SELECT 1 FROM meta WHERE key='semantic_enabled' AND value='1'
+                     );
+                END""")
+            conn.execute("""CREATE TRIGGER trg_claims_active_content_indexes
+                AFTER UPDATE OF claim,normalized_claim,topic,evidence ON claims
+                WHEN NEW.status='active' AND OLD.status='active'
+                BEGIN
+                    DELETE FROM claims_fts WHERE id=NEW.id;
+                    INSERT INTO claims_fts(id,claim,normalized,topic,evidence,search_text)
+                    VALUES(
+                        NEW.id,NEW.claim,COALESCE(NULLIF(NEW.normalized_claim,''),NEW.claim),
+                        NEW.topic,NEW.evidence,
+                        NEW.claim || ' ' || COALESCE(NEW.normalized_claim,'') || ' ' || NEW.topic || ' ' || NEW.evidence
+                    );
+                    DELETE FROM index_outbox
+                     WHERE object_type='claim' AND object_id=NEW.id
+                       AND status='pending'
+                       AND operation IN ('upsert','embed_and_upsert','delete');
+                    INSERT INTO index_outbox(
+                        id,operation,object_type,object_id,payload_json,
+                        created_at,updated_at,next_retry_at
+                    )
+                    SELECT lower(hex(randomblob(8))),'embed_and_upsert','claim',NEW.id,
+                           json_object(
+                               'text',COALESCE(NULLIF(NEW.normalized_claim,''),NEW.claim),
+                               'topic',NEW.topic,
+                               'memory_revision',NEW.memory_revision,
+                               'visibility_scope',NEW.visibility_scope,
+                               'origin_bot_id',NEW.origin_bot_id,
+                               'origin_chat_hash',NEW.origin_chat_hash,
+                               'project_id',NEW.project_id,
+                               'event_at',NEW.event_at
+                           ),
+                           CAST(strftime('%s','now') AS INTEGER),
+                           CAST(strftime('%s','now') AS INTEGER),
+                           CAST(strftime('%s','now') AS INTEGER)
+                     WHERE EXISTS (
+                        SELECT 1 FROM meta WHERE key='semantic_enabled' AND value='1'
+                     );
+                END""")
+        except Exception as index_trigger_exc:
+            _debug_log(f"index synchronization trigger install failed: {index_trigger_exc}")
+
     def _rebuild_fts(self) -> None:
         c = self._connect()
         shadow = "claims_fts_rebuild"
         try:
             with c:
+                self._drop_index_sync_triggers(c)
                 c.execute(f"DROP TABLE IF EXISTS {shadow}")
                 c.execute(
                     f"CREATE VIRTUAL TABLE {shadow} USING "
@@ -5779,6 +6075,7 @@ class MemoryWikiProvider(MemoryProvider):
                     )
                 c.execute("DROP TABLE IF EXISTS claims_fts")
                 c.execute(f"ALTER TABLE {shadow} RENAME TO claims_fts")
+                self._install_index_sync_triggers(c)
                 self._set_meta_max(
                     "fts_latest_revision", self._meta_int("memory_revision"), conn=c
                 )
@@ -5786,6 +6083,11 @@ class MemoryWikiProvider(MemoryProvider):
             _debug_log(f"FTS rebuild failed: {type(exc).__name__}: {exc}")
             try:
                 c.execute(f"DROP TABLE IF EXISTS {shadow}")
+                fts_exists = c.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='claims_fts'"
+                ).fetchone()
+                if fts_exists:
+                    self._install_index_sync_triggers(c)
                 c.commit()
             except Exception:
                 pass
@@ -6557,7 +6859,7 @@ class MemoryWikiProvider(MemoryProvider):
             n=c.execute('SELECT count(*) n FROM claims').fetchone()['n']; add('claims_count', True, str(n))
         except Exception as e: add('claims_count', False, str(e), 'memory_wiki_repair target=integrity dry_run=false')
         try:
-            invalid_status=c.execute("SELECT count(*) n FROM claims WHERE status NOT IN ('active','retired','superseded','uncertain')").fetchone()['n']
+            invalid_status=c.execute("SELECT count(*) n FROM claims WHERE status NOT IN ('active','archived','retired','superseded','uncertain')").fetchone()['n']
             bad_topic_count=0
             for r in c.execute("SELECT topic FROM claims LIMIT 10000").fetchall():
                 if topic_integrity_reason(r['topic']): bad_topic_count += 1
@@ -6567,7 +6869,7 @@ class MemoryWikiProvider(MemoryProvider):
         try:
             fts_exists='claims_fts' in existing
             if fts_exists:
-                cn=c.execute('SELECT count(*) n FROM claims').fetchone()['n']; fn=c.execute('SELECT count(*) n FROM claims_fts').fetchone()['n']
+                cn=c.execute("SELECT count(*) n FROM claims WHERE status='active'").fetchone()['n']; fn=c.execute('SELECT count(*) n FROM claims_fts').fetchone()['n']
                 add('fts_claim_count_match', cn==fn, f'claims={cn} fts={fn}', 'memory_wiki_repair target=fts dry_run=false')
             else: add('fts_exists', False, 'claims_fts missing', 'memory_wiki_repair target=fts dry_run=false')
         except Exception as e: add('fts_claim_count_match', False, str(e), 'memory_wiki_repair target=fts dry_run=false')
@@ -6606,9 +6908,9 @@ class MemoryWikiProvider(MemoryProvider):
         backup_db_path = None
         try:
             if self._conn:
-                backup_db_path = safe_join(self.root, 'memory_wiki_backup_temp.db')
+                backup_db_path = safe_join(self.root, f'.memory_wiki_backup_{uuid.uuid4().hex}.db')
                 with self._conn:
-                    self._conn.execute(f"VACUUM INTO '{backup_db_path}'")
+                    self._conn.execute("VACUUM INTO ?", (str(backup_db_path),))
         except Exception:
             backup_db_path = None
         try:
@@ -6633,6 +6935,11 @@ class MemoryWikiProvider(MemoryProvider):
             try:
                 if tmp_path.exists(): tmp_path.unlink()
             except Exception: pass
+            try:
+                if backup_db_path and Path(backup_db_path).exists():
+                    Path(backup_db_path).unlink()
+            except Exception as cleanup_exc:
+                _debug_log(f"backup temp database cleanup failed: {cleanup_exc}")
         # --- P5: SHA256 checksum for backup integrity verification ---
         checksum_path = path.with_suffix(path.suffix + '.sha256')
         try:
@@ -6873,7 +7180,7 @@ class MemoryWikiProvider(MemoryProvider):
         graph=self._graph_query(pid + ' ' + q, lim)
         return {"project_id":pid,"profile":self._sanitize_row(profile) if profile else None,"claims":claims[:lim],"task_capsules":tasks[:lim],"graph":graph}
 
-    def _transaction(self, operations: List[Dict[str,Any]], mode: str = "suggest", reason: str = "") -> Dict[str,Any]:
+    def _transaction(self, operations: List[Dict[str,Any]], mode: str = "suggest", reason: str = "", stop_on_error: bool = True) -> Dict[str,Any]:
         mode=(mode or 'suggest').lower(); ops=list(operations or [])[:50]; batch_id='batch_'+sha(json.dumps(ops, ensure_ascii=False, sort_keys=True, default=str)+str(now()))[:12]
         backup=None; results=[]
         if mode == 'apply_with_backup':
@@ -6926,32 +7233,70 @@ class MemoryWikiProvider(MemoryProvider):
                     results.append({'operation':name,'mutation_id':mid,'result':res})
             except Exception as e:
                 results.append({'operation':name,'error':str(e)})
-        self._audit('transaction', 'ok' if not any('error' in r for r in results) else 'partial', f'{batch_id} ops={len(ops)} mode={mode}')
-        return {"batch_id":batch_id,"mode":mode,"backup":backup,"results":results,"errors":[r for r in results if 'error' in r]}
+                if mode != 'suggest' and stop_on_error:
+                    break
+        errors = [r for r in results if 'error' in r]
+        self._audit(
+            'transaction',
+            'ok' if not errors else 'partial',
+            f'{batch_id} ops_requested={len(ops)} ops_attempted={len(results)} mode={mode} atomic=false',
+        )
+        return {
+            "batch_id": batch_id,
+            "mode": mode,
+            "atomic": False,
+            "partial_commit_possible": mode != 'suggest',
+            "stop_on_error": bool(stop_on_error),
+            "backup": backup,
+            "results": results,
+            "errors": errors,
+        }
 
     def _gc_dead_claims(self, dry_run: bool=True, max_age_days: int=90, min_salience: float=0.05) -> Dict[str, Any]:
-        """v1.6: Garbage collect dead/stale claims — archive them."""
-        c=self._connect(); ts=now(); cutoff=ts-(max_age_days*86400)
-        candidates=c.execute("""SELECT id,claim,topic,salience,updated_at,access_count
-            FROM claims WHERE status='active' AND pinned=0 AND salience<? AND updated_at<?
-            ORDER BY salience ASC, updated_at ASC LIMIT 500""", (min_salience, cutoff)).fetchall()
-        result={"candidates":len(candidates),"dry_run":dry_run,"archived":[],"kept":[]}
-        for r in candidates:
-            rid=r["id"]; claim_text=str(r["claim"] or "")
-            refs=c.execute("SELECT count(*) n FROM relations WHERE subject=? OR object=?",(rid,rid)).fetchone()["n"]
-            conts=c.execute("SELECT count(*) n FROM contradictions WHERE (claim_a=? OR claim_b=?) AND status='open'",(rid,rid)).fetchone()["n"]
-            if refs>0 or conts>0:
-                result["kept"].append({"id":rid,"reason":"has references","refs":refs+conts})
+        """Garbage collect unreferenced stale claims with index consistency."""
+        c = self._connect()
+        cutoff = now() - (max_age_days * 86400)
+        candidates = c.execute(
+            """SELECT id,claim,topic,salience,updated_at,access_count
+                 FROM claims
+                WHERE status='active' AND pinned=0 AND salience<? AND updated_at<?
+                ORDER BY salience ASC, updated_at ASC LIMIT 500""",
+            (min_salience, cutoff),
+        ).fetchall()
+        result = {"candidates": len(candidates), "dry_run": dry_run, "archived": [], "kept": []}
+        archive_ids = []
+        for row in candidates:
+            claim_id = row["id"]
+            references = c.execute(
+                "SELECT count(*) n FROM relations WHERE subject=? OR object=?",
+                (claim_id, claim_id),
+            ).fetchone()["n"]
+            contradictions = c.execute(
+                "SELECT count(*) n FROM contradictions WHERE (claim_a=? OR claim_b=?) AND status='open'",
+                (claim_id, claim_id),
+            ).fetchone()["n"]
+            if references > 0 or contradictions > 0:
+                result["kept"].append(
+                    {"id": claim_id, "reason": "has references", "refs": references + contradictions}
+                )
                 continue
-            result["archived"].append({"id":rid,"claim":short(claim_text,80),"salience":r["salience"]})
-            if not dry_run:
-                c.execute("""INSERT INTO claims_history(id,claim_id,claim,topic,confidence,salience,status,scope,project_id,trust_class,trust_score,quality,secrecy_level,changed_at,change_type)
-                    SELECT hex(randomblob(16)),id,claim,topic,confidence,salience,status,scope,project_id,trust_class,trust_score,quality,COALESCE(secrecy_level,'public'),?,? FROM claims WHERE id=?""", (ts,"gc_archive",rid))
-                c.execute("UPDATE claims SET status='archived', updated_at=? WHERE id=?",(ts,rid))
-                self._add_change('gc_archive',rid,f'GC: archived (salience={r["salience"]:.2f})')
-        if not dry_run and result["archived"]:
-            self._rebuild_fts()
-        self._audit('gc','ok' if not dry_run else 'dry_run',f'candidates={len(candidates)} archived={len(result["archived"])}')
+            archive_ids.append(claim_id)
+            result["archived"].append(
+                {"id": claim_id, "claim": short(str(row["claim"] or ""), 80), "salience": row["salience"]}
+            )
+        if not dry_run and archive_ids:
+            result["archived_count"] = self._archive_claim_ids(
+                archive_ids,
+                reason=f"gc:max_age_days={max_age_days},min_salience={min_salience}",
+                change_type="gc_archive",
+            )
+        else:
+            result["archived_count"] = 0
+        self._audit(
+            "gc",
+            "ok" if not dry_run else "dry_run",
+            f"candidates={len(candidates)} archived={len(archive_ids)}",
+        )
         return result
 
     def _federate_merge(self, payload_json: str="", source_instance: str="remote") -> Dict[str,Any]:
