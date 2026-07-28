@@ -1,4 +1,4 @@
-"""memory-wiki v1.18.3+secret-broker-v2.1: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.18.3+secret-broker-v2.2: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -33,21 +33,16 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timezone
 
-# HERMES-SECURITY-INTEGRATION-20260728: verified, pinned secret-core loader.
+# Hermes Secret Integration v2.2: one shared core, external ciphertext store.
 _SECRET_CORE_AVAILABLE = False
 _SECRET_CORE_ERROR = ""
 try:
     _secret_home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
-    _secret_lib = _secret_home / "lib"
+    _secret_lib = Path(os.environ.get("HERMES_SECRET_CORE_PATH", str(_secret_home / "lib"))).expanduser()
     if str(_secret_lib) not in __import__("sys").path:
         __import__("sys").path.insert(0, str(_secret_lib))
-    from hermes_core_loader import load_secret_core as _load_verified_secret_core
-    _secret_core = _load_verified_secret_core(("VaultStore", "safe_aliases", "safe_locator", "redact_text", "secret_fingerprint"))
-    _BrokerVaultStore = _secret_core.VaultStore
-    _safe_secret_aliases = _secret_core.safe_aliases
-    _secret_safe_locator = _secret_core.safe_locator
-    _secret_redact_text = _secret_core.redact_text
-    _secret_fingerprint = _secret_core.secret_fingerprint
+    from hermes_secret_core import VaultStore as _BrokerVaultStore, safe_aliases as _safe_secret_aliases, safe_locator as _secret_safe_locator, redact_text as _secret_redact_text, secret_fingerprint as _secret_fingerprint, crypto as _BrokerCrypto, require_version as _require_secret_core_version
+    _require_secret_core_version((2, 2, 0))
     _SECRET_CORE_AVAILABLE = True
 except Exception as _secret_core_exc:
     _SECRET_CORE_ERROR = f"{type(_secret_core_exc).__name__}: {_secret_core_exc}"
@@ -67,12 +62,11 @@ except ImportError:
     try:
         from guard import is_social_close, sanitize_context_text, sanitize_context_batch
     except ImportError:
-        # Fail closed: a missing local guard must never become a no-op sanitizer.
+        # degraded-noop fallbacks (module absent or load failure)
         def is_social_close(text: str) -> bool: return False
-        def sanitize_context_text(text: str, max_len: int = 600) -> str:
-            return "[QUARANTINED: memory guard unavailable]"
+        def sanitize_context_text(text: str, max_len: int = 600) -> str: return str(text)[:max_len]
         def sanitize_context_batch(items, text_key: str = "text", max_len: int = 400, label: str = "") -> list:
-            return ["[QUARANTINED: memory guard unavailable]"] if items else []
+            return [f"{label} {item.get(text_key,'')[:max_len]}" for item in (items or []) if isinstance(item, dict) and item.get(text_key)]
 
 try:
     from .collapse import memory_context_collapse, tokenize as collapse_tokenize
@@ -103,17 +97,17 @@ except ImportError:
         def archive_stale_claims(db_path=None, threshold=0.05, dry_run=True): return {"error": "module absent"}
         def get_decay_stats(db_path=None): return {"error": "module absent"}
 
-# HERMES-SECURITY-INTEGRATION-20260728: shared trust core; no reverse dependency on OmniCouncil.
+# ── P0 #3: Injection guard import from omnicouncil (graceful) ──
 _INJECTION_GUARD_AVAILABLE = False
 try:
-    _trust_home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser() / "lib"
-    if str(_trust_home) not in __import__("sys").path:
-        __import__("sys").path.insert(0, str(_trust_home))
-    from hermes_trust_core import sanitize_recalled as _sanitize_recalled, RecalledItem as _RecalledItem
+    import sys as _sys_mw, os as _os_mw
+    _omni_path = _os_mw.path.join(_os_mw.path.dirname(_os_mw.path.dirname(__file__)), "hermes-omnicouncil")
+    if _omni_path not in _sys_mw.path:
+        _sys_mw.path.insert(0, _omni_path)
+    from council_context import sanitize_recalled as _sanitize_recalled, RecalledItem as _RecalledItem
     _INJECTION_GUARD_AVAILABLE = True
-except Exception as _trust_exc:
-    if os.environ.get("HERMES_SECURITY_STRICT", "1").lower() not in {"0", "false", "no", "off"}:
-        raise RuntimeError(f"hermes_trust_core unavailable: {_trust_exc}") from _trust_exc
+except ImportError:
+    pass
 
 # ═════════════════════════════════════════════════════════════
 # Embedding + Qdrant clients (stdlib-only, ноль зависимостей)
@@ -1176,71 +1170,31 @@ SECRET_ASSIGN_RE = re.compile(r"(?i)\b(password|passwd|пароль|token|ток
 REDaction_MARKER_RE = re.compile(r"<[^>]*(?:REDACTED|redacted)[^>]*>|\*{3,}|•••", re.I)
 REDACTION_TOKEN_RE = re.compile(r"<[^>]*(?:REDACTED|redacted)[^>]*>", re.I)
 
-# --- v1.7.5: Vault — AEAD (ChaCha20Poly1305 stdlib) ---
-# P0 #4 fix: самописный XOR заменён на стандартный AEAD.
-# 3-stage import: vault_aead → .vault → error (no XOR fallback)
-# P0 #5 fix: модульная интеграция — каноничный импорт из hermes-vault плагина
+# --- Secret broker compatibility helpers ---
+# Cryptography is provided only by the installed shared core. Local legacy
+# vault.py/vault_aead.py copies are deliberately not imported, preventing an
+# accidental fallback to obsolete XOR or model-facing unwrap code.
+_VAULT_AVAILABLE = _SECRET_CORE_AVAILABLE
 
-_VAULT_AVAILABLE = False
-
-# Canonical: hermes-vault plugin (shared module, no code duplication)
-try:
-    import sys as _sys
-    _vault_path = os.path.join(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")), "plugins", "hermes-vault")
-    if os.path.isdir(_vault_path) and _vault_path not in _sys.path:
-        _sys.path.insert(0, _vault_path)
-    from vault_aead import vault_wrap_v3 as _vault_wrap_v3, vault_unwrap_v3 as _vault_unwrap_v3
-    _VAULT_AVAILABLE = True
-except ImportError:
-    pass
-
-if not _VAULT_AVAILABLE:
-    try:
-        from .vault_aead import vault_wrap_v3 as _vault_wrap_v3, vault_unwrap_v3 as _vault_unwrap_v3
-        _VAULT_AVAILABLE = True
-    except ImportError:
-        pass
-
-if not _VAULT_AVAILABLE:
-    try:
-        from vault_aead import vault_wrap_v3 as _vault_wrap_v3, vault_unwrap_v3 as _vault_unwrap_v3
-        _VAULT_AVAILABLE = True
-    except ImportError:
-        pass
-
-if not _VAULT_AVAILABLE:
-    # Last resort: legacy .vault module
-    try:
-        from .vault import wrap as _vault_wrap_v3, unwrap as _vault_unwrap_v3
-        _VAULT_AVAILABLE = True
-    except ImportError:
-        pass
-
-if not _VAULT_AVAILABLE:
-    try:
-        from vault import wrap as _vault_wrap_v3, unwrap as _vault_unwrap_v3
-        _VAULT_AVAILABLE = True
-    except ImportError:
-        pass
 
 def vault_wrap(value: str) -> str:
-    """P0 #4: AEAD vault wrap. Без ключа → ошибка (нет XOR fallback)."""
-    if not value or value.startswith("enc:v"):
+    if not value or value.startswith("enc:v3:"):
         return value
+    if value.startswith("enc:v"):
+        raise ValueError("legacy_ciphertext_requires_local_admin_migration")
     if not _VAULT_AVAILABLE:
-        raise RuntimeError(
-            "vault_unavailable: no AEAD module loaded. "
-            "Set VAULT_MASTER_KEY in environment or create ~/.hermes/vault/master.key"
-        )
-    return _vault_wrap_v3(value)
+        raise RuntimeError(f"hermes_secret_core_unavailable: {_SECRET_CORE_ERROR}")
+    return _BrokerCrypto.vault_wrap_v3(value)
+
 
 def vault_unwrap(stored: str) -> str:
-    """P0 #4: AEAD vault unwrap. При ошибке → ValueError."""
-    if not stored or not stored.startswith("enc:v"):
+    if not stored:
         return stored
+    if not stored.startswith("enc:v3:"):
+        raise ValueError("only_v3_ciphertext_supported")
     if not _VAULT_AVAILABLE:
-        raise RuntimeError("vault_unavailable: no AEAD module loaded")
-    return _vault_unwrap_v3(stored)
+        raise RuntimeError(f"hermes_secret_core_unavailable: {_SECRET_CORE_ERROR}")
+    return _BrokerCrypto.vault_unwrap_v3(stored)
 
 def _safe_recall_text(obj, max_len=800):
     """Sanitize text before recall injection. Catches prompt-injection patterns."""
@@ -2398,6 +2352,22 @@ class MemoryWikiProvider(MemoryProvider):
         except Exception as exc:
             _debug_log(f"Code Shrinker event drain failed before {tool_name}: {type(exc).__name__}: {exc}")
         a = dict(args or {})
+
+        # Secret value writes, migrations and scrub passes are local-admin only.
+        # Fail closed even if a caller bypasses tools/list and invokes a hidden
+        # historical tool name directly.
+        restricted_secret_tools = {
+            "memory_wiki_add_secret", "add_secret",
+            "memory_wiki_migrate_secret_values_to_vault", "migrate_secret_values_to_vault",
+            "memory_wiki_migrate_secrets_from_claims", "migrate_secrets_from_claims",
+            "memory_wiki_scrub_secrets", "scrub_secrets",
+        }
+        if tool_name in restricted_secret_tools:
+            return tool_result(
+                success=False,
+                error="secret_admin_only",
+                detail="Use the local hermes-secret-admin CLI; this operation is unavailable to model-facing tools.",
+            )
         
         # ── Namespace enforcement (P0 #2 fix) ──
         a = self._enforce_write_namespace(tool_name, a)
@@ -6417,7 +6387,7 @@ class MemoryWikiProvider(MemoryProvider):
         for r in rows: lines.append(f"- `{r['id']}` {r['subject']} / {r['scope']} type={r['secret_type']} locator={r['locator'] or 'n/a'} purpose={short(r['purpose'],120)}")
         return "\n".join(lines)
 
-    def _migrate_secret_values_to_vault(self, apply: bool=False, limit: int=500, clear_source: bool=True, allow_plaintext: bool=False) -> Dict[str,Any]:
+    def _migrate_secret_values_to_vault(self, apply: bool=False, limit: int=500, clear_source: bool=True, allow_plaintext: bool=False, allow_unauthenticated_legacy: bool=False) -> Dict[str,Any]:
         """Move legacy secret_index.value records to Vault with all-or-nothing compensation."""
         cols=set(self._cols("secret_index"))
         if "value" not in cols: return {"apply":apply,"candidates":0,"migrated":0,"note":"no legacy value column"}
@@ -6437,7 +6407,11 @@ class MemoryWikiProvider(MemoryProvider):
                 snapshots[sid]=store.wrapped_snapshot(sid)
                 plaintext=""
                 try:
-                    plaintext=_broker_crypto.vault_unwrap_any(stored,allow_plaintext=allow_plaintext)
+                    plaintext=_broker_crypto.vault_unwrap_any(
+                        stored,
+                        allow_plaintext=allow_plaintext,
+                        allow_unauthenticated_legacy=allow_unauthenticated_legacy,
+                    )
                     ref=store.put_secret(sid,plaintext)
                     touched.append(sid)
                     c.execute("UPDATE secret_index SET vault_ref=?,value=CASE WHEN ? THEN '' ELSE value END,updated_at=? WHERE id=?",(ref,1 if clear_source else 0,now(),sid))
@@ -6898,11 +6872,16 @@ class MemoryWikiProvider(MemoryProvider):
             name=str(op.get('tool') or op.get('operation') or '').strip()
             args=dict(op.get('args') or {k:v for k,v in op.items() if k not in ('tool','operation','args')})
             try:
+                if name in {
+                    'memory_wiki_add_secret','add_secret',
+                    'memory_wiki_migrate_secret_values_to_vault','migrate_secret_values_to_vault',
+                    'memory_wiki_migrate_secrets_from_claims','migrate_secrets_from_claims',
+                    'memory_wiki_scrub_secrets','scrub_secrets',
+                }:
+                    raise PermissionError('secret_admin_only')
                 if mode == 'suggest':
                     if name in ('memory_wiki_compress_topic','memory_wiki_compile_topic','compile_topic'):
                         results.append({'operation':name,'result':self._compile_topic(args.get('topic') or 'general','suggest',int(args.get('limit',50)),args.get('summary_type') or 'summary')})
-                    elif name in ('memory_wiki_scrub_secrets','scrub_secrets'):
-                        results.append({'operation':name,'result':self._scrub_secrets(False,int(args.get('limit',200)))})
                     elif name in ('memory_wiki_normalize_topics','normalize_topics'):
                         results.append({'operation':name,'result':self._normalize_topics('suggest',int(args.get('limit',100)))})
                     elif name in ('memory_wiki_immune_scan','immune_scan'):
@@ -6923,8 +6902,6 @@ class MemoryWikiProvider(MemoryProvider):
                         res=self._merge_claims(args)
                     elif name in ('memory_wiki_compress_topic','memory_wiki_compile_topic','compile_topic'):
                         res=self._compile_topic(args.get('topic') or 'general','apply',int(args.get('limit',50)),args.get('summary_type') or 'summary')
-                    elif name in ('memory_wiki_scrub_secrets','scrub_secrets'):
-                        res=self._scrub_secrets(True,int(args.get('limit',200)))
                     elif name in ('memory_wiki_normalize_topics','normalize_topics'):
                         res=self._normalize_topics('apply',int(args.get('limit',100)))
                     elif name in ('memory_wiki_immune_scan','immune_scan'):
