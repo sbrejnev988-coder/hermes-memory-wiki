@@ -1159,12 +1159,27 @@ REDACTION_TOKEN_RE = re.compile(r"<[^>]*(?:REDACTED|redacted)[^>]*>", re.I)
 # --- v1.7.5: Vault — AEAD (ChaCha20Poly1305 stdlib) ---
 # P0 #4 fix: самописный XOR заменён на стандартный AEAD.
 # 3-stage import: vault_aead → .vault → error (no XOR fallback)
+# P0 #5 fix: модульная интеграция — каноничный импорт из hermes-vault плагина
+
 _VAULT_AVAILABLE = False
+
+# Canonical: hermes-vault plugin (shared module, no code duplication)
 try:
-    from .vault_aead import vault_wrap_v3 as _vault_wrap_v3, vault_unwrap_v3 as _vault_unwrap_v3
+    import sys as _sys
+    _vault_path = os.path.join(os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes")), "plugins", "hermes-vault")
+    if os.path.isdir(_vault_path) and _vault_path not in _sys.path:
+        _sys.path.insert(0, _vault_path)
+    from vault_aead import vault_wrap_v3 as _vault_wrap_v3, vault_unwrap_v3 as _vault_unwrap_v3
     _VAULT_AVAILABLE = True
 except ImportError:
     pass
+
+if not _VAULT_AVAILABLE:
+    try:
+        from .vault_aead import vault_wrap_v3 as _vault_wrap_v3, vault_unwrap_v3 as _vault_unwrap_v3
+        _VAULT_AVAILABLE = True
+    except ImportError:
+        pass
 
 if not _VAULT_AVAILABLE:
     try:
