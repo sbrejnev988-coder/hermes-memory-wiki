@@ -22,10 +22,11 @@ import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from collections import Counter
+from socket import SOL_SOCKET, SO_REUSEADDR
 
-VECTOR_SIZE = int(os.environ.get("EMBED_VECTOR_SIZE", "768"))
+VECTOR_SIZE = int(os.environ.get("EMBED_VECTOR_SIZE", "768"))  # matches Qdrant collection
 NGRAM_SIZES = [2, 3, 4]
-MAX_TEXT_LEN = 8000
+MAX_TEXT_LEN = 32768  # pplx-embed-v1-4b context: 32768 tokens (~4 chars/tok)
 
 idf_cache = {}
 idf_lock = threading.Lock()
@@ -96,6 +97,8 @@ def text_to_vector(text, idf=None, instruction: str = "", task_type: str = "sear
 
 class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
     allow_reuse_address = True; daemon_threads = True
+    def server_bind(self):
+        self.socket.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
 
 class EmbedHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
