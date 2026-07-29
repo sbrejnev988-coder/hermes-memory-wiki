@@ -1,4 +1,4 @@
-"""memory-wiki v1.19.0+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.20.0+document-knowledge-graph-v2+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -138,6 +138,45 @@ except ImportError:
         def _install_code_graph_schema(conn): return None
         _ingest_code_graph_event = _query_code_graph = _code_line_context = _code_graph_neighbors = _code_graph_status = _embed_pending_chunks = _code_graph_unavailable
         def _maybe_prefetch_code_context(*args, **kwargs): return ""
+
+# HERMES-DOCUMENT-KNOWLEDGE-GRAPH-v0.2.0: universal structured document ingestion.
+try:
+    from .document_knowledge_graph import (
+        install_document_graph_schema as _install_document_graph_schema,
+        ingest_document as _document_ingest,
+        scan_documents as _document_scan,
+        embed_pending_documents as _document_embed_pending,
+        query_documents as _document_query,
+        document_source as _document_source,
+        document_unit_context as _document_unit_context,
+        document_neighbors as _document_neighbors,
+        document_status as _document_status,
+        delete_document as _document_delete,
+        ingest_document_inbox as _document_ingest_inbox,
+        maybe_prefetch_document_context as _maybe_prefetch_document_context,
+    )
+except ImportError:
+    try:
+        from document_knowledge_graph import (
+            install_document_graph_schema as _install_document_graph_schema,
+            ingest_document as _document_ingest,
+            scan_documents as _document_scan,
+            embed_pending_documents as _document_embed_pending,
+            query_documents as _document_query,
+            document_source as _document_source,
+            document_unit_context as _document_unit_context,
+            document_neighbors as _document_neighbors,
+            document_status as _document_status,
+            delete_document as _document_delete,
+            ingest_document_inbox as _document_ingest_inbox,
+            maybe_prefetch_document_context as _maybe_prefetch_document_context,
+        )
+    except ImportError as _document_graph_import_exc:
+        def _document_graph_unavailable(*args, **kwargs):
+            raise RuntimeError(f"document_knowledge_graph unavailable: {_document_graph_import_exc}")
+        def _install_document_graph_schema(conn): return None
+        _document_ingest = _document_scan = _document_embed_pending = _document_query = _document_source = _document_unit_context = _document_neighbors = _document_status = _document_delete = _document_ingest_inbox = _document_graph_unavailable
+        def _maybe_prefetch_document_context(*args, **kwargs): return ""
 
 # HERMES-SECURITY-INTEGRATION-20260728: shared trust core; no reverse dependency on OmniCouncil.
 _INJECTION_GUARD_AVAILABLE = False
@@ -2474,7 +2513,15 @@ class MemoryWikiProvider(MemoryProvider):
             )
         except Exception as code_prefetch_exc:
             _debug_log(f"Code graph prefetch failed: {type(code_prefetch_exc).__name__}: {code_prefetch_exc}")
-        if not rows and not delta_rows and not env_meta and not plan.get("topics") and not secrets_meta and not code_prefetch:
+        document_prefetch = ""
+        try:
+            document_prefetch = _maybe_prefetch_document_context(
+                self, query,
+                max_chars=_env_int("MEMORY_WIKI_DOCUMENT_PREFETCH_CHARS", 7000, 1000, 24000),
+            )
+        except Exception as document_prefetch_exc:
+            _debug_log(f"Document graph prefetch failed: {type(document_prefetch_exc).__name__}: {document_prefetch_exc}")
+        if not rows and not delta_rows and not env_meta and not plan.get("topics") and not secrets_meta and not code_prefetch and not document_prefetch:
             return ""
         lines = [
             "## Active Memory Wiki Recall",
@@ -2526,10 +2573,12 @@ class MemoryWikiProvider(MemoryProvider):
             lines.append("\nContradictions to handle explicitly:")
             for c in cons:
                 lines.append(f"- `{c['id']}` {redact_secrets(c['claim_a'])} ↔ {redact_secrets(c['claim_b'])}: {redact_secrets(c['reason'])} [{c['status']}]")
-        if code_prefetch:
-            code_budget = min(len(code_prefetch) + 2, max(1000, MAX_PREFETCH_CHARS // 3))
-            memory_budget = max(0, MAX_PREFETCH_CHARS - code_budget)
-            out = ("\n".join(lines)[:memory_budget] + "\n" + code_prefetch[:code_budget])[:MAX_PREFETCH_CHARS]
+        knowledge_blocks = [block for block in (code_prefetch, document_prefetch) if block]
+        if knowledge_blocks:
+            knowledge_text = "\n".join(knowledge_blocks)
+            knowledge_budget = min(len(knowledge_text) + 2, max(2000, int(MAX_PREFETCH_CHARS * 0.45)))
+            memory_budget = max(0, MAX_PREFETCH_CHARS - knowledge_budget)
+            out = ("\n".join(lines)[:memory_budget] + "\n" + knowledge_text[:knowledge_budget])[:MAX_PREFETCH_CHARS]
         else:
             out = "\n".join(lines)[:MAX_PREFETCH_CHARS]
         if out:
@@ -2786,6 +2835,18 @@ class MemoryWikiProvider(MemoryProvider):
             {"name":"memory_wiki_context_sanitize","description":"Sanitize text for safe context injection: strips injection patterns, normalizes whitespace, truncates.","parameters":P({"text":{"type":"string"},"max_len":{"type":"integer","default":400}}, ["text"])},
             {"name":"memory_wiki_is_social_close","description":"Check if text is a social closer (ok, thanks, 👍) that should skip memory search.","parameters":P({"text":{"type":"string"}}, ["text"])},
         
+            # ── Universal document knowledge graph v2 ──
+            {"name":"memory_wiki_document_ingest","description":"Parse and index one allowlisted document in an isolated worker. Supports Office/OpenDocument/PDF/text/data formats; no automatic full reindex.","parameters":P({"path":{"type":"string","minLength":1},"scope_id":{"type":"string","default":""},"repository_id":{"type":"string","default":""},"ocr":{"type":"boolean","default":False},"ocr_language":{"type":"string","default":"eng+rus"},"embed":{"type":"boolean","default":False},"embed_limit":{"type":"integer","default":200,"minimum":1,"maximum":10000}}, ["path"])},
+            {"name":"memory_wiki_document_scan","description":"Recursively discover and incrementally index supported documents below an allowlisted directory.","parameters":P({"root":{"type":"string","minLength":1},"scope_id":{"type":"string","default":""},"repository_id":{"type":"string","default":""},"recursive":{"type":"boolean","default":True},"max_files":{"type":"integer","default":5000,"minimum":1,"maximum":100000},"extensions":{"type":"array","items":{"type":"string"}},"exclude_dirs":{"type":"array","items":{"type":"string"}},"ocr":{"type":"boolean","default":False}}, ["root"])},
+            {"name":"memory_wiki_document_embed_pending","description":"Create/reuse embeddings for pending semantic document chunks in a bounded batch.","parameters":P({"source_id":{"type":"string","default":""},"scope_id":{"type":"string","default":""},"repository_id":{"type":"string","default":""},"limit":{"type":"integer","default":500,"minimum":1,"maximum":10000}}, [])},
+            {"name":"memory_wiki_document_query","description":"Hybrid document retrieval: FTS5/BM25 over addressable units and chunks + Qdrant embeddings + weighted RRF + configured reranker.","parameters":P({"query":{"type":"string","minLength":1},"source_id":{"type":"string","default":""},"scope_id":{"type":"string","default":""},"repository_id":{"type":"string","default":""},"extension":{"type":"string","default":""},"limit":{"type":"integer","default":12,"minimum":1,"maximum":50},"candidate_limit":{"type":"integer","default":120,"minimum":20,"maximum":500},"max_chars_per_hit":{"type":"integer","default":3000,"minimum":300,"maximum":20000}}, ["query"])},
+            {"name":"memory_wiki_document_source","description":"Show indexed metadata, revision and counts for one document source.","parameters":P({"source_id":{"type":"string","default":""},"path":{"type":"string","default":""}}, [])},
+            {"name":"memory_wiki_document_unit_context","description":"Return neighbouring addressable document units around an anchor or unit ID.","parameters":P({"source_id":{"type":"string"},"unit_id":{"type":"string","default":""},"anchor":{"type":"string","default":""},"radius":{"type":"integer","default":5,"minimum":0,"maximum":100}}, ["source_id"])},
+            {"name":"memory_wiki_document_neighbors","description":"Traverse structural and formula/reference edges around a document anchor.","parameters":P({"source_id":{"type":"string"},"anchor":{"type":"string"},"hops":{"type":"integer","default":1,"minimum":1,"maximum":3},"limit":{"type":"integer","default":100,"minimum":1,"maximum":1000}}, ["source_id","anchor"])},
+            {"name":"memory_wiki_document_status","description":"Show indexed document sources, parser capabilities and pending embedding counts.","parameters":P({"scope_id":{"type":"string","default":""},"repository_id":{"type":"string","default":""}}, [])},
+            {"name":"memory_wiki_document_delete","description":"Soft-delete a document graph and archive its active embedding claims.","parameters":P({"source_id":{"type":"string"}}, ["source_id"])},
+            {"name":"memory_wiki_document_ingest_inbox","description":"Consume bounded document manifests emitted by Code Shrinker from the shared inbox.","parameters":P({"limit":{"type":"integer","default":25,"minimum":1,"maximum":1000}}, [])},
+
             # ── Repository code knowledge graph v1 ──
             {"name":"memory_wiki_code_graph_status","description":"Show indexed repositories and counts for files, symbols, semantic chunks, addressable lines, edges and embedded chunks.","parameters":P({"repository_id":{"type":"string","default":""}}, [])},
             {"name":"memory_wiki_code_graph_embed_pending","description":"Create/reuse semantic claims for pending code chunks in a bounded batch. Repeat until pending_after is zero; no full reindex is started.","parameters":P({"repository_id":{"type":"string"},"limit":{"type":"integer","default":1000,"minimum":1,"maximum":10000}}, ["repository_id"])},
@@ -3146,6 +3207,16 @@ class MemoryWikiProvider(MemoryProvider):
             if tool_name == "memory_wiki_semantic_status": return tool_result(success=True, **self._semantic_status())
             if tool_name == "memory_wiki_reindex": return tool_result(success=True, **self._reindex(int(a.get("limit",0) or 0), bool(a.get("force", False))))
             if tool_name == "memory_wiki_debug_search": return tool_result(success=True, **self._debug_search(a.get("query",""), int(a.get("limit",10)), a.get("topic")))
+            if tool_name == "memory_wiki_document_ingest": return tool_result(success=True, **_document_ingest(self, a))
+            if tool_name == "memory_wiki_document_scan": return tool_result(success=True, **_document_scan(self, a))
+            if tool_name == "memory_wiki_document_embed_pending": return tool_result(success=True, **_document_embed_pending(self, a))
+            if tool_name == "memory_wiki_document_query": return tool_result(success=True, **_document_query(self, a))
+            if tool_name == "memory_wiki_document_source": return tool_result(success=True, **_document_source(self, a))
+            if tool_name == "memory_wiki_document_unit_context": return tool_result(success=True, **_document_unit_context(self, a))
+            if tool_name == "memory_wiki_document_neighbors": return tool_result(success=True, **_document_neighbors(self, a))
+            if tool_name == "memory_wiki_document_status": return tool_result(success=True, **_document_status(self, a))
+            if tool_name == "memory_wiki_document_delete": return tool_result(success=True, **_document_delete(self, a))
+            if tool_name == "memory_wiki_document_ingest_inbox": return tool_result(success=True, **_document_ingest_inbox(self, a))
             if tool_name == "memory_wiki_code_graph_status": return tool_result(success=True, **_code_graph_status(self, a))
             if tool_name == "memory_wiki_code_graph_embed_pending": return tool_result(success=True, **_embed_pending_chunks(self, a))
             if tool_name == "memory_wiki_code_graph_query": return tool_result(success=True, **_query_code_graph(self, a))
@@ -3328,6 +3399,8 @@ class MemoryWikiProvider(MemoryProvider):
             "memory_wiki_memory_diff", "memory_wiki_preference_layer", "memory_wiki_get_project_context",
             "memory_wiki_source_policy", "memory_wiki_export", "memory_wiki_audit_log", "memory_wiki_mutation_log",
             "memory_wiki_journal_status",
+            "memory_wiki_document_query", "memory_wiki_document_source", "memory_wiki_document_unit_context",
+            "memory_wiki_document_neighbors", "memory_wiki_document_status",
         }
         if tool_name in read_only:
             return False
@@ -4149,6 +4222,7 @@ class MemoryWikiProvider(MemoryProvider):
             c.execute("CREATE INDEX IF NOT EXISTS idx_ccm_symbol ON code_claim_metadata(repository_id, symbol_id)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_ccm_hash ON code_claim_metadata(repository_id, content_hash)")
             _install_code_graph_schema(c)
+            _install_document_graph_schema(c)
             self._connect().commit()
 
     def _cols(self, table: str) -> set[str]: return {r[1] for r in self._connect().execute(f"PRAGMA table_info({table})").fetchall()}
