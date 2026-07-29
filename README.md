@@ -1,4 +1,4 @@
-# Hermes Memory Wiki v1.18.5
+# Hermes Memory Wiki v1.18.6
 
 Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 85 MCP tools.
 
@@ -271,6 +271,22 @@ A rules file may be placed next to `__init__.py`:
 ```
 
 Set `MEMORY_WIKI_RERANK_RULES_FILE=rerank-rules.json` to load it. Environment variables override the file.
+
+## Embedding provider routing (v1.18.6)
+
+`perplexity/pplx-embed-v1-4b` is a remote OpenRouter model. It is used only when the **running Hermes gateway process** has all of the following effective values:
+
+```env
+MEMORY_WIKI_EMBED_PROVIDER=openrouter
+MEMORY_WIKI_EMBED_URL=https://openrouter.ai/api/v1
+MEMORY_WIKI_EMBED_MODEL=perplexity/pplx-embed-v1-4b
+MEMORY_WIKI_EMBED_DIMENSIONS=2560
+MEMORY_WIKI_VECTOR_SIZE=2560
+```
+
+Setting only the model slug while leaving `MEMORY_WIKI_EMBED_PROVIDER=stub` does not call PPLX. v1.18.6 detects that mismatch, disables semantic operations with an explicit diagnostic, and prevents a misleading reindex. `memory_wiki_semantic_status` now reports the effective provider, URL, API-key presence, and configuration errors.
+
+The bundled `stubs/embed_stub.py` is a deterministic local fallback, not an ML model. It now defaults to 2560 dimensions, honors the request `dimensions` field, and reports `algorithm`, `model`, and `vector_size` from `/health`.
 
 ## Recovery
 

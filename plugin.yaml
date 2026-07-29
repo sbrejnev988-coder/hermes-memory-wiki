@@ -1,6 +1,6 @@
 name: memory-wiki
-version: 1.18.5
-description: "Hermes Memory OS - 85 tools, expanded semantic recall hydration, configurable prefetch and diversity, SQLite source of truth, FTS5 + Qdrant hybrid retrieval, 2560-dimensional embedding contract, instruction-aware Voyage/Cohere reranking, durable code metadata, journaling, recovery and secret-safe recall. Stdlib-only Python."
+version: 1.18.6
+description: "Hermes Memory OS - 85 tools, expanded semantic recall hydration, strict provider routing, fixed 2560d local stub diagnostics, configurable prefetch and diversity, SQLite source of truth, FTS5 + Qdrant hybrid retrieval, 2560-dimensional embedding contract, instruction-aware Voyage/Cohere reranking, durable code metadata, journaling, recovery and secret-safe recall. Stdlib-only Python."
 provides_tools:
   - memory_wiki_query
   - memory_wiki_add_claim

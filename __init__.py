@@ -1,4 +1,4 @@
-"""memory-wiki v1.18.5+recall-expansion+secret-broker-v2.2: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.18.6+embedding-provider-fix+secret-broker-v2.2: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -154,6 +154,23 @@ _DEFAULT_EMBED_MODEL = (
     else f"hash-ngram-{EMBED_DIMENSIONS}"
 )
 EMBED_MODEL = os.environ.get("MEMORY_WIKI_EMBED_MODEL", _DEFAULT_EMBED_MODEL).strip() or _DEFAULT_EMBED_MODEL
+
+# Fail closed when a remote model slug is accidentally routed to the local hash stub.
+# This was previously easy to miss because a healthy :4000 endpoint made the
+# semantic layer look available even though PPLX was never called.
+EMBED_CONFIG_ERROR = ""
+if EMBED_PROVIDER not in {"stub", "openrouter"}:
+    EMBED_CONFIG_ERROR = f"unsupported MEMORY_WIKI_EMBED_PROVIDER={EMBED_PROVIDER!r}"
+elif EMBED_PROVIDER == "stub" and EMBED_MODEL.startswith(("perplexity/", "openai/", "qwen/", "cohere/", "voyage/")):
+    EMBED_CONFIG_ERROR = (
+        f"model {EMBED_MODEL!r} requires MEMORY_WIKI_EMBED_PROVIDER=openrouter; "
+        "the local stub only provides deterministic hash-ngram vectors"
+    )
+elif EMBED_PROVIDER == "openrouter" and EMBED_URL.startswith(("http://127.0.0.1", "http://localhost")):
+    EMBED_CONFIG_ERROR = (
+        f"MEMORY_WIKI_EMBED_PROVIDER=openrouter but MEMORY_WIKI_EMBED_URL={EMBED_URL!r}; "
+        "use https://openrouter.ai/api/v1"
+    )
 
 # Retrieval instruction for search_query (not for stored documents).
 QWEN_QUERY_INSTRUCTION = os.environ.get(
@@ -570,14 +587,16 @@ def _wake_outbox_worker(db_path: Optional[str] = None) -> None:
             worker["wake"].set()
 
 
-# --- Embedding contract guard: every provider must match the Qdrant collection. ---
-EMBED_CONTRACT_VALID = EMBED_DIMENSIONS == QDRANT_VECTOR_SIZE
-if not EMBED_CONTRACT_VALID:
-    _debug_log(
-        f"FATAL: MEMORY_WIKI_EMBED_DIMENSIONS ({EMBED_DIMENSIONS}) "
-        f"!= MEMORY_WIKI_VECTOR_SIZE ({QDRANT_VECTOR_SIZE}). "
-        "Semantic indexing/search is disabled until both values match."
+# --- Embedding contract guard: provider routing and vector dimensions must agree. ---
+_EMBED_BOOT_ERRORS: List[str] = []
+if EMBED_DIMENSIONS != QDRANT_VECTOR_SIZE:
+    _EMBED_BOOT_ERRORS.append(
+        f"MEMORY_WIKI_EMBED_DIMENSIONS ({EMBED_DIMENSIONS}) "
+        f"!= MEMORY_WIKI_VECTOR_SIZE ({QDRANT_VECTOR_SIZE})"
     )
+if EMBED_CONFIG_ERROR:
+    _EMBED_BOOT_ERRORS.append(EMBED_CONFIG_ERROR)
+EMBED_CONTRACT_VALID = not _EMBED_BOOT_ERRORS
 
 SEMANTIC_ENABLED = os.environ.get("MEMORY_WIKI_SEMANTIC", "1").lower() not in ("0", "no", "false", "off")
 REINDEX_BATCH_SIZE = _env_int("MEMORY_WIKI_REINDEX_BATCH_SIZE", 20, 1, 500)
@@ -848,6 +867,9 @@ def _debug_log(msg: str) -> None:
         with open(DEBUG_LOG, "a") as f:
             f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}\n")
     except Exception: pass
+
+for _embed_boot_error in _EMBED_BOOT_ERRORS:
+    _debug_log(f"FATAL embedding configuration: {_embed_boot_error}")
 
 def _rrf_fusion(lexical_scores: Dict[str, float], semantic_scores: Dict[str, float], 
                 k: int = RRF_K, lexical_weight: float = 1.0, semantic_weight: float = 1.0) -> Dict[str, float]:
@@ -1277,8 +1299,12 @@ def _switch_alias(new_collection: str) -> bool:
 
 
 def _semantic_available() -> bool:
-    """Check the embedding contract, provider and Qdrant before semantic operations."""
-    if not SEMANTIC_ENABLED or not EMBED_CONTRACT_VALID:
+    """Check the embedding contract, effective provider and Qdrant before semantic operations."""
+    if not SEMANTIC_ENABLED:
+        return False
+    if not EMBED_CONTRACT_VALID:
+        for error in _EMBED_BOOT_ERRORS:
+            _debug_log(f"semantic disabled: {error}")
         return False
     if EMBED_PROVIDER == "openrouter":
         now_ts = time.time()
@@ -8549,7 +8575,11 @@ class MemoryWikiProvider(MemoryProvider):
             "embedding_ok": embed_ok,
             "semantic_enabled": SEMANTIC_ENABLED,
             "embedding_contract_valid": EMBED_CONTRACT_VALID,
+            "embedding_config_error": EMBED_CONFIG_ERROR,
+            "embedding_contract_errors": list(_EMBED_BOOT_ERRORS),
             "embedding_provider": EMBED_PROVIDER,
+            "embedding_url": EMBED_URL,
+            "embedding_api_key_present": bool(EMBED_API_KEY),
             "embedding_model": EMBED_MODEL,
             "embedding_dimensions": EMBED_DIMENSIONS,
             "qdrant_vector_size": QDRANT_VECTOR_SIZE,
@@ -8569,7 +8599,10 @@ class MemoryWikiProvider(MemoryProvider):
         if not EMBED_CONTRACT_VALID:
             return {
                 "ok": False,
-                "error": "embedding dimension contract mismatch",
+                "error": "embedding provider/vector contract invalid",
+                "details": list(_EMBED_BOOT_ERRORS),
+                "embed_provider": EMBED_PROVIDER,
+                "embed_model": EMBED_MODEL,
                 "embed_dimensions": EMBED_DIMENSIONS,
                 "qdrant_vector_size": QDRANT_VECTOR_SIZE,
             }
