@@ -1,1 +1,2619 @@
-[{"name": "memory_wiki_query", "description": "Search memory-wiki claims with FTS + salience/freshness scoring.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "default": 10}, "include_stale": {"type": "boolean", "default": true}, "topic": {"type": "string"}}, "required": ["query"]}}, {"name": "memory_wiki_add_claim", "description": "Add/update a structured durable claim.", "inputSchema": {"type": "object", "properties": {"claim": {"type": "string"}, "topic": {"type": "string", "default": "general"}, "evidence": {"type": "string", "default": ""}, "source": {"type": "string", "default": "tool"}, "confidence": {"type": "number", "default": 0.75}, "salience": {"type": "number", "default": 0.7}}, "required": ["claim"]}}, {"name": "memory_wiki_add_secret", "description": "Add/update a structured credential/secret index entry. Values are stored locally with redacted recall summaries.", "inputSchema": {"type": "object", "properties": {"subject": {"type": "string"}, "scope": {"type": "string"}, "secret_type": {"type": "string", "default": "credential"}, "locator": {"type": "string", "default": ""}, "value": {"type": "string", "default": ""}, "purpose": {"type": "string", "default": ""}, "source": {"type": "string", "default": "tool"}, "confidence": {"type": "number", "default": 0.85}, "salience": {"type": "number", "default": 0.85}}, "required": ["subject", "scope"]}}, {"name": "memory_wiki_query_secrets", "description": "Query secret vault index. By default returns redacted values. Set reveal=true + confirm_reveal=true to decrypt. Secrets wrapped at rest (key-obfuscation).", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "default": 10}, "reveal": {"type": "boolean", "default": false}, "confirm_reveal": {"type": "boolean", "default": false}}, "required": ["query"]}}, {"name": "memory_wiki_recall_plan", "description": "Plan which topics/types/secrets should be recalled for a query.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "default": 8}}, "required": ["query"]}}, {"name": "memory_wiki_post_task", "description": "Record a post-task durable summary with changed files, backups, verification and service restarts.", "inputSchema": {"type": "object", "properties": {"summary": {"type": "string"}, "topic": {"type": "string", "default": "operations"}, "changed_files": {"type": "array", "items": {"type": "string"}}, "backups": {"type": "array", "items": {"type": "string"}}, "verification": {"type": "string", "default": ""}, "services": {"type": "array", "items": {"type": "string"}}, "source": {"type": "string", "default": "post_task"}}, "required": ["summary"]}}, {"name": "memory_wiki_active_dashboard", "description": "Render/read active operational memory dashboard.", "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "default": 80}}, "required": []}}, {"name": "memory_wiki_doctor", "description": "Run diagnostics over schema, FTS, dashboards, backups, secrets, contradictions and recall health.", "inputSchema": {"type": "object", "properties": {"repair": {"type": "boolean", "default": false}}, "required": []}}, {"name": "memory_wiki_backup", "description": "Create a full zip backup of sqlite/pages/dashboards/metadata.", "inputSchema": {"type": "object", "properties": {"reason": {"type": "string", "default": "manual"}}, "required": []}}, {"name": "memory_wiki_list_backups", "description": "List memory-wiki backups.", "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "default": 20}}, "required": []}}, {"name": "memory_wiki_restore", "description": "Restore memory-wiki from a backup id/path.", "inputSchema": {"type": "object", "properties": {"backup": {"type": "string"}}, "required": ["backup"]}}, {"name": "memory_wiki_add_decision", "description": "Record an architectural/product decision with rationale and alternatives.", "inputSchema": {"type": "object", "properties": {"decision": {"type": "string"}, "rationale": {"type": "string", "default": ""}, "topic": {"type": "string", "default": "decisions"}, "alternatives": {"type": "array", "items": {"type": "string"}}, "source": {"type": "string", "default": "tool"}}, "required": ["decision"]}}, {"name": "memory_wiki_add_mistake", "description": "Record an anti-regression mistake/lesson with trigger, fix and prevention.", "inputSchema": {"type": "object", "properties": {"trigger": {"type": "string"}, "mistake": {"type": "string"}, "fix": {"type": "string", "default": ""}, "prevention": {"type": "string", "default": ""}, "topic": {"type": "string", "default": "lessons"}}, "required": ["trigger", "mistake"]}}, {"name": "memory_wiki_add_project_profile", "description": "Add/update a project profile: root, purpose, commands, services, notes.", "inputSchema": {"type": "object", "properties": {"project_id": {"type": "string"}, "root": {"type": "string", "default": ""}, "purpose": {"type": "string", "default": ""}, "commands": {"type": "array", "items": {"type": "string"}}, "services": {"type": "array", "items": {"type": "string"}}, "notes": {"type": "string", "default": ""}}, "required": ["project_id"]}}, {"name": "memory_wiki_add_task_capsule", "description": "Record a rich task capsule with intent, plan, files, commands, errors, fixes, verification, followups.", "inputSchema": {"type": "object", "properties": {"intent": {"type": "string"}, "topic": {"type": "string", "default": "tasks"}, "plan": {"type": "string", "default": ""}, "files": {"type": "array", "items": {"type": "string"}}, "commands": {"type": "array", "items": {"type": "string"}}, "errors": {"type": "array", "items": {"type": "string"}}, "fixes": {"type": "array", "items": {"type": "string"}}, "verification": {"type": "string", "default": ""}, "followups": {"type": "array", "items": {"type": "string"}}}, "required": ["intent"]}}, {"name": "memory_wiki_add_entity", "description": "Add/update entity and aliases for lightweight knowledge graph.", "inputSchema": {"type": "object", "properties": {"name": {"type": "string"}, "entity_type": {"type": "string", "default": "thing"}, "aliases": {"type": "array", "items": {"type": "string"}}, "notes": {"type": "string", "default": ""}}, "required": ["name"]}}, {"name": "memory_wiki_add_relation", "description": "Add a typed relation edge between entities. Valid predicates: owns, owned_by, runs_on, hosts, depends_on, required_by, uses_provider, authenticated_by, replaces, replaced_by, valid_until, supports, contradicts, related_to. Prefer specific over generic.", "inputSchema": {"type": "object", "properties": {"subject": {"type": "string"}, "predicate": {"type": "string"}, "object": {"type": "string"}, "confidence": {"type": "number", "default": 0.8}, "evidence": {"type": "string", "default": ""}}, "required": ["subject", "predicate", "object"]}}, {"name": "memory_wiki_graph_query", "description": "Query lightweight entity graph around an entity/text.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "default": 20}}, "required": ["query"]}}, {"name": "memory_wiki_apply_user_correction", "description": "Capture user correction, supersede/uncertain matching old claims, and add corrected claim.", "inputSchema": {"type": "object", "properties": {"correction": {"type": "string"}, "target_claim_id": {"type": "string", "default": ""}, "topic": {"type": "string", "default": "corrections"}}, "required": ["correction"]}}, {"name": "memory_wiki_pack_context", "description": "Budget-aware recall/context packing for a query.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "max_chars": {"type": "integer", "default": 3800}}, "required": ["query"]}}, {"name": "memory_wiki_memory_diff", "description": "Compare recalled memory against supplied verified/current facts before answering; returns confirmed, changed/conflicting and stale/unverified memory.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "verified_facts": {"type": "array", "items": {"type": "string"}}, "current_context": {"type": "string", "default": ""}, "limit": {"type": "integer", "default": 12}}, "required": ["query"]}}, {"name": "memory_wiki_preference_layer", "description": "Return prioritized durable user preferences/constraints plus the precedence policy for fresh instructions vs memory.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string", "default": ""}, "limit": {"type": "integer", "default": 20}, "include_policy": {"type": "boolean", "default": true}}, "required": []}}, {"name": "memory_wiki_add_preference_rule", "description": "Add/update a first-class preference priority rule used by the preference layer.", "inputSchema": {"type": "object", "properties": {"rule": {"type": "string"}, "priority": {"type": "integer", "default": 100}, "scope": {"type": "string", "default": "global"}, "source": {"type": "string", "default": "explicit"}, "status": {"type": "string", "enum": ["active", "retired"], "default": "active"}}, "required": ["rule"]}}, {"name": "memory_wiki_migrate_secrets_from_claims", "description": "Best-effort migration of secret-like claims into secret_index.", "inputSchema": {"type": "object", "properties": {"apply": {"type": "boolean", "default": true}, "limit": {"type": "integer", "default": 100}}, "required": []}}, {"name": "memory_wiki_scrub_secrets", "description": "Scan memory tables for raw secrets, create secret_index metadata, and redact/quarantine matching fields.", "inputSchema": {"type": "object", "properties": {"apply": {"type": "boolean", "default": false}, "limit": {"type": "integer", "default": 200}}, "required": []}}, {"name": "memory_wiki_snapshot", "description": "Write a human-readable snapshot markdown of active memory.", "inputSchema": {"type": "object", "properties": {"name": {"type": "string", "default": ""}}, "required": []}}, {"name": "memory_wiki_add_evidence", "description": "Attach evidence to a claim and refresh it.", "inputSchema": {"type": "object", "properties": {"claim_id": {"type": "string"}, "text": {"type": "string"}, "kind": {"type": "string", "enum": ["support", "refute", "source", "note"], "default": "support"}, "source": {"type": "string", "default": "tool"}}, "required": ["claim_id", "text"]}}, {"name": "memory_wiki_update_claim", "description": "Patch claim fields: claim/topic/status/confidence/salience/freshness.", "inputSchema": {"type": "object", "properties": {"claim_id": {"type": "string"}, "claim": {"type": "string"}, "topic": {"type": "string"}, "status": {"type": "string", "enum": ["active", "retired", "superseded", "uncertain"]}, "confidence": {"type": "number"}, "salience": {"type": "number"}, "refresh": {"type": "boolean", "default": false}}, "required": ["claim_id"]}}, {"name": "memory_wiki_contradict", "description": "Record contradiction between two claims.", "inputSchema": {"type": "object", "properties": {"claim_a": {"type": "string"}, "claim_b": {"type": "string"}, "reason": {"type": "string"}}, "required": ["claim_a", "claim_b", "reason"]}}, {"name": "memory_wiki_resolve_contradiction", "description": "Resolve a contradiction and optionally retire/supersede a claim.", "inputSchema": {"type": "object", "properties": {"contradiction_id": {"type": "string"}, "resolution": {"type": "string"}, "winner_claim_id": {"type": "string"}, "loser_status": {"type": "string", "enum": ["retired", "superseded", "uncertain"], "default": "superseded"}}, "required": ["contradiction_id", "resolution"]}}, {"name": "memory_wiki_dashboard", "description": "Return dashboard: counts, topics, stale claims, contradictions, paths.", "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "default": 20}}, "required": []}}, {"name": "memory_wiki_get_page", "description": "Read a topic page from the markdown wiki vault.", "inputSchema": {"type": "object", "properties": {"topic": {"type": "string"}}, "required": ["topic"]}}, {"name": "memory_wiki_maintenance", "description": "Run vault maintenance: rebuild FTS, detect contradictions, render pages, optionally prune low-salience retired claims.", "inputSchema": {"type": "object", "properties": {"prune_retired_days": {"type": "integer", "default": 0}}, "required": []}}, {"name": "memory_wiki_merge_claims", "description": "Merge duplicate/overlapping claims, keeping one canonical claim and superseding or retiring the rest.", "inputSchema": {"type": "object", "properties": {"keep_id": {"type": "string"}, "merge_ids": {"type": "array", "items": {"type": "string"}}, "resolution": {"type": "string", "default": "merged as duplicate"}, "loser_status": {"type": "string", "enum": ["retired", "superseded", "uncertain"], "default": "superseded"}}, "required": ["keep_id", "merge_ids"]}}, {"name": "memory_wiki_import", "description": "Import claims/evidence from a memory_wiki_export JSON payload.", "inputSchema": {"type": "object", "properties": {"payload": {"type": "object"}, "mode": {"type": "string", "enum": ["upsert"], "default": "upsert"}}, "required": ["payload"]}}, {"name": "memory_wiki_curate", "description": "Suggest or apply cleanup: bad topics, low-quality fragments, duplicate-like claims, and optional pinning.", "inputSchema": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["suggest", "apply"], "default": "suggest"}, "limit": {"type": "integer", "default": 80}, "aggressiveness": {"type": "number", "default": 0.45}}, "required": []}}, {"name": "memory_wiki_pin_claim", "description": "Pin a claim so recall/curation preserve it.", "inputSchema": {"type": "object", "properties": {"claim_id": {"type": "string"}, "pinned": {"type": "boolean", "default": true}}, "required": ["claim_id"]}}, {"name": "memory_wiki_health", "description": "Audit memory-wiki quality: schema, low-quality fragments, bad topics, raw logs, secret exposure, duplicate-like claims.", "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "default": 100}}, "required": []}}, {"name": "memory_wiki_evaluate_retrieval", "description": "Run a golden-query retrieval quality suite for recall/pack_context precision and artifact leakage.", "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "default": 10}, "max_chars": {"type": "integer", "default": 3800}}, "required": []}}, {"name": "memory_wiki_rewrite_claim", "description": "Rewrite one claim in-place with normalized text/topic/type and quality recomputation.", "inputSchema": {"type": "object", "properties": {"claim_id": {"type": "string"}, "claim": {"type": "string"}, "topic": {"type": "string"}, "reason": {"type": "string", "default": "manual rewrite"}}, "required": ["claim_id", "claim"]}}, {"name": "memory_wiki_explain_recall", "description": "Explain why query returns specific claims.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "default": 10}, "topic": {"type": "string"}}, "required": ["query"]}}, {"name": "memory_wiki_vacuum", "description": "Aggressively deduplicate, merge near-duplicates, resolve stale contradiction noise, normalize topics, and optionally apply changes.", "inputSchema": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["suggest", "apply"], "default": "suggest"}, "limit": {"type": "integer", "default": 120}, "similarity": {"type": "number", "default": 0.82}, "max_pairs": {"type": "integer", "default": 2500}}, "required": []}}, {"name": "memory_wiki_review_queue", "description": "List/approve/reject/rewrite candidate memories before they become durable claims.", "inputSchema": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["list", "approve", "reject", "rewrite"], "default": "list"}, "item_id": {"type": "string"}, "claim": {"type": "string"}, "topic": {"type": "string"}, "reason": {"type": "string"}, "limit": {"type": "integer", "default": 20}}, "required": []}}, {"name": "memory_wiki_lint_claim", "description": "Lint a candidate memory claim and suggest topic/type/scope rewrites.", "inputSchema": {"type": "object", "properties": {"claim": {"type": "string"}, "topic": {"type": "string", "default": "general"}}, "required": ["claim"]}}, {"name": "memory_wiki_why_believe", "description": "Explain provenance, evidence, trust score and contradictions for a claim.", "inputSchema": {"type": "object", "properties": {"claim_id": {"type": "string"}}, "required": ["claim_id"]}}, {"name": "memory_wiki_secret_quarantine", "description": "List quarantined secret-like memory fields; originals are never returned, only hashes/redacted text.", "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "default": 20}, "status": {"type": "string", "default": "active"}}, "required": []}}, {"name": "memory_wiki_recent_changes", "description": "Show memory mutations since N seconds ago.", "inputSchema": {"type": "object", "properties": {"since_seconds": {"type": "integer", "default": 3600}, "limit": {"type": "integer", "default": 50}}, "required": []}}, {"name": "memory_wiki_mark_used", "description": "Feedback loop: mark recalled claims as useful or not useful.", "inputSchema": {"type": "object", "properties": {"claim_ids": {"type": "array", "items": {"type": "string"}}, "usefulness": {"type": "number", "default": 1.0}, "query": {"type": "string"}}, "required": ["claim_ids"]}}, {"name": "memory_wiki_normalize_topics", "description": "Suggest/apply topic alias normalization.", "inputSchema": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["suggest", "apply"], "default": "suggest"}, "limit": {"type": "integer", "default": 100}}, "required": []}}, {"name": "memory_wiki_immune_scan", "description": "Scan memory database for quality issues and report findings.", "inputSchema": {"type": "object", "properties": {"mode": {"type": "string", "enum": ["suggest", "apply"], "default": "suggest"}, "limit": {"type": "integer", "default": 100}}, "required": []}}, {"name": "memory_wiki_compress_topic", "description": "Create a synthetic summary claim for a topic and optionally supersede older low-priority claims.", "inputSchema": {"type": "object", "properties": {"topic": {"type": "string"}, "mode": {"type": "string", "enum": ["suggest", "apply"], "default": "suggest"}, "limit": {"type": "integer", "default": 30}}, "required": ["topic"]}}, {"name": "memory_wiki_resolve_by_policy", "description": "Resolve contradiction using policy: prefer_explicit_user, prefer_recent, prefer_verified, prefer_environment_probe.", "inputSchema": {"type": "object", "properties": {"contradiction_id": {"type": "string"}, "policy": {"type": "string", "default": "prefer_explicit_user"}}, "required": ["contradiction_id"]}}, {"name": "memory_wiki_repair", "description": "Run targeted self-healing repairs: fts, dashboards, integrity, or all.", "inputSchema": {"type": "object", "properties": {"target": {"type": "string", "enum": ["fts", "dashboards", "integrity", "all"], "default": "all"}, "dry_run": {"type": "boolean", "default": true}}, "required": []}}, {"name": "memory_wiki_audit_log", "description": "Show recent memory-wiki write/repair/backup/restore audit events.", "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "default": 50}}, "required": []}}, {"name": "memory_wiki_write_firewall", "description": "Dry-run or queue a candidate memory through source policy, quality lint, artifact detection and secret firewall before durable write.", "inputSchema": {"type": "object", "properties": {"claim": {"type": "string"}, "topic": {"type": "string", "default": "general"}, "evidence": {"type": "string", "default": ""}, "source": {"type": "string", "default": "tool"}, "mode": {"type": "string", "enum": ["check", "queue", "apply"], "default": "check"}, "confidence": {"type": "number", "default": 0.75}, "salience": {"type": "number", "default": 0.7}}, "required": ["claim"]}}, {"name": "memory_wiki_mutation_log", "description": "Return transactional mutation log entries with before/after metadata for undo/audit.", "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "default": 50}, "target_table": {"type": "string", "default": ""}, "target_id": {"type": "string", "default": ""}, "since_seconds": {"type": "integer", "default": 0}}, "required": []}}, {"name": "memory_wiki_undo_last", "description": "Undo the last reversible memory mutation or a specific mutation id.", "inputSchema": {"type": "object", "properties": {"mutation_id": {"type": "string", "default": ""}, "dry_run": {"type": "boolean", "default": true}}, "required": []}}, {"name": "memory_wiki_transaction", "description": "Dry-run/apply a bounded batch of memory operations with optional pre-apply backup and rollback ids.", "inputSchema": {"type": "object", "properties": {"operations": {"type": "array", "items": {"type": "object"}}, "mode": {"type": "string", "enum": ["suggest", "apply", "apply_with_backup"], "default": "suggest"}, "reason": {"type": "string", "default": ""}}, "required": ["operations"]}}, {"name": "memory_wiki_compile_topic", "description": "Compile micro-claims in a topic into a curated structured summary; suggest or apply with superseding of older low-priority claims.", "inputSchema": {"type": "object", "properties": {"topic": {"type": "string"}, "mode": {"type": "string", "enum": ["suggest", "apply"], "default": "suggest"}, "limit": {"type": "integer", "default": 50}, "summary_type": {"type": "string", "enum": ["summary", "runbook", "profile", "timeline", "decision"], "default": "summary"}}, "required": ["topic"]}}, {"name": "memory_wiki_get_project_context", "description": "Return first-class project profile plus related claims/task capsules/graph context.", "inputSchema": {"type": "object", "properties": {"project_id": {"type": "string"}, "query": {"type": "string", "default": ""}, "limit": {"type": "integer", "default": 20}}, "required": ["project_id"]}}, {"name": "memory_wiki_source_policy", "description": "Show ingestion policy and write-firewall decision for a source/candidate.", "inputSchema": {"type": "object", "properties": {"source": {"type": "string", "default": "tool"}, "claim": {"type": "string", "default": ""}, "topic": {"type": "string", "default": "general"}}, "required": []}}, {"name": "memory_wiki_export_bundle", "description": "Export a redacted scoped sync bundle for cross-profile/remote memory-wiki import.", "inputSchema": {"type": "object", "properties": {"topic": {"type": "string", "default": ""}, "project_id": {"type": "string", "default": ""}, "scope": {"type": "string", "default": ""}, "limit": {"type": "integer", "default": 500}, "write_file": {"type": "boolean", "default": true}}, "required": []}}, {"name": "memory_wiki_import_bundle", "description": "Import a redacted memory-wiki sync bundle from payload or local path.", "inputSchema": {"type": "object", "properties": {"payload": {"type": "object"}, "path": {"type": "string", "default": ""}, "mode": {"type": "string", "enum": ["suggest", "upsert"], "default": "suggest"}}, "required": []}}, {"name": "memory_wiki_journal_status", "description": "Inspect append-only JSONL journal health, hash chain and recent events.", "inputSchema": {"type": "object", "properties": {"verify": {"type": "boolean", "default": true}, "limit": {"type": "integer", "default": 5}}, "required": []}}, {"name": "memory_wiki_journal_checkpoint", "description": "Write a logical JSON checkpoint of SQLite tables for journal-based recovery. Secret values are redacted by default.", "inputSchema": {"type": "object", "properties": {"name": {"type": "string", "default": "manual"}, "include_secret_values": {"type": "boolean", "default": false}}, "required": []}}, {"name": "memory_wiki_semantic_status", "description": "Check embedding (:4000) and Qdrant (:6333) health and point count.", "inputSchema": {"type": "object", "properties": {}, "required": []}}, {"name": "memory_wiki_reindex", "description": "Re-index all active claims into Qdrant vector store.", "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "default": 0}, "force": {"type": "boolean", "default": false}}, "required": []}}, {"name": "memory_wiki_debug_search", "description": "Search with full breakdown: FTS rank, vector rank, RRF score per claim.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "default": 10}, "topic": {"type": "string", "default": ""}}, "required": ["query"]}}, {"name": "memory_wiki_compare_search", "description": "Compare FTS-only vs vector-only vs hybrid retrieval.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}, "limit": {"type": "integer", "default": 10}, "topic": {"type": "string", "default": ""}}, "required": ["query"]}}, {"name": "memory_wiki_query_mode", "description": "Detect query type (technical/semantic/mixed) without searching.", "inputSchema": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}, {"name": "memory_wiki_rebuild_from_journal", "description": "Plan or apply SQLite rebuild from latest logical checkpoint plus append-only JSONL after-events.", "inputSchema": {"type": "object", "properties": {"apply": {"type": "boolean", "default": false}, "checkpoint": {"type": "string", "default": ""}, "max_events": {"type": "integer", "default": 0}}, "required": []}}, {"name": "memory_wiki_export", "description": "Export bounded claims/evidence/contradictions JSON.", "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "default": 200}}, "required": []}}, {"name": "memory_wiki_decay_scan", "description": "Scan claims with exponential decay scoring. Returns stale candidates below threshold.", "inputSchema": {"type": "object", "properties": {"threshold": {"type": "number", "default": 0.15}}, "required": []}}, {"name": "memory_wiki_decay_stats", "description": "Get decay statistics: total/active/archived claim counts.", "inputSchema": {"type": "object", "properties": {}, "required": []}}, {"name": "memory_wiki_decay_archive", "description": "Archive claims with decay_score below threshold. High-confidence (>=0.7) claims are only flagged, never auto-archived.", "inputSchema": {"type": "object", "properties": {"threshold": {"type": "number", "default": 0.05}, "apply": {"type": "boolean", "default": false}}, "required": []}}, {"name": "memory_wiki_gc", "description": "Garbage collect dead/stale claims: archive claims with low salience and no recent access. Safe with dry_run first.", "inputSchema": {"type": "object", "properties": {"dry_run": {"type": "boolean", "default": true, "description": "If true, only list candidates without archiving"}, "max_age_days": {"type": "integer", "default": 90, "description": "Max age in days before a claim is considered stale"}, "min_salience": {"type": "number", "default": 0.05, "description": "Minimum salience to keep"}}, "required": ["dry_run"]}}, {"name": "memory_wiki_federate_merge", "description": "Merge claims from another memory-wiki instance. Provide remote claims as JSON string.", "inputSchema": {"type": "object", "properties": {"payload_json": {"type": "string", "default": "", "description": "JSON string with {claims: [...]} from remote export"}, "source_instance": {"type": "string", "default": "remote", "description": "Identifier for the remote instance"}}, "required": ["payload_json"]}}, {"name": "memory_wiki_summarize_topic", "description": "Generate a structured summary of a topic with key facts, type breakdown, and open contradictions.", "inputSchema": {"type": "object", "properties": {"topic": {"type": "string", "default": "general", "description": "Topic to summarize (uses alias resolution)"}, "limit": {"type": "integer", "default": 30, "description": "Max claims to include"}}, "required": ["topic"]}}, {"name": "memory_wiki_claim_history", "description": "Show revision history for a specific claim from the BEFORE UPDATE trigger.", "inputSchema": {"type": "object", "properties": {"claim_id": {"type": "string", "description": "Claim ID to show history for"}, "limit": {"type": "integer", "default": 20, "description": "Max history entries"}}, "required": ["claim_id"]}}, {"name": "memory_wiki_secrecy_report", "description": "Report on secrecy_level distribution across active claims and secret index entries.", "inputSchema": {"type": "object", "properties": {}, "required": []}}, {"name": "memory_wiki_context_sanitize", "description": "Sanitize text for safe context injection: strips injection patterns, normalizes whitespace, truncates.", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}, "max_len": {"type": "integer", "default": 400}}, "required": ["text"]}}, {"name": "memory_wiki_is_social_close", "description": "Check if text is a social closer (ok, thanks, \ud83d\udc4d) that should skip memory search.", "inputSchema": {"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}}, {"name": "memory_wiki_code_claim_add", "description": "Add/update a code-linked claim with repository/symbol/revision metadata.", "inputSchema": {"type": "object", "properties": {"claim": {"type": "string"}, "topic": {"type": "string", "default": "code-shrinker"}, "repository_id": {"type": "string"}, "commit_sha": {"type": "string", "default": ""}, "file_path": {"type": "string", "default": ""}, "symbol_id": {"type": "string", "default": ""}, "symbol_revision": {"type": "string", "default": ""}, "claim_type": {"type": "string", "default": "code_claim"}, "confidence": {"type": "number", "default": 0.75}, "salience": {"type": "number", "default": 0.7}, "evidence": {"type": "string", "default": ""}}, "required": ["claim"]}}, {"name": "memory_wiki_code_claim_query", "description": "Query code-linked claims by repository/symbol/file criteria.", "inputSchema": {"type": "object", "properties": {"repository_id": {"type": "string", "default": ""}, "file_path": {"type": "string", "default": ""}, "symbol_id": {"type": "string", "default": ""}, "query": {"type": "string", "default": ""}, "limit": {"type": "integer", "default": 10}}}}, {"name": "memory_wiki_symbol_history", "description": "Get revision history for a specific symbol across claims.", "inputSchema": {"type": "object", "properties": {"symbol_id": {"type": "string"}, "limit": {"type": "integer", "default": 20}}, "required": ["symbol_id"]}}, {"name": "memory_wiki_repository_context", "description": "Return all code-linked claims for a repository.", "inputSchema": {"type": "object", "properties": {"repository_id": {"type": "string"}, "limit": {"type": "integer", "default": 30}}, "required": ["repository_id"]}}, {"name": "memory_wiki_invalidate_revision", "description": "Mark code claims stale after symbol/file change.", "inputSchema": {"type": "object", "properties": {"symbol_id": {"type": "string", "default": ""}, "file_path": {"type": "string", "default": ""}, "new_commit_sha": {"type": "string", "default": ""}}}}, {"name": "memory_wiki_patch_outcome_add", "description": "Record the outcome of a patch application with validation results.", "inputSchema": {"type": "object", "properties": {"patch_id": {"type": "string"}, "outcome": {"type": "string"}, "repository_id": {"type": "string", "default": ""}, "validation_report": {"type": "object"}, "changed_files": {"type": "array", "items": {"type": "string"}}, "changed_symbols": {"type": "array", "items": {"type": "string"}}, "rollback_steps": {"type": "string", "default": ""}}, "required": ["patch_id", "outcome"]}}]
+[
+  {
+    "name": "memory_wiki_query",
+    "description": "Search memory-wiki claims with FTS + salience/freshness scoring.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 10
+        },
+        "include_stale": {
+          "type": "boolean",
+          "default": true
+        },
+        "topic": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_add_claim",
+    "description": "Add/update a structured durable claim with visibility and event time.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "claim": {
+          "type": "string"
+        },
+        "topic": {
+          "type": "string",
+          "default": "general"
+        },
+        "evidence": {
+          "type": "string",
+          "default": ""
+        },
+        "source": {
+          "type": "string",
+          "default": "tool"
+        },
+        "confidence": {
+          "type": "number",
+          "default": 0.75
+        },
+        "salience": {
+          "type": "number",
+          "default": 0.7
+        },
+        "visibility_scope": {
+          "type": "string",
+          "enum": [
+            "global",
+            "bot",
+            "chat",
+            "project",
+            "private"
+          ]
+        },
+        "project_id": {
+          "type": "string",
+          "default": ""
+        },
+        "event_at": {
+          "type": "integer",
+          "default": 0
+        },
+        "event_timezone": {
+          "type": "string",
+          "default": "UTC"
+        }
+      },
+      "required": [
+        "claim"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_query_secrets",
+    "description": "Query safe secret metadata. Plaintext and capability tokens are never returned to the model.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "minLength": 2
+        },
+        "limit": {
+          "type": "integer",
+          "default": 10
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "memory_wiki_recall_plan",
+    "description": "Plan which topics/types/secrets should be recalled for a query.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 8
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_post_task",
+    "description": "Record a post-task durable summary with changed files, backups, verification and service restarts.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "summary": {
+          "type": "string"
+        },
+        "topic": {
+          "type": "string",
+          "default": "operations"
+        },
+        "changed_files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "backups": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "verification": {
+          "type": "string",
+          "default": ""
+        },
+        "services": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "source": {
+          "type": "string",
+          "default": "post_task"
+        }
+      },
+      "required": [
+        "summary"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_active_dashboard",
+    "description": "Render/read active operational memory dashboard.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 80
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_doctor",
+    "description": "Run diagnostics over schema, FTS, dashboards, backups, secrets, contradictions and recall health.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "repair": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_backup",
+    "description": "Create a full zip backup of sqlite/pages/dashboards/metadata.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string",
+          "default": "manual"
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_list_backups",
+    "description": "List memory-wiki backups.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 20
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_restore",
+    "description": "Restore memory-wiki from a backup id/path.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "backup": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "backup"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_add_decision",
+    "description": "Record an architectural/product decision with rationale and alternatives.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "decision": {
+          "type": "string"
+        },
+        "rationale": {
+          "type": "string",
+          "default": ""
+        },
+        "topic": {
+          "type": "string",
+          "default": "decisions"
+        },
+        "alternatives": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "source": {
+          "type": "string",
+          "default": "tool"
+        }
+      },
+      "required": [
+        "decision"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_add_mistake",
+    "description": "Record an anti-regression mistake/lesson with trigger, fix and prevention.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "trigger": {
+          "type": "string"
+        },
+        "mistake": {
+          "type": "string"
+        },
+        "fix": {
+          "type": "string",
+          "default": ""
+        },
+        "prevention": {
+          "type": "string",
+          "default": ""
+        },
+        "topic": {
+          "type": "string",
+          "default": "lessons"
+        }
+      },
+      "required": [
+        "trigger",
+        "mistake"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_add_project_profile",
+    "description": "Add/update a project profile: root, purpose, commands, services, notes.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "project_id": {
+          "type": "string"
+        },
+        "root": {
+          "type": "string",
+          "default": ""
+        },
+        "purpose": {
+          "type": "string",
+          "default": ""
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "services": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "notes": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "required": [
+        "project_id"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_add_task_capsule",
+    "description": "Record a rich task capsule with intent, plan, files, commands, errors, fixes, verification, followups.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "intent": {
+          "type": "string"
+        },
+        "topic": {
+          "type": "string",
+          "default": "tasks"
+        },
+        "plan": {
+          "type": "string",
+          "default": ""
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "fixes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "verification": {
+          "type": "string",
+          "default": ""
+        },
+        "followups": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "intent"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_add_entity",
+    "description": "Add/update entity and aliases for lightweight knowledge graph.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "entity_type": {
+          "type": "string",
+          "default": "thing"
+        },
+        "aliases": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "notes": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "required": [
+        "name"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_add_relation",
+    "description": "Add a typed relation edge between entities. Valid predicates: owns, owned_by, runs_on, hosts, depends_on, required_by, uses_provider, authenticated_by, replaces, replaced_by, valid_until, supports, contradicts, related_to. Prefer specific over generic.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "subject": {
+          "type": "string"
+        },
+        "predicate": {
+          "type": "string"
+        },
+        "object": {
+          "type": "string"
+        },
+        "confidence": {
+          "type": "number",
+          "default": 0.8
+        },
+        "evidence": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "required": [
+        "subject",
+        "predicate",
+        "object"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_graph_query",
+    "description": "Query lightweight entity graph around an entity/text.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 20
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_apply_user_correction",
+    "description": "Capture user correction, supersede/uncertain matching old claims, and add corrected claim.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "correction": {
+          "type": "string"
+        },
+        "target_claim_id": {
+          "type": "string",
+          "default": ""
+        },
+        "topic": {
+          "type": "string",
+          "default": "corrections"
+        }
+      },
+      "required": [
+        "correction"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_pack_context",
+    "description": "Budget-aware recall/context packing with optional Code Shrinker coverage deduplication.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "max_tokens": {
+          "type": "integer",
+          "default": 4000
+        },
+        "max_chars": {
+          "type": "integer",
+          "default": 12000,
+          "description": "Deprecated — use max_tokens"
+        },
+        "output_mode": {
+          "type": "string",
+          "enum": [
+            "canonical",
+            "debug"
+          ],
+          "default": "canonical"
+        },
+        "repository_id": {
+          "type": "string",
+          "default": "",
+          "description": "Expected repository for coverage_manifest validation"
+        },
+        "coverage_manifest": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_memory_diff",
+    "description": "Compare recalled memory against supplied verified/current facts before answering; returns confirmed, changed/conflicting and stale/unverified memory.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "verified_facts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "current_context": {
+          "type": "string",
+          "default": ""
+        },
+        "limit": {
+          "type": "integer",
+          "default": 12
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_preference_layer",
+    "description": "Return prioritized durable user preferences/constraints plus the precedence policy for fresh instructions vs memory.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "default": ""
+        },
+        "limit": {
+          "type": "integer",
+          "default": 20
+        },
+        "include_policy": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_add_preference_rule",
+    "description": "Add/update a first-class preference priority rule used by the preference layer.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "rule": {
+          "type": "string"
+        },
+        "priority": {
+          "type": "integer",
+          "default": 100
+        },
+        "scope": {
+          "type": "string",
+          "default": "global"
+        },
+        "source": {
+          "type": "string",
+          "default": "explicit"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "active",
+            "retired"
+          ],
+          "default": "active"
+        }
+      },
+      "required": [
+        "rule"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_snapshot",
+    "description": "Write a human-readable snapshot markdown of active memory.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_add_evidence",
+    "description": "Attach evidence to a claim and refresh it.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "claim_id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "support",
+            "refute",
+            "source",
+            "note"
+          ],
+          "default": "support"
+        },
+        "source": {
+          "type": "string",
+          "default": "tool"
+        }
+      },
+      "required": [
+        "claim_id",
+        "text"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_update_claim",
+    "description": "Patch claim fields: claim/topic/status/confidence/salience/freshness.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "claim_id": {
+          "type": "string"
+        },
+        "claim": {
+          "type": "string"
+        },
+        "topic": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "active",
+            "retired",
+            "superseded",
+            "uncertain"
+          ]
+        },
+        "confidence": {
+          "type": "number"
+        },
+        "salience": {
+          "type": "number"
+        },
+        "refresh": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "claim_id"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_contradict",
+    "description": "Record contradiction between two claims.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "claim_a": {
+          "type": "string"
+        },
+        "claim_b": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "claim_a",
+        "claim_b",
+        "reason"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_resolve_contradiction",
+    "description": "Resolve a contradiction and optionally retire/supersede a claim.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "contradiction_id": {
+          "type": "string"
+        },
+        "resolution": {
+          "type": "string"
+        },
+        "winner_claim_id": {
+          "type": "string"
+        },
+        "loser_status": {
+          "type": "string",
+          "enum": [
+            "retired",
+            "superseded",
+            "uncertain"
+          ],
+          "default": "superseded"
+        }
+      },
+      "required": [
+        "contradiction_id",
+        "resolution"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_dashboard",
+    "description": "Return dashboard: counts, topics, stale claims, contradictions, paths.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 20
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_get_page",
+    "description": "Read a topic page from the markdown wiki vault.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "topic": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "topic"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_maintenance",
+    "description": "Run vault maintenance: rebuild FTS, detect contradictions, render pages, optionally prune low-salience retired claims.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "prune_retired_days": {
+          "type": "integer",
+          "default": 0
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_merge_claims",
+    "description": "Merge duplicate/overlapping claims, keeping one canonical claim and superseding or retiring the rest.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "keep_id": {
+          "type": "string"
+        },
+        "merge_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "resolution": {
+          "type": "string",
+          "default": "merged as duplicate"
+        },
+        "loser_status": {
+          "type": "string",
+          "enum": [
+            "retired",
+            "superseded",
+            "uncertain"
+          ],
+          "default": "superseded"
+        }
+      },
+      "required": [
+        "keep_id",
+        "merge_ids"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_import",
+    "description": "Import claims/evidence from a memory_wiki_export JSON payload.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "type": "object"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "upsert"
+          ],
+          "default": "upsert"
+        }
+      },
+      "required": [
+        "payload"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_curate",
+    "description": "Suggest or apply cleanup: bad topics, low-quality fragments, duplicate-like claims, and optional pinning.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "suggest",
+            "apply"
+          ],
+          "default": "suggest"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 80
+        },
+        "aggressiveness": {
+          "type": "number",
+          "default": 0.45
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_pin_claim",
+    "description": "Pin a claim so recall/curation preserve it.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "claim_id": {
+          "type": "string"
+        },
+        "pinned": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": [
+        "claim_id"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_health",
+    "description": "Audit memory-wiki quality: schema, low-quality fragments, bad topics, raw logs, secret exposure, duplicate-like claims.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 100
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_evaluate_retrieval",
+    "description": "Run a golden-query retrieval quality suite for recall/pack_context precision and artifact leakage.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 10
+        },
+        "max_chars": {
+          "type": "integer",
+          "default": 3800
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_rewrite_claim",
+    "description": "Rewrite one claim in-place with normalized text/topic/type and quality recomputation.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "claim_id": {
+          "type": "string"
+        },
+        "claim": {
+          "type": "string"
+        },
+        "topic": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string",
+          "default": "manual rewrite"
+        }
+      },
+      "required": [
+        "claim_id",
+        "claim"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_explain_recall",
+    "description": "Explain why query returns specific claims.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 10
+        },
+        "topic": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_vacuum",
+    "description": "Aggressively deduplicate, merge near-duplicates, resolve stale contradiction noise, normalize topics, and optionally apply changes.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "suggest",
+            "apply"
+          ],
+          "default": "suggest"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 120
+        },
+        "similarity": {
+          "type": "number",
+          "default": 0.82
+        },
+        "max_pairs": {
+          "type": "integer",
+          "default": 2500
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_review_queue",
+    "description": "List/approve/reject/rewrite candidate memories before they become durable claims.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "list",
+            "approve",
+            "reject",
+            "rewrite"
+          ],
+          "default": "list"
+        },
+        "item_id": {
+          "type": "string"
+        },
+        "claim": {
+          "type": "string"
+        },
+        "topic": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 20
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_lint_claim",
+    "description": "Lint a candidate memory claim and suggest topic/type/scope rewrites.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "claim": {
+          "type": "string"
+        },
+        "topic": {
+          "type": "string",
+          "default": "general"
+        }
+      },
+      "required": [
+        "claim"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_why_believe",
+    "description": "Explain provenance, evidence, trust score and contradictions for a claim.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "claim_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "claim_id"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_secret_quarantine",
+    "description": "List quarantined secret-like memory fields; originals are never returned, only hashes/redacted text.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 20
+        },
+        "status": {
+          "type": "string",
+          "default": "active"
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_recent_changes",
+    "description": "Show memory mutations since N seconds ago.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "since_seconds": {
+          "type": "integer",
+          "default": 3600
+        },
+        "limit": {
+          "type": "integer",
+          "default": 50
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_mark_used",
+    "description": "Feedback loop: mark recalled claims as useful or not useful.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "claim_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "usefulness": {
+          "type": "number",
+          "default": 1.0
+        },
+        "query": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "claim_ids"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_normalize_topics",
+    "description": "Suggest/apply topic alias normalization.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "suggest",
+            "apply"
+          ],
+          "default": "suggest"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 100
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_immune_scan",
+    "description": "Scan memory database for quality issues and report findings.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "suggest",
+            "apply"
+          ],
+          "default": "suggest"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 100
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_compress_topic",
+    "description": "Create a synthetic summary claim for a topic and optionally supersede older low-priority claims.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "topic": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "suggest",
+            "apply"
+          ],
+          "default": "suggest"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 30
+        }
+      },
+      "required": [
+        "topic"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_resolve_by_policy",
+    "description": "Resolve contradiction using policy: prefer_explicit_user, prefer_recent, prefer_verified, prefer_environment_probe.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "contradiction_id": {
+          "type": "string"
+        },
+        "policy": {
+          "type": "string",
+          "default": "prefer_explicit_user"
+        }
+      },
+      "required": [
+        "contradiction_id"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_repair",
+    "description": "Run targeted self-healing repairs: fts, dashboards, integrity, or all.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "enum": [
+            "fts",
+            "dashboards",
+            "integrity",
+            "all"
+          ],
+          "default": "all"
+        },
+        "dry_run": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_audit_log",
+    "description": "Show recent memory-wiki write/repair/backup/restore audit events.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 50
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_write_firewall",
+    "description": "Dry-run or queue a candidate memory through source policy, quality lint, artifact detection and secret firewall before durable write.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "claim": {
+          "type": "string"
+        },
+        "topic": {
+          "type": "string",
+          "default": "general"
+        },
+        "evidence": {
+          "type": "string",
+          "default": ""
+        },
+        "source": {
+          "type": "string",
+          "default": "tool"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "check",
+            "queue",
+            "apply"
+          ],
+          "default": "check"
+        },
+        "confidence": {
+          "type": "number",
+          "default": 0.75
+        },
+        "salience": {
+          "type": "number",
+          "default": 0.7
+        }
+      },
+      "required": [
+        "claim"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_mutation_log",
+    "description": "Return transactional mutation log entries with before/after metadata for undo/audit.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 50
+        },
+        "target_table": {
+          "type": "string",
+          "default": ""
+        },
+        "target_id": {
+          "type": "string",
+          "default": ""
+        },
+        "since_seconds": {
+          "type": "integer",
+          "default": 0
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_undo_last",
+    "description": "Undo the last reversible memory mutation or a specific mutation id.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "mutation_id": {
+          "type": "string",
+          "default": ""
+        },
+        "dry_run": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_transaction",
+    "description": "Dry-run/apply a bounded non-atomic batch. Each operation may commit independently; use apply_with_backup and stop_on_error for safer rollback.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "operations": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "suggest",
+            "apply",
+            "apply_with_backup"
+          ],
+          "default": "suggest"
+        },
+        "reason": {
+          "type": "string",
+          "default": ""
+        },
+        "stop_on_error": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": [
+        "operations"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_compile_topic",
+    "description": "Compile micro-claims in a topic into a curated structured summary; suggest or apply with superseding of older low-priority claims.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "topic": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "suggest",
+            "apply"
+          ],
+          "default": "suggest"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 50
+        },
+        "summary_type": {
+          "type": "string",
+          "enum": [
+            "summary",
+            "runbook",
+            "profile",
+            "timeline",
+            "decision"
+          ],
+          "default": "summary"
+        }
+      },
+      "required": [
+        "topic"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_get_project_context",
+    "description": "Return first-class project profile plus related claims/task capsules/graph context.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "project_id": {
+          "type": "string"
+        },
+        "query": {
+          "type": "string",
+          "default": ""
+        },
+        "limit": {
+          "type": "integer",
+          "default": 20
+        }
+      },
+      "required": [
+        "project_id"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_source_policy",
+    "description": "Show ingestion policy and write-firewall decision for a source/candidate.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "default": "tool"
+        },
+        "claim": {
+          "type": "string",
+          "default": ""
+        },
+        "topic": {
+          "type": "string",
+          "default": "general"
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_export_bundle",
+    "description": "Export a redacted scoped sync bundle for cross-profile/remote memory-wiki import.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "topic": {
+          "type": "string",
+          "default": ""
+        },
+        "project_id": {
+          "type": "string",
+          "default": ""
+        },
+        "scope": {
+          "type": "string",
+          "default": ""
+        },
+        "limit": {
+          "type": "integer",
+          "default": 500
+        },
+        "write_file": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_import_bundle",
+    "description": "Import a redacted memory-wiki sync bundle from payload or local path.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "type": "object"
+        },
+        "path": {
+          "type": "string",
+          "default": ""
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "suggest",
+            "upsert"
+          ],
+          "default": "suggest"
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_journal_status",
+    "description": "Inspect append-only JSONL journal health, hash chain and recent events.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "verify": {
+          "type": "boolean",
+          "default": true
+        },
+        "limit": {
+          "type": "integer",
+          "default": 5
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_journal_checkpoint",
+    "description": "Write a logical JSON checkpoint of SQLite tables for journal-based recovery. Secret values are always excluded.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "default": "manual"
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_semantic_status",
+    "description": "Check embedding (:4000) and Qdrant (:6333) health and point count.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_reindex",
+    "description": "Re-index all active claims into Qdrant vector store.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 0
+        },
+        "force": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_debug_search",
+    "description": "Search with full breakdown: FTS rank, vector rank, RRF score per claim.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 10
+        },
+        "topic": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_compare_search",
+    "description": "Compare FTS-only vs vector-only vs hybrid retrieval.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 10
+        },
+        "topic": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_query_mode",
+    "description": "Detect query type (technical/semantic/mixed) without searching.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_rebuild_from_journal",
+    "description": "Plan or apply SQLite rebuild from latest logical checkpoint plus append-only JSONL after-events.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "apply": {
+          "type": "boolean",
+          "default": false
+        },
+        "checkpoint": {
+          "type": "string",
+          "default": ""
+        },
+        "max_events": {
+          "type": "integer",
+          "default": 0
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_export",
+    "description": "Export bounded claims/evidence/contradictions JSON.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 200
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_decay_scan",
+    "description": "Scan claims with exponential decay scoring. Returns stale candidates below threshold.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "threshold": {
+          "type": "number",
+          "default": 0.15
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_decay_stats",
+    "description": "Get decay statistics: total/active/archived claim counts.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_decay_archive",
+    "description": "Archive claims with decay_score below threshold. High-confidence (>=0.7) claims are only flagged, never auto-archived.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "threshold": {
+          "type": "number",
+          "default": 0.05
+        },
+        "apply": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_gc",
+    "description": "Garbage collect dead/stale claims: archive claims with low salience and no recent access. Safe with dry_run first.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "dry_run": {
+          "type": "boolean",
+          "default": true,
+          "description": "If true, only list candidates without archiving"
+        },
+        "max_age_days": {
+          "type": "integer",
+          "default": 90,
+          "description": "Max age in days before a claim is considered stale"
+        },
+        "min_salience": {
+          "type": "number",
+          "default": 0.05,
+          "description": "Minimum salience to keep"
+        }
+      },
+      "required": [
+        "dry_run"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_federate_merge",
+    "description": "Merge claims from another memory-wiki instance. Provide remote claims as JSON string.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "payload_json": {
+          "type": "string",
+          "default": "",
+          "description": "JSON string with {claims: [...]} from remote export"
+        },
+        "source_instance": {
+          "type": "string",
+          "default": "remote",
+          "description": "Identifier for the remote instance"
+        }
+      },
+      "required": [
+        "payload_json"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_summarize_topic",
+    "description": "Generate a structured summary of a topic with key facts, type breakdown, and open contradictions.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "topic": {
+          "type": "string",
+          "default": "general",
+          "description": "Topic to summarize (uses alias resolution)"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 30,
+          "description": "Max claims to include"
+        }
+      },
+      "required": [
+        "topic"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_claim_history",
+    "description": "Show revision history for a specific claim from the BEFORE UPDATE trigger.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "claim_id": {
+          "type": "string",
+          "description": "Claim ID to show history for"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 20,
+          "description": "Max history entries"
+        }
+      },
+      "required": [
+        "claim_id"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_secrecy_report",
+    "description": "Report on secrecy_level distribution across active claims and secret index entries.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_context_sanitize",
+    "description": "Sanitize text for safe context injection: strips injection patterns, normalizes whitespace, truncates.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "max_len": {
+          "type": "integer",
+          "default": 400
+        }
+      },
+      "required": [
+        "text"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_is_social_close",
+    "description": "Check if text is a social closer (ok, thanks, 👍) that should skip memory search.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_document_ingest",
+    "description": "Parse and index one allowlisted document in an isolated worker. Supports Office/OpenDocument/PDF/text/data formats; no automatic full reindex.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope_id": {
+          "type": "string",
+          "default": ""
+        },
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        },
+        "ocr": {
+          "type": "boolean",
+          "default": false
+        },
+        "ocr_language": {
+          "type": "string",
+          "default": "eng+rus"
+        },
+        "embed": {
+          "type": "boolean",
+          "default": false
+        },
+        "embed_limit": {
+          "type": "integer",
+          "default": 200,
+          "minimum": 1,
+          "maximum": 10000
+        }
+      },
+      "required": [
+        "path"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_document_scan",
+    "description": "Recursively discover and incrementally index supported documents below an allowlisted directory.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "root": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope_id": {
+          "type": "string",
+          "default": ""
+        },
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        },
+        "recursive": {
+          "type": "boolean",
+          "default": true
+        },
+        "max_files": {
+          "type": "integer",
+          "default": 5000,
+          "minimum": 1,
+          "maximum": 100000
+        },
+        "extensions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "exclude_dirs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "ocr": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "root"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_document_embed_pending",
+    "description": "Create/reuse embeddings for pending semantic document chunks in a bounded batch.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "source_id": {
+          "type": "string",
+          "default": ""
+        },
+        "scope_id": {
+          "type": "string",
+          "default": ""
+        },
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        },
+        "limit": {
+          "type": "integer",
+          "default": 500,
+          "minimum": 1,
+          "maximum": 10000
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_document_query",
+    "description": "Hybrid document retrieval: FTS5/BM25 over addressable units and chunks + Qdrant embeddings + weighted RRF + configured reranker.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_id": {
+          "type": "string",
+          "default": ""
+        },
+        "scope_id": {
+          "type": "string",
+          "default": ""
+        },
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        },
+        "extension": {
+          "type": "string",
+          "default": ""
+        },
+        "limit": {
+          "type": "integer",
+          "default": 12,
+          "minimum": 1,
+          "maximum": 50
+        },
+        "candidate_limit": {
+          "type": "integer",
+          "default": 120,
+          "minimum": 20,
+          "maximum": 500
+        },
+        "max_chars_per_hit": {
+          "type": "integer",
+          "default": 3000,
+          "minimum": 300,
+          "maximum": 20000
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_document_source",
+    "description": "Show indexed metadata, revision and counts for one document source.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "source_id": {
+          "type": "string",
+          "default": ""
+        },
+        "path": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_document_unit_context",
+    "description": "Return neighbouring addressable document units around an anchor or unit ID.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "source_id": {
+          "type": "string"
+        },
+        "unit_id": {
+          "type": "string",
+          "default": ""
+        },
+        "anchor": {
+          "type": "string",
+          "default": ""
+        },
+        "radius": {
+          "type": "integer",
+          "default": 5,
+          "minimum": 0,
+          "maximum": 100
+        }
+      },
+      "required": [
+        "source_id"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_document_neighbors",
+    "description": "Traverse structural and formula/reference edges around a document anchor.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "source_id": {
+          "type": "string"
+        },
+        "anchor": {
+          "type": "string"
+        },
+        "hops": {
+          "type": "integer",
+          "default": 1,
+          "minimum": 1,
+          "maximum": 3
+        },
+        "limit": {
+          "type": "integer",
+          "default": 100,
+          "minimum": 1,
+          "maximum": 1000
+        }
+      },
+      "required": [
+        "source_id",
+        "anchor"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_document_status",
+    "description": "Show indexed document sources, parser capabilities and pending embedding counts.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "scope_id": {
+          "type": "string",
+          "default": ""
+        },
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_document_delete",
+    "description": "Soft-delete a document graph and archive its active embedding claims.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "source_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_id"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_document_ingest_inbox",
+    "description": "Consume bounded document manifests emitted by Code Shrinker from the shared inbox.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 25,
+          "minimum": 1,
+          "maximum": 1000
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_code_graph_status",
+    "description": "Show indexed repositories and counts for files, symbols, semantic chunks, addressable lines, edges and embedded chunks.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_code_graph_embed_pending",
+    "description": "Create/reuse semantic claims for pending code chunks in a bounded batch. Repeat until pending_after is zero; no full reindex is started.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "repository_id": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 1000,
+          "minimum": 1,
+          "maximum": 10000
+        }
+      },
+      "required": [
+        "repository_id"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_code_graph_query",
+    "description": "Hybrid code retrieval: FTS5/BM25 over symbols/chunks/lines + Qdrant semantic chunks + weighted RRF + configured reranker + graph-neighbour boost.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "minLength": 1
+        },
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        },
+        "limit": {
+          "type": "integer",
+          "default": 12,
+          "minimum": 1,
+          "maximum": 50
+        },
+        "candidate_limit": {
+          "type": "integer",
+          "default": 96,
+          "minimum": 20,
+          "maximum": 300
+        },
+        "max_chars_per_hit": {
+          "type": "integer",
+          "default": 2400,
+          "minimum": 300,
+          "maximum": 12000
+        }
+      },
+      "required": [
+        "query"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_code_line_context",
+    "description": "Return redacted addressable lines around line_id or repository/file/line, with owning symbols and chunks. Escalate to Code Shrinker file.lines for exact source.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "repository_id": {
+          "type": "string"
+        },
+        "line_id": {
+          "type": "string",
+          "default": ""
+        },
+        "file_path": {
+          "type": "string",
+          "default": ""
+        },
+        "line_no": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0
+        },
+        "radius": {
+          "type": "integer",
+          "default": 12,
+          "minimum": 0,
+          "maximum": 100
+        }
+      },
+      "required": [
+        "repository_id"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_code_graph_neighbors",
+    "description": "Traverse typed code-graph edges around a symbol/node for up to three hops.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "repository_id": {
+          "type": "string"
+        },
+        "node_id": {
+          "type": "string"
+        },
+        "hops": {
+          "type": "integer",
+          "default": 1,
+          "minimum": 1,
+          "maximum": 3
+        },
+        "limit": {
+          "type": "integer",
+          "default": 50,
+          "minimum": 1,
+          "maximum": 500
+        }
+      },
+      "required": [
+        "repository_id",
+        "node_id"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_code_graph_ingest_inbox",
+    "description": "Consume pending Code Shrinker patch and code_graph_snapshot events from the shared inbox.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 25,
+          "minimum": 1,
+          "maximum": 250
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_code_claim_add",
+    "description": "Add/update a code-linked claim with repository/symbol/revision metadata. Repository, file_path, and content_hash required.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "claim": {
+          "type": "string",
+          "maxLength": 12000
+        },
+        "topic": {
+          "type": "string",
+          "default": "code-shrinker",
+          "maxLength": 200
+        },
+        "repository_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "commit_sha": {
+          "type": "string",
+          "default": "",
+          "maxLength": 64,
+          "pattern": "^(?:[0-9a-fA-F]{7,64})?$"
+        },
+        "file_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "symbol_id": {
+          "type": "string",
+          "default": "",
+          "maxLength": 512
+        },
+        "symbol_revision": {
+          "type": "string",
+          "default": "",
+          "maxLength": 128
+        },
+        "content_hash": {
+          "type": "string",
+          "description": "SHA-256 of symbol or file content",
+          "pattern": "^(?:sha256:)?[0-9a-fA-F]{64}$"
+        },
+        "claim_type": {
+          "type": "string",
+          "default": "code_claim",
+          "maxLength": 100
+        },
+        "confidence": {
+          "type": "number",
+          "default": 0.75,
+          "minimum": 0,
+          "maximum": 1
+        },
+        "salience": {
+          "type": "number",
+          "default": 0.7,
+          "minimum": 0,
+          "maximum": 1
+        },
+        "evidence": {
+          "type": "string",
+          "default": "",
+          "maxLength": 20000
+        },
+        "source_event_id": {
+          "type": "string",
+          "default": "",
+          "maxLength": 512,
+          "description": "Durable producer event identifier for exactly-once ingestion"
+        },
+        "producer": {
+          "type": "string",
+          "default": "code-shrinker",
+          "maxLength": 100
+        },
+        "phase_sep_version": {
+          "type": "string",
+          "default": "2",
+          "maxLength": 32
+        }
+      },
+      "required": [
+        "claim",
+        "repository_id",
+        "file_path",
+        "content_hash"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "memory_wiki_code_claim_query",
+    "description": "Query code-linked claims by repository/symbol/file criteria.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        },
+        "file_path": {
+          "type": "string",
+          "default": ""
+        },
+        "symbol_id": {
+          "type": "string",
+          "default": ""
+        },
+        "query": {
+          "type": "string",
+          "default": ""
+        },
+        "limit": {
+          "type": "integer",
+          "default": 10
+        }
+      },
+      "required": [
+        "repository_id"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_symbol_history",
+    "description": "Get repository-scoped revision history for a code symbol.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "repository_id": {
+          "type": "string"
+        },
+        "symbol_id": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 20
+        }
+      },
+      "required": [
+        "repository_id",
+        "symbol_id"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_repository_context",
+    "description": "Return all code-linked claims for a repository.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "repository_id": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 30
+        }
+      },
+      "required": [
+        "repository_id"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_invalidate_revision",
+    "description": "Mark code claims stale after symbol/file change — scoped by repository. Requires symbol_id or file_path.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "repository_id": {
+          "type": "string",
+          "default": "",
+          "description": "Repository identifier"
+        },
+        "symbol_id": {
+          "type": "string",
+          "default": ""
+        },
+        "file_path": {
+          "type": "string",
+          "default": ""
+        },
+        "new_commit_sha": {
+          "type": "string",
+          "default": "",
+          "maxLength": 64,
+          "pattern": "^(?:[0-9a-fA-F]{7,64})?$",
+          "description": "Git commit SHA after the change"
+        },
+        "new_content_hash": {
+          "type": "string",
+          "default": "",
+          "pattern": "^(?:sha256:)?[0-9a-fA-F]{64}$",
+          "description": "SHA-256 of the new file or symbol content"
+        }
+      },
+      "required": [
+        "repository_id"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_patch_outcome_add",
+    "description": "Record the outcome of a patch application with structured validation and revision metadata.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "patch_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "outcome": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "repository_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "commit_sha": {
+          "type": "string",
+          "default": "",
+          "maxLength": 64,
+          "pattern": "^(?:[0-9a-fA-F]{7,64})?$"
+        },
+        "old_content_hash": {
+          "type": "string",
+          "default": "",
+          "pattern": "^(?:sha256:)?[0-9a-fA-F]{64}$"
+        },
+        "new_content_hash": {
+          "type": "string",
+          "default": "",
+          "pattern": "^(?:sha256:)?[0-9a-fA-F]{64}$"
+        },
+        "validation_report": {
+          "type": "object"
+        },
+        "changed_files": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "type": "string",
+            "maxLength": 1024
+          }
+        },
+        "changed_symbols": {
+          "type": "array",
+          "maxItems": 500,
+          "items": {
+            "type": "string",
+            "maxLength": 512
+          }
+        },
+        "rollback_steps": {
+          "type": "string",
+          "default": "",
+          "maxLength": 20000
+        },
+        "source_event_id": {
+          "type": "string",
+          "default": "",
+          "maxLength": 512
+        },
+        "producer": {
+          "type": "string",
+          "default": "mcp-code-shrinker",
+          "maxLength": 100
+        },
+        "phase_sep_version": {
+          "type": "string",
+          "default": "2",
+          "maxLength": 32
+        }
+      },
+      "required": [
+        "patch_id",
+        "outcome",
+        "repository_id"
+      ],
+      "additionalProperties": false
+    }
+  }
+]

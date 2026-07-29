@@ -1,4 +1,4 @@
-"""memory-wiki v1.20.0+document-knowledge-graph-v2+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.20.1+audit-fix-r1+document-knowledge-graph-v2+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -133,8 +133,9 @@ except ImportError:
             maybe_prefetch_code_context as _maybe_prefetch_code_context,
         )
     except ImportError as _code_graph_import_exc:
+        _CODE_GRAPH_IMPORT_ERROR = f"{type(_code_graph_import_exc).__name__}: {_code_graph_import_exc}"
         def _code_graph_unavailable(*args, **kwargs):
-            raise RuntimeError(f"code_knowledge_graph unavailable: {_code_graph_import_exc}")
+            raise RuntimeError(f"code_knowledge_graph unavailable: {_CODE_GRAPH_IMPORT_ERROR}")
         def _install_code_graph_schema(conn): return None
         _ingest_code_graph_event = _query_code_graph = _code_line_context = _code_graph_neighbors = _code_graph_status = _embed_pending_chunks = _code_graph_unavailable
         def _maybe_prefetch_code_context(*args, **kwargs): return ""
@@ -172,8 +173,9 @@ except ImportError:
             maybe_prefetch_document_context as _maybe_prefetch_document_context,
         )
     except ImportError as _document_graph_import_exc:
+        _DOCUMENT_GRAPH_IMPORT_ERROR = f"{type(_document_graph_import_exc).__name__}: {_document_graph_import_exc}"
         def _document_graph_unavailable(*args, **kwargs):
-            raise RuntimeError(f"document_knowledge_graph unavailable: {_document_graph_import_exc}")
+            raise RuntimeError(f"document_knowledge_graph unavailable: {_DOCUMENT_GRAPH_IMPORT_ERROR}")
         def _install_document_graph_schema(conn): return None
         _document_ingest = _document_scan = _document_embed_pending = _document_query = _document_source = _document_unit_context = _document_neighbors = _document_status = _document_delete = _document_ingest_inbox = _document_graph_unavailable
         def _maybe_prefetch_document_context(*args, **kwargs): return ""
@@ -1866,6 +1868,31 @@ def zip_member_regular(info: zipfile.ZipInfo) -> bool:
     """Only restore regular files; never trust symlink/device entries from archives."""
     mode = (int(getattr(info, "external_attr", 0) or 0) >> 16) & 0o170000
     return mode in (0, stat.S_IFREG)
+
+def validate_restore_archive(zf: zipfile.ZipFile) -> List[zipfile.ZipInfo]:
+    """Validate paths, entry types and expansion limits before any restore write."""
+    max_files = max(1, min(int(os.environ.get("MEMORY_WIKI_RESTORE_MAX_FILES", "20000") or 20000), 200000))
+    max_total = max(1_000_000, min(int(os.environ.get("MEMORY_WIKI_RESTORE_MAX_BYTES", str(2 * 1024**3)) or 2 * 1024**3), 20 * 1024**3))
+    max_member = max(1_000_000, min(int(os.environ.get("MEMORY_WIKI_RESTORE_MAX_MEMBER_BYTES", str(1024**3)) or 1024**3), 10 * 1024**3))
+    max_ratio = max(5, min(int(os.environ.get("MEMORY_WIKI_RESTORE_MAX_RATIO", "200") or 200), 10000))
+    infos = [info for info in zf.infolist() if not info.is_dir()]
+    if len(infos) > max_files:
+        raise ValueError(f"backup contains too many files: {len(infos)} > {max_files}")
+    total = 0
+    for info in infos:
+        if not zip_member_safe(info.filename) or not zip_member_regular(info):
+            raise ValueError(f"unsafe zip member: {info.filename}")
+        if int(getattr(info, "flag_bits", 0) or 0) & 0x1:
+            raise ValueError(f"encrypted zip member is unsupported: {info.filename}")
+        size = int(info.file_size or 0); compressed = max(1, int(info.compress_size or 0))
+        if size > max_member:
+            raise ValueError(f"backup member exceeds size limit: {info.filename}")
+        if size > 1024 * 1024 and size / compressed > max_ratio:
+            raise ValueError(f"suspicious compression ratio: {info.filename}")
+        total += size
+        if total > max_total:
+            raise ValueError(f"backup expands beyond configured limit: {total} > {max_total}")
+    return infos
 
 def redact_secrets(text: str) -> str:
     s = str(text or "")
@@ -4537,10 +4564,17 @@ class MemoryWikiProvider(MemoryProvider):
         return {'query':query, 'remembered':remembered, 'verified_now':facts, 'confirmed':confirmed, 'changed_or_conflicting':changed, 'stale_or_unverified':stale_unverified, 'answer_basis':basis, 'policy':['fresh verified facts > explicit user correction > pinned preference > recent high-trust claim > stale/unverified memory']}
 
     def _sanitize_row(self, row: Dict[str, Any] | sqlite3.Row) -> Dict[str, Any]:
-        """Last-mile guard: public recall/export/tool rows must never expose raw secrets."""
+        """Last-mile guard without destroying generated integrity digests."""
         d = dict(row)
+        digest_fields = {"hash", "content_hash", "file_hash", "text_hash", "snapshot_hash", "payload_hash", "old_content_hash", "new_content_hash"}
+        digest_re = re.compile(r"^(?:sha256:)?[0-9a-fA-F]{64}$")
         for k, v in list(d.items()):
             if isinstance(v, str):
+                # These fields are generated by Memory Wiki/Code Shrinker and
+                # are required for deduplication and revision diagnostics. A
+                # generic secret regex used to redact every 64-hex digest.
+                if k in digest_fields and digest_re.fullmatch(v.strip()):
+                    continue
                 d[k] = redact_secrets(v)
         if "value" in d:
             d["has_value"] = bool(d.get("value"))
@@ -6443,8 +6477,12 @@ class MemoryWikiProvider(MemoryProvider):
         _debug_log(f"SEMANTIC hydrated={hydrated} requested={len(claim_ids)}")
         return hydrated
 
-    def _search(self, query: str, limit=10, include_stale=True, topic: Optional[str]=None, session_id: str="") -> List[Dict[str, Any]]:
+    def _search(self, query: str, limit=10, include_stale=True, topic: Optional[str]=None, session_id: str="", retrieval_mode: str="hybrid") -> List[Dict[str, Any]]:
         limit = max(1, min(int(limit or 10), 50)); q = query or ""; qt = tokens(q); c = self._connect()
+        retrieval_mode = str(retrieval_mode or "hybrid").strip().lower()
+        if retrieval_mode not in {"hybrid", "fts", "vector"}:
+            raise ValueError("retrieval_mode must be one of: hybrid, fts, vector")
+        semantic_enabled = bool(SEMANTIC_ENABLED and retrieval_mode != "fts")
         # --- v1.6: Auto-repair FTS on corruption ---
         try:
             c.execute("SELECT count(*) FROM claims_fts").fetchone()
@@ -6465,7 +6503,7 @@ class MemoryWikiProvider(MemoryProvider):
         rrf_fused: Dict[str, float] = {}
         query_mode = _detect_query_mode(q)
         _debug_log(f"QUERY mode={query_mode} q={q[:200]}")
-        if q and SEMANTIC_ENABLED:
+        if q and semantic_enabled:
             # Layer 2 (единственный): HTTP/OpenRouter embeddings → Qdrant
             if _semantic_available():
                 try:
@@ -6492,7 +6530,7 @@ class MemoryWikiProvider(MemoryProvider):
             try:
                 for r in c.execute(sql + f" LIMIT {int(cap)}", params).fetchall(): candidates.setdefault(r["id"], r)
             except Exception: pass
-        if q.strip():
+        if q.strip() and retrieval_mode != "vector":
             for ftsq in (safe_fts_query(q, mode="and"), safe_fts_query(q, mode="or")):
                 try:
                     fts_sql = "SELECT claims.*, bm25(claims_fts) AS rank FROM claims_fts JOIN claims ON claims_fts.id=claims.id WHERE claims_fts MATCH ? AND claims.status='active'"
@@ -6521,9 +6559,10 @@ class MemoryWikiProvider(MemoryProvider):
                 except Exception: pass
             like = f"%{q.strip()[:180]}%"
             add_rows(f"SELECT * FROM claims WHERE {base_where} AND (claim LIKE ? OR normalized_claim LIKE ? OR evidence LIKE ?)", base_params + [like, like, like], 80)
-        add_rows(f"SELECT * FROM claims WHERE {base_where} ORDER BY pinned DESC, salience DESC, usefulness DESC, trust_score DESC, updated_at DESC", base_params, 120)
-        add_rows(f"SELECT * FROM claims WHERE {base_where} ORDER BY updated_at DESC", base_params, 160)
-        add_rows(f"SELECT * FROM claims WHERE {base_where} AND risk!='secret' ORDER BY recall_count ASC, freshness_at DESC", base_params, 80)
+        if retrieval_mode == "hybrid":
+            add_rows(f"SELECT * FROM claims WHERE {base_where} ORDER BY pinned DESC, salience DESC, usefulness DESC, trust_score DESC, updated_at DESC", base_params, 120)
+            add_rows(f"SELECT * FROM claims WHERE {base_where} ORDER BY updated_at DESC", base_params, 160)
+            add_rows(f"SELECT * FROM claims WHERE {base_where} AND risk!='secret' ORDER BY recall_count ASC, freshness_at DESC", base_params, 80)
         # --- RRF fusion: объединяем lexical (bm25) и semantic (cosine) ранги ---
         lex_weights = {r["id"]: bm25.get(r["id"], 0.01) for r in candidates.values() if r["status"] == "active"}
         if query_mode == "technical": lw, sw = 1.4, 0.6
@@ -7651,16 +7690,19 @@ class MemoryWikiProvider(MemoryProvider):
                 raise
             except Exception:
                 pass  # best-effort, continue if checksum file is broken
+        with zipfile.ZipFile(path) as validation_zip:
+            try:
+                validate_restore_archive(validation_zip)
+            except ValueError as exc:
+                self._audit('restore','blocked',f'{exc} in {path}')
+                raise
         safety=self._backup('pre-restore safety backup')
         extracted=[]; staged=[]
         with tempfile.TemporaryDirectory(prefix='memory_wiki_restore_', dir=str(self.root)) as td:
             stage=Path(td)
             with zipfile.ZipFile(path) as z:
-                infos=[i for i in z.infolist() if not i.is_dir()]
+                infos=validate_restore_archive(z)
                 for info in infos:
-                    if not zip_member_safe(info.filename) or not zip_member_regular(info):
-                        self._audit('restore','blocked',f'unsafe zip member {info.filename} in {path}')
-                        raise ValueError(f'unsafe zip member: {info.filename}')
                     dest=safe_join(stage, info.filename); dest.parent.mkdir(parents=True, exist_ok=True)
                     with z.open(info) as src, open(dest, 'wb') as out:
                         shutil.copyfileobj(src, out)
@@ -9068,14 +9110,16 @@ class MemoryWikiProvider(MemoryProvider):
         return {"query": q, "query_mode": qm, "results": items}
 
     def _compare_search(self, query: str, limit: int = 10, topic: str = "") -> Dict[str,Any]:
-        q = query or ""; top = max(1, min(limit, 20))
-        orig = os.environ.get("MEMORY_WIKI_SEMANTIC", "1")
-        os.environ["MEMORY_WIKI_SEMANTIC"] = "0"
-        fts = [{"id": d.get("id"), "score": d.get("score", 0), "claim": short(d.get("claim", ""), 80)} for d in self._search(q, top, False, topic if topic else None)]
-        os.environ["MEMORY_WIKI_SEMANTIC"] = "1"
-        hyb = [{"id": d.get("id"), "score": d.get("score", 0), "claim": short(d.get("claim", ""), 80)} for d in self._search(q, top, False, topic if topic else None)]
-        os.environ["MEMORY_WIKI_SEMANTIC"] = orig
-        return {"query": q, "query_mode": _detect_query_mode(q), "fts_only": fts, "hybrid": hyb}
+        q = query or ""; top = max(1, min(limit, 20)); selected_topic = topic if topic else None
+        def compact(rows):
+            return [{"id": d.get("id"), "score": d.get("score", 0), "claim": short(d.get("claim", ""), 80)} for d in rows]
+        # Never mutate process-wide environment variables here. The former
+        # implementation was thread-unsafe and did not affect the module-level
+        # SEMANTIC_ENABLED constant after import.
+        fts = compact(self._search(q, top, False, selected_topic, retrieval_mode="fts"))
+        vector = compact(self._search(q, top, False, selected_topic, retrieval_mode="vector"))
+        hybrid = compact(self._search(q, top, False, selected_topic, retrieval_mode="hybrid"))
+        return {"query": q, "query_mode": _detect_query_mode(q), "fts_only": fts, "vector_only": vector, "hybrid": hybrid}
 
     def _query_mode_tool(self, query: str) -> Dict[str,Any]:
         q = query or ""

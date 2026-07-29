@@ -1,6 +1,6 @@
-# Hermes Memory Wiki v1.18.6
+# Hermes Memory Wiki v1.20.1
 
-Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 85 MCP tools.
+Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 101 MCP tools.
 
 ## Architecture
 
@@ -333,3 +333,8 @@ Latency and reindex duration depend on the embedding provider, Qdrant placement,
 ## License
 
 MIT
+
+
+## Audit fix r1 (2026-07-29)
+
+This source package includes the runtime modules required by the advertised code and document graph tools. `plugin.yaml`, the MCP schema cache and the Python provider are generated from the same 101-schema source. `memory_wiki_compare_search` now performs real FTS-only, vector-only and hybrid runs without mutating process-wide environment variables. Backup restore validates archive entry count, uncompressed size, member size and compression ratio before creating a safety backup or writing staged files.

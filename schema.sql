@@ -520,3 +520,226 @@ CREATE TRIGGER trg_no_context_capsule_upd
                 BEGIN
                     SELECT RAISE(FAIL, 'context capsule forbidden by DB trigger (council fix 2026-06-26)');
                 END;
+
+-- AUDIT-FIX v1.20.1: canonical schemas for the shipped code/document graph runtimes.
+CREATE TABLE code_graph_chunks(
+            repository_id TEXT NOT NULL,
+            chunk_id TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            symbol_id TEXT NOT NULL DEFAULT '',
+            qualified_name TEXT NOT NULL DEFAULT '',
+            chunk_kind TEXT NOT NULL DEFAULT 'semantic',
+            start_line INTEGER NOT NULL DEFAULT 0,
+            end_line INTEGER NOT NULL DEFAULT 0,
+            content_hash TEXT NOT NULL DEFAULT '',
+            embedding_claim_id TEXT NOT NULL DEFAULT '',
+            token_estimate INTEGER NOT NULL DEFAULT 0,
+            chunk_text TEXT NOT NULL DEFAULT '',
+            embedding_text TEXT NOT NULL DEFAULT '',
+            search_text TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(repository_id,chunk_id)
+        );
+
+CREATE VIRTUAL TABLE code_graph_chunks_fts USING fts5(repository_id UNINDEXED,chunk_id UNINDEXED,file_path,symbol_id,qualified_name,search_text,chunk_text,tokenize='unicode61 tokenchars ''_./:@#$-''');
+
+CREATE TABLE code_graph_edges(
+            repository_id TEXT NOT NULL,
+            edge_id TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            predicate TEXT NOT NULL,
+            target_id TEXT NOT NULL,
+            source_file TEXT NOT NULL DEFAULT '',
+            source_line INTEGER NOT NULL DEFAULT 0,
+            target_file TEXT NOT NULL DEFAULT '',
+            confidence REAL NOT NULL DEFAULT 0.5,
+            evidence TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(repository_id,edge_id)
+        );
+
+CREATE TABLE code_graph_events(
+            event_id TEXT PRIMARY KEY,
+            repository_id TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            snapshot_mode TEXT NOT NULL DEFAULT 'full',
+            status TEXT NOT NULL DEFAULT 'completed',
+            stats_json TEXT NOT NULL DEFAULT '{}',
+            created_at INTEGER NOT NULL
+        );
+
+CREATE TABLE code_graph_files(
+            repository_id TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            language TEXT NOT NULL DEFAULT '',
+            file_hash TEXT NOT NULL DEFAULT '',
+            line_count INTEGER NOT NULL DEFAULT 0,
+            imports_json TEXT NOT NULL DEFAULT '[]',
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(repository_id,file_path)
+        );
+
+CREATE TABLE code_graph_lines(
+            repository_id TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            line_no INTEGER NOT NULL,
+            line_id TEXT NOT NULL DEFAULT '',
+            anchor_hash TEXT NOT NULL DEFAULT '',
+            text_hash TEXT NOT NULL DEFAULT '',
+            line_text TEXT NOT NULL DEFAULT '',
+            symbol_id TEXT NOT NULL DEFAULT '',
+            chunk_id TEXT NOT NULL DEFAULT '',
+            flags TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(repository_id,file_path,line_no)
+        );
+
+CREATE VIRTUAL TABLE code_graph_lines_fts USING fts5(repository_id UNINDEXED,file_path UNINDEXED,line_no UNINDEXED,line_text,tokenize='unicode61 tokenchars ''_./:@#$-''');
+
+CREATE TABLE code_graph_repositories(
+            repository_id TEXT PRIMARY KEY,
+            root TEXT NOT NULL DEFAULT '',
+            commit_sha TEXT NOT NULL DEFAULT '',
+            graph_revision TEXT NOT NULL DEFAULT '',
+            snapshot_hash TEXT NOT NULL DEFAULT '',
+            generated_at INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            stats_json TEXT NOT NULL DEFAULT '{}'
+        );
+
+CREATE TABLE code_graph_symbols(
+            repository_id TEXT NOT NULL,
+            symbol_id TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            qualified_name TEXT NOT NULL DEFAULT '',
+            short_name TEXT NOT NULL DEFAULT '',
+            kind TEXT NOT NULL DEFAULT '',
+            language TEXT NOT NULL DEFAULT '',
+            signature TEXT NOT NULL DEFAULT '',
+            visibility TEXT NOT NULL DEFAULT '',
+            start_line INTEGER NOT NULL DEFAULT 0,
+            end_line INTEGER NOT NULL DEFAULT 0,
+            symbol_revision TEXT NOT NULL DEFAULT '',
+            content_hash TEXT NOT NULL DEFAULT '',
+            contract_json TEXT NOT NULL DEFAULT '{}',
+            search_text TEXT NOT NULL DEFAULT '',
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            PRIMARY KEY(repository_id,symbol_id)
+        );
+
+CREATE VIRTUAL TABLE code_graph_symbols_fts USING fts5(repository_id UNINDEXED,symbol_id UNINDEXED,file_path,qualified_name,signature,search_text,tokenize='unicode61 tokenchars ''_./:@#$-''');
+
+CREATE TABLE document_chunks(
+            chunk_id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL,
+            revision_id TEXT NOT NULL,
+            scope_id TEXT NOT NULL DEFAULT '',
+            repository_id TEXT NOT NULL DEFAULT '',
+            start_unit_id TEXT NOT NULL DEFAULT '',
+            end_unit_id TEXT NOT NULL DEFAULT '',
+            start_anchor TEXT NOT NULL DEFAULT '',
+            end_anchor TEXT NOT NULL DEFAULT '',
+            chunk_kind TEXT NOT NULL DEFAULT 'semantic',
+            title TEXT NOT NULL DEFAULT '',
+            chunk_text TEXT NOT NULL DEFAULT '',
+            embedding_text TEXT NOT NULL DEFAULT '',
+            content_hash TEXT NOT NULL DEFAULT '',
+            embedding_claim_id TEXT NOT NULL DEFAULT '',
+            token_estimate INTEGER NOT NULL DEFAULT 0,
+            active INTEGER NOT NULL DEFAULT 1,
+            updated_at INTEGER NOT NULL DEFAULT 0
+        );
+
+CREATE VIRTUAL TABLE document_chunks_fts USING fts5(
+            source_id UNINDEXED, chunk_id UNINDEXED, title, anchors, chunk_text,
+            tokenize='unicode61 remove_diacritics 2'
+        );
+
+CREATE TABLE document_edges(
+            edge_id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL,
+            revision_id TEXT NOT NULL,
+            source_anchor TEXT NOT NULL,
+            predicate TEXT NOT NULL,
+            target_anchor TEXT NOT NULL,
+            evidence TEXT NOT NULL DEFAULT '',
+            confidence REAL NOT NULL DEFAULT 0.7,
+            active INTEGER NOT NULL DEFAULT 1,
+            updated_at INTEGER NOT NULL DEFAULT 0
+        );
+
+CREATE TABLE document_events(
+            event_id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL DEFAULT '',
+            event_type TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            status TEXT NOT NULL,
+            result_json TEXT NOT NULL DEFAULT '{}',
+            created_at INTEGER NOT NULL DEFAULT 0
+        );
+
+CREATE TABLE document_graph_meta(
+            key TEXT PRIMARY KEY, value TEXT NOT NULL
+        );
+
+CREATE TABLE document_revisions(
+            revision_id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL,
+            file_hash TEXT NOT NULL,
+            parser TEXT NOT NULL DEFAULT '',
+            parser_version TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active',
+            unit_count INTEGER NOT NULL DEFAULT 0,
+            chunk_count INTEGER NOT NULL DEFAULT 0,
+            edge_count INTEGER NOT NULL DEFAULT 0,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(source_id) REFERENCES document_sources(source_id)
+        );
+
+CREATE TABLE document_sources(
+            source_id TEXT PRIMARY KEY,
+            scope_id TEXT NOT NULL DEFAULT '',
+            repository_id TEXT NOT NULL DEFAULT '',
+            source_path TEXT NOT NULL UNIQUE,
+            display_name TEXT NOT NULL DEFAULT '',
+            extension TEXT NOT NULL DEFAULT '',
+            mime_type TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            file_hash TEXT NOT NULL DEFAULT '',
+            mtime_ns INTEGER NOT NULL DEFAULT 0,
+            size_bytes INTEGER NOT NULL DEFAULT 0,
+            parser TEXT NOT NULL DEFAULT '',
+            parser_version TEXT NOT NULL DEFAULT '',
+            revision_id TEXT NOT NULL DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'active',
+            active INTEGER NOT NULL DEFAULT 1,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            warnings_json TEXT NOT NULL DEFAULT '[]',
+            last_error TEXT NOT NULL DEFAULT '',
+            created_at INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL DEFAULT 0
+        );
+
+CREATE TABLE document_units(
+            unit_id TEXT PRIMARY KEY,
+            source_id TEXT NOT NULL,
+            revision_id TEXT NOT NULL,
+            parent_unit_id TEXT NOT NULL DEFAULT '',
+            unit_type TEXT NOT NULL DEFAULT 'text',
+            anchor TEXT NOT NULL,
+            ordinal INTEGER NOT NULL DEFAULT 0,
+            title TEXT NOT NULL DEFAULT '',
+            unit_text TEXT NOT NULL DEFAULT '',
+            content_hash TEXT NOT NULL DEFAULT '',
+            locator_json TEXT NOT NULL DEFAULT '{}',
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            active INTEGER NOT NULL DEFAULT 1,
+            updated_at INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(source_id,revision_id,anchor)
+        );
+
+CREATE VIRTUAL TABLE document_units_fts USING fts5(
+            source_id UNINDEXED, unit_id UNINDEXED, unit_type, title, anchor, unit_text,
+            tokenize='unicode61 remove_diacritics 2'
+        );
