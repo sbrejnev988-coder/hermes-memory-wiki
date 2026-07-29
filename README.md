@@ -1,6 +1,6 @@
-# Hermes Memory Wiki v1.18.3
+# Hermes Memory Wiki v1.18.4
 
-Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 88 MCP tools.
+Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 85 MCP tools.
 
 ## Architecture
 
@@ -21,7 +21,7 @@ Outbox worker (async):
   → статус: completed / failed (5 попыток)
 
 Retrieval pipeline:
-  FTS5/BM25 + Qdrant/PPLX → RRF → Cohere rerank → diversity → structured XML
+  FTS5/BM25 + Qdrant embeddings → RRF → Voyage/Cohere instruction-aware rerank → diversity → structured XML
 ```
 
 ## Requirements
@@ -38,12 +38,19 @@ Retrieval pipeline:
 |---|---|---|
 | `MEMORY_WIKI_EMBED_PROVIDER` | `stub` | `openrouter` or local `stub` fallback |
 | `MEMORY_WIKI_EMBED_URL` | provider-dependent | `https://openrouter.ai/api/v1` for `openrouter`, otherwise `http://127.0.0.1:4000` |
-| `MEMORY_WIKI_EMBED_MODEL` | `qwen/qwen3-embedding-8b` | Embedding model |
-| `MEMORY_WIKI_EMBED_DIMENSIONS` | `768` | Embedding response dimensions |
+| `MEMORY_WIKI_EMBED_MODEL` | provider-dependent | `hash-ngram-2560` for `stub`; `qwen/qwen3-embedding-8b` for `openrouter` |
+| `MEMORY_WIKI_EMBED_DIMENSIONS` | `2560` | Embedding response dimensions; must equal `MEMORY_WIKI_VECTOR_SIZE` |
+| `MEMORY_WIKI_EMBED_INPUT_MAX_CHARS` | `12000` | Maximum document/query characters sent to the embedding endpoint; included in the embedding manifest |
 | `MEMORY_WIKI_QDRANT_COLLECTION` | `memory_wiki_claims` | Collection name prefix |
-| `MEMORY_WIKI_VECTOR_SIZE` | `768` | Must match stored vector dimensions |
-| `MEMORY_WIKI_RERANK_ENABLED` | `false` | Enable Cohere/OpenRouter rerank |
-| `MEMORY_WIKI_RERANK_MODEL` | `cohere/rerank-4-pro` | Reranker model ID |
+| `MEMORY_WIKI_VECTOR_SIZE` | `2560` | Qdrant vector size; the local stub and provider response are validated against it |
+| `MEMORY_WIKI_RERANK_ENABLED` | `false` | Enable second-stage reranking |
+| `MEMORY_WIKI_RERANK_MODEL` | `voyageai/rerank-2.5` | Reranker model ID |
+| `MEMORY_WIKI_RERANK_API_STYLE` | `auto` | `openrouter` or direct `voyage` payload style |
+| `MEMORY_WIKI_RERANK_RULES_ENABLED` | auto for Voyage 2.5 | Prepend/append ranking rules to the query |
+| `MEMORY_WIKI_RERANK_RULES_FILE` | (empty) | Relative/absolute JSON or text file with `default`, `technical`, `semantic`, `mixed` rules |
+| `MEMORY_WIKI_RERANK_RULES_POSITION` | `prepend` | `prepend` or `append` |
+| `MEMORY_WIKI_RERANK_SKIP_EXACT_TECHNICAL` | `false` with rules | Allow exact technical searches to bypass reranking |
+| `MEMORY_WIKI_REINDEX_BATCH_SIZE` | `20` | Reindex checkpoint batch size |
 | `MEMORY_WIKI_RERANK_API_KEY` | (uses `OPENROUTER_API_KEY`) | API key for reranker |
 | `MEMORY_WIKI_QDRANT_API_KEY` | (empty) | Qdrant API key if auth enabled |
 | `MEMORY_WIKI_CONTEXT_MAX_TOKENS` | `4000` | Token budget for context packer |
@@ -82,14 +89,14 @@ On first init the plugin creates:
 |---|---|
 | `memory_wiki_add_claim` | Add/update a structured durable claim |
 | `memory_wiki_add_evidence` | Attach evidence to a claim |
-| `memory_wiki_add_secret` | Store credential/secret index entry (redacted at rest) |
+| `memory_wiki_query_secrets` | Query safe secret metadata; secret writes remain local-admin only |
 | `memory_wiki_update_claim` | Update claim fields |
 | `memory_wiki_apply_user_correction` | Apply user correction |
 
 ### Retrieval tools
 | Tool | Description |
 |---|---|
-| `memory_wiki_query` | FTS5 + Qdrant hybrid search with RRF + Cohere rerank + diversity |
+| `memory_wiki_query` | FTS5 + Qdrant hybrid search with RRF + instruction-aware rerank + diversity |
 | `memory_wiki_pack_context` | Budget-aware context packer with structured XML output |
 | `memory_wiki_debug_search` | Full breakdown: FTS rank, vector rank, RRF score per claim |
 | `memory_wiki_compare_search` | Compare FTS-only vs vector-only vs hybrid |
@@ -125,7 +132,7 @@ On first init the plugin creates:
 | `memory_wiki_add_relation` | Add directed relation between entities |
 | `memory_wiki_graph_query` | Query entity graph |
 
-Full list: 88 tools in `plugin.yaml`.
+Full list: 85 tools in `plugin.yaml` (generated from `get_tool_schemas()`).
 
 ## Usage examples
 
@@ -181,15 +188,16 @@ memory_wiki_add_claim({
 
 ### Reindex after embedding model change
 ```python
-# After changing MEMORY_WIKI_EMBED_MODEL or dimensions:
-# Manifest auto-detects change → logs migration hint on init
+# After changing the model, dimensions, input limit, document prefix or
+# document template, the manifest selects a new immutable collection.
 
 # Run resumable reindex:
-memory_wiki_reindex({"force": True})
-# → creates new collection memory_wiki_claims_{new_hash}
-# → batches of 20 with checkpointing
-# → atomic alias switch on completion (95%+ success)
-# → old collection preserved for rollback
+memory_wiki_reindex({"force": False})
+# → creates/resumes memory_wiki_claims_{new_hash}
+# → retries failed claim IDs before continuing the source scan
+# → reconciles claim IDs and vector-text hashes against SQLite
+# → atomically switches the alias only after a complete, revision-stable build
+# → old active collection remains available until the switch
 
 # For incremental (process N claims at a time):
 memory_wiki_reindex({"limit": 100})
@@ -207,6 +215,34 @@ memory_wiki_query({"query": "proxy port"})
 # retrieved → injected → used → helpful/irrelevant/harmful
 ```
 
+
+## 2560-dimensional migration note
+
+This build uses a strict `2560 = 2560` dimensional contract for both `MEMORY_WIKI_EMBED_DIMENSIONS` and `MEMORY_WIKI_VECTOR_SIZE`. Here `2560` is the length of every vector, not the number of Qdrant points. The local `stubs/embed_stub.py` reports its dimension and actual hashing model in `/health`; Memory Wiki refuses semantic indexing when the provider/Qdrant dimensions differ or the bundled hash-stub model identity is inconsistent. Embedding values are also rejected when they are non-numeric or contain `NaN`/`Inf`.
+
+Do not replace plugin files while a reindex call is actively running. Let the current call finish, stop/restart the gateway, install this build, then start the new manifest reindex. The installer included in the release package checks `reindex_jobs` and refuses installation while a running job is recorded unless explicitly overridden.
+
+The embedding manifest was upgraded to v2 and now includes the input character limit and document-prefix hash. Query-instruction changes are tracked but intentionally excluded from the physical collection hash, because they do not change stored document vectors. Therefore a reindex that started with the previous code belongs to the previous physical collection. It may finish safely and remain active, but after installing this build run `memory_wiki_reindex({"force": false})` until `status="completed"`. The alias is not switched during a partial rebuild.
+
+`memory_wiki_semantic_status` now exposes the configured provider/model, embedding and Qdrant dimensions, contract validity, input limit and manifest hash for deployment diagnostics.
+
+## Rerank rules
+
+`voyageai/rerank-2.5` receives rules inside the query. Candidate documents now include safe claim metadata and, when present, `repository_id`, `file_path`, `symbol_id`, commit and content hashes from `code_claim_metadata`. Candidate text is secret-scanned/redacted before the remote call.
+
+A rules file may be placed next to `__init__.py`:
+
+```json
+{
+  "default": "Prefer current, verified and specific claims.",
+  "technical": "Prefer exact repository, file, symbol, error, version and content-hash matches.",
+  "semantic": "Prefer explicit user facts, corrections, active decisions and durable preferences.",
+  "mixed": "Balance exact matches with semantic usefulness."
+}
+```
+
+Set `MEMORY_WIKI_RERANK_RULES_FILE=rerank-rules.json` to load it. Environment variables override the file.
+
 ## Recovery
 
 ### After process crash during write
@@ -219,7 +255,7 @@ The transactional outbox ensures claim writes and index tasks are atomic:
 ### After Qdrant/OpenRouter outage
 - FTS5 search continues working without Qdrant
 - Outbox tasks remain pending (retry up to 5 times)
-- Cohere reranker has circuit breaker + cache + fallback to RRF scoring
+- Remote reranker has retries, circuit breaker, cache and fallback to RRF scoring
 - `memory_wiki_reindex` has resumable checkpoints
 
 ### Database maintenance
@@ -234,12 +270,12 @@ memory_wiki_gc({"dry_run": False})  # Archive stale claims
 Database migrations are fully automated via `_migrate()`:
 - All schema changes via `ALTER TABLE ADD COLUMN` (safe for existing DBs)
 - Schema compatibility checks on startup
-- `schema.sql` serves as canonical reference
+- runtime `_migrate()` is authoritative; `schema.sql` is only a legacy/reference snapshot
 
 ## Advanced: Embedding manifest
 
-When embedding model, dimensions, or query instruction changes:
-1. `_check_manifest_change()` detects the difference on init
+When the document-vector contract changes (model, dimensions, input limit, document prefix or template):
+1. `_check_manifest_change()` detects the physical document-vector difference on init
 2. Logs: `Embedding manifest changed. Run memory_wiki_reindex to migrate.`
 3. Old collection preserved, new collection named `memory_wiki_claims_{new_hash}`
 4. After reindex: `_switch_alias()` atomically switches `memory_wiki_claims_active`
@@ -247,11 +283,7 @@ When embedding model, dimensions, or query instruction changes:
 
 ## Performance
 
-- FTS5 retrieval: ~1-5ms per query
-- Qdrant search: ~50-200ms (depends on collection size and network)
-- Cohere rerank: ~200-500ms (cached for repeated queries)
-- Structured XML packing: ~5-10ms
-- Full reindex (2000 claims): ~10-15 minutes with batch size 20
+Latency and reindex duration depend on the embedding provider, Qdrant placement, candidate count and hardware. The bounded rerank top-K, cache, circuit breaker and resumable reindex checkpoints are intended to keep degradation controlled; measure on the actual deployment rather than relying on fixed timing estimates.
 
 ## License
 
