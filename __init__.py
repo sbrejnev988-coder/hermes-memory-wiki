@@ -1,4 +1,4 @@
-"""memory-wiki v1.18.6+embedding-provider-fix+secret-broker-v2.2: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.19.0+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -107,6 +107,37 @@ except ImportError:
         def scan_decay(db_path=None, threshold=0.1): return []
         def archive_stale_claims(db_path=None, threshold=0.05, dry_run=True): return {"error": "module absent"}
         def get_decay_stats(db_path=None): return {"error": "module absent"}
+
+# HERMES-CODE-KNOWLEDGE-GRAPH-v0.1.0: durable repository graph integration.
+try:
+    from .code_knowledge_graph import (
+        install_code_graph_schema as _install_code_graph_schema,
+        ingest_code_graph_event as _ingest_code_graph_event,
+        query_code_graph as _query_code_graph,
+        code_line_context as _code_line_context,
+        code_graph_neighbors as _code_graph_neighbors,
+        code_graph_status as _code_graph_status,
+        embed_pending_chunks as _embed_pending_chunks,
+        maybe_prefetch_code_context as _maybe_prefetch_code_context,
+    )
+except ImportError:
+    try:
+        from code_knowledge_graph import (
+            install_code_graph_schema as _install_code_graph_schema,
+            ingest_code_graph_event as _ingest_code_graph_event,
+            query_code_graph as _query_code_graph,
+            code_line_context as _code_line_context,
+            code_graph_neighbors as _code_graph_neighbors,
+            code_graph_status as _code_graph_status,
+            embed_pending_chunks as _embed_pending_chunks,
+            maybe_prefetch_code_context as _maybe_prefetch_code_context,
+        )
+    except ImportError as _code_graph_import_exc:
+        def _code_graph_unavailable(*args, **kwargs):
+            raise RuntimeError(f"code_knowledge_graph unavailable: {_code_graph_import_exc}")
+        def _install_code_graph_schema(conn): return None
+        _ingest_code_graph_event = _query_code_graph = _code_line_context = _code_graph_neighbors = _code_graph_status = _embed_pending_chunks = _code_graph_unavailable
+        def _maybe_prefetch_code_context(*args, **kwargs): return ""
 
 # HERMES-SECURITY-INTEGRATION-20260728: shared trust core; no reverse dependency on OmniCouncil.
 _INJECTION_GUARD_AVAILABLE = False
@@ -2435,7 +2466,15 @@ class MemoryWikiProvider(MemoryProvider):
         delta_rows = selected["delta_rows"]
         env_meta = self._env_metadata_context(query)
         secrets_meta = self._secret_context(query, limit=3)
-        if not rows and not delta_rows and not env_meta and not plan.get("topics") and not secrets_meta:
+        code_prefetch = ""
+        try:
+            code_prefetch = _maybe_prefetch_code_context(
+                self, query,
+                max_chars=_env_int("MEMORY_WIKI_CODE_GRAPH_PREFETCH_CHARS", 8000, 1000, 24000),
+            )
+        except Exception as code_prefetch_exc:
+            _debug_log(f"Code graph prefetch failed: {type(code_prefetch_exc).__name__}: {code_prefetch_exc}")
+        if not rows and not delta_rows and not env_meta and not plan.get("topics") and not secrets_meta and not code_prefetch:
             return ""
         lines = [
             "## Active Memory Wiki Recall",
@@ -2487,7 +2526,12 @@ class MemoryWikiProvider(MemoryProvider):
             lines.append("\nContradictions to handle explicitly:")
             for c in cons:
                 lines.append(f"- `{c['id']}` {redact_secrets(c['claim_a'])} ↔ {redact_secrets(c['claim_b'])}: {redact_secrets(c['reason'])} [{c['status']}]")
-        out = "\n".join(lines)[:MAX_PREFETCH_CHARS]
+        if code_prefetch:
+            code_budget = min(len(code_prefetch) + 2, max(1000, MAX_PREFETCH_CHARS // 3))
+            memory_budget = max(0, MAX_PREFETCH_CHARS - code_budget)
+            out = ("\n".join(lines)[:memory_budget] + "\n" + code_prefetch[:code_budget])[:MAX_PREFETCH_CHARS]
+        else:
+            out = "\n".join(lines)[:MAX_PREFETCH_CHARS]
         if out:
             self._mark_seen_revision(selected["watermark"], sid)
         return out
@@ -2742,6 +2786,14 @@ class MemoryWikiProvider(MemoryProvider):
             {"name":"memory_wiki_context_sanitize","description":"Sanitize text for safe context injection: strips injection patterns, normalizes whitespace, truncates.","parameters":P({"text":{"type":"string"},"max_len":{"type":"integer","default":400}}, ["text"])},
             {"name":"memory_wiki_is_social_close","description":"Check if text is a social closer (ok, thanks, 👍) that should skip memory search.","parameters":P({"text":{"type":"string"}}, ["text"])},
         
+            # ── Repository code knowledge graph v1 ──
+            {"name":"memory_wiki_code_graph_status","description":"Show indexed repositories and counts for files, symbols, semantic chunks, addressable lines, edges and embedded chunks.","parameters":P({"repository_id":{"type":"string","default":""}}, [])},
+            {"name":"memory_wiki_code_graph_embed_pending","description":"Create/reuse semantic claims for pending code chunks in a bounded batch. Repeat until pending_after is zero; no full reindex is started.","parameters":P({"repository_id":{"type":"string"},"limit":{"type":"integer","default":1000,"minimum":1,"maximum":10000}}, ["repository_id"])},
+            {"name":"memory_wiki_code_graph_query","description":"Hybrid code retrieval: FTS5/BM25 over symbols/chunks/lines + Qdrant semantic chunks + weighted RRF + configured reranker + graph-neighbour boost.","parameters":P({"query":{"type":"string","minLength":1},"repository_id":{"type":"string","default":""},"limit":{"type":"integer","default":12,"minimum":1,"maximum":50},"candidate_limit":{"type":"integer","default":96,"minimum":20,"maximum":300},"max_chars_per_hit":{"type":"integer","default":2400,"minimum":300,"maximum":12000}}, ["query"])},
+            {"name":"memory_wiki_code_line_context","description":"Return redacted addressable lines around line_id or repository/file/line, with owning symbols and chunks. Escalate to Code Shrinker file.lines for exact source.","parameters":P({"repository_id":{"type":"string"},"line_id":{"type":"string","default":""},"file_path":{"type":"string","default":""},"line_no":{"type":"integer","default":0,"minimum":0},"radius":{"type":"integer","default":12,"minimum":0,"maximum":100}}, ["repository_id"])},
+            {"name":"memory_wiki_code_graph_neighbors","description":"Traverse typed code-graph edges around a symbol/node for up to three hops.","parameters":P({"repository_id":{"type":"string"},"node_id":{"type":"string"},"hops":{"type":"integer","default":1,"minimum":1,"maximum":3},"limit":{"type":"integer","default":50,"minimum":1,"maximum":500}}, ["repository_id","node_id"])},
+            {"name":"memory_wiki_code_graph_ingest_inbox","description":"Consume pending Code Shrinker patch and code_graph_snapshot events from the shared inbox.","parameters":P({"limit":{"type":"integer","default":25,"minimum":1,"maximum":250}}, [])},
+
             {"name":"memory_wiki_code_claim_add","description":"Add/update a code-linked claim with repository/symbol/revision metadata. Repository, file_path, and content_hash required.","parameters":{"type":"object","properties":{"claim":{"type":"string","maxLength":12000},"topic":{"type":"string","default":"code-shrinker","maxLength":200},"repository_id":{"type":"string","minLength":1,"maxLength":300},"commit_sha":{"type":"string","default":"","maxLength":64,"pattern":"^(?:[0-9a-fA-F]{7,64})?$"},"file_path":{"type":"string","minLength":1,"maxLength":1024},"symbol_id":{"type":"string","default":"","maxLength":512},"symbol_revision":{"type":"string","default":"","maxLength":128},"content_hash":{"type":"string","description":"SHA-256 of symbol or file content","pattern":"^(?:sha256:)?[0-9a-fA-F]{64}$"},"claim_type":{"type":"string","default":"code_claim","maxLength":100},"confidence":{"type":"number","default":0.75,"minimum":0,"maximum":1},"salience":{"type":"number","default":0.7,"minimum":0,"maximum":1},"evidence":{"type":"string","default":"","maxLength":20000},"source_event_id":{"type":"string","default":"","maxLength":512,"description":"Durable producer event identifier for exactly-once ingestion"},"producer":{"type":"string","default":"code-shrinker","maxLength":100},"phase_sep_version":{"type":"string","default":"2","maxLength":32}},"required":["claim","repository_id","file_path","content_hash"],"additionalProperties":False}},
             {"name":"memory_wiki_code_claim_query","description":"Query code-linked claims by repository/symbol/file criteria.","parameters":{"type":"object","properties":{"repository_id":{"type":"string","default":""},"file_path":{"type":"string","default":""},"symbol_id":{"type":"string","default":""},"query":{"type":"string","default":""},"limit":{"type":"integer","default":10}},
     "required": ["repository_id"]
@@ -3094,6 +3146,12 @@ class MemoryWikiProvider(MemoryProvider):
             if tool_name == "memory_wiki_semantic_status": return tool_result(success=True, **self._semantic_status())
             if tool_name == "memory_wiki_reindex": return tool_result(success=True, **self._reindex(int(a.get("limit",0) or 0), bool(a.get("force", False))))
             if tool_name == "memory_wiki_debug_search": return tool_result(success=True, **self._debug_search(a.get("query",""), int(a.get("limit",10)), a.get("topic")))
+            if tool_name == "memory_wiki_code_graph_status": return tool_result(success=True, **_code_graph_status(self, a))
+            if tool_name == "memory_wiki_code_graph_embed_pending": return tool_result(success=True, **_embed_pending_chunks(self, a))
+            if tool_name == "memory_wiki_code_graph_query": return tool_result(success=True, **_query_code_graph(self, a))
+            if tool_name == "memory_wiki_code_line_context": return tool_result(success=True, **_code_line_context(self, a))
+            if tool_name == "memory_wiki_code_graph_neighbors": return tool_result(success=True, **_code_graph_neighbors(self, a))
+            if tool_name == "memory_wiki_code_graph_ingest_inbox": return tool_result(success=True, **self._drain_code_shrinker_events(int(a.get("limit",25))))
             if tool_name == "memory_wiki_code_claim_add": return tool_result(success=True, **self._code_claim_add(a))
             if tool_name == "memory_wiki_code_claim_query": return tool_result(success=True, **self._code_claim_query(a))
             if tool_name == "memory_wiki_symbol_history": return tool_result(success=True, **self._symbol_history(a))
@@ -4090,6 +4148,7 @@ class MemoryWikiProvider(MemoryProvider):
             c.execute("CREATE INDEX IF NOT EXISTS idx_ccm_repo ON code_claim_metadata(repository_id)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_ccm_symbol ON code_claim_metadata(repository_id, symbol_id)")
             c.execute("CREATE INDEX IF NOT EXISTS idx_ccm_hash ON code_claim_metadata(repository_id, content_hash)")
+            _install_code_graph_schema(c)
             self._connect().commit()
 
     def _cols(self, table: str) -> set[str]: return {r[1] for r in self._connect().execute(f"PRAGMA table_info({table})").fetchall()}
@@ -5098,13 +5157,23 @@ class MemoryWikiProvider(MemoryProvider):
                 event = json.loads(raw)
                 if not isinstance(event, dict):
                     raise ValueError("event must be an object")
-                if int(event.get("event_version", 0)) != 1:
+                event_version = int(event.get("event_version", 0))
+                event_type = str(event.get("type") or "")
+                if event_version not in {1, 2}:
                     raise ValueError("unsupported event_version")
                 producer = str(event.get("producer") or "")
                 if producer not in {"mcp-code-shrinker", "code-shrinker"}:
                     raise ValueError("unexpected producer")
-                if str(event.get("type") or "") != "patch_applied":
-                    raise ValueError("unsupported event type")
+                if event_type == "code_graph_snapshot":
+                    graph_result = _ingest_code_graph_event(self, event)
+                    if graph_result.get("deduplicated"):
+                        deduplicated += 1
+                    destination = done / event_path.name
+                    os.replace(claimed, destination)
+                    processed += 1
+                    continue
+                if event_version != 1 or event_type != "patch_applied":
+                    raise ValueError("unsupported event type/version combination")
                 event_id = str(event.get("event_id") or "").strip()
                 repository_id = str(event.get("repository_id") or "").strip()
                 patch_id = str(event.get("patch_id") or "").strip()
