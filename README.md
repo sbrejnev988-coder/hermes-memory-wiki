@@ -1,4 +1,4 @@
-# Hermes Memory Wiki v1.18.4
+# Hermes Memory Wiki v1.18.5
 
 Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 85 MCP tools.
 
@@ -21,7 +21,7 @@ Outbox worker (async):
   → статус: completed / failed (5 попыток)
 
 Retrieval pipeline:
-  FTS5/BM25 + Qdrant embeddings → RRF → Voyage/Cohere instruction-aware rerank → diversity → structured XML
+  FTS5/BM25 + Qdrant embeddings → hydrate Qdrant-only claims from SQLite → RRF → Voyage/Cohere instruction-aware rerank → configurable diversity → structured XML
 ```
 
 ## Requirements
@@ -53,11 +53,40 @@ Retrieval pipeline:
 | `MEMORY_WIKI_REINDEX_BATCH_SIZE` | `20` | Reindex checkpoint batch size |
 | `MEMORY_WIKI_RERANK_API_KEY` | (uses `OPENROUTER_API_KEY`) | API key for reranker |
 | `MEMORY_WIKI_QDRANT_API_KEY` | (empty) | Qdrant API key if auth enabled |
-| `MEMORY_WIKI_CONTEXT_MAX_TOKENS` | `4000` | Token budget for context packer |
-| `MEMORY_WIKI_CONTEXT_MAX_CLAIMS` | `16` | Max claims in packed context |
+| `MEMORY_WIKI_PREFETCH_CLAIM_LIMIT` | `20` | Maximum main claims in automatic prompt-time recall |
+| `MEMORY_WIKI_MAX_PREFETCH_CHARS` | `24000` | Character budget for automatic prompt-time recall |
+| `MEMORY_WIKI_DIVERSITY_MAX_PER_TOPIC` | `8` | Maximum claims retained from one topic after reranking |
+| `MEMORY_WIKI_DIVERSITY_MAX_SOURCE_SHARE` | `0.65` | Source-share threshold that applies a soft score penalty |
+| `MEMORY_WIKI_CONTEXT_MAX_TOKENS` | `6000` | Token budget for structured context packer |
+| `MEMORY_WIKI_CONTEXT_MAX_CLAIMS` | `24` | Max claims in structured context packer |
+| `MEMORY_WIKI_CONTEXT_MAX_PER_TOPIC` | `8` | Max claims from one topic in structured context packer |
 | `MEMORY_WIKI_SIMHASH_MAX_DISTANCE` | `3` | Conservative 64-bit near-duplicate threshold |
 | `HERMES_SECURITY_STRICT` | `1` | Quarantine recalled content if the shared trust core fails |
 | `HERMES_HOME` | `~/.hermes` | Hermes data directory (DB at `{HERMES_HOME}/memory-wiki/memory_wiki.sqlite3`) |
+
+
+## Recall expansion in v1.18.5
+
+- Qdrant-only matches are now hydrated from SQLite before scoring. SQLite remains the source of truth; Qdrant contributes IDs and similarity scores.
+- Automatic `prefetch()` now uses configurable claim and character budgets instead of fixed `10` and `12000` limits.
+- The hard three-claims-per-topic diversity cap is configurable and defaults to eight, preserving coherent PPLX result sets while retaining a bounded context.
+- Existing reindex and atomic alias-switch behavior is unchanged. Reindex is still required after changing embedding model or vector dimensions.
+
+Recommended starting values for `perplexity/pplx-embed-v1-4b`:
+
+```env
+MEMORY_WIKI_EMBED_PROVIDER=openrouter
+MEMORY_WIKI_EMBED_MODEL=perplexity/pplx-embed-v1-4b
+MEMORY_WIKI_EMBED_DIMENSIONS=2560
+MEMORY_WIKI_VECTOR_SIZE=2560
+MEMORY_WIKI_VECTOR_TOP_K=200
+MEMORY_WIKI_PREFETCH_CLAIM_LIMIT=20
+MEMORY_WIKI_MAX_PREFETCH_CHARS=24000
+MEMORY_WIKI_DIVERSITY_MAX_PER_TOPIC=8
+MEMORY_WIKI_CONTEXT_MAX_TOKENS=6000
+MEMORY_WIKI_CONTEXT_MAX_CLAIMS=24
+MEMORY_WIKI_CONTEXT_MAX_PER_TOPIC=8
+```
 
 ## Installation
 

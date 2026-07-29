@@ -1,4 +1,4 @@
-"""memory-wiki v1.18.4+secret-broker-v2.2: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.18.5+recall-expansion+secret-broker-v2.2: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -802,10 +802,18 @@ _FAULT_INJECT_FTS_CORRUPT = os.environ.get("MW_FAULT_INJECT_FTS_CORRUPT", "0") =
 _FAULT_INJECT_STALE = os.environ.get("MW_FAULT_INJECT_STALE", "0") == "1"
 _FAULT_INJECT_BACKUP_CHECKSUM_MISMATCH = os.environ.get("MW_FAULT_INJECT_BACKUP_CHECKSUM_MISMATCH", "0") == "1"
 # RRF (Reciprocal Rank Fusion) + query mode detection
-RRF_K = int(os.environ.get("MEMORY_WIKI_RRF_K", "60"))
-FTS_TOP_K = int(os.environ.get("MEMORY_WIKI_FTS_TOP_K", "200"))
-VECTOR_TOP_K = int(os.environ.get("MEMORY_WIKI_VECTOR_TOP_K", "200"))
-HYBRID_TOP_K = int(os.environ.get("MEMORY_WIKI_HYBRID_TOP_K", "100"))
+RRF_K = _env_int("MEMORY_WIKI_RRF_K", 60, 1, 1000)
+FTS_TOP_K = _env_int("MEMORY_WIKI_FTS_TOP_K", 200, 10, 1000)
+VECTOR_TOP_K = _env_int("MEMORY_WIKI_VECTOR_TOP_K", 200, 10, 1000)
+HYBRID_TOP_K = _env_int("MEMORY_WIKI_HYBRID_TOP_K", 100, 10, 500)
+PREFETCH_CLAIM_LIMIT = _env_int("MEMORY_WIKI_PREFETCH_CLAIM_LIMIT", 20, 5, 50)
+DIVERSITY_MAX_PER_TOPIC = _env_int("MEMORY_WIKI_DIVERSITY_MAX_PER_TOPIC", 8, 3, 20)
+DIVERSITY_MAX_SOURCE_SHARE = _rerank_env_float(
+    "MEMORY_WIKI_DIVERSITY_MAX_SOURCE_SHARE", 0.65, 0.20, 1.0
+)
+CONTEXT_MAX_TOKENS = _env_int("MEMORY_WIKI_CONTEXT_MAX_TOKENS", 6000, 800, 32000)
+CONTEXT_MAX_CLAIMS = _env_int("MEMORY_WIKI_CONTEXT_MAX_CLAIMS", 24, 4, 50)
+CONTEXT_MAX_PER_TOPIC = _env_int("MEMORY_WIKI_CONTEXT_MAX_PER_TOPIC", 8, 2, 20)
 DEBUG_MODE = os.environ.get("MEMORY_WIKI_DEBUG", "0") in ("1", "true", "yes")
 DEBUG_LOG = "/tmp/memory_wiki_debug.log"
 
@@ -1427,7 +1435,7 @@ TOOL_ARTIFACT_HINT_RE = re.compile(
 PATH_ONLY_RE = re.compile(r"^`?/?[\w./\\-]+\.(?:md|py|json|ya?ml|toml|log|txt|sh)`?$", re.I)
 RAW_BLOB_HINT_RE = re.compile(r"(?i)(?:^\{|\\n\s*\d+\||session_20\d{6}|/tmp/hermes_session_index_corpus|raw preview|background process proc_|full output:|tests/.+\.py:\d+)")
 STALE_DAYS = 30
-MAX_PREFETCH_CHARS = int(os.environ.get("MEMORY_WIKI_MAX_PREFETCH_CHARS", "12000"))
+MAX_PREFETCH_CHARS = _env_int("MEMORY_WIKI_MAX_PREFETCH_CHARS", 24000, 4000, 60000)
 MAX_RENDER_CLAIMS_PER_TOPIC = 500
 MAX_RENDER_TOPICS = 250
 MIN_AUTO_INGEST_SCORE = 2
@@ -2394,8 +2402,8 @@ class MemoryWikiProvider(MemoryProvider):
         sid = session_id or self.session_id
         plan = self._recall_plan(query, limit=6)
         selected = self._select_recall_rows(
-            query, session_id=sid, limit=10, include_stale=True,
-            delta_limit=int(os.environ.get("MEMORY_WIKI_REVISION_DELTA_LIMIT", "3")),
+            query, session_id=sid, limit=PREFETCH_CLAIM_LIMIT, include_stale=True,
+            delta_limit=_env_int("MEMORY_WIKI_REVISION_DELTA_LIMIT", 3, 0, 4),
         )
         rows = selected["rows"]
         delta_rows = selected["delta_rows"]
@@ -3000,8 +3008,11 @@ class MemoryWikiProvider(MemoryProvider):
                 if suppression_error:
                     result["suppression_error"] = suppression_error
                 if output_mode == "debug":
-                    result["results"] = [{"id":str(r.get("id","")),"text":str(r.get("text",r.get("claim","")))[:600],"confidence":float(r.get("confidence",0.5) or 0.5),"temporal_status":str(r.get("temporal_status","current"))} for r in rows[:16]]
-                    result["structured_pack"] = self._pack_selected_claims(rows[:16], token_budget=min(max_chars, 6000))
+                    result["results"] = [{"id":str(r.get("id","")),"text":str(r.get("text",r.get("claim","")))[:600],"confidence":float(r.get("confidence",0.5) or 0.5),"temporal_status":str(r.get("temporal_status","current"))} for r in rows[:CONTEXT_MAX_CLAIMS]]
+                    result["structured_pack"] = self._pack_selected_claims(
+                        rows[:CONTEXT_MAX_CLAIMS],
+                        token_budget=min(max_chars, CONTEXT_MAX_TOKENS),
+                    )
                 if classification:
                     result["suppression_manifest"] = classification.to_dict()
                     result["dedup_saved_tokens"] = classification.total_saved_tokens
@@ -5871,24 +5882,39 @@ class MemoryWikiProvider(MemoryProvider):
     # ----- search/scoring -----------------------------------------------
 
     def _apply_diversity(self, scored: list, query_mode: str) -> list:
-        """MMR diversity: max 3 per cluster, max 40% per source, penalty for near-duplicates."""
-        if len(scored) <= 3: return scored
+        """MMR-style diversity with configurable topic and source limits.
+
+        The previous hard cap of three claims per topic discarded most of the
+        strongest PPLX matches when a query correctly concentrated on one topic.
+        Keep diversity, but allow a wider coherent evidence set by default.
+        """
+        if len(scored) <= 3:
+            return scored
         selected = [scored[0]]
-        src_count = {str(scored[0].get("source","") or scored[0].get("topic","")): 1}
-        cl_count = {str(scored[0].get("topic","general")): 1}
+        src_count = {str(scored[0].get("source", "") or scored[0].get("topic", "")): 1}
+        cl_count = {str(scored[0].get("topic", "general")): 1}
         for item in scored[1:]:
-            src = str(item.get("source","") or item.get("topic",""))
-            cl = str(item.get("topic","general"))
-            if cl_count.get(cl,0) >= 3: continue
-            if src_count.get(src,0) > 0 and (src_count[src]+1)/(len(selected)+1) > 0.4:
-                item["score"] = float(item.get("score",0)) * 0.6
+            src = str(item.get("source", "") or item.get("topic", ""))
+            cl = str(item.get("topic", "general"))
+            if cl_count.get(cl, 0) >= DIVERSITY_MAX_PER_TOPIC:
+                continue
+            projected_share = (src_count.get(src, 0) + 1) / (len(selected) + 1)
+            if src_count.get(src, 0) > 0 and projected_share > DIVERSITY_MAX_SOURCE_SHARE:
+                item["score"] = float(item.get("score", 0)) * 0.75
             selected.append(item)
-            src_count[src] = src_count.get(src,0) + 1
-            cl_count[cl] = cl_count.get(cl,0) + 1
+            src_count[src] = src_count.get(src, 0) + 1
+            cl_count[cl] = cl_count.get(cl, 0) + 1
         return selected
 
 
-    def _pack_selected_claims(self, claims: List[Dict[str, Any]], token_budget: int = 4000, max_claims: int = 16, max_per_cluster: int = 3, max_per_source: int = 5) -> str:
+    def _pack_selected_claims(
+        self,
+        claims: List[Dict[str, Any]],
+        token_budget: int = CONTEXT_MAX_TOKENS,
+        max_claims: int = CONTEXT_MAX_CLAIMS,
+        max_per_cluster: int = CONTEXT_MAX_PER_TOPIC,
+        max_per_source: int = 8,
+    ) -> str:
         """Pack claims into structured XML context blocks respecting token budget."""
         if not claims: return "<memory_context/>"
         budget_remaining = token_budget
@@ -6213,6 +6239,41 @@ class MemoryWikiProvider(MemoryProvider):
         params.append(limit)
         return [self._sanitize_row(r) for r in c.execute(sql, params).fetchall()]
 
+    def _hydrate_semantic_candidates(
+        self,
+        conn: sqlite3.Connection,
+        candidates: Dict[str, sqlite3.Row],
+        semantic_ids: Dict[str, float],
+        base_where: str,
+        base_params: List[Any],
+    ) -> int:
+        """Load Qdrant-only matches from SQLite before RRF/scoring.
+
+        Qdrant stores identifiers and vectors, while SQLite remains the source
+        of truth. Without this hydration step, semantic IDs that were not also
+        found by FTS/LIKE/recent-row fallbacks never reached the scorer.
+        """
+        claim_ids = [str(cid) for cid in semantic_ids if str(cid)][:VECTOR_TOP_K]
+        if not claim_ids:
+            return 0
+        hydrated = 0
+        # Stay below common SQLite host-parameter limits after base_params.
+        chunk_size = max(1, min(400, 900 - len(base_params)))
+        for offset in range(0, len(claim_ids), chunk_size):
+            chunk = claim_ids[offset:offset + chunk_size]
+            placeholders = ",".join("?" for _ in chunk)
+            sql = f"SELECT * FROM claims WHERE id IN ({placeholders}) AND {base_where}"
+            try:
+                for row in conn.execute(sql, chunk + list(base_params)).fetchall():
+                    if row["id"] not in candidates:
+                        hydrated += 1
+                    candidates.setdefault(row["id"], row)
+            except (sqlite3.DatabaseError, sqlite3.OperationalError) as exc:
+                _debug_log(f"SEMANTIC hydration error: {type(exc).__name__}: {exc}")
+                break
+        _debug_log(f"SEMANTIC hydrated={hydrated} requested={len(claim_ids)}")
+        return hydrated
+
     def _search(self, query: str, limit=10, include_stale=True, topic: Optional[str]=None, session_id: str="") -> List[Dict[str, Any]]:
         limit = max(1, min(int(limit or 10), 50)); q = query or ""; qt = tokens(q); c = self._connect()
         # --- v1.6: Auto-repair FTS on corruption ---
@@ -6255,6 +6316,9 @@ class MemoryWikiProvider(MemoryProvider):
         if topic_slug:
             base_where += " AND topic=?"
         base_params = [pid] + ([topic_slug] if topic_slug else [])
+        semantic_hydrated = self._hydrate_semantic_candidates(
+            c, candidates, semantic_ids, base_where, base_params
+        )
         def add_rows(sql: str, params: List[Any], cap: int = 80) -> None:
             try:
                 for r in c.execute(sql + f" LIMIT {int(cap)}", params).fetchall(): candidates.setdefault(r["id"], r)
@@ -6297,7 +6361,10 @@ class MemoryWikiProvider(MemoryProvider):
         elif query_mode == "semantic": lw, sw = 0.6, 1.4
         else: lw, sw = 1.0, 1.0
         rrf_fused = _rrf_fusion(lex_weights, semantic_ids, RRF_K, lw, sw)
-        _debug_log(f"RRF fused={len(rrf_fused)} FTS_candidates={len(candidates)} semantic={len(semantic_ids)} lw={lw} sw={sw}")
+        _debug_log(
+            f"RRF fused={len(rrf_fused)} candidates={len(candidates)} "
+            f"semantic={len(semantic_ids)} hydrated={semantic_hydrated} lw={lw} sw={sw}"
+        )
         scored=[]
         for r in candidates.values():
             if r["status"] != "active": continue
