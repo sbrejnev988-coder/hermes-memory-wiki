@@ -13,12 +13,10 @@ import os
 import sys
 import traceback
 from pathlib import Path
-
 try:
     from .document_extractors import extract_document
 except ImportError:
     from document_extractors import extract_document
-
 
 def main() -> int:
     try:
@@ -34,15 +32,20 @@ def main() -> int:
             raise ValueError("options must be an object")
         payload = extract_document(path, options)
         response = {"ok": True, "document": payload}
-    except BaseException as exc:  # worker boundary: always return structured failure
+    except BaseException as exc:
         response = {
             "ok": False,
             "error": f"{type(exc).__name__}: {exc}",
-            "traceback": traceback.format_exc(limit=8)[-6000:],
         }
-    sys.stdout.write(json.dumps(response, ensure_ascii=False, separators=(",", ":"), default=str))
+        if os.environ.get("MEMORY_WIKI_DOCUMENT_WORKER_DEBUG", "0").lower() not in {"", "0", "false", "no", "off"}:
+            response["traceback"] = traceback.format_exc(limit=8)[-6000:]
+    encoded = json.dumps(response, ensure_ascii=False, separators=(",", ":"), default=str)
+    max_output = max(1, int(os.environ.get("MEMORY_WIKI_DOCUMENT_WORKER_OUTPUT_MB", "512"))) * 1024 * 1024
+    if len(encoded.encode("utf-8")) > max_output:
+        response = {"ok": False, "error": "document worker output exceeds configured limit"}
+        encoded = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
+    sys.stdout.write(encoded)
     return 0 if response.get("ok") else 2
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

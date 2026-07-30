@@ -1,6 +1,6 @@
 name: memory-wiki
-version: 1.20.1
-description: "Hermes Memory Wiki - 101 synchronized tools; SQLite/FTS5/Qdrant hybrid retrieval, safe graph/document runtimes, deterministic compare modes, hardened backup restore and MCP cache drift recovery."
+version: 1.20.2
+description: "Hermes Memory Wiki - 101 synchronized tools; SQLite/FTS5/Qdrant hybrid retrieval, hardened document indexing, scope-safe prefetch, deterministic compare modes, backup restore and MCP cache drift recovery."
 provides_tools:
   - memory_wiki_query
   - memory_wiki_add_claim

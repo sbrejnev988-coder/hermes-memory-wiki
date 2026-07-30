@@ -1,4 +1,4 @@
-# Hermes Memory Wiki v1.20.1
+# Hermes Memory Wiki v1.20.2
 
 Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 101 MCP tools.
 
@@ -161,7 +161,7 @@ On first init the plugin creates:
 | `memory_wiki_add_relation` | Add directed relation between entities |
 | `memory_wiki_graph_query` | Query entity graph |
 
-Full list: 85 tools in `plugin.yaml` (generated from `get_tool_schemas()`).
+Full list: 101 tools in `plugin.yaml` (generated from `get_tool_schemas()`).
 
 ## Usage examples
 
@@ -287,6 +287,30 @@ MEMORY_WIKI_VECTOR_SIZE=2560
 Setting only the model slug while leaving `MEMORY_WIKI_EMBED_PROVIDER=stub` does not call PPLX. v1.18.6 detects that mismatch, disables semantic operations with an explicit diagnostic, and prevents a misleading reindex. `memory_wiki_semantic_status` now reports the effective provider, URL, API-key presence, and configuration errors.
 
 The bundled `stubs/embed_stub.py` is a deterministic local fallback, not an ML model. It now defaults to 2560 dimensions, honors the request `dimensions` field, and reports `algorithm`, `model`, and `vector_size` from `/health`.
+
+
+## Document indexing support (v1.20.2)
+
+The document graph distinguishes **discovered**, **metadata-only**, **unsupported**, **encrypted**, and **content-indexed** files. A supported extension no longer implies that body text was extracted.
+
+| Format family | Body indexing | Requirements / limitations |
+|---|---|---|
+| TXT, Markdown, JSON/JSONL, XML/HTML, CSV/TSV, RTF, config/log/source-like text | Native | Standard-library parser; CSV/TSV is streamed and bounded. |
+| DOCX/DOCM/DOTX, XLSX/XLSM/XLTX, PPTX/PPTM/POTX | Native | OOXML ZIP/XML parser; macros are not executed. XLSX sheet names are resolved through workbook relationships. |
+| ODT/ODS/ODP/ODG and templates | Native | ODF ZIP/XML parser. |
+| EML, EPUB | Native | Addressable headers/body/chapters where available. |
+| PDF | Conditional | PyMuPDF or pypdf; scanned pages need OCR. Encrypted files are reported as `encrypted`. |
+| PNG/JPEG/TIFF/BMP/WebP | Conditional | Requires OCR enabled and local Tesseract. Otherwise `metadata_only`. |
+| DOC/XLS/PPT, MSG, VSD, PUB, WPS, Pages/Numbers/Keynote | Conditional | Requires an explicitly configured **loopback-only** Apache Tika server. Redirects are refused. |
+| GDOC/GSHEET/GSLIDES/GDRAW pointer files | Metadata only | These local files contain links/metadata, not the remote Google document body. Export the document or add an authenticated Google Drive ingestion connector to index its content. |
+
+Operational notes:
+
+- `memory_wiki_document_scan` reports missing previously indexed files; deletion is applied only with `prune_missing=true`.
+- Automatic prompt-time document prefetch is restricted to global-scope material. Scoped material must be queried with an explicit scope.
+- Changing `scope_id` or `repository_id` on an unchanged file updates the stored identity and queues fresh embeddings instead of silently returning `unchanged`.
+- Parser metadata is recursively bounded and secret-redacted before SQLite storage or tool output.
+- Document workers receive a minimal environment rather than API keys, tokens, proxy variables, and unrelated Hermes secrets.
 
 ## Recovery
 

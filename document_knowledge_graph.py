@@ -26,8 +26,19 @@ from collections import defaultdict, deque
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
+try:
+    from .document_extractors import (
+        SUPPORTED_EXTENSIONS as _EXTRACTOR_SUPPORTED_EXTENSIONS,
+        sanitize_json as _sanitize_extracted_json,
+    )
+except ImportError:
+    from document_extractors import (
+        SUPPORTED_EXTENSIONS as _EXTRACTOR_SUPPORTED_EXTENSIONS,
+        sanitize_json as _sanitize_extracted_json,
+    )
+
 SCHEMA_VERSION = 2
-MODULE_VERSION = "0.2.0"
+MODULE_VERSION = "0.3.0"
 _TOPIC = "document-intelligence"
 _TOKEN_RE = re.compile(r"[\w./:@#$+\-]+", re.UNICODE)
 _DOC_HINT = re.compile(
@@ -38,15 +49,7 @@ _DOC_HINT = re.compile(
     r"\.(?:docx?|xlsx?|pptx?|pdf|odt|ods|odp|csv|tsv|md|txt|json|html?)\b)",
     re.IGNORECASE,
 )
-_SUPPORTED_EXTENSIONS = {
-    ".txt", ".md", ".markdown", ".rst", ".log", ".ini", ".cfg", ".conf", ".yaml", ".yml",
-    ".toml", ".html", ".htm", ".xhtml", ".xml", ".json", ".jsonl", ".ndjson", ".csv", ".tsv",
-    ".rtf", ".docx", ".docm", ".dotx", ".xlsx", ".xlsm", ".xltx", ".pptx", ".pptm", ".potx",
-    ".odt", ".ods", ".odp", ".odg", ".ott", ".ots", ".otp", ".pdf", ".eml", ".epub",
-    ".gdoc", ".gsheet", ".gslides", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp",
-    # Legacy/binary and exotic formats are accepted only when local Tika is enabled.
-    ".doc", ".xls", ".ppt", ".msg", ".pages", ".numbers", ".key",
-}
+_SUPPORTED_EXTENSIONS = frozenset(_EXTRACTOR_SUPPORTED_EXTENSIONS)
 _DEFAULT_IGNORES = {
     ".git", ".hg", ".svn", "node_modules", "vendor", ".venv", "venv", "__pycache__",
     "dist", "build", "target", ".idea", ".vscode", ".cache", ".tox", ".mypy_cache",
@@ -66,6 +69,18 @@ def _sha(value: Any) -> str:
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def _safe_json(value: Any) -> str:
+    return _json(_sanitize_extracted_json(value))
+
+
+def _decode_json(value: Any, default: Any) -> Any:
+    try:
+        decoded = json.loads(str(value or _json(default)))
+    except Exception:
+        decoded = default
+    return _sanitize_extracted_json(decoded)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -150,9 +165,24 @@ def _allowed_path(value: Any, *, must_exist: bool = True) -> Path:
 
 
 def install_document_graph_schema(conn: sqlite3.Connection) -> None:
+    """Install schema without committing the caller's transaction."""
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.executescript(
-        """
+    try:
+        row = conn.execute(
+            "SELECT value FROM document_graph_meta WHERE key='schema_version'"
+        ).fetchone()
+        if row and int(row[0]) >= SCHEMA_VERSION:
+            required = {"document_sources", "document_units", "document_chunks", "document_units_fts", "document_chunks_fts"}
+            present = {
+                str(item[0]) for item in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE name LIKE 'document_%'"
+                ).fetchall()
+            }
+            if required.issubset(present):
+                return
+    except sqlite3.OperationalError:
+        pass
+    schema_sql = """
         CREATE TABLE IF NOT EXISTS document_graph_meta(
             key TEXT PRIMARY KEY, value TEXT NOT NULL
         );
@@ -269,12 +299,14 @@ def install_document_graph_schema(conn: sqlite3.Connection) -> None:
             tokenize='unicode61 remove_diacritics 2'
         );
         """
-    )
+    for statement in schema_sql.split(";"):
+        statement = statement.strip()
+        if statement:
+            conn.execute(statement)
     conn.execute(
         "INSERT OR REPLACE INTO document_graph_meta(key,value) VALUES('schema_version',?)",
         (str(SCHEMA_VERSION),),
     )
-    conn.commit()
 
 
 def _worker_options(args: Dict[str, Any]) -> Dict[str, Any]:
@@ -309,6 +341,24 @@ def _worker_preexec() -> None:  # pragma: no cover - Unix only
         pass
 
 
+def _worker_env(worker: Path) -> Dict[str, str]:
+    """Build a minimal parser environment and do not inherit provider secrets."""
+    allowed = {
+        "PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "LC_CTYPE",
+        "SYSTEMROOT", "WINDIR", "PATHEXT",
+    }
+    env = {key: value for key, value in os.environ.items() if key in allowed}
+    for key in (
+        "MEMORY_WIKI_TESSERACT_BIN", "MEMORY_WIKI_OCR_PSM",
+        "MEMORY_WIKI_DOCUMENT_WORKER_INPUT_MAX", "MEMORY_WIKI_DOCUMENT_WORKER_OUTPUT_MB",
+        "MEMORY_WIKI_DOCUMENT_WORKER_DEBUG",
+    ):
+        if key in os.environ:
+            env[key] = os.environ[key]
+    env["PYTHONPATH"] = str(worker.parent)
+    return env
+
+
 def _extract(path: Path, args: Dict[str, Any]) -> Dict[str, Any]:
     worker = Path(__file__).with_name("document_worker.py")
     timeout = _env_int("MEMORY_WIKI_DOCUMENT_WORKER_TIMEOUT", 180, 10, 1800)
@@ -318,7 +368,7 @@ def _extract(path: Path, args: Dict[str, Any]) -> Dict[str, Any]:
         kwargs["preexec_fn"] = _worker_preexec
     proc = subprocess.run(
         [sys.executable, str(worker)], input=request, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        timeout=timeout, check=False, env={**os.environ, "PYTHONPATH": str(worker.parent)}, **kwargs,
+        timeout=timeout, check=False, env=_worker_env(worker), **kwargs,
     )
     max_out = _env_int("MEMORY_WIKI_DOCUMENT_WORKER_OUTPUT_MB", 512, 8, 4096) * 1024 * 1024
     if len(proc.stdout) > max_out:
@@ -357,6 +407,8 @@ def _make_chunks(source: Dict[str, Any], units: List[Dict[str, Any]]) -> List[Di
     max_chars = _env_int("MEMORY_WIKI_DOCUMENT_CHUNK_CHARS", 6000, 800, 30_000)
     min_chars = _env_int("MEMORY_WIKI_DOCUMENT_CHUNK_MIN_CHARS", 240, 40, max_chars)
     max_units = _env_int("MEMORY_WIKI_DOCUMENT_CHUNK_MAX_UNITS", 40, 1, 500)
+    # claims has a database-level 8000-character guard.
+    embed_claim_chars = _env_int("MEMORY_WIKI_DOCUMENT_EMBED_CLAIM_CHARS", 7800, 1000, 7900)
     chunks: List[Dict[str, Any]] = []
     current: List[Dict[str, Any]] = []; current_chars = 0; current_prefix = ""; heading = ""
 
@@ -382,7 +434,7 @@ def _make_chunks(source: Dict[str, Any], units: List[Dict[str, Any]]) -> List[Di
             "chunk_text": body, "embedding_text": (
                 f"Document: {source.get('file_name','')}\nTitle: {source.get('title','')}\n"
                 f"Location: {start}..{end}\n{body}"
-            )[: max_chars + 1200],
+            )[:embed_claim_chars],
             "content_hash": content_hash, "token_estimate": max(1, len(body) // 4),
             "chunk_kind": "semantic",
         })
@@ -433,10 +485,56 @@ def ingest_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     parser_version = str(payload.get("parser_version") or "")
     revision_id = "docrev_" + _sha(f"{source_id}\0{file_hash}\0{parser}\0{parser_version}")[:28]
     existing = conn.execute("SELECT * FROM document_sources WHERE source_id=?", (source_id,)).fetchone()
-    if existing and str(existing["file_hash"] or "") == file_hash and int(existing["active"] or 0) == 1:
+    extractor_status = str(payload.get("status") or "ok").strip().lower()
+    same_identity = bool(
+        existing
+        and str(existing["scope_id"] or "") == scope_id
+        and str(existing["repository_id"] or "") == repository_id
+    )
+    if (existing and same_identity and str(existing["file_hash"] or "") == file_hash
+            and int(existing["active"] or 0) == 1):
+        active_units = int(conn.execute(
+            "SELECT COUNT(*) FROM document_units WHERE source_id=? AND active=1",
+            (source_id,),
+        ).fetchone()[0])
         return {
-            "status": "unchanged", "source_id": source_id, "revision_id": str(existing["revision_id"]),
-            "path": str(path), "file_hash": file_hash,
+            "status": "unchanged", "extractor_status": extractor_status,
+            "content_indexed": extractor_status == "ok" and active_units > 0,
+            "source_id": source_id, "revision_id": str(existing["revision_id"]),
+            "path": str(path), "file_hash": file_hash, "units": active_units,
+        }
+    if (existing and not same_identity and str(existing["file_hash"] or "") == file_hash
+            and int(existing["active"] or 0) == 1):
+        old_claims = [str(row[0]) for row in conn.execute(
+            "SELECT embedding_claim_id FROM document_chunks WHERE source_id=? AND active=1 AND embedding_claim_id<>''",
+            (source_id,),
+        ).fetchall()]
+        ts = _now()
+        with conn:
+            archived = _archive_claims(conn, old_claims)
+            conn.execute(
+                "UPDATE document_sources SET scope_id=?,repository_id=?,updated_at=? WHERE source_id=?",
+                (scope_id, repository_id, ts, source_id),
+            )
+            conn.execute(
+                "UPDATE document_chunks SET scope_id=?,repository_id=?,embedding_claim_id='',updated_at=? "
+                "WHERE source_id=? AND active=1",
+                (scope_id, repository_id, ts, source_id),
+            )
+        pending = conn.execute(
+            "SELECT COUNT(*) FROM document_chunks WHERE source_id=? AND active=1 AND embedding_claim_id=''",
+            (source_id,),
+        ).fetchone()[0]
+        active_units = int(conn.execute(
+            "SELECT COUNT(*) FROM document_units WHERE source_id=? AND active=1",
+            (source_id,),
+        ).fetchone()[0])
+        return {
+            "status": "scope_updated", "extractor_status": extractor_status,
+            "content_indexed": extractor_status == "ok" and active_units > 0,
+            "source_id": source_id, "revision_id": str(existing["revision_id"]),
+            "path": str(path), "file_hash": file_hash, "units": active_units,
+            "archived_claims": archived, "embedding_pending": int(pending),
         }
 
     units = list(payload.get("units") or [])
@@ -470,8 +568,8 @@ def ingest_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
              str(payload.get("extension") or path.suffix.lower()), str(payload.get("mime_type") or ""),
              _clean(payload.get("title") or path.stem, 1000), file_hash, int(payload.get("mtime_ns") or 0),
              int(payload.get("file_size") or 0), parser, parser_version, revision_id,
-             str(payload.get("status") or "active"), 1, _json(payload.get("metadata") or {}),
-             _json(payload.get("warnings") or []), "", int(existing["created_at"] if existing else ts), ts),
+             extractor_status, 1, _safe_json(payload.get("metadata") or {}),
+             _safe_json(payload.get("warnings") or []), "", int(existing["created_at"] if existing else ts), ts),
         )
         anchor_to_id: Dict[str, str] = {}
         for ordinal, unit in enumerate(units, 1):
@@ -490,7 +588,7 @@ def ingest_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1,?)""",
                 (uid, source_id, revision_id, parent_id, str(unit.get("kind") or unit.get("unit_type") or "text")[:100], anchor,
                  int(unit.get("ordinal") or ordinal), title, text, str(unit.get("content_hash") or _sha(text)),
-                 _json(unit.get("locator") or {}), _json(unit.get("metadata") or {}), ts),
+                 _safe_json(unit.get("locator") or {}), _safe_json(unit.get("metadata") or {}), ts),
             )
             conn.execute("INSERT INTO document_units_fts(source_id,unit_id,unit_type,title,anchor,unit_text) VALUES(?,?,?,?,?,?)",
                          (source_id, uid, str(unit.get("kind") or unit.get("unit_type") or "text"), title, anchor, text))
@@ -528,19 +626,22 @@ def ingest_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
         conn.execute(
             "INSERT INTO document_revisions(revision_id,source_id,file_hash,parser,parser_version,status,unit_count,chunk_count,edge_count,metadata_json,created_at) VALUES(?,?,?,?,?,'active',?,?,?,?,?)",
             (revision_id, source_id, file_hash, parser, parser_version, len(units), len(chunks), len(edges),
-             _json({"title": payload.get("title"), "warnings": payload.get("warnings") or []}), ts),
+             _safe_json({"title": payload.get("title"), "warnings": payload.get("warnings") or []}), ts),
         )
     event_id = "docevt_" + _sha(f"ingest\0{source_id}\0{revision_id}")[:28]
+    result_status = "indexed" if extractor_status == "ok" else extractor_status
     result = {
-        "status": "indexed", "source_id": source_id, "revision_id": revision_id, "path": str(path),
+        "status": result_status, "extractor_status": extractor_status,
+        "content_indexed": extractor_status == "ok" and bool(units),
+        "source_id": source_id, "revision_id": revision_id, "path": str(path),
         "parser": parser, "file_hash": file_hash, "units": len(units), "chunks": len(chunks),
         "edges": len(payload.get("edges") or []), "archived_claims": archived,
-        "warnings": payload.get("warnings") or [], "embedding_pending": len(chunks),
+        "warnings": _sanitize_extracted_json(payload.get("warnings") or []), "embedding_pending": len(chunks),
     }
     with conn:
         conn.execute(
             "INSERT OR REPLACE INTO document_events(event_id,source_id,event_type,payload_hash,status,result_json,created_at) VALUES(?,?,?,?,?,?,?)",
-            (event_id, source_id, "ingest", _sha(_json(result)), "completed", _json(result), ts),
+            (event_id, source_id, "ingest", _sha(_safe_json(result)), "completed", _safe_json(result), ts),
         )
     if bool(args.get("embed", _env_bool("MEMORY_WIKI_DOCUMENT_EMBED_ON_INGEST", False))):
         result["embedding"] = embed_pending_documents(provider, {"source_id": source_id, "limit": int(args.get("embed_limit") or 200)})
@@ -567,7 +668,7 @@ def scan_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     excludes = set(_DEFAULT_IGNORES) | {str(x) for x in (args.get("exclude_dirs") or [])}
     candidates: List[Path] = []
     iterator = root.rglob("*") if recursive else root.glob("*")
-    for path in iterator:
+    for path in sorted(iterator, key=lambda item: str(item).casefold()):
         if any(part in excludes for part in path.parts):
             continue
         if path.is_symlink() or not path.is_file():
@@ -585,10 +686,42 @@ def scan_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
             results.append(ingest_document(provider, item_args))
         except Exception as exc:
             errors.append({"path": str(path), "error": f"{type(exc).__name__}: {exc}"})
+    truncated = len(candidates) >= max_files
+    candidate_paths = {str(path.resolve(strict=False)) for path in candidates}
+    missing_sources: List[Dict[str, Any]] = []
+    if recursive and not includes and not truncated:
+        conn = provider._connect(); install_document_graph_schema(conn)
+        for row in conn.execute(
+            "SELECT source_id,source_path,display_name FROM document_sources WHERE active=1"
+        ).fetchall():
+            source_path = Path(str(row["source_path"] or "")).resolve(strict=False)
+            try:
+                source_path.relative_to(root)
+            except ValueError:
+                continue
+            if str(source_path) not in candidate_paths and not source_path.exists():
+                missing_sources.append({
+                    "source_id": str(row["source_id"]), "path": str(source_path),
+                    "display_name": str(row["display_name"] or source_path.name),
+                })
+    pruned = []
+    if bool(args.get("prune_missing", False)) and missing_sources:
+        for item in missing_sources:
+            try:
+                pruned.append(delete_document(provider, {"source_id": item["source_id"]}))
+            except Exception as exc:
+                errors.append({"path": item["path"], "error": f"prune {type(exc).__name__}: {exc}"})
     return {
-        "root": str(root), "discovered": len(candidates), "indexed": sum(1 for r in results if r.get("status") == "indexed"),
-        "unchanged": sum(1 for r in results if r.get("status") == "unchanged"), "failed": len(errors),
-        "results": results[:200], "errors": errors[:200], "truncated": len(candidates) >= max_files,
+        "root": str(root), "discovered": len(candidates),
+        "indexed": sum(1 for r in results if r.get("status") == "indexed"),
+        "unchanged": sum(1 for r in results if r.get("status") == "unchanged"),
+        "scope_updated": sum(1 for r in results if r.get("status") == "scope_updated"),
+        "metadata_only": sum(1 for r in results if r.get("status") == "metadata_only"),
+        "unsupported": sum(1 for r in results if r.get("status") == "unsupported"),
+        "encrypted": sum(1 for r in results if r.get("status") == "encrypted"),
+        "failed": len(errors), "missing_existing": len(missing_sources), "pruned": len(pruned),
+        "missing_sources": missing_sources[:200], "results": results[:200], "errors": errors[:200],
+        "truncated": truncated,
     }
 
 
@@ -669,7 +802,9 @@ def _load_candidate(conn: sqlite3.Connection, key: str) -> Optional[Dict[str, An
         ).fetchone()
         if not row: return None
         out = _row(row); out["candidate_type"] = "unit"; out["id"] = object_id; out["excerpt"] = out.get("unit_text")
-        return out
+        out["locator"] = _decode_json(out.pop("locator_json", ""), {})
+        out["metadata"] = _decode_json(out.pop("metadata_json", ""), {})
+        return _sanitize_extracted_json(out)
     if kind == "chunk":
         row = conn.execute(
             """SELECT c.*,s.source_path,s.display_name,s.title source_title,s.extension
@@ -678,7 +813,7 @@ def _load_candidate(conn: sqlite3.Connection, key: str) -> Optional[Dict[str, An
         ).fetchone()
         if not row: return None
         out = _row(row); out["candidate_type"] = "chunk"; out["id"] = object_id; out["excerpt"] = out.get("chunk_text")
-        return out
+        return _sanitize_extracted_json(out)
     return None
 
 
@@ -688,6 +823,7 @@ def query_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     source_id = str(args.get("source_id") or "").strip()
     scope_id = str(args.get("scope_id") or "").strip()
     repository_id = str(args.get("repository_id") or "").strip()
+    global_only = bool(args.get("global_only", False))
     extension = str(args.get("extension") or "").lower().strip()
     if extension and not extension.startswith("."): extension = "." + extension
     limit = max(1, min(int(args.get("limit") or 12), 50))
@@ -700,6 +836,7 @@ def query_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     if scope_id: filters.append("s.scope_id=?"); filter_params.append(scope_id)
     if repository_id: filters.append("s.repository_id=?"); filter_params.append(repository_id)
     if extension: filters.append("s.extension=?"); filter_params.append(extension)
+    if global_only: filters.append("s.scope_id='' AND s.repository_id=''")
     filter_sql = (" AND " + " AND ".join(filters)) if filters else ""
     unit_rows: List[Dict[str, Any]] = []; chunk_rows: List[Dict[str, Any]] = []
     if fts:
@@ -750,6 +887,7 @@ def query_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
             if scope_id: sql += " AND s.scope_id=?"; params.append(scope_id)
             if repository_id: sql += " AND s.repository_id=?"; params.append(repository_id)
             if extension: sql += " AND s.extension=?"; params.append(extension)
+            if global_only: sql += " AND s.scope_id='' AND s.repository_id=''"
             mapping = {str(r["embedding_claim_id"]): str(r["chunk_id"]) for r in conn.execute(sql, params).fetchall()}
             sem_keys = [f"chunk:{mapping[cid]}" for cid in claim_ids if cid in mapping]
             semantic_count = len(sem_keys); _rrf(scores, parts, sem_keys, "semantic", 1.30)
@@ -771,9 +909,10 @@ def query_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
         if not item: continue
         item["score"] = round(scores[key], 8); item["score_parts"] = parts[key]
         item["excerpt"] = _clean(item.get("excerpt"), max_chars)
-        item["locator"] = json.loads(str(item.get("locator_json") or "{}")) if item.get("locator_json") else {
-            "start_anchor": item.get("start_anchor"), "end_anchor": item.get("end_anchor")
-        }
+        if "locator" not in item:
+            item["locator"] = {
+                "start_anchor": item.get("start_anchor"), "end_anchor": item.get("end_anchor")
+            }
         candidates.append(item)
     reranked = False; rerank_error = ""
     if len(candidates) >= 3 and _env_bool("MEMORY_WIKI_DOCUMENT_RERANK", True) and hasattr(provider, "_rerank_rows"):
@@ -793,6 +932,7 @@ def query_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
             rerank_error = f"{type(exc).__name__}: {exc}"
     return {
         "query": query, "source_id": source_id, "scope_id": scope_id, "repository_id": repository_id,
+        "global_only": global_only,
         "results": candidates[:limit],
         "retrieval": {"fts_units": len(unit_rows), "fts_chunks": len(chunk_rows), "semantic_chunks": semantic_count,
                       "semantic_error": semantic_error, "fusion": "weighted_rrf_k60", "reranked": reranked,
@@ -816,10 +956,7 @@ def document_source(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     for key in ("metadata_json", "warnings_json"):
         raw = out.pop(key, "")
         default = {} if key == "metadata_json" else []
-        try:
-            out[key[:-5]] = json.loads(str(raw or _json(default)))
-        except Exception:
-            out[key[:-5]] = default
+        out[key[:-5]] = _decode_json(raw, default)
     out["counts"] = {
         "units": conn.execute("SELECT COUNT(*) FROM document_units WHERE source_id=? AND active=1", (out["source_id"],)).fetchone()[0],
         "chunks": conn.execute("SELECT COUNT(*) FROM document_chunks WHERE source_id=? AND active=1", (out["source_id"],)).fetchone()[0],
@@ -848,9 +985,14 @@ def document_unit_context(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]
         "WHERE source_id=? AND active=1 AND ordinal BETWEEN ? AND ? ORDER BY ordinal",
         (source_id, max(0, ordinal-radius), ordinal+radius),
     ).fetchall()
-    return {"source_id": source_id, "target_ordinal": ordinal, "units": [
-        {**_row(r), "unit_text": _clean(r["unit_text"], 20_000)} for r in rows
-    ]}
+    units = []
+    for raw in rows:
+        item = _row(raw)
+        item["unit_text"] = _clean(item.get("unit_text"), 20_000)
+        item["locator"] = _decode_json(item.pop("locator_json", ""), {})
+        item["metadata"] = _decode_json(item.pop("metadata_json", ""), {})
+        units.append(_sanitize_extracted_json(item))
+    return {"source_id": source_id, "target_ordinal": ordinal, "units": units}
 
 
 def document_neighbors(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -949,7 +1091,8 @@ def maybe_prefetch_document_context(provider: Any, query: str, max_chars: int = 
     if not conn.execute("SELECT 1 FROM document_sources WHERE active=1 LIMIT 1").fetchone():
         return ""
     result = query_documents(provider, {"query": query, "limit": _env_int("MEMORY_WIKI_DOCUMENT_PREFETCH_HITS", 6, 1, 15),
-                                        "candidate_limit": 80, "max_chars_per_hit": 1800})
+                                        "candidate_limit": 80, "max_chars_per_hit": 1800,
+                                        "global_only": True})
     hits = result.get("results") or []
     if not hits: return ""
     lines = [

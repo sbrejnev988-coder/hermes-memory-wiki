@@ -17,6 +17,8 @@ import email
 import hashlib
 import html
 import io
+import ipaddress
+import itertools
 import json
 import mimetypes
 import os
@@ -24,6 +26,7 @@ import re
 import subprocess
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass, field, asdict
@@ -46,7 +49,10 @@ PDF_EXTENSIONS = {".pdf"}
 EMAIL_EXTENSIONS = {".eml"}
 EBOOK_EXTENSIONS = {".epub"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
-LEGACY_OFFICE_EXTENSIONS = {".doc", ".xls", ".ppt", ".vsd", ".pub", ".wps"}
+LEGACY_OFFICE_EXTENSIONS = {
+    ".doc", ".xls", ".ppt", ".vsd", ".pub", ".wps",
+    ".msg", ".pages", ".numbers", ".key",
+}
 GOOGLE_POINTER_EXTENSIONS = {".gdoc", ".gsheet", ".gslides", ".gdraw"}
 SUPPORTED_EXTENSIONS = (
     TEXT_EXTENSIONS | OOXML_EXTENSIONS | ODF_EXTENSIONS | PDF_EXTENSIONS |
@@ -85,6 +91,50 @@ def clean_text(value: Any, limit: int = 200_000) -> str:
     return text[: max(0, int(limit))]
 
 
+def sanitize_json(value: Any, *, depth: int = 0, max_depth: int = 8,
+                  max_items: int = 10_000, max_string: int = 20_000) -> Any:
+    """Return a JSON-safe, bounded and secret-redacted copy.
+
+    Extracted text was already redacted, but parser metadata previously retained
+    raw spreadsheet cell values, Google-pointer fields and PDF metadata.  Since
+    metadata is returned by document tools, it must cross the same redaction
+    boundary as visible text.
+    """
+    if depth >= max_depth:
+        return "<MAX_DEPTH>"
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return clean_text(value, max_string)
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        return f"<BINARY:{len(value)} bytes>"
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= max_items:
+                out["<TRUNCATED>"] = len(value) - max_items
+                break
+            safe_key = clean_text(key, 500)
+            out[safe_key] = sanitize_json(
+                item, depth=depth + 1, max_depth=max_depth,
+                max_items=max_items, max_string=max_string,
+            )
+        return out
+    if isinstance(value, (list, tuple, set)):
+        seq = list(value)
+        out = [
+            sanitize_json(
+                item, depth=depth + 1, max_depth=max_depth,
+                max_items=max_items, max_string=max_string,
+            )
+            for item in seq[:max_items]
+        ]
+        if len(seq) > max_items:
+            out.append(f"<TRUNCATED:{len(seq) - max_items}>")
+        return out
+    return clean_text(value, max_string)
+
+
 def decode_text(data: bytes) -> Tuple[str, str]:
     if data.startswith(b"\xff\xfe") or data.startswith(b"\xfe\xff"):
         encodings = ["utf-16", "utf-8-sig", "utf-8", "cp1251", "latin-1"]
@@ -113,6 +163,10 @@ class Unit:
         item = asdict(self)
         item["text"] = clean_text(item["text"])
         item["title"] = clean_text(item["title"], 2000)
+        item["anchor"] = clean_text(item["anchor"], 2000)
+        item["parent_anchor"] = clean_text(item["parent_anchor"], 2000)
+        item["locator"] = sanitize_json(item.get("locator") or {})
+        item["metadata"] = sanitize_json(item.get("metadata") or {})
         return item
 
 
@@ -134,9 +188,9 @@ class ExtractedDocument:
             "mime_type": self.mime_type,
             "title": clean_text(self.title, 2000),
             "units": [u.to_dict() for u in self.units],
-            "metadata": self.metadata,
-            "warnings": self.warnings,
-            "edges": self.edges,
+            "metadata": sanitize_json(self.metadata),
+            "warnings": sanitize_json(self.warnings, max_string=4000),
+            "edges": sanitize_json(self.edges, max_string=4000),
             "status": self.status,
         }
 
@@ -227,7 +281,10 @@ def _read_zip_xml(zf: zipfile.ZipFile, name: str, max_bytes: int = 32_000_000) -
     if info.file_size > max_bytes:
         raise ValueError(f"XML part too large: {name}")
     with zf.open(info) as fh:
-        return ET.fromstring(fh.read(max_bytes + 1))
+        data = fh.read(max_bytes + 1)
+    if len(data) > max_bytes:
+        raise ValueError(f"XML part exceeds {max_bytes} bytes: {name}")
+    return ET.fromstring(data)
 
 
 def _mime_for(path: Path) -> str:
@@ -287,15 +344,23 @@ def extract_plain(path: Path, data: bytes, max_units: int) -> ExtractedDocument:
     if ext in {".csv", ".tsv"}:
         delim = "\t" if ext == ".tsv" else ","
         reader = csv.reader(io.StringIO(text), delimiter=delim)
-        rows = list(reader)
+        sampled = list(itertools.islice(reader, max_units + 1))
+        truncated = len(sampled) > max_units
+        rows = sampled[:max_units]
         header = rows[0] if rows else []
-        for r_idx, row in enumerate(rows[:max_units], 1):
+        max_columns = 0
+        for r_idx, row in enumerate(rows, 1):
             cells = [str(v) for v in row]
+            max_columns = max(max_columns, len(cells))
             label = " | ".join(f"{header[i]}={v}" if i < len(header) and r_idx > 1 else v for i, v in enumerate(cells))
             units.append(_unit("table_row", f"row:{r_idx}", label, ordinal=r_idx,
                                locator={"row": r_idx}, metadata={"cells": cells}))
-        return ExtractedDocument("stdlib-csv", "text/tab-separated-values" if ext == ".tsv" else "text/csv", title, units,
-                                 {"encoding": encoding, "delimiter": delim, "rows": len(rows), "columns": max((len(r) for r in rows), default=0)})
+        warnings = ["max_units reached; CSV rows were truncated"] if truncated else []
+        return ExtractedDocument(
+            "stdlib-csv", "text/tab-separated-values" if ext == ".tsv" else "text/csv", title, units,
+            {"encoding": encoding, "delimiter": delim, "rows_indexed": len(rows), "columns": max_columns,
+             "truncated": truncated}, warnings=warnings,
+        )
     if ext == ".rtf":
         # Conservative RTF fallback. Tika/LibreOffice remains preferable for complex RTF.
         stripped = re.sub(r"\\'[0-9a-fA-F]{2}", " ", text)
@@ -396,23 +461,59 @@ def _xlsx_shared_strings(zf: zipfile.ZipFile) -> List[str]:
     return out
 
 
+def _xlsx_sheet_parts(zf: zipfile.ZipFile) -> List[Tuple[str, str]]:
+    """Resolve workbook sheet names through relationship IDs.
+
+    OOXML does not guarantee that workbook order/names match sorted
+    ``sheet1.xml``, ``sheet2.xml`` filenames.  The old positional mapping could
+    silently assign a sheet's data to the wrong name after sheets were reordered.
+    """
+    fallback = sorted(
+        (name for name in zf.namelist() if re.match(r"xl/worksheets/sheet\d+\.xml$", name)),
+        key=lambda name: int(re.search(r"(\d+)", name).group(1)),
+    )
+    try:
+        workbook = _read_zip_xml(zf, "xl/workbook.xml")
+        rels = _read_zip_xml(zf, "xl/_rels/workbook.xml.rels")
+        rel_targets: Dict[str, str] = {}
+        for rel in rels.iter():
+            if _xml_local(rel.tag) != "Relationship":
+                continue
+            rel_id = str(rel.attrib.get("Id") or "")
+            target = str(rel.attrib.get("Target") or "").replace("\\", "/")
+            if not rel_id or not target:
+                continue
+            if target.startswith("/"):
+                normalized = target.lstrip("/")
+            elif target.startswith("xl/"):
+                normalized = target
+            else:
+                normalized = "xl/" + target.lstrip("./")
+            rel_targets[rel_id] = normalized
+        parts: List[Tuple[str, str]] = []
+        for sheet in (elem for elem in workbook.iter() if _xml_local(elem.tag) == "sheet"):
+            name = next((str(value) for key, value in sheet.attrib.items() if key.endswith("name")), "")
+            rel_id = next((str(value) for key, value in sheet.attrib.items() if key.endswith("}id") or key == "r:id"), "")
+            target = rel_targets.get(rel_id, "")
+            if target in zf.namelist():
+                parts.append((name or Path(target).stem, target))
+        if parts:
+            return parts
+    except Exception:
+        pass
+    return [(f"Sheet{index}", name) for index, name in enumerate(fallback, 1)]
+
+
 def extract_xlsx(path: Path, max_units: int, max_cells: int, zip_limits: Dict[str, int]) -> ExtractedDocument:
     units: List[Unit] = []; edges: List[Dict[str, Any]] = []; warnings: List[str] = []
     with zipfile.ZipFile(path) as zf:
         _zip_guard(zf, **zip_limits)
         shared = _xlsx_shared_strings(zf)
-        sheet_names: List[str] = []
-        try:
-            wb = _read_zip_xml(zf, "xl/workbook.xml")
-            sheet_names = [next((v for k, v in e.attrib.items() if k.endswith("name")), "") for e in wb.iter() if _xml_local(e.tag) == "sheet"]
-        except Exception:
-            pass
-        sheet_files = sorted((n for n in zf.namelist() if re.match(r"xl/worksheets/sheet\d+\.xml$", n)),
-                             key=lambda n: int(re.search(r"(\d+)", n).group(1)))
+        sheet_parts = _xlsx_sheet_parts(zf)
+        sheet_names = [name for name, _ in sheet_parts]
         cells_seen = 0
-        for s_idx, name in enumerate(sheet_files, 1):
-            sheet_name = sheet_names[s_idx-1] if s_idx <= len(sheet_names) and sheet_names[s_idx-1] else f"Sheet{s_idx}"
-            root = _read_zip_xml(zf, name)
+        for s_idx, (sheet_name, part_name) in enumerate(sheet_parts, 1):
+            root = _read_zip_xml(zf, part_name)
             units.append(_unit("sheet", f"sheet:{s_idx}", sheet_name, title=sheet_name, ordinal=len(units)+1,
                                locator={"sheet": sheet_name, "sheet_index": s_idx}))
             for row in (e for e in root.iter() if _xml_local(e.tag) == "row"):
@@ -437,7 +538,7 @@ def extract_xlsx(path: Path, max_units: int, max_cells: int, zip_limits: Dict[st
                         rendered = "TRUE" if value == "1" else "FALSE"
                     else:
                         rendered = value or inline
-                    display = f"={formula}" if formula else rendered
+                    display = (f"={formula} => {rendered}" if rendered else f"={formula}") if formula else rendered
                     row_values.append(f"{coord}={display}")
                     cell_meta.append({"coordinate": coord, "value": rendered, "formula": formula, "type": ctype})
                     if formula:
@@ -505,7 +606,15 @@ def extract_odf(path: Path, max_units: int, zip_limits: Dict[str, int]) -> Extra
         _zip_guard(zf, **zip_limits)
         root = _read_zip_xml(zf, "content.xml")
         counts: Dict[str, int] = {}
-        accepted = {"h": "heading", "p": "paragraph", "table-row": "table_row", "table-cell": "cell", "page": "slide"}
+        ext = path.suffix.lower()
+        if ext in {".ods", ".ots"}:
+            # A table-row already contains all descendant cell text; indexing
+            # both rows and cells duplicated the workbook content substantially.
+            accepted = {"table-row": "table_row", "h": "heading", "p": "paragraph"}
+        elif ext in {".odp", ".otp", ".odg"}:
+            accepted = {"page": "slide", "h": "heading", "p": "paragraph"}
+        else:
+            accepted = {"h": "heading", "p": "paragraph", "table-row": "table_row"}
         for elem in root.iter():
             local = _xml_local(elem.tag)
             if local not in accepted:
@@ -662,22 +771,50 @@ def extract_image_ocr(path: Path, max_chars: int, language: str, timeout: int) -
     return ExtractedDocument("tesseract", _mime_for(path), path.stem, units, metadata={"language": language})
 
 
+def _is_loopback_http_url(value: str) -> bool:
+    try:
+        parsed = urllib.parse.urlsplit(str(value or ""))
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return False
+        host = parsed.hostname.rstrip(".").lower()
+        if host == "localhost":
+            return True
+        return ipaddress.ip_address(host).is_loopback
+    except (ValueError, TypeError):
+        return False
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Reject redirects before urllib can resend untrusted document bytes."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        raise urllib.error.HTTPError(
+            req.full_url, code, f"Tika redirect refused: {newurl}", headers, fp
+        )
+
+
 def extract_tika(path: Path, *, tika_url: str, timeout: int, max_chars: int) -> ExtractedDocument:
     if not tika_url:
         return ExtractedDocument("none", _mime_for(path), path.stem, [], warnings=["no parser available and Tika disabled"], status="unsupported")
-    if not re.match(r"^https?://(?:127\.0\.0\.1|localhost|\[::1\])(?::\d+)?/", tika_url):
+    if not _is_loopback_http_url(tika_url):
         raise ValueError("Tika URL must be loopback-only")
     data = path.read_bytes()
     req = urllib.request.Request(tika_url, data=data, method="PUT", headers={"Accept": "text/plain", "Content-Type": _mime_for(path)})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
+        opener = urllib.request.build_opener(_NoRedirectHandler())
+        with opener.open(req, timeout=timeout) as response:
+            if not _is_loopback_http_url(response.geturl()):
+                raise ValueError("Tika response came from a non-loopback URL")
             raw = response.read(max_chars + 1)
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"Tika HTTP {exc.code}: {exc.reason}") from exc
+    truncated = len(raw) > max_chars
     text, encoding = decode_text(raw[:max_chars])
     text = clean_text(text, max_chars).strip()
     units = [_unit("document_text", "document:1", text, title=path.stem, ordinal=1)] if text else []
-    return ExtractedDocument("apache-tika", _mime_for(path), path.stem, units, metadata={"encoding": encoding})
+    warnings = ["Tika response truncated at configured max_chars"] if truncated else []
+    return ExtractedDocument("apache-tika", _mime_for(path), path.stem, units,
+                             metadata={"encoding": encoding, "truncated": truncated}, warnings=warnings)
 
 
 def extract_document(path: Path, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
