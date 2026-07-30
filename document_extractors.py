@@ -36,7 +36,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from xml.etree import ElementTree as ET
 
-EXTRACTOR_VERSION = "2.0.0"
+EXTRACTOR_VERSION = "3.0.0"
+SECRET_POLICY_VERSION = "3.0.0"
 
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".markdown", ".rst", ".log", ".ini", ".cfg", ".conf",
@@ -60,11 +61,99 @@ SUPPORTED_EXTENSIONS = (
     LEGACY_OFFICE_EXTENSIONS | GOOGLE_POINTER_EXTENSIONS
 )
 
-_SECRET_RE = re.compile(
-    r"(?i)(\b(?:api[_-]?key|token|password|passwd|secret|authorization|private[_-]?key)\b\s*[:=]\s*)"
-    r"([\"']?)[^\s,;\"']{8,}\2"
+_SECRET_LABEL_RE = re.compile(
+    r"(?ix)^\s*(?:"
+    r"password|passwd|passcode|pwd|парол(?:ь|я|и|ем)?|код[ _-]?доступа|"
+    r"api[ _-]?key|access[ _-]?key|secret[ _-]?key|client[ _-]?secret|"
+    r"token|токен|секрет|authorization|авторизац(?:ия|ии)|"
+    r"private[ _-]?key|приватн(?:ый|ого)[ _-]?ключ|ssh[ _-]?key"
+    r")\s*[:=\-–—]?\s*$"
 )
+_SECRET_ASSIGN_RE = re.compile(
+    r"(?ix)(?P<label>\b(?:"
+    r"password|passwd|passcode|pwd|парол(?:ь|я|и|ем)?|код[ _-]?доступа|"
+    r"api[ _-]?key|access[ _-]?key|secret[ _-]?key|client[ _-]?secret|"
+    r"token|токен|секрет|authorization|авторизац(?:ия|ии)|"
+    r"private[ _-]?key|приватн(?:ый|ого)[ _-]?ключ|ssh[ _-]?key"
+    r")\b\s*(?:[:=|]|[-–—]>?|\s{1,4})\s*)"
+    r"(?P<quote>[\"']?)(?P<value>[^\s|,;\"']{4,})(?P=quote)"
+)
+_PROVIDER_SECRET_PATTERNS = [
+    ("openai", re.compile(r"(?<![A-Za-z0-9])[s]k-(?:proj-)?[A-Za-z0-9_-]{16,}")),
+    ("github", re.compile(r"(?<![A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})")),
+    ("aws_access_key", re.compile(r"(?<![A-Z0-9])(?:AKIA|ASIA)[A-Z0-9]{16}(?![A-Z0-9])")),
+    ("google_api_key", re.compile(r"(?<![A-Za-z0-9])AIza[0-9A-Za-z_-]{30,}")),
+    ("slack", re.compile(r"(?<![A-Za-z0-9])xox[baprs]-[A-Za-z0-9-]{16,}")),
+    ("jwt", re.compile(r"(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")),
+]
+_PRIVATE_KEY_RE = re.compile(
+    r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----.*?"
+    r"-----END (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----",
+    re.IGNORECASE | re.DOTALL,
+)
+_URL_CREDENTIAL_RE = re.compile(r"(?i)\b(https?://)([^\s/@:]+):([^\s/@]+)@")
 _FORMULA_REF_RE = re.compile(r"(?<![A-Za-z0-9_])(?:'([^']+)'|([A-Za-z0-9_ ]+))?!?\$?([A-Z]{1,3})\$?(\d+)")
+
+
+def _is_secret_label(value: Any) -> bool:
+    text = str(value or "").strip()
+    return bool(text and len(text) <= 80 and _SECRET_LABEL_RE.fullmatch(text))
+
+
+def redact_secret_text(value: Any, limit: int = 200_000) -> Tuple[str, List[Dict[str, Any]]]:
+    """Redact secrets before any SQLite, FTS or embedding persistence.
+
+    The detector combines labelled assignments, well-known provider token shapes,
+    URL credentials and PEM private-key blocks.  It never returns a raw secret in
+    findings; only category and count are exposed for diagnostics.
+    """
+    text = str(value or "").replace("\x00", "")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    findings: List[Dict[str, Any]] = []
+
+    def note(category: str) -> None:
+        findings.append({"category": category})
+
+    def replace_assignment(match: re.Match[str]) -> str:
+        label = match.group("label")
+        note("labelled_secret")
+        return f"{label}<REDACTED>"
+
+    text = _PRIVATE_KEY_RE.sub(lambda _m: (note("private_key") or "<REDACTED_PRIVATE_KEY>"), text)
+    text = _URL_CREDENTIAL_RE.sub(lambda m: (note("url_credentials") or f"{m.group(1)}<REDACTED>@"), text)
+    text = _SECRET_ASSIGN_RE.sub(replace_assignment, text)
+    for category, pattern in _PROVIDER_SECRET_PATTERNS:
+        text = pattern.sub(lambda _m, category=category: (note(category) or "<REDACTED>"), text)
+    text = "\n".join(line.rstrip() for line in text.splitlines())
+    text = re.sub(r"\n{4,}", "\n\n\n", text)
+    return text[: max(0, int(limit))], findings
+
+
+def sanitize_table_cells(cells: Sequence[Any], headers: Optional[Sequence[Any]] = None) -> Tuple[List[str], List[Dict[str, Any]]]:
+    """Context-aware redaction for CSV/Word/Excel rows.
+
+    Handles both header-oriented tables (``Password`` column) and key/value rows
+    (``Пароль | value``).  Raw values are replaced before building unit text or
+    metadata, so they never reach SQLite/FTS/Qdrant.
+    """
+    raw = [str(item or "") for item in cells]
+    safe: List[str] = []
+    findings: List[Dict[str, Any]] = []
+    header_values = [str(item or "") for item in (headers or [])]
+    secret_columns = {idx for idx, item in enumerate(header_values) if _is_secret_label(item)}
+    label_columns = {idx for idx, item in enumerate(raw) if _is_secret_label(item)}
+    adjacent_secret_columns = {idx + 1 for idx in label_columns if idx + 1 < len(raw)}
+
+    for idx, item in enumerate(raw):
+        if item and (idx in secret_columns or idx in adjacent_secret_columns):
+            safe.append("<REDACTED>")
+            findings.append({"category": "table_context", "column": idx + 1})
+            continue
+        redacted, local = redact_secret_text(item, 200_000)
+        safe.append(redacted)
+        findings.extend({**entry, "column": idx + 1} for entry in local)
+    return safe, findings
+
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -83,12 +172,7 @@ def sha256_file(path: Path, block: int = 1024 * 1024) -> str:
 
 
 def clean_text(value: Any, limit: int = 200_000) -> str:
-    text = str(value or "").replace("\x00", "")
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    text = _SECRET_RE.sub(lambda m: m.group(1) + "<REDACTED>", text)
-    text = "\n".join(line.rstrip() for line in text.splitlines())
-    text = re.sub(r"\n{4,}", "\n\n\n", text)
-    return text[: max(0, int(limit))]
+    return redact_secret_text(value, limit)[0]
 
 
 def sanitize_json(value: Any, *, depth: int = 0, max_depth: int = 8,
@@ -347,14 +431,15 @@ def extract_plain(path: Path, data: bytes, max_units: int) -> ExtractedDocument:
         sampled = list(itertools.islice(reader, max_units + 1))
         truncated = len(sampled) > max_units
         rows = sampled[:max_units]
-        header = rows[0] if rows else []
+        header = [str(v) for v in (rows[0] if rows else [])]
         max_columns = 0
         for r_idx, row in enumerate(rows, 1):
-            cells = [str(v) for v in row]
+            raw_cells = [str(v) for v in row]
+            cells, findings = sanitize_table_cells(raw_cells, header if r_idx > 1 else None)
             max_columns = max(max_columns, len(cells))
-            label = " | ".join(f"{header[i]}={v}" if i < len(header) and r_idx > 1 else v for i, v in enumerate(cells))
+            label = " | ".join(f"{clean_text(header[i], 500)}={v}" if i < len(header) and r_idx > 1 else v for i, v in enumerate(cells))
             units.append(_unit("table_row", f"row:{r_idx}", label, ordinal=r_idx,
-                               locator={"row": r_idx}, metadata={"cells": cells}))
+                               locator={"row": r_idx}, metadata={"cells": cells, "secret_findings": findings}))
         warnings = ["max_units reached; CSV rows were truncated"] if truncated else []
         return ExtractedDocument(
             "stdlib-csv", "text/tab-separated-values" if ext == ".tsv" else "text/csv", title, units,
@@ -422,14 +507,19 @@ def extract_docx(path: Path, max_units: int, zip_limits: Dict[str, int]) -> Extr
             elif local == "tbl":
                 table_no += 1
                 row_no = 0
+                table_header: List[str] = []
                 for tr in (e for e in child.iter() if _xml_local(e.tag) == "tr"):
                     row_no += 1
-                    cells = []
+                    raw_cells = []
                     for tc in (e for e in list(tr) if _xml_local(e.tag) == "tc"):
-                        cells.append(clean_text(" ".join(t.text or "" for t in tc.iter() if _xml_local(t.tag) == "t")).strip())
+                        raw_cells.append(" ".join(t.text or "" for t in tc.iter() if _xml_local(t.tag) == "t").strip())
+                    cells, findings = sanitize_table_cells(raw_cells, table_header if row_no > 1 else None)
+                    if row_no == 1:
+                        table_header = [clean_text(value, 500) for value in raw_cells]
                     units.append(_unit("table_row", f"table:{table_no}/row:{row_no}", " | ".join(cells),
                                        parent=f"table:{table_no}", ordinal=len(units)+1,
-                                       locator={"table": table_no, "row": row_no}, metadata={"cells": cells}))
+                                       locator={"table": table_no, "row": row_no},
+                                       metadata={"cells": cells, "secret_findings": findings}))
             if len(units) >= max_units:
                 warnings.append("max_units reached")
                 break
@@ -516,10 +606,10 @@ def extract_xlsx(path: Path, max_units: int, max_cells: int, zip_limits: Dict[st
             root = _read_zip_xml(zf, part_name)
             units.append(_unit("sheet", f"sheet:{s_idx}", sheet_name, title=sheet_name, ordinal=len(units)+1,
                                locator={"sheet": sheet_name, "sheet_index": s_idx}))
+            sheet_header: List[str] = []
             for row in (e for e in root.iter() if _xml_local(e.tag) == "row"):
                 row_num = int(row.attrib.get("r") or 0)
-                row_values: List[str] = []
-                cell_meta: List[Dict[str, Any]] = []
+                raw_cells: List[Dict[str, Any]] = []
                 for cell in (e for e in list(row) if _xml_local(e.tag) == "c"):
                     cells_seen += 1
                     if cells_seen > max_cells:
@@ -538,20 +628,31 @@ def extract_xlsx(path: Path, max_units: int, max_cells: int, zip_limits: Dict[st
                         rendered = "TRUE" if value == "1" else "FALSE"
                     else:
                         rendered = value or inline
-                    display = (f"={formula} => {rendered}" if rendered else f"={formula}") if formula else rendered
-                    row_values.append(f"{coord}={display}")
-                    cell_meta.append({"coordinate": coord, "value": rendered, "formula": formula, "type": ctype})
+                    raw_cells.append({"coordinate": coord, "value": rendered, "formula": formula, "type": ctype})
                     if formula:
                         for match in _FORMULA_REF_RE.finditer(formula):
                             ref_sheet = (match.group(1) or match.group(2) or sheet_name).strip()
                             ref_coord = f"{match.group(3)}{match.group(4)}"
                             edges.append({"source_anchor": f"sheet:{sheet_name}/cell:{coord}", "predicate": "formula_ref",
                                           "target_anchor": f"sheet:{ref_sheet}/cell:{ref_coord}", "evidence": formula})
+                raw_values = [item["value"] for item in raw_cells]
+                safe_values, findings = sanitize_table_cells(raw_values, sheet_header if sheet_header else None)
+                if not sheet_header and raw_values:
+                    sheet_header = [clean_text(value, 500) for value in raw_values]
+                row_values: List[str] = []
+                cell_meta: List[Dict[str, Any]] = []
+                for index, item in enumerate(raw_cells):
+                    safe_value = safe_values[index]
+                    formula = clean_text(item["formula"], 4000)
+                    display = (f"={formula} => {safe_value}" if safe_value else f"={formula}") if formula else safe_value
+                    row_values.append(f"{item['coordinate']}={display}")
+                    cell_meta.append({"coordinate": item["coordinate"], "value": safe_value,
+                                      "formula": formula, "type": item["type"]})
                 if row_values:
                     anchor = f"sheet:{sheet_name}/row:{row_num}"
                     units.append(_unit("table_row", anchor, " | ".join(row_values), parent=f"sheet:{s_idx}",
                                        ordinal=len(units)+1, locator={"sheet": sheet_name, "row": row_num},
-                                       metadata={"cells": cell_meta}))
+                                       metadata={"cells": cell_meta, "secret_findings": findings}))
                 if len(units) >= max_units or cells_seen > max_cells:
                     break
             if len(units) >= max_units or cells_seen > max_cells:
@@ -872,9 +973,19 @@ def extract_document(path: Path, options: Optional[Dict[str, Any]] = None) -> Di
         result = extract_tika(path, tika_url=str(options.get("tika_url") or ""),
                               timeout=int(options.get("external_timeout", 90)), max_chars=max_chars)
     payload = result.to_dict()
+    finding_categories: Dict[str, int] = {}
+    finding_count = 0
+    for unit in payload.get("units") or []:
+        for finding in (unit.get("metadata") or {}).get("secret_findings") or []:
+            category = str(finding.get("category") or "secret")
+            finding_categories[category] = finding_categories.get(category, 0) + 1
+            finding_count += 1
     payload.update({
         "path": str(path), "file_name": path.name, "extension": ext,
         "file_size": size, "file_hash": sha256_file(path), "mtime_ns": path.stat().st_mtime_ns,
+        "parser_version": f"{EXTRACTOR_VERSION}:secret-policy-{SECRET_POLICY_VERSION}",
+        "secret_redactions": finding_count, "secret_categories": finding_categories,
+        "security_status": "redacted_before_index" if finding_count else "no_detected_secret",
     })
     # Stable contains/next edges are generated after parser-specific edges.
     prev = ""

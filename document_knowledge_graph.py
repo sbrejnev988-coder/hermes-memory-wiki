@@ -29,16 +29,21 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 try:
     from .document_extractors import (
         SUPPORTED_EXTENSIONS as _EXTRACTOR_SUPPORTED_EXTENSIONS,
+        EXTRACTOR_VERSION as _EXTRACTOR_VERSION,
+        SECRET_POLICY_VERSION as _SECRET_POLICY_VERSION,
         sanitize_json as _sanitize_extracted_json,
     )
 except ImportError:
     from document_extractors import (
         SUPPORTED_EXTENSIONS as _EXTRACTOR_SUPPORTED_EXTENSIONS,
+        EXTRACTOR_VERSION as _EXTRACTOR_VERSION,
+        SECRET_POLICY_VERSION as _SECRET_POLICY_VERSION,
         sanitize_json as _sanitize_extracted_json,
     )
 
 SCHEMA_VERSION = 2
-MODULE_VERSION = "0.4.0"
+MODULE_VERSION = "0.5.0"
+_CURRENT_PARSER_VERSION = f"{_EXTRACTOR_VERSION}:secret-policy-{_SECRET_POLICY_VERSION}"
 _TOPIC = "document-intelligence"
 _TOKEN_RE = re.compile(r"[\w./:@#$+\-]+", re.UNICODE)
 _DOC_HINT = re.compile(
@@ -540,6 +545,8 @@ def ingest_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
         and str(existing["repository_id"] or "") == repository_id
     )
     if (existing and same_identity and str(existing["file_hash"] or "") == file_hash
+            and str(existing["parser"] or "") == parser
+            and str(existing["parser_version"] or "") == parser_version
             and int(existing["active"] or 0) == 1):
         active_units = int(conn.execute(
             "SELECT COUNT(*) FROM document_units WHERE source_id=? AND active=1",
@@ -552,6 +559,8 @@ def ingest_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
             "path": str(path), "file_hash": file_hash, "units": active_units,
         }
     if (existing and not same_identity and str(existing["file_hash"] or "") == file_hash
+            and str(existing["parser"] or "") == parser
+            and str(existing["parser_version"] or "") == parser_version
             and int(existing["active"] or 0) == 1):
         old_claims = [str(row[0]) for row in conn.execute(
             "SELECT embedding_claim_id FROM document_chunks WHERE source_id=? AND active=1 AND embedding_claim_id<>''",
@@ -685,6 +694,9 @@ def ingest_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
         "parser": parser, "file_hash": file_hash, "units": len(units), "chunks": len(chunks),
         "edges": len(payload.get("edges") or []), "archived_claims": archived,
         "warnings": _sanitize_extracted_json(payload.get("warnings") or []), "embedding_pending": len(chunks),
+        "security_status": str(payload.get("security_status") or "unknown"),
+        "secret_redactions": int(payload.get("secret_redactions") or 0),
+        "secret_categories": _sanitize_extracted_json(payload.get("secret_categories") or {}),
     }
     with conn:
         conn.execute(
@@ -748,7 +760,7 @@ def scan_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     conn = provider._connect(); install_document_graph_schema(conn)
     existing_by_path = {
         str(row["source_path"]): row for row in conn.execute(
-            "SELECT source_path,source_id,revision_id,mtime_ns,size_bytes,scope_id,repository_id,status,active "
+            "SELECT source_path,source_id,revision_id,mtime_ns,size_bytes,scope_id,repository_id,status,active,parser,parser_version "
             "FROM document_sources WHERE active=1"
         ).fetchall()
     }
@@ -767,7 +779,8 @@ def scan_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
                     and int(existing["mtime_ns"] or 0) == int(stat.st_mtime_ns)
                     and int(existing["size_bytes"] or 0) == int(stat.st_size)
                     and str(existing["scope_id"] or "") == requested_scope
-                    and str(existing["repository_id"] or "") == requested_repo):
+                    and str(existing["repository_id"] or "") == requested_repo
+                    and str(existing["parser_version"] or "") == _CURRENT_PARSER_VERSION):
                 results.append({
                     "status": "unchanged", "source_id": str(existing["source_id"]),
                     "revision_id": str(existing["revision_id"]), "path": str(path),
@@ -1171,7 +1184,9 @@ def document_status(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     else:
         totals = {"chunks": 0, "pending": 0, "embedded": 0}; unit_count = 0
     cache_root = _document_cache_root()
-    return {"schema_version": SCHEMA_VERSION, "module_version": MODULE_VERSION, "roots": [str(p) for p in _roots()],
+    return {"schema_version": SCHEMA_VERSION, "module_version": MODULE_VERSION,
+            "document_parser_version": _CURRENT_PARSER_VERSION, "secret_policy": "redact_before_index",
+            "roots": [str(p) for p in _roots()],
             "attachment_cache": {"path": str(cache_root), "exists": cache_root.is_dir(),
                                  "auto_scan": _env_bool("MEMORY_WIKI_DOCUMENT_AUTO_SCAN_CACHE", False),
                                  "auto_embed": _env_bool("MEMORY_WIKI_DOCUMENT_AUTO_EMBED", False)},
