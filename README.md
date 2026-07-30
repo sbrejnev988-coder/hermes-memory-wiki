@@ -1,4 +1,4 @@
-# Hermes Memory Wiki v1.20.2
+# Hermes Memory Wiki v1.20.3
 
 Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 101 MCP tools.
 
@@ -289,7 +289,7 @@ Setting only the model slug while leaving `MEMORY_WIKI_EMBED_PROVIDER=stub` does
 The bundled `stubs/embed_stub.py` is a deterministic local fallback, not an ML model. It now defaults to 2560 dimensions, honors the request `dimensions` field, and reports `algorithm`, `model`, and `vector_size` from `/health`.
 
 
-## Document indexing support (v1.20.2)
+## Document indexing support (v1.20.3)
 
 The document graph distinguishes **discovered**, **metadata-only**, **unsupported**, **encrypted**, and **content-indexed** files. A supported extension no longer implies that body text was extracted.
 
@@ -306,11 +306,29 @@ The document graph distinguishes **discovered**, **metadata-only**, **unsupporte
 
 Operational notes:
 
+- Hermes attachment files are expected under `${HERMES_HOME:-~/.hermes}/cache/documents`. This directory is allowlisted by default.
+- `memory_wiki_document_scan({})` scans that attachment cache when `root` is omitted. An explicit `root` remains available for other allowlisted directories.
+- Optional turn-start ingestion is controlled by `MEMORY_WIKI_DOCUMENT_AUTO_SCAN_CACHE=1`; it is bounded, skips files younger than two seconds, never prunes missing files, and does not create embeddings unless `MEMORY_WIKI_DOCUMENT_AUTO_EMBED=1`.
 - `memory_wiki_document_scan` reports missing previously indexed files; deletion is applied only with `prune_missing=true`.
 - Automatic prompt-time document prefetch is restricted to global-scope material. Scoped material must be queried with an explicit scope.
 - Changing `scope_id` or `repository_id` on an unchanged file updates the stored identity and queues fresh embeddings instead of silently returning `unchanged`.
 - Parser metadata is recursively bounded and secret-redacted before SQLite storage or tool output.
 - Document workers receive a minimal environment rather than API keys, tokens, proxy variables, and unrelated Hermes secrets.
+
+Recommended configuration for Hermes/Termux attachments:
+
+```bash
+MEMORY_WIKI_DOCUMENT_CACHE_DIR=/root/.hermes/cache/documents
+MEMORY_WIKI_DOCUMENT_AUTO_SCAN_CACHE=1
+MEMORY_WIKI_DOCUMENT_AUTO_SCAN_SECONDS=15
+MEMORY_WIKI_DOCUMENT_AUTO_SCAN_MAX_FILES=200
+MEMORY_WIKI_DOCUMENT_AUTO_SCAN_MAX_CHANGED=3
+MEMORY_WIKI_DOCUMENT_AUTO_MIN_AGE_SECONDS=2
+# Enable only when automatic API-backed embedding cost/latency is acceptable:
+MEMORY_WIKI_DOCUMENT_AUTO_EMBED=0
+```
+
+If `HERMES_HOME=/root/.hermes`, the explicit cache-dir line is optional.
 
 ## Recovery
 

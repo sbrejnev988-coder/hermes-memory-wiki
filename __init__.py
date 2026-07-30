@@ -1,4 +1,4 @@
-"""memory-wiki v1.20.2+audit-fix-r1+document-indexing-hardening-r1+document-knowledge-graph-v2+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.20.3+audit-fix-r1+document-cache-integration-r2+document-knowledge-graph-v2+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -140,7 +140,7 @@ except ImportError:
         _ingest_code_graph_event = _query_code_graph = _code_line_context = _code_graph_neighbors = _code_graph_status = _embed_pending_chunks = _code_graph_unavailable
         def _maybe_prefetch_code_context(*args, **kwargs): return ""
 
-# HERMES-DOCUMENT-KNOWLEDGE-GRAPH-v0.2.0: universal structured document ingestion.
+# HERMES-DOCUMENT-KNOWLEDGE-GRAPH-v0.4.0: universal structured document ingestion.
 try:
     from .document_knowledge_graph import (
         install_document_graph_schema as _install_document_graph_schema,
@@ -154,6 +154,7 @@ try:
         document_status as _document_status,
         delete_document as _document_delete,
         ingest_document_inbox as _document_ingest_inbox,
+        maybe_ingest_document_cache as _maybe_ingest_document_cache,
         maybe_prefetch_document_context as _maybe_prefetch_document_context,
     )
 except ImportError:
@@ -178,6 +179,7 @@ except ImportError:
             raise RuntimeError(f"document_knowledge_graph unavailable: {_DOCUMENT_GRAPH_IMPORT_ERROR}")
         def _install_document_graph_schema(conn): return None
         _document_ingest = _document_scan = _document_embed_pending = _document_query = _document_source = _document_unit_context = _document_neighbors = _document_status = _document_delete = _document_ingest_inbox = _document_graph_unavailable
+        def _maybe_ingest_document_cache(*args, **kwargs): return {"status": "unavailable"}
         def _maybe_prefetch_document_context(*args, **kwargs): return ""
 
 # HERMES-SECURITY-INTEGRATION-20260728: shared trust core; no reverse dependency on OmniCouncil.
@@ -2516,6 +2518,22 @@ class MemoryWikiProvider(MemoryProvider):
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         self.turn = int(turn_number or self.turn or 0)
+        try:
+            cache_scan = _maybe_ingest_document_cache(self)
+            if cache_scan.get("status") == "scanned" and (
+                cache_scan.get("indexed") or cache_scan.get("metadata_only")
+                or cache_scan.get("unsupported") or cache_scan.get("failed")
+            ):
+                _debug_log(
+                    "Hermes document cache scan: "
+                    f"indexed={cache_scan.get('indexed', 0)} "
+                    f"metadata_only={cache_scan.get('metadata_only', 0)} "
+                    f"unsupported={cache_scan.get('unsupported', 0)} "
+                    f"failed={cache_scan.get('failed', 0)} "
+                    f"deferred={cache_scan.get('deferred_changed', 0)}"
+                )
+        except Exception as cache_scan_exc:
+            _debug_log(f"Hermes document cache scan failed: {type(cache_scan_exc).__name__}: {cache_scan_exc}")
         if self.turn and self.turn % 15 == 0:
             self._maintenance()
 
@@ -2864,7 +2882,7 @@ class MemoryWikiProvider(MemoryProvider):
         
             # ── Universal document knowledge graph v2 ──
             {"name":"memory_wiki_document_ingest","description":"Parse and index one allowlisted document in an isolated worker. Supports Office/OpenDocument/PDF/text/data formats; no automatic full reindex.","parameters":P({"path":{"type":"string","minLength":1},"scope_id":{"type":"string","default":""},"repository_id":{"type":"string","default":""},"ocr":{"type":"boolean","default":False},"ocr_language":{"type":"string","default":"eng+rus"},"embed":{"type":"boolean","default":False},"embed_limit":{"type":"integer","default":200,"minimum":1,"maximum":10000}}, ["path"])},
-            {"name":"memory_wiki_document_scan","description":"Recursively discover and incrementally index supported documents below an allowlisted directory. Reports missing indexed sources and prunes them only when prune_missing=true.","parameters":P({"root":{"type":"string","minLength":1},"scope_id":{"type":"string","default":""},"repository_id":{"type":"string","default":""},"recursive":{"type":"boolean","default":True},"max_files":{"type":"integer","default":5000,"minimum":1,"maximum":100000},"extensions":{"type":"array","items":{"type":"string"}},"exclude_dirs":{"type":"array","items":{"type":"string"}},"ocr":{"type":"boolean","default":False},"prune_missing":{"type":"boolean","default":False}}, ["root"])},
+            {"name":"memory_wiki_document_scan","description":"Recursively discover and incrementally index supported documents below an allowlisted directory. If root is omitted, scans the Hermes attachment cache (~/.hermes/cache/documents). Reports missing indexed sources and prunes them only when prune_missing=true.","parameters":P({"root":{"type":"string","default":""},"scope_id":{"type":"string","default":""},"repository_id":{"type":"string","default":""},"recursive":{"type":"boolean","default":True},"max_files":{"type":"integer","default":5000,"minimum":1,"maximum":100000},"extensions":{"type":"array","items":{"type":"string"}},"exclude_dirs":{"type":"array","items":{"type":"string"}},"ocr":{"type":"boolean","default":False},"embed":{"type":"boolean","default":False},"prune_missing":{"type":"boolean","default":False}}, [])},
             {"name":"memory_wiki_document_embed_pending","description":"Create/reuse embeddings for pending semantic document chunks in a bounded batch.","parameters":P({"source_id":{"type":"string","default":""},"scope_id":{"type":"string","default":""},"repository_id":{"type":"string","default":""},"limit":{"type":"integer","default":500,"minimum":1,"maximum":10000}}, [])},
             {"name":"memory_wiki_document_query","description":"Hybrid document retrieval: FTS5/BM25 over addressable units and chunks + Qdrant embeddings + weighted RRF + configured reranker.","parameters":P({"query":{"type":"string","minLength":1},"source_id":{"type":"string","default":""},"scope_id":{"type":"string","default":""},"repository_id":{"type":"string","default":""},"global_only":{"type":"boolean","default":False},"extension":{"type":"string","default":""},"limit":{"type":"integer","default":12,"minimum":1,"maximum":50},"candidate_limit":{"type":"integer","default":120,"minimum":20,"maximum":500},"max_chars_per_hit":{"type":"integer","default":3000,"minimum":300,"maximum":20000}}, ["query"])},
             {"name":"memory_wiki_document_source","description":"Show indexed metadata, revision and counts for one document source.","parameters":P({"source_id":{"type":"string","default":""},"path":{"type":"string","default":""}}, [])},

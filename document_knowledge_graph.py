@@ -38,7 +38,7 @@ except ImportError:
     )
 
 SCHEMA_VERSION = 2
-MODULE_VERSION = "0.3.0"
+MODULE_VERSION = "0.4.0"
 _TOPIC = "document-intelligence"
 _TOKEN_RE = re.compile(r"[\w./:@#$+\-]+", re.UNICODE)
 _DOC_HINT = re.compile(
@@ -98,6 +98,14 @@ def _env_int(name: str, default: int, low: int, high: int) -> int:
     return max(low, min(value, high))
 
 
+def _env_float(name: str, default: float, low: float, high: float) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(value, high))
+
+
 def _clean(value: Any, limit: int = 200_000) -> str:
     text = str(value or "").replace("\x00", "")
     # Secondary redaction. The main Memory Wiki sanitiser still applies at recall time.
@@ -132,20 +140,60 @@ def _fts_query(query: str) -> str:
     return " OR ".join(parts)
 
 
+def _hermes_home() -> Path:
+    return Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser().resolve(strict=False)
+
+
+def _document_cache_root() -> Path:
+    configured = (
+        os.environ.get("MEMORY_WIKI_DOCUMENT_CACHE_DIR", "").strip()
+        or os.environ.get("HERMES_DOCUMENT_CACHE_DIR", "").strip()
+    )
+    if configured:
+        return Path(configured).expanduser().resolve(strict=False)
+    return (_hermes_home() / "cache" / "documents").resolve(strict=False)
+
+
 def _roots() -> List[Path]:
     configured = os.environ.get("MEMORY_WIKI_DOCUMENT_ROOTS", "").strip()
     if configured:
         raw = [p for p in configured.split(os.pathsep) if p.strip()]
     else:
-        home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
-        raw = [str(home / "workspace"), str(home / "documents"), str(home / "uploads")]
+        home = _hermes_home()
+        # Hermes stores user-provided attachments here. Keep it first so an omitted
+        # scan root resolves to the actual attachment cache rather than workspace.
+        raw = [
+            str(_document_cache_root()),
+            str(home / "workspace"),
+            str(home / "documents"),
+            str(home / "uploads"),
+        ]
     roots: List[Path] = []
+    seen: set[str] = set()
     for item in raw:
         try:
-            roots.append(Path(item).expanduser().resolve(strict=False))
+            root = Path(item).expanduser().resolve(strict=False)
         except Exception:
             continue
+        key = os.path.normcase(str(root))
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(root)
     return roots
+
+
+def _scan_root(args: Dict[str, Any]) -> Path:
+    root_value = args.get("root") or args.get("path")
+    if root_value:
+        return Path(str(root_value)).expanduser().resolve(strict=True)
+    cache_root = _document_cache_root()
+    if not cache_root.exists():
+        raise ValueError(
+            "scan root omitted and Hermes document cache does not exist: "
+            f"{cache_root}; pass root explicitly or set MEMORY_WIKI_DOCUMENT_CACHE_DIR"
+        )
+    return cache_root.resolve(strict=True)
 
 
 def _allowed_path(value: Any, *, must_exist: bool = True) -> Path:
@@ -649,8 +697,7 @@ def ingest_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def scan_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
-    root_value = args.get("root") or args.get("path")
-    root = Path(str(root_value or "")).expanduser().resolve(strict=True)
+    root = _scan_root(args)
     if not root.is_dir() or root.is_symlink():
         raise ValueError("scan root must be a regular directory")
     # Verify directory is itself beneath an allowed root.
@@ -668,7 +715,19 @@ def scan_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     excludes = set(_DEFAULT_IGNORES) | {str(x) for x in (args.get("exclude_dirs") or [])}
     candidates: List[Path] = []
     iterator = root.rglob("*") if recursive else root.glob("*")
-    for path in sorted(iterator, key=lambda item: str(item).casefold()):
+    ordered = list(iterator)
+    if bool(args.get("newest_first", False)):
+        def _mtime(item: Path) -> int:
+            try:
+                return int(item.stat().st_mtime_ns)
+            except OSError:
+                return -1
+        ordered.sort(key=_mtime, reverse=True)
+    else:
+        ordered.sort(key=lambda item: str(item).casefold())
+    min_age_seconds = max(0.0, float(args.get("min_age_seconds") or 0.0))
+    now_ns = time.time_ns()
+    for path in ordered:
         if any(part in excludes for part in path.parts):
             continue
         if path.is_symlink() or not path.is_file():
@@ -676,14 +735,52 @@ def scan_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
         ext = path.suffix.lower()
         if ext not in _SUPPORTED_EXTENSIONS or (includes and ext not in includes):
             continue
+        if min_age_seconds:
+            try:
+                if now_ns - int(path.stat().st_mtime_ns) < int(min_age_seconds * 1_000_000_000):
+                    continue
+            except OSError:
+                continue
         candidates.append(path)
         if len(candidates) >= max_files:
             break
+
+    conn = provider._connect(); install_document_graph_schema(conn)
+    existing_by_path = {
+        str(row["source_path"]): row for row in conn.execute(
+            "SELECT source_path,source_id,revision_id,mtime_ns,size_bytes,scope_id,repository_id,status,active "
+            "FROM document_sources WHERE active=1"
+        ).fetchall()
+    }
+    requested_scope = str(args.get("scope_id") or "").strip()
+    requested_repo = str(args.get("repository_id") or "").strip()
+    stat_fast_path = bool(args.get("stat_fast_path", False))
+    max_changed = max(1, min(int(args.get("max_changed") or max_files), max_files))
+    changed_processed = 0
+    deferred = 0
     results = []; errors = []
     for path in candidates:
         try:
-            item_args = dict(args); item_args["path"] = str(path); item_args["embed"] = False
+            stat = path.stat()
+            existing = existing_by_path.get(str(path.resolve(strict=False)))
+            if (stat_fast_path and existing and int(existing["active"] or 0) == 1
+                    and int(existing["mtime_ns"] or 0) == int(stat.st_mtime_ns)
+                    and int(existing["size_bytes"] or 0) == int(stat.st_size)
+                    and str(existing["scope_id"] or "") == requested_scope
+                    and str(existing["repository_id"] or "") == requested_repo):
+                results.append({
+                    "status": "unchanged", "source_id": str(existing["source_id"]),
+                    "revision_id": str(existing["revision_id"]), "path": str(path),
+                    "fast_path": "mtime_size",
+                })
+                continue
+            if changed_processed >= max_changed:
+                deferred += 1
+                continue
+            item_args = dict(args); item_args["path"] = str(path)
+            item_args["embed"] = bool(args.get("embed", False))
             results.append(ingest_document(provider, item_args))
+            changed_processed += 1
         except Exception as exc:
             errors.append({"path": str(path), "error": f"{type(exc).__name__}: {exc}"})
     truncated = len(candidates) >= max_files
@@ -720,9 +817,47 @@ def scan_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
         "unsupported": sum(1 for r in results if r.get("status") == "unsupported"),
         "encrypted": sum(1 for r in results if r.get("status") == "encrypted"),
         "failed": len(errors), "missing_existing": len(missing_sources), "pruned": len(pruned),
+        "deferred_changed": deferred,
         "missing_sources": missing_sources[:200], "results": results[:200], "errors": errors[:200],
         "truncated": truncated,
     }
+
+
+def maybe_ingest_document_cache(provider: Any, *, force: bool = False) -> Dict[str, Any]:
+    """Optionally ingest new/changed Hermes attachment-cache files in bounded batches.
+
+    Automatic cache ingestion is deliberately opt-in because parsing large files can
+    add latency and semantic embedding can incur API cost. The cache directory is
+    nevertheless allowlisted by default and manual scan may omit ``root``.
+    """
+    if not force and not _env_bool("MEMORY_WIKI_DOCUMENT_AUTO_SCAN_CACHE", False):
+        return {"status": "disabled", "root": str(_document_cache_root())}
+    root = _document_cache_root()
+    if not root.exists() or not root.is_dir() or root.is_symlink():
+        return {"status": "missing", "root": str(root)}
+    now = time.monotonic()
+    cooldown = _env_int("MEMORY_WIKI_DOCUMENT_AUTO_SCAN_SECONDS", 15, 1, 3600)
+    last = float(getattr(provider, "_memory_wiki_document_cache_scan_at", 0.0) or 0.0)
+    if not force and last and now - last < cooldown:
+        return {"status": "cooldown", "root": str(root), "retry_after": max(0.0, cooldown - (now - last))}
+    setattr(provider, "_memory_wiki_document_cache_scan_at", now)
+    result = scan_documents(provider, {
+        "root": str(root),
+        "recursive": True,
+        "max_files": _env_int("MEMORY_WIKI_DOCUMENT_AUTO_SCAN_MAX_FILES", 200, 1, 5000),
+        "max_changed": _env_int("MEMORY_WIKI_DOCUMENT_AUTO_SCAN_MAX_CHANGED", 3, 1, 100),
+        "newest_first": True,
+        "stat_fast_path": True,
+        "min_age_seconds": _env_float("MEMORY_WIKI_DOCUMENT_AUTO_MIN_AGE_SECONDS", 2.0, 0.0, 300.0),
+        "ocr": _env_bool("MEMORY_WIKI_DOCUMENT_OCR", False),
+        "embed": _env_bool("MEMORY_WIKI_DOCUMENT_AUTO_EMBED", False),
+        "scope_id": os.environ.get("MEMORY_WIKI_DOCUMENT_AUTO_SCOPE_ID", "").strip(),
+        "repository_id": os.environ.get("MEMORY_WIKI_DOCUMENT_AUTO_REPOSITORY_ID", "").strip(),
+        "prune_missing": False,
+    })
+    result["status"] = "scanned"
+    result["automatic"] = True
+    return result
 
 
 def embed_pending_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1035,7 +1170,11 @@ def document_status(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
         unit_count = conn.execute(f"SELECT COUNT(*) FROM document_units WHERE active=1 AND source_id IN ({ph})", source_ids).fetchone()[0]
     else:
         totals = {"chunks": 0, "pending": 0, "embedded": 0}; unit_count = 0
+    cache_root = _document_cache_root()
     return {"schema_version": SCHEMA_VERSION, "module_version": MODULE_VERSION, "roots": [str(p) for p in _roots()],
+            "attachment_cache": {"path": str(cache_root), "exists": cache_root.is_dir(),
+                                 "auto_scan": _env_bool("MEMORY_WIKI_DOCUMENT_AUTO_SCAN_CACHE", False),
+                                 "auto_embed": _env_bool("MEMORY_WIKI_DOCUMENT_AUTO_EMBED", False)},
             "sources": sources, "counts": {"sources": len(sources), "units": int(unit_count),
             "chunks": int(totals.get("chunks") or 0), "pending": int(totals.get("pending") or 0),
             "embedded": int(totals.get("embedded") or 0)},
