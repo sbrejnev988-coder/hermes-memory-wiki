@@ -1,4 +1,4 @@
-"""memory-wiki v1.20.3+audit-fix-r1+document-cache-integration-r2+document-knowledge-graph-v2+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.20.4+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -900,6 +900,22 @@ FTS_TOP_K = _env_int("MEMORY_WIKI_FTS_TOP_K", 200, 10, 1000)
 VECTOR_TOP_K = _env_int("MEMORY_WIKI_VECTOR_TOP_K", 200, 10, 1000)
 HYBRID_TOP_K = _env_int("MEMORY_WIKI_HYBRID_TOP_K", 100, 10, 500)
 PREFETCH_CLAIM_LIMIT = _env_int("MEMORY_WIKI_PREFETCH_CLAIM_LIMIT", 20, 5, 50)
+# r4: automatic recall uses a larger candidate pool, but only relevant + guard-safe
+# claims count toward the soft minimum. These are targets, never permission to inject
+# unrelated or quarantined content.
+PREFETCH_MIN_RELEVANT_CLAIMS = _env_int("MEMORY_WIKI_PREFETCH_MIN_RELEVANT_CLAIMS", 4, 0, 20)
+PREFETCH_MIN_RELEVANT_CHARS = _env_int("MEMORY_WIKI_PREFETCH_MIN_RELEVANT_CHARS", 2000, 0, 12000)
+PREFETCH_EXPANSION_FACTOR = _env_int("MEMORY_WIKI_PREFETCH_EXPANSION_FACTOR", 3, 1, 10)
+PREFETCH_CANDIDATE_LIMIT = max(
+    PREFETCH_CLAIM_LIMIT, min(50, PREFETCH_CLAIM_LIMIT * PREFETCH_EXPANSION_FACTOR)
+)
+PREFETCH_CLAIM_MAX_CHARS = _env_int("MEMORY_WIKI_PREFETCH_CLAIM_MAX_CHARS", 1200, 300, 2400)
+PREFETCH_EVIDENCE_MAX_CHARS = _env_int("MEMORY_WIKI_PREFETCH_EVIDENCE_MAX_CHARS", 600, 0, 1600)
+PREFETCH_DIAGNOSTICS_MODE = str(
+    os.environ.get("MEMORY_WIKI_PREFETCH_DIAGNOSTICS", "anomalies") or "anomalies"
+).strip().lower()
+if PREFETCH_DIAGNOSTICS_MODE not in {"off", "anomalies", "always"}:
+    PREFETCH_DIAGNOSTICS_MODE = "anomalies"
 DIVERSITY_MAX_PER_TOPIC = _env_int("MEMORY_WIKI_DIVERSITY_MAX_PER_TOPIC", 8, 3, 20)
 DIVERSITY_MAX_SOURCE_SHARE = _rerank_env_float(
     "MEMORY_WIKI_DIVERSITY_MAX_SOURCE_SHARE", 0.65, 0.20, 1.0
@@ -2218,6 +2234,7 @@ class MemoryWikiProvider(MemoryProvider):
         self._last_io_error = ""
         self._lock = threading.RLock()
         self._secret_store = None
+        self._last_prefetch_diagnostics: Dict[str, Any] = {}
         # --- F2/F3: Регистрируем глобальный инстанс для TF-IDF (доступ из статических функций) ---
         import __main__
         __main__._memory_wiki_instance = self
@@ -2496,8 +2513,12 @@ class MemoryWikiProvider(MemoryProvider):
         return {"rows": visible, "watermark": watermark}
 
     def _select_recall_rows(self, query: str, *, session_id: str = "", limit: int = 10,
-                            include_stale: bool = True, delta_limit: int = 4) -> Dict[str, Any]:
-        main_rows = self._search(query, limit=limit, include_stale=include_stale, session_id=session_id)
+                            include_stale: bool = True, delta_limit: int = 4,
+                            record_retrieval: bool = True) -> Dict[str, Any]:
+        main_rows = self._search(
+            query, limit=limit, include_stale=include_stale, session_id=session_id,
+            record_retrieval=record_retrieval,
+        )
         delta_result = self._revision_delta(query, session_id=session_id, limit=delta_limit)
         raw_delta_rows = delta_result["rows"]
         seen = {str(row.get("id", "")) for row in main_rows}
@@ -2537,17 +2558,98 @@ class MemoryWikiProvider(MemoryProvider):
         if self.turn and self.turn % 15 == 0:
             self._maintenance()
 
+    def _prefetch_row_relevant(self, row: Dict[str, Any]) -> bool:
+        """Require an actual query/retrieval signal before a row may fill the minimum.
+
+        Hybrid search deliberately keeps recent/high-salience fallbacks. They remain useful
+        for explicit tools, but automatic prefetch must not pad the prompt with unrelated rows.
+        """
+        if int(row.get("pinned") or 0):
+            return True
+        parts = dict(row.get("score_parts") or {})
+        signal = sum(max(0.0, float(parts.get(name, 0.0) or 0.0)) for name in (
+            "lexical", "exact", "bm25", "rrf"
+        ))
+        if signal > 0.0001:
+            return True
+        if float(row.get("rerank_score") or 0.0) > 0.0:
+            return True
+        return False
+
+    def _record_prefetch_rows(self, query: str, rows: Iterable[Dict[str, Any]]) -> None:
+        """Record only claims that were actually injected, not the expanded candidate pool."""
+        unique: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            cid = str(row.get("id") or "")
+            if cid:
+                unique.setdefault(cid, row)
+        if not unique:
+            return
+        try:
+            c = self._connect(); ts = now(); q = short(query or "", 500)
+            with c:
+                c.executemany(
+                    "UPDATE claims SET access_count=access_count+1, recall_count=recall_count+1, "
+                    "last_accessed=?, last_recalled=? WHERE id=?",
+                    [(ts, ts, cid) for cid in unique],
+                )
+                c.executemany(
+                    "INSERT OR IGNORE INTO recall_events(id,claim_id,query,score,used,created_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    [(
+                        "re_" + sha(f"prefetch:{cid}:{q}:{ts}")[:12], cid, q,
+                        float(row.get("score") or 0.0), -1, ts,
+                    ) for cid, row in unique.items()],
+                )
+        except Exception as exc:
+            _debug_log(f"prefetch retrieval accounting failed: {type(exc).__name__}: {exc}")
+
+    def _finish_prefetch_diagnostics(self, diag: Dict[str, Any], *, status: str = "ok") -> None:
+        clean = {
+            "status": str(status or "ok"),
+            "query_hash": str(diag.get("query_hash") or ""),
+            "candidate_limit": int(diag.get("candidate_limit") or 0),
+            "searched": int(diag.get("searched") or 0),
+            "relevant": int(diag.get("relevant") or 0),
+            "safe": int(diag.get("safe") or 0),
+            "rendered": int(diag.get("rendered") or 0),
+            "delta_rendered": int(diag.get("delta_rendered") or 0),
+            "quarantined": int(diag.get("quarantined") or 0),
+            "claim_quarantined": int(diag.get("claim_quarantined") or 0),
+            "delta_quarantined": int(diag.get("delta_quarantined") or 0),
+            "auxiliary_quarantined": int(diag.get("auxiliary_quarantined") or 0),
+            "runtime_failures": int(diag.get("runtime_failures") or 0),
+            "guard_disagreements": int(diag.get("guard_disagreements") or 0),
+            "irrelevant_skipped": int(diag.get("irrelevant_skipped") or 0),
+            "budget_skipped": int(diag.get("budget_skipped") or 0),
+            "output_chars": int(diag.get("output_chars") or 0),
+            "estimated_tokens": int(diag.get("estimated_tokens") or 0),
+            "rendered_claim_chars": int(diag.get("rendered_claim_chars") or 0),
+            "min_claim_shortfall": int(diag.get("min_claim_shortfall") or 0),
+            "min_char_shortfall": int(diag.get("min_char_shortfall") or 0),
+        }
+        self._last_prefetch_diagnostics = clean
+        audit_status = status if status != "ok" else (
+            "degraded" if clean["quarantined"] or clean["runtime_failures"] or clean["min_claim_shortfall"] or clean["min_char_shortfall"] else "ok"
+        )
+        self._audit("prefetch", audit_status, json.dumps(clean, ensure_ascii=False, sort_keys=True))
+        _debug_log("PREFETCH " + json.dumps(clean, ensure_ascii=False, sort_keys=True))
+
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         if is_social_close(query):
             return ""
         sid = session_id or self.session_id
-        plan = self._recall_plan(query, limit=6)
+        candidate_limit = max(PREFETCH_CLAIM_LIMIT, PREFETCH_CANDIDATE_LIMIT)
         selected = self._select_recall_rows(
-            query, session_id=sid, limit=PREFETCH_CLAIM_LIMIT, include_stale=True,
+            query, session_id=sid, limit=candidate_limit, include_stale=True,
             delta_limit=_env_int("MEMORY_WIKI_REVISION_DELTA_LIMIT", 3, 0, 4),
+            record_retrieval=False,
         )
         rows = selected["rows"]
         delta_rows = selected["delta_rows"]
+        # Reuse the already selected rows. The former plan path could execute a
+        # second hybrid search and count candidates before Injection Guard.
+        plan = self._recall_plan(query, limit=6, preselected_rows=rows)
         env_meta = self._env_metadata_context(query)
         secrets_meta = self._secret_context(query, limit=3)
         code_prefetch = ""
@@ -2566,68 +2668,224 @@ class MemoryWikiProvider(MemoryProvider):
             )
         except Exception as document_prefetch_exc:
             _debug_log(f"Document graph prefetch failed: {type(document_prefetch_exc).__name__}: {document_prefetch_exc}")
-        if not rows and not delta_rows and not env_meta and not plan.get("topics") and not secrets_meta and not code_prefetch and not document_prefetch:
+
+        diag: Dict[str, Any] = {
+            "query_hash": sha(query or "")[:16], "candidate_limit": candidate_limit,
+            "searched": len(rows), "relevant": 0, "safe": 0, "rendered": 0,
+            "delta_rendered": 0, "quarantined": 0, "claim_quarantined": 0,
+            "delta_quarantined": 0, "auxiliary_quarantined": 0, "runtime_failures": 0,
+            "guard_disagreements": 0, "irrelevant_skipped": 0,
+            "budget_skipped": 0, "output_chars": 0, "estimated_tokens": 0,
+            "rendered_claim_chars": 0,
+        }
+        claim_blocks: List[Tuple[Dict[str, Any], str, int]] = []
+        for r in rows:
+            if not self._prefetch_row_relevant(r):
+                diag["irrelevant_skipped"] += 1
+                continue
+            diag["relevant"] += 1
+            inspected = self._inspect_recall_item(r, audit=True, max_len=PREFETCH_CLAIM_MAX_CHARS)
+            if inspected.get("status") != "safe":
+                diag["quarantined"] += 1
+                diag["claim_quarantined"] += 1
+                if inspected.get("status") == "runtime_failure_quarantined":
+                    diag["runtime_failures"] += 1
+                if inspected.get("guard_disagreement"):
+                    diag["guard_disagreements"] += 1
+                continue
+            diag["safe"] += 1
+            if len(claim_blocks) >= PREFETCH_CLAIM_LIMIT:
+                continue
+            flags = []
+            if self._is_stale(r["freshness_at"]): flags.append("STALE")
+            if r["status"] != "active": flags.append(str(r["status"]).upper())
+            if inspected.get("trust_level") and inspected["trust_level"] not in ("trusted", "verified"):
+                flags.append(str(inspected["trust_level"]).upper())
+            tag = f" [{' '.join(flags)}]" if flags else ""
+            pin = " PINNED" if int(r.get("pinned") or 0) else ""
+            claim_text = str(inspected.get("content") or "")
+            cls = r.get("memory_class") or memory_classify(claim_text, r.get("topic", "")).get("class", "fact")
+            trust = float(r.get("trust_score", memory_classify(claim_text, r.get("topic", "")).get("trust", .5)) or .5)
+            why = r.get("why_believe") or f"source={r.get('source','')}; evidence_count={r.get('evidence_count',0)}"
+            block = [
+                f"- `{r['id']}`{tag}{pin} rev={int(r.get('memory_revision') or 0)} "
+                f"visibility={r.get('visibility_scope','global')} time={self._format_claim_time(r)} "
+                f"class={cls} trust={trust:.2f} topic={r['topic']} conf={r['confidence']:.2f} "
+                f"sal={r['salience']:.2f} score={r.get('score',0):.2f}: {claim_text}",
+            ]
+            why_check = self._inspect_recall_text(
+                why, source=f"why_believe:{r['id']}", mem_type="provenance",
+                item_id=f"{r['id']}:why_believe", audit=True, max_len=180,
+            )
+            if why_check.get("status") == "safe" and why_check.get("content"):
+                block.append(f"  why_believe: {why_check['content']}")
+            elif why_check.get("status") != "safe":
+                diag["quarantined"] += 1
+                diag["auxiliary_quarantined"] += 1
+                if why_check.get("status") == "runtime_failure_quarantined":
+                    diag["runtime_failures"] += 1
+                if why_check.get("guard_disagreement"):
+                    diag["guard_disagreements"] += 1
+            if PREFETCH_EVIDENCE_MAX_CHARS:
+                ev = self._top_evidence(r["id"], 1)
+                if ev:
+                    ev_check = self._inspect_recall_text(
+                        ev[0].get("text", ""), source=f"evidence:{r['id']}",
+                        mem_type="evidence", item_id=f"{r['id']}:evidence", audit=True,
+                        max_len=PREFETCH_EVIDENCE_MAX_CHARS,
+                    )
+                    if ev_check.get("status") == "safe" and ev_check.get("content"):
+                        block.append(f"  evidence: {ev_check['content']}")
+                    elif ev_check.get("status") != "safe":
+                        diag["quarantined"] += 1
+                        diag["auxiliary_quarantined"] += 1
+                        if ev_check.get("status") == "runtime_failure_quarantined":
+                            diag["runtime_failures"] += 1
+                        if ev_check.get("guard_disagreement"):
+                            diag["guard_disagreements"] += 1
+            claim_blocks.append((r, "\n".join(block), len(claim_text)))
+
+        delta_blocks: List[Tuple[Dict[str, Any], str]] = []
+        delta_quarantined = 0
+        for r in delta_rows:
+            inspected = self._inspect_recall_item(r, audit=True, max_len=min(PREFETCH_CLAIM_MAX_CHARS, 900))
+            if inspected.get("status") != "safe":
+                delta_quarantined += 1; diag["quarantined"] += 1; diag["delta_quarantined"] += 1
+                if inspected.get("status") == "runtime_failure_quarantined":
+                    diag["runtime_failures"] += 1
+                if inspected.get("guard_disagreement"):
+                    diag["guard_disagreements"] += 1
+                continue
+            delta_blocks.append((
+                r,
+                f"- `{r['id']}` rev={int(r.get('memory_revision') or 0)} "
+                f"visibility={r.get('visibility_scope','global')} time={self._format_claim_time(r)} "
+                f"topic={r.get('topic','')}: {inspected.get('content','')}",
+            ))
+
+        trusted_blocks = [block for block in (env_meta, secrets_meta) if block]
+        knowledge_blocks = [block for block in (code_prefetch, document_prefetch) if block]
+        has_safe_payload = bool(claim_blocks or delta_blocks or trusted_blocks or knowledge_blocks)
+        anomaly = bool(
+            diag["quarantined"] or diag["runtime_failures"] or
+            (diag["relevant"] and len(claim_blocks) < PREFETCH_MIN_RELEVANT_CLAIMS)
+        )
+        diagnostic_line = (
+            "Recall diagnostics: "
+            f"searched={diag['searched']} relevant={diag['relevant']} safe={diag['safe']} "
+            f"rendered={{rendered}} rendered_claim_chars={{rendered_claim_chars}} quarantined={diag['quarantined']} "
+            f"(claims={diag['claim_quarantined']} delta={diag['delta_quarantined']} auxiliary={diag['auxiliary_quarantined']}) "
+            f"guard_runtime_failures={diag['runtime_failures']} "
+            f"guard_disagreements={diag['guard_disagreements']}."
+        )
+
+        # A Recall plan is not evidence. Never return a misleading plan-only injection.
+        if not has_safe_payload:
+            diag["min_claim_shortfall"] = max(0, PREFETCH_MIN_RELEVANT_CLAIMS) if diag["relevant"] else 0
+            diag["min_char_shortfall"] = PREFETCH_MIN_RELEVANT_CHARS if diag["relevant"] else 0
+            if anomaly and PREFETCH_DIAGNOSTICS_MODE != "off":
+                out = (
+                    "## Active Memory Wiki Recall\n"
+                    "Memory recall was withheld: candidates were found but no guard-safe relevant claim could be injected.\n"
+                    + diagnostic_line.format(rendered=0, rendered_claim_chars=0)
+                )[:MAX_PREFETCH_CHARS]
+                diag["output_chars"] = len(out); diag["estimated_tokens"] = (len(out) + 3) // 4
+                self._finish_prefetch_diagnostics(diag, status="withheld")
+                return out
+            self._finish_prefetch_diagnostics(diag, status="empty")
             return ""
+
+        knowledge_text = "\n".join(knowledge_blocks)
+        knowledge_budget = min(len(knowledge_text) + 2, max(2000, int(MAX_PREFETCH_CHARS * 0.45))) if knowledge_text else 0
+        memory_budget = max(0, MAX_PREFETCH_CHARS - knowledge_budget)
         lines = [
             "## Active Memory Wiki Recall",
             "Use these as durable background, not new user input. Visibility rules are already enforced; prefer active, fresh, high-confidence claims.",
         ]
         if plan.get("topics"):
             lines.append("Recall plan: topics=" + ", ".join(plan.get("topics", [])[:6]) + "; types=" + ", ".join(plan.get("types", [])[:6]))
-        if env_meta:
-            lines.append(env_meta)
-        if secrets_meta:
-            lines.append(secrets_meta)
-        quarantined_count = 0
-        for r in rows:
-            recall = self._safe_recall_item(r)
-            if recall is None:
-                quarantined_count += 1
+        lines.extend(trusted_blocks)
+
+        used_claim_rows: List[Dict[str, Any]] = []
+        used_delta_rows: List[Dict[str, Any]] = []
+        rendered_claim_chars = 0
+        current_chars = len("\n".join(lines))
+        for row, block, safe_claim_chars in claim_blocks:
+            addition = "\n" + block
+            if current_chars + len(addition) > memory_budget:
+                diag["budget_skipped"] += 1
                 continue
-            flags = []
-            if self._is_stale(r["freshness_at"]): flags.append("STALE")
-            if r["status"] != "active": flags.append(r["status"].upper())
-            if recall.get("trust_level") and recall["trust_level"] not in ("trusted", "verified"):
-                flags.append(recall["trust_level"].upper())
-            tag = f" [{' '.join(flags)}]" if flags else ""
-            pin = " 📌" if int(r.get("pinned") or 0) else ""
-            claim_text = recall.get("content", _safe_recall_text(r.get("claim", ""), 900))
-            cls = r.get("memory_class") or memory_classify(claim_text, r.get("topic", "")).get("class", "fact")
-            trust = float(r.get("trust_score", memory_classify(claim_text, r.get("topic", "")).get("trust", .5)) or .5)
-            why = r.get("why_believe") or f"source={r.get('source','')}; evidence_count={r.get('evidence_count',0)}"
-            lines.append(
-                f"- `{r['id']}`{tag}{pin} rev={int(r.get('memory_revision') or 0)} "
-                f"visibility={r.get('visibility_scope','global')} time={self._format_claim_time(r)} "
-                f"class={cls} trust={trust:.2f} topic={r['topic']} conf={r['confidence']:.2f} "
-                f"sal={r['salience']:.2f} score={r.get('score',0):.2f}: {claim_text}"
+            lines.append(block); current_chars += len(addition)
+            used_claim_rows.append(row); rendered_claim_chars += safe_claim_chars
+        diag["rendered"] = len(used_claim_rows)
+        if delta_blocks:
+            delta_header_added = False
+            for row, block in delta_blocks:
+                prefix = "\n## Newly committed shared memory" if not delta_header_added else ""
+                addition = prefix + "\n" + block
+                if current_chars + len(addition) > memory_budget:
+                    diag["budget_skipped"] += 1
+                    continue
+                if not delta_header_added:
+                    lines.append("\n## Newly committed shared memory"); delta_header_added = True
+                lines.append(block); current_chars += len(addition)
+                used_delta_rows.append(row); diag["delta_rendered"] += 1
+
+        used_rows = used_claim_rows + used_delta_rows
+        rendered_ids = [str(r.get("id") or "") for r in used_rows if str(r.get("id") or "")]
+        cons = self._related_contradictions(rendered_ids, limit=4) if rendered_ids else []
+        safe_contradictions = []
+        for c in cons:
+            raw = f"{c.get('claim_a','')} ↔ {c.get('claim_b','')}: {c.get('reason','')} [{c.get('status','')}]"
+            checked = self._inspect_recall_text(
+                raw, source="contradiction", mem_type="contradiction",
+                item_id=str(c.get("id") or "contradiction"), audit=True, max_len=900,
             )
-            lines.append(f"  why_believe: {short(redact_secrets(why), 180)}")
-            ev = self._top_evidence(r["id"], 1)
-            if ev:
-                lines.append(f"  evidence: {_safe_recall_text(ev[0]['text'], 500)}")
-        if delta_rows:
-            lines.append("\n## Newly committed shared memory")
-            for r in delta_rows:
-                lines.append(
-                    f"- `{r['id']}` rev={int(r.get('memory_revision') or 0)} "
-                    f"visibility={r.get('visibility_scope','global')} time={self._format_claim_time(r)} "
-                    f"topic={r.get('topic','')}: {_safe_recall_text(r.get('claim',''), 700)}"
-                )
-        cons = self._related_contradictions([r["id"] for r in rows], limit=4)
-        if cons:
-            lines.append("\nContradictions to handle explicitly:")
-            for c in cons:
-                lines.append(f"- `{c['id']}` {redact_secrets(c['claim_a'])} ↔ {redact_secrets(c['claim_b'])}: {redact_secrets(c['reason'])} [{c['status']}]")
-        knowledge_blocks = [block for block in (code_prefetch, document_prefetch) if block]
-        if knowledge_blocks:
-            knowledge_text = "\n".join(knowledge_blocks)
-            knowledge_budget = min(len(knowledge_text) + 2, max(2000, int(MAX_PREFETCH_CHARS * 0.45)))
-            memory_budget = max(0, MAX_PREFETCH_CHARS - knowledge_budget)
-            out = ("\n".join(lines)[:memory_budget] + "\n" + knowledge_text[:knowledge_budget])[:MAX_PREFETCH_CHARS]
+            if checked.get("status") == "safe":
+                safe_contradictions.append(f"- `{c.get('id','')}` {checked.get('content','')}")
+            else:
+                diag["quarantined"] += 1
+                diag["auxiliary_quarantined"] += 1
+                if checked.get("status") == "runtime_failure_quarantined":
+                    diag["runtime_failures"] += 1
+                if checked.get("guard_disagreement"):
+                    diag["guard_disagreements"] += 1
+        if safe_contradictions:
+            block = "\nContradictions to handle explicitly:\n" + "\n".join(safe_contradictions)
+            if current_chars + len(block) <= memory_budget:
+                lines.append(block); current_chars += len(block)
+            else:
+                diag["budget_skipped"] += len(safe_contradictions)
+
+        diag["rendered_claim_chars"] = rendered_claim_chars
+        if diag["relevant"]:
+            diag["min_claim_shortfall"] = max(0, PREFETCH_MIN_RELEVANT_CLAIMS - diag["rendered"])
+            diag["min_char_shortfall"] = max(0, PREFETCH_MIN_RELEVANT_CHARS - rendered_claim_chars)
         else:
-            out = "\n".join(lines)[:MAX_PREFETCH_CHARS]
-        if out:
+            diag["min_claim_shortfall"] = 0
+            diag["min_char_shortfall"] = 0
+        anomaly = anomaly or bool(
+            diag["min_claim_shortfall"] or diag["min_char_shortfall"] or diag["budget_skipped"]
+        )
+        if PREFETCH_DIAGNOSTICS_MODE == "always" or (PREFETCH_DIAGNOSTICS_MODE == "anomalies" and anomaly):
+            line = diagnostic_line.format(
+                rendered=diag["rendered"], rendered_claim_chars=rendered_claim_chars,
+            )
+            if current_chars + len(line) + 1 <= memory_budget:
+                lines.append(line); current_chars += len(line) + 1
+
+        memory_text = "\n".join(lines)
+        out = memory_text
+        if knowledge_text:
+            out = memory_text[:memory_budget] + "\n" + knowledge_text[:knowledge_budget]
+        out = out[:MAX_PREFETCH_CHARS]
+        diag["output_chars"] = len(out); diag["estimated_tokens"] = (len(out) + 3) // 4
+        self._record_prefetch_rows(query, used_rows)
+        # Do not advance the revision watermark if a visible delta was quarantined;
+        # it must remain eligible after the guard/runtime problem is repaired.
+        if out and not delta_quarantined:
             self._mark_seen_revision(selected["watermark"], sid)
+        self._finish_prefetch_diagnostics(diag)
         return out
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None: return None
@@ -2690,41 +2948,93 @@ class MemoryWikiProvider(MemoryProvider):
         
         return a
 
-    def _safe_recall_item(self, r: dict) -> dict | None:
-        """P0 #3: Пропустить recalled claim через injection guard.
-        Возвращает dict с content/trust_level/injection_signals, или None если quarantined."""
-        raw_claim = str(r.get("claim") or "")
-        source = str(r.get("source") or "memory_wiki_query")
-        mem_type = str(r.get("type") or "claim")
-        
+    def _inspect_recall_text(
+        self, text: Any, *, source: str, mem_type: str, item_id: str = "",
+        audit: bool = True, max_len: int = 900,
+    ) -> Dict[str, Any]:
+        """Return an observable, fail-closed guard decision without exposing raw secrets.
+
+        A local explicit-injection detector is used only to identify disagreements with
+        the shared trust core. In strict mode disagreement never bypasses quarantine.
+        """
+        raw = str(text or "")
+        local = _safe_recall_text(raw, max_len)
+        local_filtered = not local or str(local).startswith("[filtered:") or str(local).startswith("[QUARANTINED:")
+        strict = os.environ.get("HERMES_SECURITY_STRICT", "1").lower() not in {"0", "false", "no", "off"}
         if _INJECTION_GUARD_AVAILABLE and _sanitize_recalled:
             try:
-                item = _sanitize_recalled(raw_claim, source, mem_type)
+                item = _sanitize_recalled(raw, source, mem_type)
+                raw_signals = item.injection_signals or []
+                if isinstance(raw_signals, (str, bytes)):
+                    raw_signals = [raw_signals]
+                signals = [short(redact_secrets(str(v)), 120) for v in list(raw_signals)[:12]]
                 if item.trust_level == "quarantined":
-                    self._audit("injection_guard", "quarantined",
-                        f"Claim {r.get('id','?')} quarantined: {item.injection_signals}")
-                    return None
+                    disagreement = not local_filtered
+                    status = "quarantined_guard_disagreement" if disagreement else "quarantined"
+                    if audit:
+                        self._audit(
+                            "injection_guard", status,
+                            f"item={item_id or '?'} type={mem_type} source={short(source,120)} signals={signals}",
+                        )
+                    return {
+                        "status": status, "content": "", "trust_level": "quarantined",
+                        "injection_signals": signals, "guard_disagreement": disagreement,
+                    }
+                content = _safe_recall_text(item.content, max_len)
+                if not content or str(content).startswith("[filtered:") or str(content).startswith("[QUARANTINED:"):
+                    if audit:
+                        self._audit("injection_guard", "local_filter_quarantined", f"item={item_id or '?'} type={mem_type}")
+                    return {
+                        "status": "local_filter_quarantined", "content": "",
+                        "trust_level": str(item.trust_level or "untrusted"),
+                        "injection_signals": signals, "guard_disagreement": False,
+                    }
                 return {
-                    "content": item.content,
-                    "trust_level": item.trust_level,
-                    "injection_signals": item.injection_signals,
+                    "status": "safe", "content": content,
+                    "trust_level": str(item.trust_level or "untrusted"),
+                    "injection_signals": signals, "guard_disagreement": False,
                 }
             except Exception as exc:
-                if os.environ.get("HERMES_SECURITY_STRICT", "1").lower() not in {"0", "false", "no", "off"}:
-                    self._audit(
-                        "injection_guard",
-                        "runtime_failure_quarantined",
-                        f"Claim {r.get('id','?')} quarantined after trust-core failure: {type(exc).__name__}: {exc}",
-                    )
-                    return None
-        
-        # Fallback is allowed only when strict mode is explicitly disabled or
-        # the optional shared guard was not loaded during a non-strict start.
-        safe_text = _safe_recall_text(raw_claim, 900)
+                if strict:
+                    if audit:
+                        self._audit(
+                            "injection_guard", "runtime_failure_quarantined",
+                            f"item={item_id or '?'} type={mem_type} source={short(source,120)} "
+                            f"error={type(exc).__name__}: {short(str(exc),300)}",
+                        )
+                    return {
+                        "status": "runtime_failure_quarantined", "content": "",
+                        "trust_level": "quarantined", "injection_signals": [],
+                        "guard_disagreement": not local_filtered,
+                    }
+        if local_filtered:
+            if audit:
+                self._audit("injection_guard", "local_filter_quarantined", f"item={item_id or '?'} type={mem_type}")
+            return {
+                "status": "local_filter_quarantined", "content": "",
+                "trust_level": "untrusted", "injection_signals": [],
+                "guard_disagreement": False,
+            }
         return {
-            "content": safe_text,
-            "trust_level": "untrusted",
-            "injection_signals": [],
+            "status": "safe", "content": local, "trust_level": "untrusted",
+            "injection_signals": [], "guard_disagreement": False,
+        }
+
+    def _inspect_recall_item(self, r: dict, *, audit: bool = True, max_len: int = 900) -> Dict[str, Any]:
+        return self._inspect_recall_text(
+            r.get("claim", ""), source=str(r.get("source") or "memory_wiki_query"),
+            mem_type=str(r.get("type") or "claim"), item_id=str(r.get("id") or "?"),
+            audit=audit, max_len=max_len,
+        )
+
+    def _safe_recall_item(self, r: dict) -> dict | None:
+        inspected = self._inspect_recall_item(r, audit=True, max_len=PREFETCH_CLAIM_MAX_CHARS)
+        if inspected.get("status") != "safe":
+            return None
+        return {
+            "content": inspected.get("content", ""),
+            "trust_level": inspected.get("trust_level", "untrusted"),
+            "injection_signals": inspected.get("injection_signals", []),
         }
 
     def on_memory_write(self, action: str, target: str, content: str, metadata: Optional[Dict[str, Any]] = None) -> None:
@@ -2736,9 +3046,18 @@ class MemoryWikiProvider(MemoryProvider):
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         text = scrub_memory_artifacts("\n".join(str(m.get("content", ""))[:3000] for m in messages[-16:]))
         self._ingest_text(text, source="pre_compress", max_claims=10)
-        rows = self._search(text, limit=12, include_stale=True)
-        if not rows: return ""
-        return "Memory-Wiki claims to preserve during compression:\n" + "\n".join(f"- `{r['id']}` {r['claim']}" for r in rows)
+        rows = self._search(text, limit=12, include_stale=True, record_retrieval=False)
+        safe = []
+        for row in rows:
+            inspected = self._inspect_recall_item(row, audit=True, max_len=PREFETCH_CLAIM_MAX_CHARS)
+            if inspected.get("status") == "safe":
+                safe.append((row, inspected.get("content", "")))
+        if not safe:
+            return ""
+        self._record_prefetch_rows(text, [row for row, _content in safe])
+        return "Memory-Wiki claims to preserve during compression:\n" + "\n".join(
+            f"- `{row['id']}` {content}" for row, content in safe
+        )
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         text = "\n".join(str(m.get("content", ""))[:4000] for m in messages[-24:])
@@ -6495,7 +6814,7 @@ class MemoryWikiProvider(MemoryProvider):
         _debug_log(f"SEMANTIC hydrated={hydrated} requested={len(claim_ids)}")
         return hydrated
 
-    def _search(self, query: str, limit=10, include_stale=True, topic: Optional[str]=None, session_id: str="", retrieval_mode: str="hybrid") -> List[Dict[str, Any]]:
+    def _search(self, query: str, limit=10, include_stale=True, topic: Optional[str]=None, session_id: str="", retrieval_mode: str="hybrid", record_retrieval: bool=True) -> List[Dict[str, Any]]:
         limit = max(1, min(int(limit or 10), 50)); q = query or ""; qt = tokens(q); c = self._connect()
         retrieval_mode = str(retrieval_mode or "hybrid").strip().lower()
         if retrieval_mode not in {"hybrid", "fts", "vector"}:
@@ -6622,12 +6941,12 @@ class MemoryWikiProvider(MemoryProvider):
         scored = self._rerank_rows(q, scored, query_mode)
         scored = self._apply_diversity(scored, query_mode)
         ids = [x["id"] for x in scored[:limit]]
-        if ids:
+        if ids and record_retrieval:
             with c:
                 ts=now(); c.executemany("UPDATE claims SET access_count=access_count+1, recall_count=recall_count+1, last_accessed=?, last_recalled=? WHERE id=?", [(ts, ts, i) for i in ids])
                 c.executemany("INSERT OR IGNORE INTO recall_events(id,claim_id,query,score,used,created_at) VALUES(?,?,?,?,?,?)", [("re_"+sha(f"{i}:{q}:{ts}")[:12], i, short(q,500), next((float(x.get("score",0)) for x in scored if x["id"]==i),0.0), -1, ts) for i in ids])
-        # Record recall feedback
-
+        # Prompt-time prefetch records only claims that survive relevance, visibility,
+        # budget and Injection Guard. Candidate expansion must not inflate recall_count.
         return scored[:limit]
 
     def _upsert_fts(self, cid: str) -> None:
@@ -7496,7 +7815,7 @@ class MemoryWikiProvider(MemoryProvider):
             topic_rows = (
                 list(preselected_rows)[:min(limit, 5)]
                 if preselected_rows is not None
-                else self._search(query, min(limit, 5), False)
+                else self._search(query, min(limit, 5), False, record_retrieval=False)
             )
             for r in topic_rows:
                 topic = str(r.get('topic') or '')
@@ -8793,6 +9112,7 @@ class MemoryWikiProvider(MemoryProvider):
             "active_collection": active_target,
             "expected_collection": _physical_collection_name(manifest),
             "rerank": self._rerank_status(),
+            "last_prefetch": dict(getattr(self, "_last_prefetch_diagnostics", {}) or {}),
         }
 
     def _reindex(self, limit: int = 0, force: bool = False) -> Dict[str,Any]:
@@ -9116,16 +9436,43 @@ class MemoryWikiProvider(MemoryProvider):
 
     def _debug_search(self, query: str, limit: int = 10, topic: str = "") -> Dict[str,Any]:
         q = query or ""; qm = _detect_query_mode(q)
-        rows = self._search(q, max(1, min(limit, 30)), False, topic if topic else None)
-        items = [{"id": d.get("id", ""), "topic": d.get("topic", ""),
-                  "lexical": round(d.get("score_parts", {}).get("lexical", 0), 4),
-                  "bm25": round(d.get("score_parts", {}).get("bm25", 0), 4),
-                  "rrf": round(d.get("score_parts", {}).get("rrf", 0), 4),
-                  "verified": round(d.get("score_parts", {}).get("verified", 0), 4),
-                  "final_score": round(d.get("score", 0), 4),
-                  "rerank_score": round(d.get("rerank_score", 0), 6), "rerank_rank": int(d.get("rerank_rank", 0) or 0),
-                  "claim": short(d.get("claim", ""), 120)} for d in rows]
-        return {"query": q, "query_mode": qm, "results": items}
+        rows = self._search(
+            q, max(1, min(limit, 30)), False, topic if topic else None,
+            record_retrieval=False,
+        )
+        items = []
+        summary = {
+            "searched_after_sql_quality_filters": len(rows), "guard_safe": 0,
+            "guard_quarantined": 0, "guard_runtime_failures": 0,
+            "guard_disagreements": 0,
+        }
+        for d in rows:
+            guard = self._inspect_recall_item(d, audit=False, max_len=PREFETCH_CLAIM_MAX_CHARS)
+            status = str(guard.get("status") or "unknown")
+            if status == "safe": summary["guard_safe"] += 1
+            else: summary["guard_quarantined"] += 1
+            if status == "runtime_failure_quarantined": summary["guard_runtime_failures"] += 1
+            if guard.get("guard_disagreement"): summary["guard_disagreements"] += 1
+            items.append({
+                "id": d.get("id", ""), "topic": d.get("topic", ""),
+                "lexical": round(d.get("score_parts", {}).get("lexical", 0), 4),
+                "bm25": round(d.get("score_parts", {}).get("bm25", 0), 4),
+                "rrf": round(d.get("score_parts", {}).get("rrf", 0), 4),
+                "verified": round(d.get("score_parts", {}).get("verified", 0), 4),
+                "final_score": round(d.get("score", 0), 4),
+                "rerank_score": round(d.get("rerank_score", 0), 6),
+                "rerank_rank": int(d.get("rerank_rank", 0) or 0),
+                "guard_status": status,
+                "guard_trust_level": guard.get("trust_level", ""),
+                "guard_disagreement": bool(guard.get("guard_disagreement")),
+                "guard_signals": list(guard.get("injection_signals") or [])[:8],
+                "claim": short(d.get("claim", ""), 120),
+            })
+        return {
+            "query": q, "query_mode": qm, "results": items,
+            "prefetch_guard_summary": summary,
+            "last_prefetch": dict(getattr(self, "_last_prefetch_diagnostics", {}) or {}),
+        }
 
     def _compare_search(self, query: str, limit: int = 10, topic: str = "") -> Dict[str,Any]:
         q = query or ""; top = max(1, min(limit, 20)); selected_topic = topic if topic else None
@@ -9134,9 +9481,9 @@ class MemoryWikiProvider(MemoryProvider):
         # Never mutate process-wide environment variables here. The former
         # implementation was thread-unsafe and did not affect the module-level
         # SEMANTIC_ENABLED constant after import.
-        fts = compact(self._search(q, top, False, selected_topic, retrieval_mode="fts"))
-        vector = compact(self._search(q, top, False, selected_topic, retrieval_mode="vector"))
-        hybrid = compact(self._search(q, top, False, selected_topic, retrieval_mode="hybrid"))
+        fts = compact(self._search(q, top, False, selected_topic, retrieval_mode="fts", record_retrieval=False))
+        vector = compact(self._search(q, top, False, selected_topic, retrieval_mode="vector", record_retrieval=False))
+        hybrid = compact(self._search(q, top, False, selected_topic, retrieval_mode="hybrid", record_retrieval=False))
         return {"query": q, "query_mode": _detect_query_mode(q), "fts_only": fts, "vector_only": vector, "hybrid": hybrid}
 
     def _query_mode_tool(self, query: str) -> Dict[str,Any]:

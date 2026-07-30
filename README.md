@@ -1,4 +1,4 @@
-# Hermes Memory Wiki v1.20.3
+# Hermes Memory Wiki v1.20.4
 
 Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 101 MCP tools.
 
@@ -55,6 +55,12 @@ Retrieval pipeline:
 | `MEMORY_WIKI_QDRANT_API_KEY` | (empty) | Qdrant API key if auth enabled |
 | `MEMORY_WIKI_PREFETCH_CLAIM_LIMIT` | `20` | Maximum main claims in automatic prompt-time recall |
 | `MEMORY_WIKI_MAX_PREFETCH_CHARS` | `24000` | Character budget for automatic prompt-time recall |
+| `MEMORY_WIKI_PREFETCH_MIN_RELEVANT_CLAIMS` | `4` | Soft minimum of relevant, guard-safe claims; never pads with unrelated/quarantined rows |
+| `MEMORY_WIKI_PREFETCH_MIN_RELEVANT_CHARS` | `2000` | Soft relevant-content target used for shortfall diagnostics |
+| `MEMORY_WIKI_PREFETCH_EXPANSION_FACTOR` | `3` | Candidate-pool multiplier, capped at 50 rows |
+| `MEMORY_WIKI_PREFETCH_DIAGNOSTICS` | `anomalies` | `off`, `anomalies`, or `always`; records searched/rendered/quarantined/size |
+| `MEMORY_WIKI_PREFETCH_CLAIM_MAX_CHARS` | `1200` | Maximum sanitized text per rendered claim |
+| `MEMORY_WIKI_PREFETCH_EVIDENCE_MAX_CHARS` | `600` | Maximum guard-safe evidence text per claim |
 | `MEMORY_WIKI_DIVERSITY_MAX_PER_TOPIC` | `8` | Maximum claims retained from one topic after reranking |
 | `MEMORY_WIKI_DIVERSITY_MAX_SOURCE_SHARE` | `0.65` | Source-share threshold that applies a soft score penalty |
 | `MEMORY_WIKI_CONTEXT_MAX_TOKENS` | `6000` | Token budget for structured context packer |
@@ -380,3 +386,14 @@ MIT
 ## Audit fix r1 (2026-07-29)
 
 This source package includes the runtime modules required by the advertised code and document graph tools. `plugin.yaml`, the MCP schema cache and the Python provider are generated from the same 101-schema source. `memory_wiki_compare_search` now performs real FTS-only, vector-only and hybrid runs without mutating process-wide environment variables. Backup restore validates archive entry count, uncompressed size, member size and compression ratio before creating a safety backup or writing staged files.
+
+
+## Automatic prefetch hardening in v1.20.4
+
+- `MEMORY_WIKI_PREFETCH_CLAIM_LIMIT` and `MEMORY_WIKI_MAX_PREFETCH_CHARS` remain upper bounds.
+- Prefetch searches an expanded pool, but only claims with an actual lexical/vector/rerank/topic signal may fill the soft minimum.
+- Every main claim, revision delta, evidence item and contradiction line passes the same observable Injection Guard path.
+- A plan-only `<memory-context>` is no longer emitted. If candidates exist but all are withheld, the prompt receives a compact non-content diagnostic instead of a misleading Recall plan.
+- `memory_wiki_debug_search` now reports guard status/signals per post-filter candidate and does not increment recall counters.
+- `memory_wiki_semantic_status` exposes `last_prefetch` telemetry. Audit events use `op=prefetch` with searched/relevant/rendered/quarantined/output size.
+- Strict mode never bypasses a trust-core quarantine merely to meet the minimum. A guard disagreement is reported separately so false positives can be fixed without weakening security.
