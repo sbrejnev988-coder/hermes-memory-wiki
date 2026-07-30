@@ -1,4 +1,4 @@
-# Hermes Memory Wiki v1.20.4
+# Hermes Memory Wiki v1.20.5
 
 Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 101 MCP tools.
 
@@ -23,6 +23,19 @@ Outbox worker (async):
 Retrieval pipeline:
   FTS5/BM25 + Qdrant embeddings → hydrate Qdrant-only claims from SQLite → RRF → Voyage/Cohere instruction-aware rerank → configurable diversity → structured XML
 ```
+
+## Secret-context bridge (r5)
+
+Memory Wiki keeps `secret_index` as its local safe metadata index, but it can now also read through an installed secret-context plugin when a context exists only in that plugin or its vault. External search results are recursively redacted and are not copied into SQLite, FTS5, Qdrant, dashboards, or markdown pages.
+
+- `memory_wiki_query_secrets` merges local `sec_*` metadata with safe external matches.
+- External matches include `origin=secret_context` and `lookup_key`; use the dedicated `secret_context_lookup` tool for the actual context.
+- `secret_context_lookup` and `secret_context_search` are patched at registration time to serialize non-string results as JSON strings, as required by Hermes/OpenAI-compatible tool messages.
+- The bridge invokes only `secret_context_search`; it never calls lookup/reveal itself.
+- Disable read-through with `MEMORY_WIKI_SECRET_CONTEXT_BRIDGE=0`.
+- Set an explicit plugin path with `MEMORY_WIKI_SECRET_CONTEXT_PLUGIN=/root/.hermes/plugins/<plugin>/__init__.py`.
+
+Plaintext returned intentionally by `secret_context_lookup` can still enter the model's tool history. For login flows, a domain-bound executor that consumes a secret reference directly remains safer than revealing plaintext to the model.
 
 ## Requirements
 
