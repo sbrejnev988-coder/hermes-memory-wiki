@@ -1,4 +1,4 @@
-"""memory-wiki v1.20.8+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.20.8+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -402,15 +402,18 @@ def _qdrant_alias_supported(*, refresh: bool = False) -> bool:
 
 
 def _active_collection_name() -> str:
-    """Online collection used by reads and outbox writes.
+    """Return a usable online target during first-start alias bootstrap.
 
-    Real Qdrant uses the stable alias. Alias-less local stubs use the physical
-    manifest collection directly, preserving semantic search instead of
-    silently accumulating failed outbox jobs.
+    Capability support alone is insufficient: after upgrading an alias-less
+    stub, GET /aliases may work before the configured alias exists. Until the
+    alias is actually mapped, reads/outbox writes stay on the deterministic
+    physical collection. Require mode remains fail-closed on the alias.
     """
     if QDRANT_ALIAS_MODE == "require":
         return QDRANT_ALIAS
-    return QDRANT_ALIAS if _qdrant_alias_supported() else _physical_collection_name()
+    if _qdrant_alias_supported():
+        return QDRANT_ALIAS if _qdrant_alias_target(QDRANT_ALIAS) else _physical_collection_name()
+    return _physical_collection_name()
 
 
 def _collection_config(collection: str) -> Optional[dict]:
@@ -450,9 +453,14 @@ def _ensure_collection(collection: Optional[str] = None) -> bool:
         f"/collections/{coll}",
         {"vectors": {"size": QDRANT_VECTOR_SIZE, "distance": "Cosine"}},
     )
-    if result is not None:
+    if (
+        isinstance(result, dict)
+        and str(result.get("status") or "") == "ok"
+        and result.get("result") is not False
+    ):
         _debug_log(f"Created Qdrant physical collection: {coll}")
         return True
+    _debug_log(f"Qdrant collection create failed for {coll}: {short(result, 500)}")
     return False
 
 def _check_manifest_change() -> dict | None:
@@ -1473,11 +1481,15 @@ def _qdrant_alias_target(alias: str = QDRANT_ALIAS) -> str:
 
 
 def _qdrant_resolved_active_collection() -> str:
-    """Resolve the collection that online queries actually use."""
+    """Resolve the actual collection, including pre-alias bootstrap fallback."""
     alias_supported = _qdrant_alias_supported()
     if alias_supported:
-        return _qdrant_alias_target(QDRANT_ALIAS)
-    if QDRANT_ALIAS_MODE == "require":
+        target = _qdrant_alias_target(QDRANT_ALIAS)
+        if target:
+            return target
+        if QDRANT_ALIAS_MODE == "require":
+            return ""
+    elif QDRANT_ALIAS_MODE == "require":
         return ""
     physical = _physical_collection_name()
     return physical if _collection_config(physical) is not None else ""
@@ -1782,11 +1794,12 @@ def vault_unwrap(stored: str) -> str:
     return _BrokerCrypto.vault_unwrap_v3(stored)
 
 def _safe_recall_text(obj, max_len=800):
-    """Sanitize text before recall injection. Catches prompt-injection patterns."""
+    """Sanitize text before recall injection and fail closed on guard errors."""
     try:
         return sanitize_context_text(str(obj or ""), max_len=max_len)
-    except Exception:
-        return str(obj or "")[:max_len]
+    except Exception as exc:
+        _debug_log(f"local recall sanitizer failed: {type(exc).__name__}: {exc}")
+        return "[QUARANTINED: memory guard runtime failure]"
 
 
 MEMORY_CLASS_WEIGHTS = {"secret": 1.0, "credential_index": 0.95, "tool_log": 0.30, "raw_blob": 0.22, "preference": 0.82, "procedure": 0.78, "environment": 0.74, "decision": 0.80, "lesson": 0.78, "fact": 0.64}
@@ -8889,11 +8902,23 @@ class MemoryWikiProvider(MemoryProvider):
         seen_rendered_content=set()
         plan_topics=set(plan.get('topics') or [])
         def add(bucket, label, text, prio, *, claim_id='', fingerprint_text=''):
-            text=redact_secrets(str(text or '')).strip()
             cid=str(claim_id or '').strip()
             if cid and cid in suppressed_ids:
                 omitted['suppressed_by_coverage']+=1
                 return
+            raw_text=str(text or '')
+            inspected=self._inspect_recall_text(
+                raw_text,
+                source=f"memory_wiki_pack_context:{bucket}:{label}",
+                mem_type=str(label or bucket or "packed_context"),
+                item_id=cid or f"{bucket}:{label}",
+                audit=True,
+                max_len=700,
+            )
+            if inspected.get('status') != 'safe':
+                omitted['secret_or_quarantined']+=1
+                return
+            text=redact_secrets(str(inspected.get('content') or '')).strip()
             if cid and cid in seen_claim_ids:
                 omitted['duplicate_claim_id']+=1
                 return
