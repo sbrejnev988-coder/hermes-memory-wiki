@@ -1,8 +1,9 @@
-"""Read-through bridge from Memory Wiki to an installed secret-context plugin.
+"""Read-through bridge from Memory Wiki to secret-context and Vault Registry.
 
-The bridge never persists or intentionally exposes plaintext secrets.  It loads the
-installed plugin in an isolated capture context, invokes only its search handler,
-and normalizes/redacts the returned metadata before Memory Wiki sees it.
+The bridge never persists or intentionally exposes plaintext secrets. It first
+tries the installed plugin search handler, then independently reads safe metadata
+from ``~/.hermes/vault/secrets_registry.json`` so a SQLite-only plugin index cannot
+make vault-only records invisible.
 """
 from __future__ import annotations
 
@@ -17,6 +18,22 @@ import sys
 import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+
+try:
+    from .vault_registry_adapter import (
+        registry_status as _registry_status,
+        search_registry_metadata as _search_registry_metadata,
+    )
+except Exception:
+    try:
+        from vault_registry_adapter import (
+            registry_status as _registry_status,
+            search_registry_metadata as _search_registry_metadata,
+        )
+    except Exception:
+        def _search_registry_metadata(*args, **kwargs): return []
+        def _registry_status(*args, **kwargs):
+            return {"available": False, "error": "adapter_import_failed", "entries": 0}
 
 _TARGET_TOOLS = {"secret_context_lookup", "secret_context_search"}
 _CACHE_LOCK = threading.RLock()
@@ -293,18 +310,22 @@ def _normalize_match(raw: Any) -> Optional[Dict[str, Any]]:
     locator = _redact_string(_pick(safe, "locator", "host", "url", "endpoint"), 500)
     purpose = _redact_string(_pick(safe, "purpose", "description"), 500)
     secret_type = _redact_string(_pick(safe, "secret_type", "type", default="credential"), 80)
+    username = _redact_string(_pick(safe, "username", "user", "login", "email"), 300)
+    origin = _redact_string(_pick(safe, "origin", default="secret_context"), 80)
+    source = _redact_string(_pick(safe, "source", default="secret_context_plugin"), 120)
     aliases = safe.get("aliases") if isinstance(safe.get("aliases"), list) else []
     policy = safe.get("policy") if isinstance(safe.get("policy"), dict) else {}
     return {
         "id": stable_id,
         "lookup_key": lookup_key,
-        "origin": "secret_context",
+        "origin": origin,
         "subject": subject,
         "scope": scope,
         "secret_type": secret_type,
         "locator": locator,
         "purpose": purpose,
-        "source": "secret_context_plugin",
+        "username": username,
+        "source": source,
         "confidence": 1.0,
         "salience": 0.9,
         "status": "active",
@@ -322,42 +343,72 @@ def search_safe_secret_context(query: str, limit: int = 10, home: Optional[Path]
         return []
     limit = max(1, min(int(limit or 10), 50))
     home = Path(home or os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")).expanduser()
-    path = discover_secret_context_plugin(home)
-    if path is None:
-        return []
-    handlers, error = _load_handlers(path, home)
-    if error or "secret_context_search" not in handlers:
-        return []
-    try:
-        payload = _invoke(handlers["secret_context_search"], {"query": query, "limit": limit})
-    except Exception:
-        return []
     out: List[Dict[str, Any]] = []
     seen = set()
-    for raw in _extract_matches(payload):
+
+    # Best-effort plugin search. Older secret-context versions may only search
+    # Memory Wiki's SQLite secret_index and legitimately return no matches.
+    path = discover_secret_context_plugin(home)
+    if path is not None:
+        handlers, error = _load_handlers(path, home)
+        if not error and "secret_context_search" in handlers:
+            try:
+                payload = _invoke(handlers["secret_context_search"], {"query": query, "limit": limit})
+            except Exception:
+                payload = []
+            for raw in _extract_matches(payload):
+                item = _normalize_match(raw)
+                if not item:
+                    continue
+                dedup = (str(item.get("lookup_key") or ""), str(item.get("id") or ""))
+                if dedup in seen:
+                    continue
+                seen.add(dedup); out.append(item)
+                if len(out) >= limit:
+                    return out
+
+    # Independent registry fallback: safe metadata only, no plaintext fields.
+    try:
+        registry_rows = _search_registry_metadata(query, limit=limit, home=home)
+    except Exception:
+        registry_rows = []
+    for raw in registry_rows:
         item = _normalize_match(raw)
         if not item:
             continue
-        dedup = (item["id"], item["lookup_key"])
+        item["origin"] = "vault_registry"
+        dedup = (str(item.get("lookup_key") or ""), str(item.get("id") or ""))
         if dedup in seen:
             continue
-        seen.add(dedup)
-        out.append(item)
+        seen.add(dedup); out.append(item)
         if len(out) >= limit:
             break
     return out
 
-
 def secret_context_bridge_status(home: Optional[Path] = None) -> Dict[str, Any]:
     home = Path(home or os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")).expanduser()
     path = discover_secret_context_plugin(home)
+    plugin_status: Dict[str, Any]
     if path is None:
-        return {"available": False, "reason": "plugin_not_found"}
-    handlers, error = _load_handlers(path, home)
+        plugin_status = {"available": False, "reason": "plugin_not_found"}
+    else:
+        handlers, error = _load_handlers(path, home)
+        plugin_status = {
+            "available": not bool(error) and "secret_context_search" in handlers,
+            "plugin": path.parent.name,
+            "path": str(path),
+            "lookup_handler": "secret_context_lookup" in handlers,
+            "search_handler": "secret_context_search" in handlers,
+            "error": error,
+        }
+    registry = _registry_status(home)
     return {
-        "available": not bool(error) and "secret_context_search" in handlers,
-        "plugin": path.parent.name,
-        "lookup_handler": "secret_context_lookup" in handlers,
-        "search_handler": "secret_context_search" in handlers,
-        "error": error,
+        "available": bool(plugin_status.get("available") or registry.get("available")),
+        "plugin": plugin_status,
+        "registry": registry,
+        "lookup_handler": bool(plugin_status.get("lookup_handler")),
+        "search_handler": bool(plugin_status.get("search_handler")),
+        "error": str(plugin_status.get("error") or registry.get("error") or ""),
+        "readthrough_mode": "plugin_plus_registry_fallback",
     }
+
