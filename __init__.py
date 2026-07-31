@@ -360,8 +360,15 @@ def _manifest_hash(manifest: dict) -> str:
     ).hexdigest()[:12]
 
 def _physical_collection_name(manifest: Optional[dict] = None) -> str:
-    """Return the immutable collection name for one embedding manifest."""
+    """Return the immutable collection name for one embedding manifest.
+
+    If MEMORY_WIKI_QDRANT_COLLECTION already carries a manifest suffix
+    (``_<12 hex>``), treat it as an explicit full collection name and use it
+    verbatim. Otherwise append the manifest hash to the base prefix.
+    """
     current = manifest or _embedding_manifest()
+    if re.match(r"^.+_[0-9a-f]{12}$", QDRANT_COLLECTION):
+        return QDRANT_COLLECTION
     return f"{QDRANT_COLLECTION}_{_manifest_hash(current)}"
 
 
