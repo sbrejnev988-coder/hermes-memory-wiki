@@ -1,4 +1,4 @@
-"""memory-wiki v1.20.7+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.20.8+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -307,6 +307,21 @@ QDRANT_ALIAS = os.environ.get(
     "MEMORY_WIKI_QDRANT_ALIAS",
     "memory_wiki_claims_active",
 ).strip() or "memory_wiki_claims_active"
+QDRANT_ALIAS_MODE = os.environ.get(
+    "MEMORY_WIKI_QDRANT_ALIAS_MODE",
+    "auto",
+).strip().lower()
+if QDRANT_ALIAS_MODE not in {"auto", "require", "physical"}:
+    QDRANT_ALIAS_MODE = "auto"
+QDRANT_ALIAS_PROBE_TTL_SECONDS = max(
+    5,
+    _env_int("MEMORY_WIKI_QDRANT_ALIAS_PROBE_TTL_SECONDS", 60, 5, 3600),
+)
+_QDRANT_ALIAS_CAPABILITY: Dict[str, Any] = {
+    "checked_at": 0.0,
+    "supported": None,
+    "error": "",
+}
 
 QDRANT_API_KEY = os.environ.get(
     "MEMORY_WIKI_QDRANT_API_KEY",
@@ -350,9 +365,45 @@ def _physical_collection_name(manifest: Optional[dict] = None) -> str:
     return f"{QDRANT_COLLECTION}_{_manifest_hash(current)}"
 
 
+def _qdrant_alias_supported(*, refresh: bool = False) -> bool:
+    """Return whether the configured Qdrant endpoint implements alias APIs.
+
+    The bundled lightweight Qdrant-compatible stub supports collections and
+    points but may not implement GET /aliases or POST /collections/aliases.
+    In auto mode we probe once per TTL and fall back to the immutable physical
+    collection. Real Qdrant keeps the atomic alias-switch path.
+    """
+    if QDRANT_ALIAS_MODE == "physical":
+        return False
+    ts = time.monotonic()
+    cached = _QDRANT_ALIAS_CAPABILITY.get("supported")
+    checked = float(_QDRANT_ALIAS_CAPABILITY.get("checked_at") or 0.0)
+    if not refresh and cached is not None and ts - checked < QDRANT_ALIAS_PROBE_TTL_SECONDS:
+        return bool(cached)
+    result = _qdrant_req("GET", "/aliases", timeout=3.0)
+    supported = bool(
+        isinstance(result, dict)
+        and str(result.get("status") or "ok") == "ok"
+        and isinstance(((result.get("result") or {}).get("aliases")), list)
+    )
+    _QDRANT_ALIAS_CAPABILITY.update({
+        "checked_at": ts,
+        "supported": supported,
+        "error": "" if supported else "alias_api_unavailable",
+    })
+    return supported
+
+
 def _active_collection_name() -> str:
-    """Stable alias used by all online reads and outbox writes."""
-    return QDRANT_ALIAS
+    """Online collection used by reads and outbox writes.
+
+    Real Qdrant uses the stable alias. Alias-less local stubs use the physical
+    manifest collection directly, preserving semantic search instead of
+    silently accumulating failed outbox jobs.
+    """
+    if QDRANT_ALIAS_MODE == "require":
+        return QDRANT_ALIAS
+    return QDRANT_ALIAS if _qdrant_alias_supported() else _physical_collection_name()
 
 
 def _collection_config(collection: str) -> Optional[dict]:
@@ -1272,6 +1323,9 @@ def _qdrant_upsert(claim_id: str, vector: List[float], payload: dict, collection
         _debug_log(f"qdrant vector size mismatch: expected={QDRANT_VECTOR_SIZE}, actual={len(vector)}")
         return False
     coll = collection or _active_collection_name()
+    if coll != QDRANT_ALIAS and not _ensure_collection(coll):
+        _debug_log(f"qdrant physical collection unavailable: {coll}")
+        return False
     stored_payload = dict(payload or {})
     stored_payload["claim_id"] = str(claim_id)
     result = _qdrant_req(
@@ -1363,9 +1417,10 @@ def _qdrant_search(vector: List[float], limit: int = 20) -> List[Tuple[str, floa
     """Векторный поиск через настоящий Qdrant."""
     if len(vector) != QDRANT_VECTOR_SIZE:
         return []
+    coll = _active_collection_name()
     result = _qdrant_req(
         "POST",
-        f"/collections/{QDRANT_ALIAS}/points/query",
+        f"/collections/{coll}/points/query",
         {
             "query": vector,
             "limit": max(1, int(limit)),
@@ -1400,6 +1455,8 @@ def _qdrant_count(collection: Optional[str] = None) -> Optional[int]:
 
 
 def _qdrant_alias_target(alias: str = QDRANT_ALIAS) -> str:
+    if not _qdrant_alias_supported():
+        return ""
     result = _qdrant_req("GET", "/aliases")
     aliases = (((result or {}).get("result") or {}).get("aliases") or [])
     for item in aliases:
@@ -1408,8 +1465,28 @@ def _qdrant_alias_target(alias: str = QDRANT_ALIAS) -> str:
     return ""
 
 
+def _qdrant_resolved_active_collection() -> str:
+    """Resolve the collection that online queries actually use."""
+    alias_supported = _qdrant_alias_supported()
+    if alias_supported:
+        return _qdrant_alias_target(QDRANT_ALIAS)
+    if QDRANT_ALIAS_MODE == "require":
+        return ""
+    physical = _physical_collection_name()
+    return physical if _collection_config(physical) is not None else ""
+
+
 def _switch_alias(new_collection: str) -> bool:
-    """Atomically move the stable alias without deleting a missing alias."""
+    """Activate a collection.
+
+    Alias-capable Qdrant gets an atomic switch. Alias-less stubs operate on the
+    deterministic physical collection, so activation is a verified no-op.
+    """
+    if not _qdrant_alias_supported(refresh=True):
+        if QDRANT_ALIAS_MODE == "require":
+            _debug_log("Qdrant alias API is required but unavailable")
+            return False
+        return _collection_config(new_collection) is not None
     current = _qdrant_alias_target(QDRANT_ALIAS)
     if current == new_collection:
         return True
@@ -2362,22 +2439,22 @@ class MemoryWikiProvider(MemoryProvider):
                 f"{manifest_change['new_hash']}. Run memory_wiki_reindex before "
                 "treating semantic results as fully compatible."
             )
-        # Alias bootstrap: ensure memory_wiki_claims_active points to active collection
+        # Qdrant bootstrap. Real Qdrant uses aliases; the lightweight stub
+        # transparently operates on the deterministic physical collection.
         if SEMANTIC_ENABLED:
             try:
-                alias_check = _qdrant_req("GET", "/aliases")
-                aliases = (((alias_check or {}).get("result") or {}).get("aliases") or [])
-                alias_exists = any(str(item.get("alias_name") or "") == QDRANT_ALIAS for item in aliases)
-                if not alias_exists:
-                    coll = _physical_collection_name()
-                    if not _ensure_collection(coll):
-                        _debug_log("Bootstrap FAILED: could not create Qdrant physical collection")
-                    elif _switch_alias(coll):
+                coll = _physical_collection_name()
+                if not _ensure_collection(coll):
+                    _debug_log("Bootstrap FAILED: could not create Qdrant physical collection")
+                elif _qdrant_alias_supported():
+                    if _switch_alias(coll):
                         _debug_log(f"Bootstrap OK: alias {QDRANT_ALIAS} → {coll}")
                     else:
                         _debug_log(f"Bootstrap FAILED: could not create alias {QDRANT_ALIAS} → {coll}")
+                else:
+                    _debug_log(f"Bootstrap OK: alias API unavailable; physical mode → {coll}")
             except Exception as e:
-                _debug_log(f"Alias bootstrap error: {e}")
+                _debug_log(f"Qdrant bootstrap error: {e}")
         # --- F2/F3: Build TF-IDF vocabulary from existing claims ---
         try:
             c = self._connect()
@@ -3204,7 +3281,7 @@ class MemoryWikiProvider(MemoryProvider):
             {"name":"memory_wiki_immune_scan","description":"Scan memory database for quality issues and report findings.","parameters":P({"mode":{"type":"string","enum":["suggest","apply"],"default":"suggest"},"limit":{"type":"integer","default":100}})},
             {"name":"memory_wiki_compress_topic","description":"Create a synthetic summary claim for a topic and optionally supersede older low-priority claims.","parameters":P({"topic":{"type":"string"},"mode":{"type":"string","enum":["suggest","apply"],"default":"suggest"},"limit":{"type":"integer","default":30}}, ["topic"])},
             {"name":"memory_wiki_resolve_by_policy","description":"Resolve contradiction using policy: prefer_explicit_user, prefer_recent, prefer_verified, prefer_environment_probe.","parameters":P({"contradiction_id":{"type":"string"},"policy":{"type":"string","default":"prefer_explicit_user"}}, ["contradiction_id"])},
-            {"name":"memory_wiki_repair","description":"Run targeted self-healing repairs: fts, dashboards, integrity, or all.","parameters":P({"target":{"type":"string","enum":["fts","dashboards","integrity","all"],"default":"all"},"dry_run":{"type":"boolean","default":True}})},
+            {"name":"memory_wiki_repair","description":"Run targeted self-healing repairs: fts, dashboards, integrity, outbox, or all.","parameters":P({"target":{"type":"string","enum":["fts","dashboards","integrity","outbox","all"],"default":"all"},"dry_run":{"type":"boolean","default":True}})},
             {"name":"memory_wiki_audit_log","description":"Show recent memory-wiki write/repair/backup/restore audit events.","parameters":P({"limit":{"type":"integer","default":50}})},
             {"name":"memory_wiki_write_firewall","description":"Dry-run or queue a candidate memory through source policy, quality lint, artifact detection and secret firewall before durable write.","parameters":P({"claim":{"type":"string"},"topic":{"type":"string","default":"general"},"evidence":{"type":"string","default":""},"source":{"type":"string","default":"tool"},"mode":{"type":"string","enum":["check","queue","apply"],"default":"check"},"confidence":{"type":"number","default":0.75},"salience":{"type":"number","default":0.7}}, ["claim"])},
             {"name":"memory_wiki_mutation_log","description":"Return transactional mutation log entries with before/after metadata for undo/audit.","parameters":P({"limit":{"type":"integer","default":50},"target_table":{"type":"string","default":""},"target_id":{"type":"string","default":""},"since_seconds":{"type":"integer","default":0}}, [])},
@@ -6369,6 +6446,14 @@ class MemoryWikiProvider(MemoryProvider):
         )
         evidence = json.dumps({"files": files, "sensitive_names": sorted(set(sensitive)), "variables": sorted(set(all_names))}, ensure_ascii=False)
         try:
+            with self._connect() as probe_conn:
+                unchanged = probe_conn.execute(
+                    """SELECT id FROM claims WHERE status='active' AND claim=? AND evidence=?
+                       AND source='memory-wiki:env-metadata:v2' LIMIT 1""",
+                    (claim, short(evidence, 2000)),
+                ).fetchone()
+            if unchanged:
+                return
             cid = self._add_claim(claim, "config", evidence, "memory-wiki:env-metadata:v2", 0.90, 0.84)
             with self._connect() as c:
                 old_rows = c.execute(
@@ -8770,7 +8855,7 @@ class MemoryWikiProvider(MemoryProvider):
         ]
         plan=self._recall_plan(query, 12, preselected_rows=rows)
         graph=self._graph_query(query, 12)
-        secrets=self._query_secrets(query, 8, False) if plan.get('secrets_recommended') else []
+        secrets=self._query_secrets(query, 8) if plan.get('secrets_recommended') else []
         qtok=set(tokens(query)); omitted={'secret_or_quarantined':0,'low_relevance':0,'artifact_or_low_quality':0,'secrets_not_requested':0,'suppressed_by_coverage':0,'duplicate_claim_id':0,'duplicate_content':0}; sources={'claims':len(rows),'secrets':len(secrets),'relations':len(graph.get('relations',[])),'task_capsules':0,'sessions':0,'preference_rules':0,'memory_diff':0,'suppressed_claims':len(suppressed_ids),'llm_refined':False,'sectioned':True}
         if not plan.get('secrets_recommended'):
             omitted['secrets_not_requested']=1
@@ -8976,6 +9061,28 @@ class MemoryWikiProvider(MemoryProvider):
             c.execute("INSERT OR IGNORE INTO source_artifacts(id,source_table,source_id,artifact_type,redacted_excerpt,source_ref,status,created_at,hash) VALUES(?,?,?,?,?,?,?,?,?)", (aid, "claims", claim_id, artifact_type, red, source_ref or f"claims:{claim_id}", "archived", now(), h))
         return aid
 
+    @staticmethod
+    def _normalize_eval_text(value: str) -> str:
+        """Lowercase, ё→е, keep only letters/digits (collapse other chars to spaces)."""
+        value = str(value or "").lower().replace("ё", "е")
+        value = re.sub(r"[^a-zа-я0-9]+", " ", value)
+        return " ".join(value.split())
+
+    @staticmethod
+    def _contains_eval_terms(text: str, terms: list) -> bool:
+        """Morphology-tolerant substring check: every term must be present.
+
+        Terms may be word roots (e.g. "русск") or full normalized phrases.
+        Matching is done on normalized text so "русском"/"русский" both
+        satisfy the root "русск"; "конкретику"/"конкретный" satisfy "конкрет".
+        """
+        normalized = MemoryWikiProvider._normalize_eval_text(text)
+        for term in terms:
+            t = MemoryWikiProvider._normalize_eval_text(term)
+            if t and t not in normalized:
+                return False
+        return True
+
     def _evaluate_retrieval(self, limit:int=10, max_chars:int=3800)->Dict[str,Any]:
         limit=max(1,min(int(limit or 10),50)); max_chars=max(800,min(int(max_chars or 3800),12000)); c=self._connect()
         cases=[dict(r) for r in c.execute("SELECT * FROM retrieval_eval_cases ORDER BY updated_at DESC LIMIT 100").fetchall()]
@@ -8990,8 +9097,8 @@ class MemoryWikiProvider(MemoryProvider):
             must_include=json.loads(case.get('must_include') or '[]'); must_not_include=json.loads(case.get('must_not_include') or '[]')
             misses=[t for t in must_topics if t and t not in topics and t not in str(pack.get('context',''))]
             bad_topics=[t for t in must_not_topics if t and (t in topics or t in str(pack.get('context','')))]
-            missing_text=[x for x in must_include if x and x.lower() not in text.lower()]
-            forbidden=[x for x in must_not_include if x and x.lower() in text.lower()]
+            missing_text=[x for x in must_include if x and not self._contains_eval_terms(text, [x])]
+            forbidden=[x for x in must_not_include if x and self._contains_eval_terms(text, [x])]
             artifact_hits=[r.get('id') for r in rows if is_ephemeral_fragment(r.get('claim','')) or str(r.get('trust_class','')) in ('tool_log','raw_blob','secret')]
             secret_leak=bool(secret_scan(text).get('raw_secret'))
             ok=not (misses or bad_topics or missing_text or forbidden or artifact_hits or secret_leak)
@@ -9097,6 +9204,79 @@ class MemoryWikiProvider(MemoryProvider):
             self._rebuild_fts(); self._render_all()
         return {'fix_count':len(fixes), 'fixes':fixes[:50]}
 
+    def _repair_failed_outbox(self, dry_run: bool=True, limit: int=5000) -> Dict[str, Any]:
+        """Safely revive failed semantic-index jobs after Qdrant recovery.
+
+        Only embed/upsert/delete jobs whose target resolves to the current online
+        collection are reset. Payloads are never returned, preventing secret or
+        claim-text leakage in diagnostics.
+        """
+        c = self._connect()
+        limit = max(1, min(int(limit or 5000), 50000))
+        online = _active_collection_name()
+        rows = c.execute(
+            """SELECT id,operation,object_id,payload_json,attempts,last_error
+               FROM index_outbox WHERE status='failed'
+               ORDER BY updated_at,id LIMIT ?""",
+            (limit,),
+        ).fetchall()
+        eligible = []
+        skipped = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"] or "{}")
+            except Exception:
+                payload = {}
+            target = str(payload.get("collection") or online)
+            item = {
+                "id": str(row["id"]),
+                "operation": str(row["operation"]),
+                "object_id": str(row["object_id"]),
+                "attempts": int(row["attempts"] or 0),
+                "last_error": short(str(row["last_error"] or ""), 180),
+                "target_collection": target,
+            }
+            if str(row["operation"]) not in {"upsert", "embed_and_upsert", "delete"}:
+                item["reason"] = "unsupported_operation"
+                skipped.append(item)
+            elif target not in {online, QDRANT_ALIAS, _physical_collection_name()}:
+                item["reason"] = "stale_collection_target"
+                skipped.append(item)
+            else:
+                eligible.append(item)
+        if not dry_run and eligible:
+            ts = now()
+            ids = [item["id"] for item in eligible]
+            with c:
+                for item in eligible:
+                    row = c.execute(
+                        "SELECT payload_json FROM index_outbox WHERE id=?",
+                        (item["id"],),
+                    ).fetchone()
+                    try:
+                        payload = json.loads((row["payload_json"] if row else "") or "{}")
+                    except Exception:
+                        payload = {}
+                    payload["collection"] = online
+                    c.execute(
+                        """UPDATE index_outbox SET status='pending',attempts=0,last_error='',
+                            worker_id='',lease_until=0,next_retry_at=?,updated_at=?,payload_json=?
+                            WHERE id=?""",
+                        (ts, ts, json.dumps(payload, ensure_ascii=False), item["id"]),
+                    )
+            _start_outbox_worker(str(self.db_path))
+            _wake_outbox_worker(str(self.db_path))
+            self._audit("repair_outbox", "ok", f"revived={len(ids)} skipped={len(skipped)}")
+        return {
+            "dry_run": dry_run,
+            "online_collection": online,
+            "failed_seen": len(rows),
+            "eligible_count": len(eligible),
+            "skipped_count": len(skipped),
+            "eligible": eligible[:100],
+            "skipped": skipped[:100],
+        }
+
     def _repair(self, target: str='all', dry_run: bool=True) -> Dict[str, Any]:
         target=(target or 'all').lower(); actions=[]
         def act(name, fn=None, run_when_dry=False):
@@ -9112,6 +9292,8 @@ class MemoryWikiProvider(MemoryProvider):
             act('rebuild_claims_fts', self._rebuild_fts)
         if target in ('all','dashboards'):
             act('render_topic_pages', self._render_all); act('render_active_dashboard', self._render_active_dashboard)
+        if target in ('all','outbox'):
+            act('revive_failed_outbox', lambda: self._repair_failed_outbox(dry_run), run_when_dry=True)
         if target in ('all','integrity'):
             def preserve():
                 self._preserve_db_files('repair')
@@ -9150,9 +9332,12 @@ class MemoryWikiProvider(MemoryProvider):
     def _semantic_status(self) -> Dict[str,Any]:
         embed_ok = bool(_semantic_available())
         pts = 0
-        active_target = _qdrant_alias_target(QDRANT_ALIAS)
+        alias_supported = _qdrant_alias_supported()
+        alias_target = _qdrant_alias_target(QDRANT_ALIAS) if alias_supported else ""
+        active_target = _qdrant_resolved_active_collection()
         try:
-            r = _qdrant_req("GET", f"/collections/{QDRANT_ALIAS}")
+            online_collection = QDRANT_ALIAS if alias_supported and alias_target else active_target
+            r = _qdrant_req("GET", f"/collections/{online_collection}") if online_collection else None
             pts = r.get("result", {}).get("points_count", 0) if r else 0
         except Exception:
             pass
@@ -9173,6 +9358,13 @@ class MemoryWikiProvider(MemoryProvider):
             "manifest_hash": _manifest_hash(manifest),
             "qdrant_points": pts,
             "alias": QDRANT_ALIAS,
+            "alias_mode": (
+                "alias" if alias_supported else
+                ("required_unavailable" if QDRANT_ALIAS_MODE == "require" else "physical_fallback")
+            ),
+            "alias_api_supported": alias_supported,
+            "atomic_alias_switch": alias_supported,
+            "alias_target": alias_target,
             "active_collection": active_target,
             "expected_collection": _physical_collection_name(manifest),
             "rerank": self._rerank_status(),
@@ -9206,7 +9398,8 @@ class MemoryWikiProvider(MemoryProvider):
         # A force+limit run must resume the same generated target instead of creating
         # a fresh timestamped collection on every call.
         target_coll = base_target
-        if force:
+        alias_supported = _qdrant_alias_supported()
+        if force and alias_supported:
             running_force = c.execute(
                 "SELECT target_collection FROM reindex_jobs "
                 "WHERE status='running' AND manifest_json=? AND target_collection LIKE ? "
@@ -9231,7 +9424,7 @@ class MemoryWikiProvider(MemoryProvider):
             "AND normalized_claim != ''"
         ).fetchone()[0])
         existing_count = _qdrant_count(target_coll) or 0
-        active_target = _qdrant_alias_target(QDRANT_ALIAS)
+        active_target = _qdrant_resolved_active_collection()
         if total_active == 0:
             target_state = _qdrant_claim_state(target_coll)
             if target_state is None:
