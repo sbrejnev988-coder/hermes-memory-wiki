@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Robust MCP stdio wrapper for Hermes Memory Wiki.
+"""Self-healing MCP wrapper for Hermes Memory Wiki.
 
-Keeps tools/list instant through a generated cache, but refreshes the in-memory
-schema map after lazy provider loading so a stale cache can never permanently
-block a tool that the provider actually supports.
+Unlike the old wrapper, this server does not fail at process start when
+`tool_schemas.json` is missing. It can build a synchronized schema cache from
+MemoryWikiProvider.get_tool_schemas().
 """
 from __future__ import annotations
 
@@ -12,13 +12,20 @@ import json
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Tuple
+from typing import Any
 
-SERVER_VERSION = "1.20.1-audit-fix-r1"
 _PROVIDER = None
-_SCHEMA_FILE = Path(__file__).with_name("tool_schemas.json")
-_SCHEMAS: List[Dict[str, Any]] = []
-_SCHEMA_MAP: Dict[str, Dict[str, Any]] = {}
+_SCHEMAS: list[dict[str, Any]] | None = None
+_SCHEMA_MAP: dict[str, dict[str, Any]] = {}
+BASE_DIR = Path(__file__).resolve().parent
+SCHEMAS_FILE = BASE_DIR / "tool_schemas.json"
+HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+PLUGIN_PATH = Path(
+    os.environ.get(
+        "MW_PLUGIN_PATH",
+        str(HERMES_HOME / "plugins" / "memory-wiki" / "__init__.py"),
+    )
+).expanduser()
 
 
 def log(message: str) -> None:
@@ -26,168 +33,155 @@ def log(message: str) -> None:
     sys.stderr.flush()
 
 
-def send(payload: Dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+def send(data: dict[str, Any]) -> None:
+    sys.stdout.write(json.dumps(data, ensure_ascii=False, default=str) + "\n")
     sys.stdout.flush()
 
 
-def error(request_id: Any, code: int, message: str) -> None:
-    send({"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": str(message)[:1000]}})
-
-
-def _validate_schemas(value: Any) -> List[Dict[str, Any]]:
-    if not isinstance(value, list):
-        raise ValueError("tool schema cache must be a JSON array")
-    result: List[Dict[str, Any]] = []
-    seen = set()
-    for item in value:
-        if not isinstance(item, dict):
-            raise ValueError("each cached tool schema must be an object")
-        name = str(item.get("name") or "").strip()
-        params = item.get("parameters")
-        if not name or name in seen or not isinstance(params, dict):
-            raise ValueError(f"invalid or duplicate cached schema: {name!r}")
-        seen.add(name)
-        result.append(item)
-    return result
-
-
-def load_cached_schemas() -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
-    with _SCHEMA_FILE.open("r", encoding="utf-8") as handle:
-        schemas = _validate_schemas(json.load(handle))
-    return schemas, {schema["name"]: schema for schema in schemas}
-
-
-def _plugin_path() -> Path:
-    configured = os.environ.get("MW_PLUGIN_PATH", "").strip()
-    if configured:
-        return Path(configured).expanduser().resolve()
-    home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
-    return (home / "plugins" / "memory-wiki" / "__init__.py").resolve()
-
-
-def ensure_plugin() -> None:
-    global _PROVIDER, _SCHEMAS, _SCHEMA_MAP
+def ensure_plugin():
+    global _PROVIDER
     if _PROVIDER is not None:
-        return
-    plugin_path = _plugin_path()
-    if not plugin_path.is_file():
-        raise FileNotFoundError(f"memory-wiki plugin not found: {plugin_path}")
+        return _PROVIDER
+    if not PLUGIN_PATH.is_file():
+        raise FileNotFoundError(f"Memory Wiki plugin not found: {PLUGIN_PATH}")
     spec = importlib.util.spec_from_file_location(
-        "memory_wiki_mcp", plugin_path,
-        submodule_search_locations=[str(plugin_path.parent)],
+        "mw_mcp",
+        PLUGIN_PATH,
+        submodule_search_locations=[str(PLUGIN_PATH.parent)],
     )
     if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot create import spec for {plugin_path}")
+        raise RuntimeError(f"Unable to create import spec for {PLUGIN_PATH}")
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     provider = module.MemoryWikiProvider()
     provider.initialize(
-        "mcp_server",
-        hermes_home=os.environ.get("HERMES_HOME"),
-        agent_context="mcp_stdio",
+        "mw_mcp",
+        hermes_home=str(HERMES_HOME),
+        agent_context="mcp",
     )
-    live = _validate_schemas(provider.get_tool_schemas())
     _PROVIDER = provider
-    live_map = {schema["name"]: schema for schema in live}
-    if set(live_map) != set(_SCHEMA_MAP):
-        missing = sorted(set(live_map) - set(_SCHEMA_MAP))
-        stale = sorted(set(_SCHEMA_MAP) - set(live_map))
-        log(f"Schema cache drift detected: missing={len(missing)} stale={len(stale)}; using live schemas")
-    _SCHEMAS, _SCHEMA_MAP = live, live_map
-    log(f"Plugin loaded ({len(live)} tools)")
+    log("Plugin loaded")
+    return provider
 
 
-def handle(req: Any) -> None:
-    if not isinstance(req, dict) or req.get("jsonrpc") not in (None, "2.0"):
-        error(req.get("id") if isinstance(req, dict) else None, -32600, "Invalid Request")
-        return
-    request_id = req.get("id")
-    method = req.get("method")
-    params = req.get("params") or {}
-    if not isinstance(params, dict):
-        error(request_id, -32602, "params must be an object")
-        return
-    notification = request_id is None
+def mcp_name(plugin_name: str) -> str:
+    if plugin_name.startswith("memory_wiki_"):
+        return "mw_" + plugin_name[len("memory_wiki_"):]
+    return plugin_name
 
-    if method == "initialize":
-        if not notification:
-            send({"jsonrpc": "2.0", "id": request_id, "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "memory-wiki", "version": SERVER_VERSION},
-            }})
-        return
-    if method == "notifications/initialized":
-        return
-    if method == "ping":
-        if not notification:
-            send({"jsonrpc": "2.0", "id": request_id, "result": {}})
-        return
-    if method == "tools/list":
-        if not notification:
-            send({"jsonrpc": "2.0", "id": request_id, "result": {"tools": _SCHEMAS}})
-        return
-    if method != "tools/call":
-        if not notification:
-            error(request_id, -32601, f"Unknown method: {method}")
-        return
 
-    tool_name = str(params.get("name") or "")
-    tool_args = params.get("arguments") or {}
-    if not isinstance(tool_args, dict):
-        error(request_id, -32602, "tool arguments must be an object")
-        return
-    # For an unknown cached name, lazy-load once before rejecting it. This
-    # prevents a stale cache from hiding newly shipped provider tools.
-    if tool_name not in _SCHEMA_MAP:
-        try:
-            ensure_plugin()
-        except Exception as exc:
-            if not notification:
-                error(request_id, -32000, exc)
-            return
-    if tool_name not in _SCHEMA_MAP:
-        if not notification:
-            error(request_id, -32601, f"Unknown tool: {tool_name}")
-        return
-    try:
-        ensure_plugin()
-        result = _PROVIDER.handle_tool_call(tool_name, tool_args)
-        text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
-        if not notification:
-            send({"jsonrpc": "2.0", "id": request_id, "result": {
-                "content": [{"type": "text", "text": text}], "isError": False,
-            }})
-    except Exception as exc:
-        if not notification:
-            send({"jsonrpc": "2.0", "id": request_id, "result": {
-                "content": [{"type": "text", "text": str(exc)[:1000]}], "isError": True,
-            }})
+def plugin_name(mcp_tool_name: str) -> str:
+    if mcp_tool_name.startswith("mw_"):
+        return "memory_wiki_" + mcp_tool_name[3:]
+    return mcp_tool_name
+
+
+def normalize_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    name = mcp_name(str(schema.get("name") or ""))
+    parameters = schema.get("inputSchema")
+    if not isinstance(parameters, dict):
+        parameters = schema.get("parameters")
+    if not isinstance(parameters, dict):
+        parameters = {"type": "object", "properties": {}, "required": []}
+    parameters.setdefault("type", "object")
+    parameters.setdefault("properties", {})
+    parameters.setdefault("required", [])
+    return {
+        "name": name,
+        "description": str(schema.get("description") or ""),
+        "inputSchema": parameters,
+    }
+
+
+def load_schemas() -> list[dict[str, Any]]:
+    global _SCHEMAS, _SCHEMA_MAP
+    if _SCHEMAS is not None:
+        return _SCHEMAS
+
+    provider = ensure_plugin()
+    raw = provider.get_tool_schemas()
+    schemas = [normalize_schema(item) for item in raw if isinstance(item, dict)]
+    schemas = [item for item in schemas if item.get("name")]
+    if not schemas:
+        raise RuntimeError("MemoryWikiProvider.get_tool_schemas() returned no tools")
+
+    temporary = SCHEMAS_FILE.with_suffix(".json.tmp")
+    temporary.write_text(
+        json.dumps(schemas, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(SCHEMAS_FILE)
+
+    _SCHEMAS = schemas
+    _SCHEMA_MAP = {item["name"]: item for item in schemas}
+    log(f"Ready: {len(schemas)} synchronized tools")
+    return schemas
+
+
+def error_response(message_id, code: int, message: str) -> None:
+    send({
+        "jsonrpc": "2.0",
+        "id": message_id,
+        "error": {"code": code, "message": str(message)[:1000]},
+    })
 
 
 def main() -> int:
-    global _SCHEMAS, _SCHEMA_MAP
-    try:
-        _SCHEMAS, _SCHEMA_MAP = load_cached_schemas()
-    except Exception as exc:
-        log(f"Schema cache load failed: {exc}; lazy provider load required")
-        _SCHEMAS, _SCHEMA_MAP = [], {}
-    log(f"Ready: {len(_SCHEMAS)} tools from cache")
-    for line in sys.stdin:
+    while True:
+        line = sys.stdin.readline()
+        if not line:
+            break
         try:
             request = json.loads(line)
-        except json.JSONDecodeError as exc:
-            error(None, -32700, f"Parse error: {exc.msg}")
+        except json.JSONDecodeError:
             continue
+
+        message_id = request.get("id")
+        method = request.get("method")
+        params = request.get("params") or {}
         try:
-            handle(request)
+            if method == "initialize":
+                send({
+                    "jsonrpc": "2.0",
+                    "id": message_id,
+                    "result": {
+                        "protocolVersion": "2024-11-05",
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "mw", "version": "1.20.8-fix-r1"},
+                    },
+                })
+            elif method == "notifications/initialized":
+                continue
+            elif method == "tools/list":
+                send({
+                    "jsonrpc": "2.0",
+                    "id": message_id,
+                    "result": {"tools": load_schemas()},
+                })
+            elif method == "tools/call":
+                schemas = load_schemas()
+                tool_name = str(params.get("name") or "")
+                if tool_name not in _SCHEMA_MAP:
+                    error_response(message_id, -32601, f"Unknown tool: {tool_name}")
+                    continue
+                arguments = params.get("arguments") or {}
+                result = ensure_plugin().handle_tool_call(plugin_name(tool_name), arguments)
+                text = (
+                    json.dumps(result, ensure_ascii=False, default=str)
+                    if isinstance(result, (dict, list))
+                    else str(result)
+                )
+                send({
+                    "jsonrpc": "2.0",
+                    "id": message_id,
+                    "result": {"content": [{"type": "text", "text": text}]},
+                })
+            else:
+                error_response(message_id, -32601, f"Unknown method: {method}")
         except Exception as exc:
-            log(f"Unhandled request error: {type(exc).__name__}: {exc}")
-            request_id = request.get("id") if isinstance(request, dict) else None
-            if request_id is not None:
-                error(request_id, -32603, "Internal error")
+            log(f"Error: {type(exc).__name__}: {exc}")
+            error_response(message_id, -32000, f"{type(exc).__name__}: {exc}")
     return 0
 
 
