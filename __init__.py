@@ -236,7 +236,7 @@ except Exception as _trust_exc:
 # Embedding + Qdrant clients (stdlib-only, ноль зависимостей)
 # Режимы: stub (n-gram cosine) / openrouter (ML embeddings)
 # ═════════════════════════════════════════════════════════════
-EMBED_PROVIDER = os.environ.get("MEMORY_WIKI_EMBED_PROVIDER", "stub").lower()
+EMBED_PROVIDER = os.environ.get("MEMORY_WIKI_EMBED_PROVIDER", "openrouter").lower()
 
 _DEFAULT_EMBED_URL = (
     "https://openrouter.ai/api/v1"
@@ -256,9 +256,9 @@ def _env_int(name: str, default: int, low: int, high: int) -> int:
         return default
 
 
-# The active Qdrant contract for this build is 2560 dimensions. Both values are
+# The active Qdrant contract for this build is 4096 dimensions. Both values are
 # kept separate so a bad .env is detected instead of silently creating mixed vectors.
-EMBED_DIMENSIONS = _env_int("MEMORY_WIKI_EMBED_DIMENSIONS", 2560, 8, 65536)
+EMBED_DIMENSIONS = _env_int("MEMORY_WIKI_EMBED_DIMENSIONS", 4096, 8, 65536)
 EMBED_INPUT_MAX_CHARS = _env_int("MEMORY_WIKI_EMBED_INPUT_MAX_CHARS", 12000, 256, 131072)
 _DEFAULT_EMBED_MODEL = (
     "qwen/qwen3-embedding-8b"
@@ -328,7 +328,7 @@ QDRANT_API_KEY = os.environ.get(
     "",
 )
 
-QDRANT_VECTOR_SIZE = _env_int("MEMORY_WIKI_VECTOR_SIZE", 2560, 8, 65536)
+QDRANT_VECTOR_SIZE = _env_int("MEMORY_WIKI_VECTOR_SIZE", 4096, 8, 65536)
 
 # ═══ Embedding Manifest v2.0 + Transactional Outbox ═══
 def _embedding_manifest() -> dict:
@@ -3009,7 +3009,37 @@ class MemoryWikiProvider(MemoryProvider):
             if current_chars + len(line) + 1 <= memory_budget:
                 lines.append(line); current_chars += len(line) + 1
 
-        memory_text = "\n".join(lines)
+        # SEMANTIC_CACHE_MEMORY_SIGNATURE_R11
+        # A compact, secret-free fingerprint lets the DeepSeek proxy reuse a
+        # response only when the actually injected Memory Wiki context is the same.
+        cache_signature_payload = {
+            "v": 1,
+            "claims": sorted([
+                [
+                    str(row.get("id") or ""),
+                    int(row.get("memory_revision") or 0),
+                    str(row.get("visibility_scope") or "global"),
+                    str(row.get("status") or "active"),
+                    sha(str(row.get("claim") or ""))[:16],
+                ]
+                for row in used_rows
+            ]),
+            "trusted": sorted(sha(str(block))[:16] for block in trusted_blocks),
+            "knowledge": sorted(sha(str(block))[:16] for block in knowledge_blocks),
+        }
+        cache_scope = "personal" if (used_rows or trusted_blocks) else ("project" if knowledge_blocks else "generic")
+        cache_revision = max([int(row.get("memory_revision") or 0) for row in used_rows] or [0])
+        cache_claim_set_hash = sha(json.dumps(cache_signature_payload, ensure_ascii=False, sort_keys=True))[:32]
+        cache_signature_line = (
+            f"[memory-cache-signature v=1 scope={cache_scope} "
+            f"claim_set_hash={cache_claim_set_hash} revision={cache_revision}]"
+        )
+        memory_text = "\n".join([lines[0], cache_signature_line, *lines[1:]])
+        diag["cache_signature"] = {
+            "scope": cache_scope,
+            "claim_set_hash": cache_claim_set_hash,
+            "revision": cache_revision,
+        }
         out = memory_text
         if knowledge_text:
             out = memory_text[:memory_budget] + "\n" + knowledge_text[:knowledge_budget]
@@ -7380,6 +7410,74 @@ class MemoryWikiProvider(MemoryProvider):
             overlap=len(t & ot); sim=overlap / max(1, len(t | ot))
             if overlap >= 18 and sim >= 0.42 and neg != self._neg(o["claim"]):
                 self._add_contradiction(cid,o["id"],"high-overlap active same-topic same-scope factual claims with opposite negation markers")
+
+
+    # HERMES-MW-4096-CONTRADICTION-FIX-R1
+    def _detect_all_contradictions(self, limit: int = 5000) -> int:
+        """Run the existing per-claim detector across active claims.
+
+        The repository's maintenance path calls this method, but some releases
+        shipped without its definition. This implementation deliberately reuses
+        _detect_contradictions_for() so contradiction policy remains unchanged.
+        Failures for one claim are logged and do not abort session-end maintenance.
+        """
+        try:
+            scan_limit = max(1, min(int(limit), 10000))
+        except (TypeError, ValueError):
+            scan_limit = 5000
+
+        connection = self._connect()
+        rows = connection.execute(
+            "SELECT id, claim FROM claims WHERE status='active' "
+            "ORDER BY pinned DESC, updated_at DESC LIMIT ?",
+            (scan_limit,),
+        ).fetchall()
+
+        try:
+            before = int(connection.execute(
+                "SELECT COUNT(*) FROM contradictions WHERE status='open'"
+            ).fetchone()[0])
+        except Exception:
+            before = 0
+
+        scanned = 0
+        for row in rows:
+            try:
+                if hasattr(row, "keys"):
+                    claim_id = str(row["id"])
+                    claim_text = str(row["claim"] or "")
+                else:
+                    claim_id = str(row[0])
+                    claim_text = str(row[1] or "")
+                if not claim_id or not self._neg(claim_text):
+                    continue
+                self._detect_contradictions_for(claim_id)
+                scanned += 1
+            except Exception as exc:
+                try:
+                    _debug_log(
+                        "contradiction scan skipped claim: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                except Exception:
+                    pass
+
+        try:
+            after = int(connection.execute(
+                "SELECT COUNT(*) FROM contradictions WHERE status='open'"
+            ).fetchone()[0])
+        except Exception:
+            after = before
+
+        try:
+            _debug_log(
+                f"contradiction scan completed: scanned={scanned} "
+                f"new_open={max(0, after - before)}"
+            )
+        except Exception:
+            pass
+
+        return max(0, after - before)
 
     def _neg(self, s: str) -> bool:
         low=f" {s.lower()} "; return any(m in low for m in (" not "," never "," no ","n't"," do not ","не ","никогда","нельзя","без "))
