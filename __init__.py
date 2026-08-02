@@ -5,6 +5,8 @@ $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
 logical checkpoints for replay recovery. Runs inside MemoryProvider lifecycle,
 so recall is near prompt building and session lifecycle, not bolted on as MCP.
 
+R17 cache contract markers: MEMORY_CACHE_STATE_CONTRACT_R17, MEMORY_WIKI_INJECTION_V2.
+
 v1.5.0 — Cross-Source Collapse & Session Intelligence (2026-06-27):
   + Cross-source collapse: salience ranking with cross-source corroboration
   + Social closer detection: skip search for trivial messages
@@ -2608,6 +2610,45 @@ class MemoryWikiProvider(MemoryProvider):
         c = conn or self._connect()
         _meta_set_max(c, key, value)
 
+    def _memory_cache_state_contract(self, used_rows: List[Dict[str, Any]], cache_scope: str) -> Dict[str, Any]:
+        """Return the v2 durable cache identity without coupling response identity to global state.
+
+        state_token advances once per accepted logical claim/evidence write.  The
+        actual FTS/Qdrant watermarks remain separately visible as index_revision
+        for diagnostics and readiness checks.
+        """
+        visibility = {str(row.get("visibility_scope") or "global") for row in (used_rows or [])}
+        projects = sorted({str(row.get("project_id") or "") for row in (used_rows or []) if row.get("project_id")})
+        if visibility & {"private", "chat"}:
+            partition = "private:" + self._chat_hash(self.session_id)
+        elif "project" in visibility or cache_scope == "project":
+            partition = "project:" + sha("|".join(projects) or str(self.project_scope or "default"))[:24]
+        elif "bot" in visibility:
+            partition = "bot:" + sha(str(self.bot_id or "default"))[:24]
+        else:
+            partition = "shared"
+        state_revision = self._meta_int("cache_state_revision", self._meta_int("memory_revision"))
+        fts_revision = self._meta_int("fts_latest_revision")
+        qdrant_revision = self._meta_int("qdrant_latest_revision")
+        database_instance_id = self.database_instance_id or self._meta_text("database_instance_id", "uninitialized")
+        state_material = {
+            "contract": "memory-cache-state-v2-r17",
+            "database_instance_id": database_instance_id,
+            "partition": partition,
+            "state_revision": state_revision,
+            "fts_target_revision": state_revision,
+            "qdrant_target_revision": state_revision if SEMANTIC_ENABLED else 0,
+            "semantic_enabled": bool(SEMANTIC_ENABLED),
+        }
+        return {
+            "version": 2,
+            "partition": partition,
+            "state_revision": state_revision,
+            "state_token": sha(json.dumps(state_material, ensure_ascii=False, sort_keys=True))[:32],
+            "index_revision": f"fts:{fts_revision};qdrant:{qdrant_revision}",
+            "state_consistent": bool(fts_revision >= state_revision and (not SEMANTIC_ENABLED or qdrant_revision >= state_revision)),
+        }
+
     def _chat_hash(self, session_id: str = "") -> str:
         sid = str(session_id or self.session_id or "default")
         salt = self.database_instance_id or self._meta_text("database_instance_id", "uninitialized")
@@ -3235,7 +3276,7 @@ class MemoryWikiProvider(MemoryProvider):
         # A compact, secret-free fingerprint lets the DeepSeek proxy reuse a
         # response only when the actually injected Memory Wiki context is the same.
         cache_signature_payload = {
-            "v": 1,
+            "v": 2,
             "claims": sorted([
                 [
                     str(row.get("id") or ""),
@@ -3252,15 +3293,22 @@ class MemoryWikiProvider(MemoryProvider):
         cache_scope = "personal" if (used_rows or trusted_blocks) else ("project" if knowledge_blocks else "generic")
         cache_revision = max([int(row.get("memory_revision") or 0) for row in used_rows] or [0])
         cache_claim_set_hash = sha(json.dumps(cache_signature_payload, ensure_ascii=False, sort_keys=True))[:32]
+        # MEMORY_CACHE_STATE_CONTRACT_R17
+        cache_state = self._memory_cache_state_contract(used_rows, cache_scope)
         cache_signature_line = (
-            f"[memory-cache-signature v=1 scope={cache_scope} "
-            f"claim_set_hash={cache_claim_set_hash} revision={cache_revision}]"
+            f"[memory-cache-signature v=2 scope={cache_scope} "
+            f"claim_set_hash={cache_claim_set_hash} revision={cache_revision} "
+            f"state_revision={cache_state['state_revision']} state_token={cache_state['state_token']} "
+            f'index_revision="{cache_state["index_revision"]}" partition={cache_state["partition"]} '
+            f"state_consistent={1 if cache_state['state_consistent'] else 0}]"
         )
         memory_text = "\n".join([lines[0], cache_signature_line, *lines[1:]])
         diag["cache_signature"] = {
+            "version": 2,
             "scope": cache_scope,
             "claim_set_hash": cache_claim_set_hash,
             "revision": cache_revision,
+            **cache_state,
         }
         out = memory_text
         if knowledge_text:
@@ -3274,7 +3322,12 @@ class MemoryWikiProvider(MemoryProvider):
         context_open = (
             f'<memory-context source="memory-wiki" version="2" '
             f'scope="{_xml_escape(cache_scope)}" revision="{cache_revision}" '
-            f'claim_set_hash="{cache_claim_set_hash}">'
+            f'claim_set_hash="{cache_claim_set_hash}" '
+            f'state_revision="{cache_state["state_revision"]}" '
+            f'state_token="{cache_state["state_token"]}" '
+            f'index_revision="{_xml_escape(cache_state["index_revision"])}" '
+            f'partition="{_xml_escape(cache_state["partition"])}" '
+            f'state_consistent="{1 if cache_state["state_consistent"] else 0}">'
         )
         context_close = "</memory-context>"
         inner_budget = max(0, MAX_PREFETCH_CHARS - len(context_open) - len(context_close) - 2)
@@ -4627,6 +4680,10 @@ class MemoryWikiProvider(MemoryProvider):
             # Shared-memory identity, revision clock, consumer watermarks and leased outbox.
             c.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('database_instance_id',?)", (uuid.uuid4().hex,))
             c.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('memory_revision','0')")
+            c.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('cache_state_revision','0')")
+            c.execute("""UPDATE meta SET value=(SELECT value FROM meta WHERE key='memory_revision')
+                         WHERE key='cache_state_revision' AND CAST(value AS INTEGER)=0
+                           AND CAST((SELECT value FROM meta WHERE key='memory_revision') AS INTEGER)>0""")
             c.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('fts_latest_revision','0')")
             c.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('qdrant_latest_revision','0')")
             c.execute(
@@ -4693,6 +4750,11 @@ class MemoryWikiProvider(MemoryProvider):
                 for r in c.execute("SELECT id,claim,topic,source FROM claims WHERE quality IS NULL OR quality=0 OR type='fact' OR source_type='unknown'").fetchall():
                     c.execute("UPDATE claims SET quality=?, type=?, source_type=? WHERE id=?", (claim_quality(r["claim"], r["topic"]), infer_claim_type(r["claim"], r["topic"]), infer_source_type(r["source"]), r["id"]))
             c.execute("""CREATE TABLE IF NOT EXISTS evidence(id TEXT PRIMARY KEY, claim_id TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'support', text TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, FOREIGN KEY(claim_id) REFERENCES claims(id) ON DELETE CASCADE)""")
+            c.execute("""CREATE TABLE IF NOT EXISTS claim_write_fingerprints(
+                fingerprint TEXT PRIMARY KEY, claim_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                FOREIGN KEY(claim_id) REFERENCES claims(id) ON DELETE CASCADE)""")
+            c.execute("CREATE INDEX IF NOT EXISTS idx_claim_write_fingerprints_claim ON claim_write_fingerprints(claim_id)")
             c.execute("""CREATE TABLE IF NOT EXISTS contradictions(id TEXT PRIMARY KEY, claim_a TEXT NOT NULL, claim_b TEXT NOT NULL, reason TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open', resolution TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, resolved_at INTEGER, FOREIGN KEY(claim_a) REFERENCES claims(id) ON DELETE CASCADE, FOREIGN KEY(claim_b) REFERENCES claims(id) ON DELETE CASCADE)""")
             if "resolution" not in self._cols("contradictions"): c.execute("ALTER TABLE contradictions ADD COLUMN resolution TEXT NOT NULL DEFAULT ''")
             if "severity" not in self._cols("contradictions"): c.execute("ALTER TABLE contradictions ADD COLUMN severity TEXT NOT NULL DEFAULT 'possible'")
@@ -5661,9 +5723,10 @@ class MemoryWikiProvider(MemoryProvider):
                 phase_sep_version=phase_sep_version,
                 conn=conn,
             )
-        post_commit_failures = self._after_claim_commit(cid, prepared["topic"], prepared["claim"])
+        post_commit_failures = [] if prepared.get("_no_op") else self._after_claim_commit(cid, prepared["topic"], prepared["claim"])
         result = {"id": cid, "type": claim_type, "repository_id": repo_id,
-                  "source_event_id": source_event_id, "deduplicated": False}
+                  "source_event_id": source_event_id, "deduplicated": bool(prepared.get("_no_op")),
+                  "status": "deduplicated" if prepared.get("_no_op") else "committed"}
         if post_commit_failures:
             result["status"] = "committed_with_deferred_failures"
             result["post_commit_failures"] = post_commit_failures
@@ -6496,7 +6559,35 @@ class MemoryWikiProvider(MemoryProvider):
         flags = p["quality_flags"]; source_ref = p["source_ref"]; review_state = p["review_state"]
         raw_secret = p["raw_secret"]
         c = conn
+        write_fingerprint = sha(json.dumps({
+            "contract": "claim-write-r17",
+            "hash": h,
+            "claim": normalized,
+            "topic": topic,
+            "evidence": evidence_full,
+            "source": source,
+            "confidence": round(clamp(confidence), 8),
+            "salience": round(clamp(salience), 8),
+            "visibility_scope": str(p.get("visibility_scope") or "global"),
+            "project_id": str(p.get("project_id") or ""),
+            "repository_id": str(p.get("repository_id") or ""),
+            "file_path": str(p.get("file_path") or ""),
+            "symbol_id": str(p.get("symbol_id") or ""),
+            "symbol_revision": str(p.get("symbol_revision") or ""),
+            "content_hash": str(p.get("content_hash") or ""),
+        }, ensure_ascii=False, sort_keys=True))
         with self._lock:
+            prior_write = c.execute(
+                "SELECT claim_id FROM claim_write_fingerprints WHERE fingerprint=?",
+                (write_fingerprint,),
+            ).fetchone()
+            if prior_write:
+                existing = c.execute("SELECT id FROM claims WHERE id=?", (prior_write["claim_id"],)).fetchone()
+                if existing:
+                    p["_no_op"] = True
+                    p["_state_revision"] = self._meta_int("cache_state_revision", self._meta_int("memory_revision"))
+                    return str(existing["id"])
+            p["_no_op"] = False
             ex = c.execute("SELECT id FROM claims WHERE hash=?", (h,)).fetchone()
             if ex:
                 cid = ex["id"]
@@ -6579,7 +6670,8 @@ class MemoryWikiProvider(MemoryProvider):
                  p.get("event_timezone", "UTC"), p.get("project_id", ""),
                  p.get("project_id", ""), cid),
             )
-            if evidence_full: self._add_evidence(cid, evidence_full, "support", source, commit=False)
+            if evidence_full:
+                self._add_evidence(cid, evidence_full, "support", source, commit=False, conn=c, touch_claim=False)
             after_row = self._table_row("claims", cid)
             self._record_mutation("upsert_claim", "claims", cid, {} if not ex else {"id": cid, "note": "pre-existing claim updated"}, after_row, source, conn=c)
             self._audit(
@@ -6624,6 +6716,15 @@ class MemoryWikiProvider(MemoryProvider):
             )
             if temporal_result.get("supersedes"):
                 self._apply_supersession(temporal_result["supersedes"], cid, conn=c)
+            c.execute(
+                "INSERT OR IGNORE INTO claim_write_fingerprints(fingerprint,claim_id,created_at) VALUES(?,?,?)",
+                (write_fingerprint, cid, ts),
+            )
+            c.execute(
+                "UPDATE meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='cache_state_revision'"
+            )
+            state_row = c.execute("SELECT value FROM meta WHERE key='cache_state_revision'").fetchone()
+            p["_state_revision"] = int(state_row["value"] if state_row else 0)
         return cid
 
     def _add_claim(self, claim: str, topic="general", evidence="", source="tool", confidence=.7, salience=.7, conn=None, *, visibility_scope="", project_id="", event_at=0, event_timezone="UTC") -> str:
@@ -6634,7 +6735,8 @@ class MemoryWikiProvider(MemoryProvider):
             return self._add_claim_tx(conn, prepared, confidence, salience)
         with self._connect() as own_conn:
             cid = self._add_claim_tx(own_conn, prepared, confidence, salience)
-        self._after_claim_commit(cid, prepared["topic"], prepared["claim"])
+        if not prepared.get("_no_op"):
+            self._after_claim_commit(cid, prepared["topic"], prepared["claim"])
         return cid
 
     def _after_claim_commit(self, cid: str, topic: str, claim: str):
@@ -6780,22 +6882,28 @@ class MemoryWikiProvider(MemoryProvider):
             lines.append(f"- {m['name']}: {m['state']}{sec} file={m['path']}")
         return "\n".join(lines)
 
-    def _add_evidence(self, claim_id: str, text: str, kind="support", source="tool", *, commit=True) -> str:
+    def _add_evidence(self, claim_id: str, text: str, kind="support", source="tool", *, commit=True, conn=None, touch_claim=True) -> str:
         if not claim_id or not text: raise ValueError("claim_id and text are required")
         text = short(redact_secrets(scrub_memory_artifacts(text)), 2500); source = short(redact_secrets(source), 300)
         if not text:
             text = "[context removed: system/tool artifact]"
-        eid = "e_" + sha(f"{claim_id}:{kind}:{source}:{text}")[:12]; ts = now(); c = self._connect()
+        eid = "e_" + sha(f"{claim_id}:{kind}:{source}:{text}")[:12]; ts = now(); c = conn or self._connect()
         def work():
-            c.execute("INSERT OR IGNORE INTO evidence(id,claim_id,kind,text,source,created_at) VALUES(?,?,?,?,?,?)", (eid, claim_id, kind, text, source, ts))
-            if kind in ("support","source"):
+            cur = c.execute("INSERT OR IGNORE INTO evidence(id,claim_id,kind,text,source,created_at) VALUES(?,?,?,?,?,?)", (eid, claim_id, kind, text, source, ts))
+            inserted = bool(cur.rowcount)
+            if touch_claim and inserted and kind in ("support","source"):
                 c.execute("UPDATE claims SET freshness_at=?, updated_at=?, confidence=min(1.0, confidence+0.03), salience=min(1.0, salience+0.02) WHERE id=?", (ts, ts, claim_id))
-            elif kind == "refute":
+            elif touch_claim and inserted and kind == "refute":
                 c.execute("UPDATE claims SET updated_at=?, confidence=max(0.0, confidence-0.12), status=CASE WHEN confidence<0.35 THEN 'uncertain' ELSE status END WHERE id=?", (ts, claim_id))
-        if commit:
-            with c: work()
+            return inserted
+        if commit and conn is None:
+            with c: inserted = work()
+            if inserted:
+                with self._connect() as state_conn:
+                    state_conn.execute("UPDATE meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='cache_state_revision'")
             self._upsert_fts(claim_id); self._render_all()
-        else: work()
+        else:
+            inserted = work()
         return eid
 
     def _update_claim(self, a: Dict[str, Any]) -> Dict[str, Any]:
