@@ -57,6 +57,8 @@ Plaintext returned intentionally by `secret_context_lookup` can still enter the 
 | `MEMORY_WIKI_QDRANT_COLLECTION` | `memory_wiki_claims` | Collection name prefix |
 | `MEMORY_WIKI_VECTOR_SIZE` | `2560` | Qdrant vector size; the local stub and provider response are validated against it |
 | `MEMORY_WIKI_RERANK_ENABLED` | `false` | Enable second-stage reranking |
+| `MEMORY_WIKI_RERANK_TIMEOUT` | `3.0` | Per-request rerank timeout; runtime hard-caps it at 3 seconds |
+| `MEMORY_WIKI_RERANK_RETRY_COUNT` | `1` | Compatibility setting; prompt-time reranking is always single-attempt |
 | `MEMORY_WIKI_RERANK_MODEL` | `voyageai/rerank-2.5` | Reranker model ID |
 | `MEMORY_WIKI_RERANK_API_STYLE` | `auto` | `openrouter` or direct `voyage` payload style |
 | `MEMORY_WIKI_RERANK_RULES_ENABLED` | auto for Voyage 2.5 | Prepend/append ranking rules to the query |
@@ -67,6 +69,9 @@ Plaintext returned intentionally by `secret_context_lookup` can still enter the 
 | `MEMORY_WIKI_RERANK_API_KEY` | (uses `OPENROUTER_API_KEY`) | API key for reranker |
 | `MEMORY_WIKI_QDRANT_API_KEY` | (empty) | Qdrant API key if auth enabled |
 | `MEMORY_WIKI_PREFETCH_CLAIM_LIMIT` | `20` | Maximum main claims in automatic prompt-time recall |
+| `MEMORY_WIKI_PREFETCH_DEADLINE_SECONDS` | `5.5` | Hard prompt-time budget, clamped to 5–6 seconds |
+| `MEMORY_WIKI_PREFETCH_NETWORK_RESERVE_SECONDS` | `0.25` | Time reserved after every bounded network operation |
+| `MEMORY_WIKI_PREFETCH_FALLBACK_RESERVE_SECONDS` | `0.45` | Tail budget reserved for local FTS/SQLite fallback |
 | `MEMORY_WIKI_MAX_PREFETCH_CHARS` | `24000` | Character budget for automatic prompt-time recall |
 | `MEMORY_WIKI_PREFETCH_MIN_RELEVANT_CLAIMS` | `4` | Soft minimum of relevant, guard-safe claims; never pads with unrelated/quarantined rows |
 | `MEMORY_WIKI_PREFETCH_MIN_RELEVANT_CHARS` | `2000` | Soft relevant-content target used for shortfall diagnostics |
@@ -82,6 +87,15 @@ Plaintext returned intentionally by `secret_context_lookup` can still enter the 
 | `MEMORY_WIKI_SIMHASH_MAX_DISTANCE` | `3` | Conservative 64-bit near-duplicate threshold |
 | `HERMES_SECURITY_STRICT` | `1` | Quarantine recalled content if the shared trust core fails |
 | `HERMES_HOME` | `~/.hermes` | Hermes data directory (DB at `{HERMES_HOME}/memory-wiki/memory_wiki.sqlite3`) |
+
+## Bounded prompt-time recall
+
+- `prefetch()` returns within the configured 5–6 second hard budget. A daemon worker is cancelled logically at the deadline, and a small guard-checked local FTS/SQLite result is returned instead.
+- OpenRouter `/models`/embedding health is **stale-while-revalidate**: prefetch immediately uses the last known state while a daemon thread refreshes stale health in the background. Cold start is optimistic and the bounded embedding call remains authoritative.
+- Embedding and Qdrant HTTP timeouts are clamped to the remaining prefetch budget. Prompt-time embedding is single-attempt; any failure continues through lexical SQLite/FTS retrieval.
+- Prompt-time reranking is one attempt with a hard maximum of 3 seconds. Timeout/error returns the local RRF order rather than empty recall.
+- First-class active `preference_rules` with `system`, `user*`, `explicit*`, or `correction*` provenance are rendered separately in `# Trusted User Preference Layer` inside the real provider `system_prompt_block`. Ordinary recalled claims remain untrusted data and are never promoted into directives.
+- A cancelled late worker does not acknowledge the revision watermark, so claims that were not injected remain eligible on the next turn.
 
 
 ## Recall expansion in v1.18.5
