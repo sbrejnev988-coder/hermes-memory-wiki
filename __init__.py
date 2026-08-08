@@ -1,4 +1,4 @@
-"""memory-wiki v1.20.8+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.20.8+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -33,6 +33,7 @@ import stat
 import uuid
 import urllib.request
 import urllib.error
+from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
@@ -269,6 +270,65 @@ _DEFAULT_EMBED_MODEL = (
     else f"hash-ngram-{EMBED_DIMENSIONS}"
 )
 EMBED_MODEL = os.environ.get("MEMORY_WIKI_EMBED_MODEL", _DEFAULT_EMBED_MODEL).strip() or _DEFAULT_EMBED_MODEL
+
+# R19 token governor: exact embedding reuse inside the provider process.
+# It preserves the configured model/dimensions and only avoids re-billing
+# identical query/document texts during repeated turns and duplicate outbox work.
+EMBED_CACHE_MAX_ENTRIES = _env_int("MEMORY_WIKI_EMBED_CACHE_MAX_ENTRIES", 512, 0, 10000)
+EMBED_QUERY_CACHE_TTL_SECONDS = _env_int("MEMORY_WIKI_EMBED_QUERY_CACHE_TTL_SECONDS", 86400, 0, 2592000)
+EMBED_DOCUMENT_CACHE_TTL_SECONDS = _env_int("MEMORY_WIKI_EMBED_DOCUMENT_CACHE_TTL_SECONDS", 2592000, 0, 31536000)
+_EMBED_CACHE_LOCK = threading.RLock()
+_EMBED_CACHE: "OrderedDict[str, Tuple[float, List[float]]]" = OrderedDict()
+_EMBED_CACHE_METRICS = {"hits": 0, "misses": 0, "stores": 0, "evictions": 0}
+
+
+def _embedding_cache_key(text: str, input_type: str) -> str:
+    material = {
+        "provider": EMBED_PROVIDER,
+        "model": EMBED_MODEL,
+        "dimensions": EMBED_DIMENSIONS,
+        "input_type": str(input_type),
+        "text": str(text)[:EMBED_INPUT_MAX_CHARS],
+        "query_instruction": QWEN_QUERY_INSTRUCTION if input_type == "search_query" else "",
+        "document_prefix": QWEN_DOCUMENT_PREFIX if input_type == "search_document" else "",
+    }
+    return hashlib.sha256(json.dumps(material, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _embedding_cache_get(text: str, input_type: str) -> Optional[List[float]]:
+    if EMBED_CACHE_MAX_ENTRIES <= 0:
+        return None
+    key = _embedding_cache_key(text, input_type)
+    now_mono = time.monotonic()
+    with _EMBED_CACHE_LOCK:
+        row = _EMBED_CACHE.get(key)
+        if not row:
+            _EMBED_CACHE_METRICS["misses"] += 1
+            return None
+        expires_at, vector = row
+        if expires_at <= now_mono:
+            _EMBED_CACHE.pop(key, None)
+            _EMBED_CACHE_METRICS["misses"] += 1
+            return None
+        _EMBED_CACHE.move_to_end(key)
+        _EMBED_CACHE_METRICS["hits"] += 1
+        return list(vector)
+
+
+def _embedding_cache_put(text: str, input_type: str, vector: Optional[List[float]]) -> None:
+    if EMBED_CACHE_MAX_ENTRIES <= 0 or not vector:
+        return
+    ttl = EMBED_QUERY_CACHE_TTL_SECONDS if input_type == "search_query" else EMBED_DOCUMENT_CACHE_TTL_SECONDS
+    if ttl <= 0:
+        return
+    key = _embedding_cache_key(text, input_type)
+    with _EMBED_CACHE_LOCK:
+        _EMBED_CACHE[key] = (time.monotonic() + ttl, list(vector))
+        _EMBED_CACHE.move_to_end(key)
+        _EMBED_CACHE_METRICS["stores"] += 1
+        while len(_EMBED_CACHE) > EMBED_CACHE_MAX_ENTRIES:
+            _EMBED_CACHE.popitem(last=False)
+            _EMBED_CACHE_METRICS["evictions"] += 1
 
 # Fail closed when a remote model slug is accidentally routed to the local hash stub.
 # This was previously easy to miss because a healthy :4000 endpoint made the
@@ -508,9 +568,10 @@ _OUTBOX_INDEXES = """CREATE INDEX IF NOT EXISTS idx_outbox_status
 
 _OUTBOX_WORKERS: Dict[str, Dict[str, Any]] = {}
 _OUTBOX_WORKERS_LOCK = threading.RLock()
-OUTBOX_POLL_SECONDS = max(0.5, float(os.environ.get("MEMORY_WIKI_OUTBOX_POLL_SECONDS", "2.0")))
+OUTBOX_POLL_SECONDS = max(0.5, float(os.environ.get("MEMORY_WIKI_OUTBOX_POLL_SECONDS", "3.0")))
 OUTBOX_LEASE_SECONDS = max(15, int(os.environ.get("MEMORY_WIKI_OUTBOX_LEASE_SECONDS", "90")))
-OUTBOX_BATCH_SIZE = max(1, min(int(os.environ.get("MEMORY_WIKI_OUTBOX_BATCH_SIZE", "32")), 200))
+OUTBOX_BATCH_SIZE = max(1, min(int(os.environ.get("MEMORY_WIKI_OUTBOX_BATCH_SIZE", "8")), 200))
+OUTBOX_EMBED_DELAY_SECONDS = max(0.0, min(float(os.environ.get("MEMORY_WIKI_OUTBOX_EMBED_DELAY_SECONDS", "0.15")), 5.0))
 
 
 def _mk_db_path() -> str:
@@ -701,6 +762,8 @@ def _outbox_process(batch_size=50, *, db_path: Optional[str] = None, worker_id: 
                     if operation in ("upsert", "embed_and_upsert"):
                         _meta_set_max(done_db, "qdrant_latest_revision", int(payload.get("memory_revision") or 0))
                 ok += 1
+                if EMBED_PROVIDER == "openrouter" and operation == "embed_and_upsert" and OUTBOX_EMBED_DELAY_SECONDS > 0:
+                    time.sleep(OUTBOX_EMBED_DELAY_SECONDS)
             except Exception as exc:
                 attempts = int(row["attempts"] or 0) + 1
                 status = "failed" if attempts >= 5 else "pending"
@@ -1068,7 +1131,7 @@ RRF_K = _env_int("MEMORY_WIKI_RRF_K", 60, 1, 1000)
 FTS_TOP_K = _env_int("MEMORY_WIKI_FTS_TOP_K", 200, 10, 1000)
 VECTOR_TOP_K = _env_int("MEMORY_WIKI_VECTOR_TOP_K", 200, 10, 1000)
 HYBRID_TOP_K = _env_int("MEMORY_WIKI_HYBRID_TOP_K", 100, 10, 500)
-PREFETCH_CLAIM_LIMIT = _env_int("MEMORY_WIKI_PREFETCH_CLAIM_LIMIT", 20, 5, 50)
+PREFETCH_CLAIM_LIMIT = _env_int("MEMORY_WIKI_PREFETCH_CLAIM_LIMIT", 12, 5, 50)
 # r4: automatic recall uses a larger candidate pool, but only relevant + guard-safe
 # claims count toward the soft minimum. These are targets, never permission to inject
 # unrelated or quarantined content.
@@ -1089,7 +1152,7 @@ DIVERSITY_MAX_PER_TOPIC = _env_int("MEMORY_WIKI_DIVERSITY_MAX_PER_TOPIC", 8, 3, 
 DIVERSITY_MAX_SOURCE_SHARE = _rerank_env_float(
     "MEMORY_WIKI_DIVERSITY_MAX_SOURCE_SHARE", 0.65, 0.20, 1.0
 )
-CONTEXT_MAX_TOKENS = _env_int("MEMORY_WIKI_CONTEXT_MAX_TOKENS", 6000, 800, 32000)
+CONTEXT_MAX_TOKENS = _env_int("MEMORY_WIKI_CONTEXT_MAX_TOKENS", 4000, 800, 32000)
 CONTEXT_MAX_CLAIMS = _env_int("MEMORY_WIKI_CONTEXT_MAX_CLAIMS", 24, 4, 50)
 CONTEXT_MAX_PER_TOPIC = _env_int("MEMORY_WIKI_CONTEXT_MAX_PER_TOPIC", 8, 2, 20)
 DEBUG_MODE = os.environ.get("MEMORY_WIKI_DEBUG", "0") in ("1", "true", "yes")
@@ -1204,26 +1267,31 @@ def _qdrant_point_id(claim_id: str):
 
 # --- Embedding dispatch: provider-aware document vs query ---
 def _embed_document(text: str) -> Optional[List[float]]:
-    """Embedding для индексации документа (claim).
-    
-    Для локального embedding-endpoint передаёт task_type="search_document"
-    (без retrieval-инструкции). OpenRouter использует input_type="search_document".
-    """
-    if EMBED_PROVIDER == "openrouter":
-        return _openrouter_embed(text, input_type="search_document")
-    return _embed_for_qdrant(text, task_type="search_document")
+    """Embedding для индексации документа с exact in-process reuse."""
+    cached = _embedding_cache_get(text, "search_document")
+    if cached is not None:
+        return cached
+    vector = (
+        _openrouter_embed(text, input_type="search_document")
+        if EMBED_PROVIDER == "openrouter"
+        else _embed_for_qdrant(text, task_type="search_document")
+    )
+    _embedding_cache_put(text, "search_document", vector)
+    return vector
 
 
 def _embed_query(text: str) -> Optional[List[float]]:
-    """Embedding для поискового запроса.
-    
-    Для локального embedding-endpoint передаёт task_type="search_query"
-    и retrieval-инструкцию (если задана). Это критично для Qwen3-Embedding-8B
-    и других instruction-aware моделей.
-    """
-    if EMBED_PROVIDER == "openrouter":
-        return _openrouter_embed(text, input_type="search_query")
-    return _embed_for_qdrant(text, task_type="search_query")
+    """Embedding для поискового запроса с exact in-process reuse."""
+    cached = _embedding_cache_get(text, "search_query")
+    if cached is not None:
+        return cached
+    vector = (
+        _openrouter_embed(text, input_type="search_query")
+        if EMBED_PROVIDER == "openrouter"
+        else _embed_for_qdrant(text, task_type="search_query")
+    )
+    _embedding_cache_put(text, "search_query", vector)
+    return vector
 
 def _openrouter_available() -> bool:
     """Check model availability using OpenRouter's documented model list, then probe if needed."""
@@ -1351,7 +1419,7 @@ def _openrouter_embed(text: str, *, input_type: str, timeout: float = 30.0) -> O
         method="POST",
     )
 
-    attempts = 1 if _prefetch_active() else 3
+    attempts = 1 if _prefetch_active() else 2
     for attempt in range(attempts):
         try:
             attempt_timeout = _prefetch_network_timeout(timeout)
@@ -1791,7 +1859,7 @@ TOOL_ARTIFACT_HINT_RE = re.compile(
 PATH_ONLY_RE = re.compile(r"^`?/?[\w./\\-]+\.(?:md|py|json|ya?ml|toml|log|txt|sh)`?$", re.I)
 RAW_BLOB_HINT_RE = re.compile(r"(?i)(?:^\{|\\n\s*\d+\||session_20\d{6}|/tmp/hermes_session_index_corpus|raw preview|background process proc_|full output:|tests/.+\.py:\d+)")
 STALE_DAYS = 30
-MAX_PREFETCH_CHARS = _env_int("MEMORY_WIKI_MAX_PREFETCH_CHARS", 24000, 4000, 60000)
+MAX_PREFETCH_CHARS = _env_int("MEMORY_WIKI_MAX_PREFETCH_CHARS", 16000, 4000, 60000)
 MAX_RENDER_CLAIMS_PER_TOPIC = 500
 MAX_RENDER_TOPICS = 250
 MIN_AUTO_INGEST_SCORE = 2
@@ -2610,6 +2678,46 @@ class MemoryWikiProvider(MemoryProvider):
         c = conn or self._connect()
         _meta_set_max(c, key, value)
 
+    def _cache_component_partition(self, visibility_scope: str = "global", *, project_id: str = "", origin_bot_id: str = "", origin_chat_hash: str = "") -> str:
+        scope = str(visibility_scope or "global").strip().lower()
+        if scope in {"private", "chat"}:
+            return "private:" + str(origin_chat_hash or self._chat_hash(self.session_id))[:32]
+        if scope == "project":
+            return "project:" + sha(str(project_id or self.project_scope or "default"))[:24]
+        if scope == "bot":
+            return "bot:" + sha(str(origin_bot_id or self.bot_id or "default"))[:24]
+        return "shared"
+
+    def _cache_component_revision(self, partition: str, conn=None) -> int:
+        key = "cache_component_revision:" + str(partition or "shared")
+        try:
+            c = conn or self._connect()
+            row = c.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+            return int(row["value"] if row else 0)
+        except Exception:
+            return 0
+
+    def _bump_cache_component_revision(self, conn, partition: str) -> int:
+        key = "cache_component_revision:" + str(partition or "shared")
+        conn.execute(
+            """INSERT INTO meta(key,value) VALUES(?, '1')
+               ON CONFLICT(key) DO UPDATE SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT)""",
+            (key,),
+        )
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return int(row["value"] if row else 0)
+
+    def _bump_cache_for_claim_row(self, conn, row) -> int:
+        if not row:
+            return 0
+        partition = self._cache_component_partition(
+            row["visibility_scope"] if "visibility_scope" in row.keys() else "global",
+            project_id=row["project_id"] if "project_id" in row.keys() else "",
+            origin_bot_id=row["origin_bot_id"] if "origin_bot_id" in row.keys() else "",
+            origin_chat_hash=row["origin_chat_hash"] if "origin_chat_hash" in row.keys() else "",
+        )
+        return self._bump_cache_component_revision(conn, partition)
+
     def _memory_cache_state_contract(self, used_rows: List[Dict[str, Any]], cache_scope: str) -> Dict[str, Any]:
         """Return the v2 durable cache identity without coupling response identity to global state.
 
@@ -2627,23 +2735,37 @@ class MemoryWikiProvider(MemoryProvider):
             partition = "bot:" + sha(str(self.bot_id or "default"))[:24]
         else:
             partition = "shared"
+        # Keep the global revision only as an index-readiness watermark. Response/tool-cache
+        # identity is scoped to the visibility components actually observable by this recall,
+        # so a write in project B no longer invalidates project A/private/bot cache entries.
+        components = {"shared"}
+        for row in (used_rows or []):
+            components.add(self._cache_component_partition(
+                str(row.get("visibility_scope") or "global"),
+                project_id=str(row.get("project_id") or ""),
+                origin_bot_id=str(row.get("origin_bot_id") or ""),
+                origin_chat_hash=str(row.get("origin_chat_hash") or ""),
+            ))
+        if cache_scope == "project" and self.project_scope:
+            components.add(self._cache_component_partition("project", project_id=str(self.project_scope)))
+        component_revisions = {name: self._cache_component_revision(name) for name in sorted(components)}
+
         state_revision = self._meta_int("cache_state_revision", self._meta_int("memory_revision"))
         fts_revision = self._meta_int("fts_latest_revision")
         qdrant_revision = self._meta_int("qdrant_latest_revision")
         database_instance_id = self.database_instance_id or self._meta_text("database_instance_id", "uninitialized")
         state_material = {
-            "contract": "memory-cache-state-v2-r17",
+            "contract": "memory-cache-state-v3-r20-partitioned",
             "database_instance_id": database_instance_id,
             "partition": partition,
-            "state_revision": state_revision,
-            "fts_target_revision": state_revision,
-            "qdrant_target_revision": state_revision if SEMANTIC_ENABLED else 0,
+            "component_revisions": component_revisions,
             "semantic_enabled": bool(SEMANTIC_ENABLED),
         }
         return {
-            "version": 2,
+            "version": 3,
             "partition": partition,
             "state_revision": state_revision,
+            "component_revisions": component_revisions,
             "state_token": sha(json.dumps(state_material, ensure_ascii=False, sort_keys=True))[:32],
             "index_revision": f"fts:{fts_revision};qdrant:{qdrant_revision}",
             "state_consistent": bool(fts_revision >= state_revision and (not SEMANTIC_ENABLED or qdrant_revision >= state_revision)),
@@ -6725,6 +6847,15 @@ class MemoryWikiProvider(MemoryProvider):
             )
             state_row = c.execute("SELECT value FROM meta WHERE key='cache_state_revision'").fetchone()
             p["_state_revision"] = int(state_row["value"] if state_row else 0)
+            p["_cache_component_revision"] = self._bump_cache_component_revision(
+                c,
+                self._cache_component_partition(
+                    str(p.get("visibility_scope") or "global"),
+                    project_id=str(p.get("project_id") or ""),
+                    origin_bot_id=str(p.get("origin_bot_id") or self.bot_id or ""),
+                    origin_chat_hash=str(p.get("origin_chat_hash") or self._chat_hash(self.session_id)),
+                ),
+            )
         return cid
 
     def _add_claim(self, claim: str, topic="general", evidence="", source="tool", confidence=.7, salience=.7, conn=None, *, visibility_scope="", project_id="", event_at=0, event_timezone="UTC") -> str:
@@ -6901,6 +7032,11 @@ class MemoryWikiProvider(MemoryProvider):
             if inserted:
                 with self._connect() as state_conn:
                     state_conn.execute("UPDATE meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='cache_state_revision'")
+                    claim_row = state_conn.execute(
+                        "SELECT visibility_scope,origin_bot_id,origin_chat_hash,project_id FROM claims WHERE id=?",
+                        (claim_id,),
+                    ).fetchone()
+                    self._bump_cache_for_claim_row(state_conn, claim_row)
             self._upsert_fts(claim_id); self._render_all()
         else:
             inserted = work()
@@ -6928,14 +7064,29 @@ class MemoryWikiProvider(MemoryProvider):
         if a.get("refresh"): fields.append("freshness_at=?"); vals.append(now())
         fields.append("updated_at=?"); vals.append(now()); vals.append(cid)
         before = self._sanitize_row(row)
-        with c: c.execute(f"UPDATE claims SET {', '.join(fields)} WHERE id=?", vals)
+        with c:
+            c.execute(f"UPDATE claims SET {', '.join(fields)} WHERE id=?", vals)
+            c.execute("UPDATE meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='cache_state_revision'")
+            cache_row = c.execute(
+                "SELECT visibility_scope,origin_bot_id,origin_chat_hash,project_id FROM claims WHERE id=?",
+                (cid,),
+            ).fetchone()
+            self._bump_cache_for_claim_row(c, cache_row)
         self._record_mutation("update_claim", "claims", cid, before, self._table_row("claims", cid), a.get("reason") or "memory_wiki_update_claim")
         self._upsert_fts(cid); self._render_all(); return {"id": cid, "updated": True}
 
     def _set_status_by_text(self, text: str, status: str, reason: str) -> None:
         h = sha(short(text,1400).lower()); c = self._connect(); row = c.execute("SELECT id FROM claims WHERE hash=?", (h,)).fetchone()
         if row:
-            with c: c.execute("UPDATE claims SET status=?, updated_at=? WHERE id=?", (status, now(), row["id"])); self._add_evidence(row["id"], reason, "note", reason, commit=False)
+            with c:
+                c.execute("UPDATE claims SET status=?, updated_at=? WHERE id=?", (status, now(), row["id"]))
+                self._add_evidence(row["id"], reason, "note", reason, commit=False, conn=c)
+                c.execute("UPDATE meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='cache_state_revision'")
+                cache_row = c.execute(
+                    "SELECT visibility_scope,origin_bot_id,origin_chat_hash,project_id FROM claims WHERE id=?",
+                    (row["id"],),
+                ).fetchone()
+                self._bump_cache_for_claim_row(c, cache_row)
             self._upsert_fts(row["id"]); self._render_all()
 
     # ----- search/scoring -----------------------------------------------
@@ -9835,6 +9986,15 @@ class MemoryWikiProvider(MemoryProvider):
             "embedding_dimensions": EMBED_DIMENSIONS,
             "qdrant_vector_size": QDRANT_VECTOR_SIZE,
             "embedding_input_max_chars": EMBED_INPUT_MAX_CHARS,
+            "embedding_cache": {
+                **dict(_EMBED_CACHE_METRICS),
+                "entries": len(_EMBED_CACHE),
+                "max_entries": EMBED_CACHE_MAX_ENTRIES,
+                "query_ttl_seconds": EMBED_QUERY_CACHE_TTL_SECONDS,
+                "document_ttl_seconds": EMBED_DOCUMENT_CACHE_TTL_SECONDS,
+            },
+            "outbox_batch_size": OUTBOX_BATCH_SIZE,
+            "outbox_embed_delay_seconds": OUTBOX_EMBED_DELAY_SECONDS,
             "manifest_hash": _manifest_hash(manifest),
             "qdrant_points": pts,
             "alias": QDRANT_ALIAS,

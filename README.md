@@ -1,6 +1,11 @@
-# Hermes Memory Wiki v1.20.5
+# Hermes Memory Wiki v1.20.8
 
 Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 101 MCP tools.
+
+## Cache identity (r19 + r20)
+
+- **r19 token governor**: exact embedding reuse inside the provider process; tool-cache contract 2.4.0 with smart initial tool mode (≤24 tools), exact-cache with tools enabled, shadow semantic mode by default.
+- **r20 partitioned cache**: cache signature is scoped per visibility component (`shared` / `bot:` / `project:` / `private:<chat_hash>`). A write in project B no longer invalidates project A / private / bot cache entries. Contract: `memory-cache-state-v3-r20-partitioned` with per-component revisions bumped on upsert / add_evidence / update_claim / set_status_by_text.
 
 ## Architecture
 
