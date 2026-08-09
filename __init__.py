@@ -245,11 +245,19 @@ EMBED_PROVIDER = os.environ.get("MEMORY_WIKI_EMBED_PROVIDER", "openrouter").lowe
 _DEFAULT_EMBED_URL = (
     "https://openrouter.ai/api/v1"
     if EMBED_PROVIDER == "openrouter"
+    else "https://inference-api.nousresearch.com/v1"
+    if EMBED_PROVIDER == "nous"
     else "http://127.0.0.1:4000"
 )
 EMBED_URL = os.environ.get("MEMORY_WIKI_EMBED_URL", _DEFAULT_EMBED_URL).rstrip("/")
 
-EMBED_API_KEY = os.environ.get("MEMORY_WIKI_EMBED_API_KEY", "") or os.environ.get("OPENROUTER_API_KEY", "")
+# Nous API использует свой ключ подписки (NOUS_API_KEY) — он не совместим
+# с OpenRouter-ключом, поэтому для провайдера nous приоритет у NOUS_API_KEY.
+# Для openrouter приоритет у явного MEMORY_WIKI_EMBED_API_KEY, затем OPENROUTER_API_KEY.
+if EMBED_PROVIDER == "nous":
+    EMBED_API_KEY = os.environ.get("NOUS_API_KEY", "") or os.environ.get("MEMORY_WIKI_EMBED_API_KEY", "")
+else:
+    EMBED_API_KEY = os.environ.get("MEMORY_WIKI_EMBED_API_KEY", "") or os.environ.get("OPENROUTER_API_KEY", "")
 
 
 def _env_int(name: str, default: int, low: int, high: int) -> int:
@@ -266,7 +274,7 @@ EMBED_DIMENSIONS = _env_int("MEMORY_WIKI_EMBED_DIMENSIONS", 4096, 8, 65536)
 EMBED_INPUT_MAX_CHARS = _env_int("MEMORY_WIKI_EMBED_INPUT_MAX_CHARS", 12000, 256, 131072)
 _DEFAULT_EMBED_MODEL = (
     "qwen/qwen3-embedding-8b"
-    if EMBED_PROVIDER == "openrouter"
+    if EMBED_PROVIDER in ("openrouter", "nous")
     else f"hash-ngram-{EMBED_DIMENSIONS}"
 )
 EMBED_MODEL = os.environ.get("MEMORY_WIKI_EMBED_MODEL", _DEFAULT_EMBED_MODEL).strip() or _DEFAULT_EMBED_MODEL
@@ -334,17 +342,17 @@ def _embedding_cache_put(text: str, input_type: str, vector: Optional[List[float
 # This was previously easy to miss because a healthy :4000 endpoint made the
 # semantic layer look available even though PPLX was never called.
 EMBED_CONFIG_ERROR = ""
-if EMBED_PROVIDER not in {"stub", "openrouter"}:
+if EMBED_PROVIDER not in {"stub", "openrouter", "nous"}:
     EMBED_CONFIG_ERROR = f"unsupported MEMORY_WIKI_EMBED_PROVIDER={EMBED_PROVIDER!r}"
 elif EMBED_PROVIDER == "stub" and EMBED_MODEL.startswith(("perplexity/", "openai/", "qwen/", "cohere/", "voyage/")):
     EMBED_CONFIG_ERROR = (
-        f"model {EMBED_MODEL!r} requires MEMORY_WIKI_EMBED_PROVIDER=openrouter; "
+        f"model {EMBED_MODEL!r} requires a remote embedding provider (openrouter/nous); "
         "the local stub only provides deterministic hash-ngram vectors"
     )
-elif EMBED_PROVIDER == "openrouter" and EMBED_URL.startswith(("http://127.0.0.1", "http://localhost")):
+elif EMBED_PROVIDER in ("openrouter", "nous") and EMBED_URL.startswith(("http://127.0.0.1", "http://localhost")):
     EMBED_CONFIG_ERROR = (
-        f"MEMORY_WIKI_EMBED_PROVIDER=openrouter but MEMORY_WIKI_EMBED_URL={EMBED_URL!r}; "
-        "use https://openrouter.ai/api/v1"
+        f"MEMORY_WIKI_EMBED_PROVIDER={EMBED_PROVIDER} but MEMORY_WIKI_EMBED_URL={EMBED_URL!r}; "
+        "remote ML embeddings need the provider API endpoint"
     )
 
 # Retrieval instruction for search_query (not for stored documents).
@@ -762,7 +770,7 @@ def _outbox_process(batch_size=50, *, db_path: Optional[str] = None, worker_id: 
                     if operation in ("upsert", "embed_and_upsert"):
                         _meta_set_max(done_db, "qdrant_latest_revision", int(payload.get("memory_revision") or 0))
                 ok += 1
-                if EMBED_PROVIDER == "openrouter" and operation == "embed_and_upsert" and OUTBOX_EMBED_DELAY_SECONDS > 0:
+                if EMBED_PROVIDER in ("openrouter", "nous") and operation == "embed_and_upsert" and OUTBOX_EMBED_DELAY_SECONDS > 0:
                     time.sleep(OUTBOX_EMBED_DELAY_SECONDS)
             except Exception as exc:
                 attempts = int(row["attempts"] or 0) + 1
@@ -1273,7 +1281,7 @@ def _embed_document(text: str) -> Optional[List[float]]:
         return cached
     vector = (
         _openrouter_embed(text, input_type="search_document")
-        if EMBED_PROVIDER == "openrouter"
+        if EMBED_PROVIDER in ("openrouter", "nous")
         else _embed_for_qdrant(text, task_type="search_document")
     )
     _embedding_cache_put(text, "search_document", vector)
@@ -1287,7 +1295,7 @@ def _embed_query(text: str) -> Optional[List[float]]:
         return cached
     vector = (
         _openrouter_embed(text, input_type="search_query")
-        if EMBED_PROVIDER == "openrouter"
+        if EMBED_PROVIDER in ("openrouter", "nous")
         else _embed_for_qdrant(text, task_type="search_query")
     )
     _embedding_cache_put(text, "search_query", vector)
@@ -1297,6 +1305,25 @@ def _openrouter_available() -> bool:
     """Check model availability using OpenRouter's documented model list, then probe if needed."""
     if not EMBED_API_KEY or not EMBED_CONTRACT_VALID:
         return False
+    if EMBED_PROVIDER == "nous":
+        # inference-api банит urllib по TLS-отпечатку (Cloudflare 1010) — curl.
+        result = _http_json_via_curl(
+            "GET", "/models?output_modalities=embeddings", timeout=10.0,
+            headers={"Authorization": f"Bearer {EMBED_API_KEY}", "Accept": "application/json"},
+        )
+        available_ids = {
+            str(item.get("id") or "")
+            for item in (result or {}).get("data", [])
+            if isinstance(item, dict)
+        }
+        if EMBED_MODEL in available_ids:
+            return True
+        _debug_log(f"Embedding model not present in Nous model list: {EMBED_MODEL}; probing endpoint")
+        return _openrouter_embed(
+            "memory-wiki embedding health probe",
+            input_type="search_query",
+            timeout=10.0,
+        ) is not None
     request = urllib.request.Request(
         f"{EMBED_URL}/models?output_modalities=embeddings",
         headers={"Authorization": f"Bearer {EMBED_API_KEY}", "Accept": "application/json"},
@@ -1385,7 +1412,33 @@ def _embed_for_qdrant(text: str, task_type: str = "search_document") -> Optional
     return _validate_embedding_vector(vector, "local embedding endpoint")
 
 
-# --- OpenRouter Embeddings client ---
+def _http_json_via_curl(method: str, path: str, body: Optional[dict] = None,
+                        timeout: float = 30.0, headers: Optional[dict] = None) -> Optional[dict]:
+    """HTTP-запрос через системный curl.
+
+    inference-api.nousresearch.com банит Python urllib по TLS-отпечатку
+    (Cloudflare 1010 browser_signature_banned), а curl проходит — поэтому
+    для провайдера nous используем subprocess+curl (curl есть в Termux,
+    proot, Linux, macOS и Windows 10+).
+    """
+    import subprocess
+    cmd = ["curl", "-s", "--max-time", str(int(timeout)), "-X", method, f"{EMBED_URL}{path}"]
+    for key, value in (headers or {}).items():
+        cmd += ["-H", f"{key}: {value}"]
+    if body is not None:
+        cmd += ["-d", json.dumps(body)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout + 5.0)
+        if proc.returncode != 0 or not proc.stdout:
+            _debug_log(f"curl {method} {path}: rc={proc.returncode} {proc.stderr.decode('utf-8', 'replace')[:200]}")
+            return None
+        return json.loads(proc.stdout.decode("utf-8", "replace"))
+    except Exception as exc:
+        _debug_log(f"curl {method} {path}: {exc}")
+        return None
+
+
+# --- OpenRouter/Nous Embeddings client ---
 def _openrouter_embed(text: str, *, input_type: str, timeout: float = 30.0) -> Optional[List[float]]:
     """OpenRouter embeddings — Bearer auth, model, dimensions, retry."""
     if not text or not text.strip():
@@ -1407,10 +1460,21 @@ def _openrouter_embed(text: str, *, input_type: str, timeout: float = 30.0) -> O
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
-    if OPENROUTER_REFERER:
-        headers["HTTP-Referer"] = OPENROUTER_REFERER
-    if OPENROUTER_TITLE:
-        headers["X-OpenRouter-Title"] = OPENROUTER_TITLE
+    if EMBED_PROVIDER == "openrouter":
+        if OPENROUTER_REFERER:
+            headers["HTTP-Referer"] = OPENROUTER_REFERER
+        if OPENROUTER_TITLE:
+            headers["X-OpenRouter-Title"] = OPENROUTER_TITLE
+
+    # Nous (inference-api) банит Python urllib по TLS-отпечатку
+    # (Cloudflare 1010 browser_signature_banned) — системный curl проходит.
+    if EMBED_PROVIDER == "nous":
+        result = _http_json_via_curl("POST", "/embeddings", payload, timeout=timeout, headers=headers)
+        vector = (result or {}).get("data", [{}])[0].get("embedding")
+        if vector is None:
+            _debug_log("Nous embeddings: no embedding in response")
+            return None
+        return _validate_embedding_vector(vector, "Nous embeddings")
 
     request = urllib.request.Request(
         f"{EMBED_URL}/embeddings",
@@ -1713,9 +1777,9 @@ def _semantic_available() -> bool:
         for error in _EMBED_BOOT_ERRORS:
             _debug_log(f"semantic disabled: {error}")
         return False
-    if EMBED_PROVIDER == "openrouter":
+    if EMBED_PROVIDER in ("openrouter", "nous"):
         if not _openrouter_health_swr():
-            _debug_log("OpenRouter embeddings unavailable (stale cached state; refresh running in background)")
+            _debug_log("OpenRouter/Nous embeddings unavailable (stale cached state; refresh running in background)")
             return False
     else:
         embed_health = _embed_req("GET", "/health")
@@ -2625,7 +2689,7 @@ class MemoryWikiProvider(MemoryProvider):
         if SEMANTIC_ENABLED:
             _start_outbox_worker(str(self.db_path))
             _wake_outbox_worker(str(self.db_path))
-            if EMBED_PROVIDER == "openrouter":
+            if EMBED_PROVIDER in ("openrouter", "nous"):
                 _openrouter_health_swr(force_refresh=True)
         manifest_change = _check_manifest_change()
         if manifest_change:

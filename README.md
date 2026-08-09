@@ -326,6 +326,20 @@ Setting only the model slug while leaving `MEMORY_WIKI_EMBED_PROVIDER=stub` does
 
 The bundled `stubs/embed_stub.py` is a deterministic local fallback, not an ML model. It now defaults to 2560 dimensions, honors the request `dimensions` field, and reports `algorithm`, `model`, and `vector_size` from `/health`.
 
+### Nous provider (v1.20.5+)
+
+`MEMORY_WIKI_EMBED_PROVIDER=nous` подключает `qwen/qwen3-embedding-8b` через inference-api.nousresearch.com (подписка Nous):
+
+```env
+MEMORY_WIKI_EMBED_PROVIDER=nous
+MEMORY_WIKI_EMBED_URL=https://inference-api.nousresearch.com/v1
+MEMORY_WIKI_EMBED_MODEL=qwen/qwen3-embedding-8b
+MEMORY_WIKI_EMBED_DIMENSIONS=4096
+MEMORY_WIKI_VECTOR_SIZE=4096
+```
+
+Для провайдера `nous` API-ключ берётся из `NOUS_API_KEY` (приоритет) или `MEMORY_WIKI_EMBED_API_KEY`. inference-api блокирует Python urllib по TLS-отпечатку (Cloudflare 1010 `browser_signature_banned`), поэтому запросы идут через системный `curl` — он доступен в Termux, proot, Linux, macOS и Windows 10+. Модель проверяется через `GET /models?output_modalities=embeddings`; если её нет в списке, endpoint probing эмбеддингом.
+
 
 ## Document indexing support (v1.20.3)
 
