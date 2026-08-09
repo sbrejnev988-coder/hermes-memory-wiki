@@ -1469,12 +1469,31 @@ def _openrouter_embed(text: str, *, input_type: str, timeout: float = 30.0) -> O
     # Nous (inference-api) банит Python urllib по TLS-отпечатку
     # (Cloudflare 1010 browser_signature_banned) — системный curl проходит.
     if EMBED_PROVIDER == "nous":
-        result = _http_json_via_curl("POST", "/embeddings", payload, timeout=timeout, headers=headers)
-        vector = (result or {}).get("data", [{}])[0].get("embedding")
-        if vector is None:
-            _debug_log("Nous embeddings: no embedding in response")
-            return None
-        return _validate_embedding_vector(vector, "Nous embeddings")
+        # inference-api: burst 429/5xx на массовой индексации — обязателен ретрай
+        # с backoff (как в openrouter-ветке). _http_json_via_curl не проверяет
+        # HTTP-статус (curl без -f возвращает rc=0 на 4xx/5xx), поэтому ошибка
+        # приходит как JSON {"error": ...} без data.
+        attempts = 3
+        for attempt in range(attempts):
+            result = _http_json_via_curl("POST", "/embeddings", payload, timeout=timeout, headers=headers)
+            if isinstance(result, dict):
+                data_list = result.get("data")
+                if data_list:
+                    vector = data_list[0].get("embedding")
+                    if vector is not None:
+                        return _validate_embedding_vector(vector, "Nous embeddings")
+                    error_info = "empty embedding in data"
+                else:
+                    vector = None
+                    error_info = str(result.get("error"))[:200] if result.get("error") else "no data in response"
+            else:
+                vector = None
+                error_info = f"curl failed/rc={result}"
+            _debug_log(f"Nous embeddings: no embedding (attempt {attempt+1}/{attempts}): {error_info}")
+            if attempt + 1 >= attempts:
+                return None
+            time.sleep(1.0 * (2 ** attempt))
+        return None
 
     request = urllib.request.Request(
         f"{EMBED_URL}/embeddings",
