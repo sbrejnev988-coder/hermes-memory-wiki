@@ -1,13 +1,12 @@
 import hashlib
 import importlib.util
-import os
 from pathlib import Path
 
 
 def load_provider(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("MEMORY_WIKI_SEMANTIC", "0")
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[2]
     spec = importlib.util.spec_from_file_location("memory_wiki_fixed", root / "__init__.py")
     module = importlib.util.module_from_spec(spec)
     assert spec.loader

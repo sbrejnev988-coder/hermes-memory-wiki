@@ -60,6 +60,14 @@ try:
     _SECRET_CORE_AVAILABLE = True
 except Exception as _secret_core_exc:
     _SECRET_CORE_ERROR = f"{type(_secret_core_exc).__name__}: {_secret_core_exc}"
+    # R21: secret-core is optional outside a fully installed Hermes runtime.
+    # Secret quarantine/audit paths still need a non-reversible fingerprint;
+    # leaving this name undefined caused patch-event processing to crash with
+    # NameError when the shared core was absent. This fallback never stores or
+    # exposes plaintext and is NOT a crypto/vault fallback.
+    def _secret_fingerprint(value: object, context: str = "") -> str:
+        material = (str(context or "") + "\0" + str(value or "")).encode("utf-8", errors="replace")
+        return hashlib.sha256(material).hexdigest()
 try:
     from zoneinfo import ZoneInfo
 except ImportError:  # Python < 3.9 fallback
