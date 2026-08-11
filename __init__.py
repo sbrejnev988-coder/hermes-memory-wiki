@@ -3988,6 +3988,7 @@ class MemoryWikiProvider(MemoryProvider):
                     str(a.get("query", "")),
                     limit=min(60, max_chars // 100),
                     include_stale=True,
+                    include_all_projects=bool(coverage),
                 )
                 rows = [
                     row for row in all_rows
@@ -7578,7 +7579,7 @@ class MemoryWikiProvider(MemoryProvider):
         _debug_log(f"SEMANTIC hydrated={hydrated} requested={len(claim_ids)}")
         return hydrated
 
-    def _search(self, query: str, limit=10, include_stale=True, topic: Optional[str]=None, session_id: str="", retrieval_mode: str="hybrid", record_retrieval: bool=True) -> List[Dict[str, Any]]:
+    def _search(self, query: str, limit=10, include_stale=True, topic: Optional[str]=None, session_id: str="", retrieval_mode: str="hybrid", record_retrieval: bool=True, include_all_projects: bool=False) -> List[Dict[str, Any]]:
         limit = max(1, min(int(limit or 10), 50)); q = query or ""; qt = tokens(q); c = self._connect()
         retrieval_mode = str(retrieval_mode or "hybrid").strip().lower()
         if retrieval_mode not in {"hybrid", "fts", "vector"}:
@@ -7618,12 +7619,14 @@ class MemoryWikiProvider(MemoryProvider):
                 except Exception as e:
                     _debug_log(f"HTTP-qdrant error: {e}")
             _debug_log(f"SEMANTIC total-{len(semantic_ids)} ids")
-        base_where = "status='active' AND (scope!='project' OR project_id=?)"
+        base_where = "status='active'"
+        if not include_all_projects:
+            base_where += " AND (scope!='project' OR project_id=?)"
         if strict:
             base_where += " AND risk!='secret' AND quarantined_at=0 AND trust_class NOT IN ('tool_log','raw_blob','secret') AND type!='source_artifact' AND quality>=0.20"
         if topic_slug:
             base_where += " AND topic=?"
-        base_params = [pid] + ([topic_slug] if topic_slug else [])
+        base_params = ([] if include_all_projects else [pid]) + ([topic_slug] if topic_slug else [])
         semantic_hydrated = self._hydrate_semantic_candidates(
             c, candidates, semantic_ids, base_where, base_params
         )
@@ -7639,7 +7642,10 @@ class MemoryWikiProvider(MemoryProvider):
                     if strict:
                         fts_sql += " AND claims.risk!='secret' AND claims.quarantined_at=0 AND claims.trust_class NOT IN ('tool_log','raw_blob','secret') AND claims.type!='source_artifact' AND claims.quality>=0.20"
                     if topic_slug: fts_sql += " AND claims.topic=?"; fts_params.append(topic_slug)
-                    fts_sql += " AND (claims.scope!='project' OR claims.project_id=?) ORDER BY rank"; fts_params.append(pid)
+                    if not include_all_projects:
+                        fts_sql += " AND (claims.scope!='project' OR claims.project_id=?)"
+                        fts_params.append(pid)
+                    fts_sql += " ORDER BY rank"
                     for r in c.execute(fts_sql + " LIMIT 100", fts_params).fetchall(): candidates.setdefault(r["id"], r); bm25[r["id"]] = max(bm25.get(r["id"], 0.0), bm25_norm(r["rank"]))
                 except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
                     # --- P3: FTS5 runtime auto-repair on corruption ---
@@ -7677,7 +7683,9 @@ class MemoryWikiProvider(MemoryProvider):
         scored=[]
         for r in candidates.values():
             if r["status"] != "active": continue
-            if not self._claim_visible(r, session_id): continue
+            if not self._claim_visible(r, session_id):
+                if not (include_all_projects and str(r["visibility_scope"] if "visibility_scope" in r.keys() else "") == "project"):
+                    continue
             if str(r["risk"] if "risk" in r.keys() else "low") == "secret": continue
             if int(r["quarantined_at"] if "quarantined_at" in r.keys() else 0) > 0: continue
             quality = float(r["quality"] if "quality" in r.keys() else claim_quality(r["claim"], r["topic"]))
