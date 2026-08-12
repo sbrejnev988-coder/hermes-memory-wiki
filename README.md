@@ -54,13 +54,13 @@ Plaintext returned intentionally by `secret_context_lookup` can still enter the 
 
 | Variable | Default | Description |
 |---|---|---|
-| `MEMORY_WIKI_EMBED_PROVIDER` | `stub` | `openrouter` or local `stub` fallback |
-| `MEMORY_WIKI_EMBED_URL` | provider-dependent | `https://openrouter.ai/api/v1` for `openrouter`, otherwise `http://127.0.0.1:4000` |
-| `MEMORY_WIKI_EMBED_MODEL` | provider-dependent | `hash-ngram-2560` for `stub`; `qwen/qwen3-embedding-8b` for `openrouter` |
-| `MEMORY_WIKI_EMBED_DIMENSIONS` | `2560` | Embedding response dimensions; must equal `MEMORY_WIKI_VECTOR_SIZE` |
+| `MEMORY_WIKI_EMBED_PROVIDER` | `openrouter` | `openrouter`, `nous`, or local `stub` fallback |
+| `MEMORY_WIKI_EMBED_URL` | provider-dependent | OpenRouter for `openrouter`, Nous inference API for `nous`, otherwise `http://127.0.0.1:4000` |
+| `MEMORY_WIKI_EMBED_MODEL` | provider-dependent | `qwen/qwen3-embedding-8b` for `openrouter`/`nous`; `hash-ngram-4096` for `stub` |
+| `MEMORY_WIKI_EMBED_DIMENSIONS` | `4096` | Embedding response dimensions; must equal `MEMORY_WIKI_VECTOR_SIZE` |
 | `MEMORY_WIKI_EMBED_INPUT_MAX_CHARS` | `12000` | Maximum document/query characters sent to the embedding endpoint; included in the embedding manifest |
 | `MEMORY_WIKI_QDRANT_COLLECTION` | `memory_wiki_claims` | Collection name prefix |
-| `MEMORY_WIKI_VECTOR_SIZE` | `2560` | Qdrant vector size; the local stub and provider response are validated against it |
+| `MEMORY_WIKI_VECTOR_SIZE` | `4096` | Qdrant vector size; the local stub and provider response are validated against it |
 | `MEMORY_WIKI_RERANK_ENABLED` | `false` | Enable second-stage reranking |
 | `MEMORY_WIKI_RERANK_TIMEOUT` | `3.0` | Per-request rerank timeout; runtime hard-caps it at 3 seconds |
 | `MEMORY_WIKI_RERANK_RETRY_COUNT` | `1` | Compatibility setting; prompt-time reranking is always single-attempt |
@@ -283,9 +283,9 @@ memory_wiki_query({"query": "proxy port"})
 ```
 
 
-## 2560-dimensional migration note
+## Vector-dimension contract
 
-This build uses a strict `2560 = 2560` dimensional contract for both `MEMORY_WIKI_EMBED_DIMENSIONS` and `MEMORY_WIKI_VECTOR_SIZE`. Here `2560` is the length of every vector, not the number of Qdrant points. The local `stubs/embed_stub.py` reports its dimension and actual hashing model in `/health`; Memory Wiki refuses semantic indexing when the provider/Qdrant dimensions differ or the bundled hash-stub model identity is inconsistent. Embedding values are also rejected when they are non-numeric or contain `NaN`/`Inf`.
+The current defaults use a strict `4096 = 4096` dimensional contract for both `MEMORY_WIKI_EMBED_DIMENSIONS` and `MEMORY_WIKI_VECTOR_SIZE`. Here `4096` is the length of every vector, not the number of Qdrant points. If you intentionally select a 2560-dimensional embedding model, set both values to `2560` and run a manifest reindex. The local `stubs/embed_stub.py` reports its dimension and actual hashing model in `/health`; Memory Wiki refuses semantic indexing when the provider/Qdrant dimensions differ or the bundled hash-stub model identity is inconsistent. Embedding values are also rejected when they are non-numeric or contain `NaN`/`Inf`.
 
 Do not replace plugin files while a reindex call is actively running. Let the current call finish, stop/restart the gateway, install this build, then start the new manifest reindex. The installer included in the release package checks `reindex_jobs` and refuses installation while a running job is recorded unless explicitly overridden.
 
