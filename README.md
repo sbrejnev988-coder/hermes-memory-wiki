@@ -7,6 +7,8 @@ Native structured long-term memory provider for Hermes Agent. SQLite claims are 
 - **r19 token governor**: exact embedding reuse inside the provider process; tool-cache contract 2.4.0 with smart initial tool mode (≤24 tools), exact-cache with tools enabled, shadow semantic mode by default.
 - **r20 partitioned cache**: cache signature is scoped per visibility component (`shared` / `bot:` / `project:` / `private:<chat_hash>`). A write in project B no longer invalidates project A / private / bot cache entries. Contract: `memory-cache-state-v3-r20-partitioned` with per-component revisions bumped on upsert / add_evidence / update_claim / set_status_by_text.
 
+- **r21 repository scope + FTS repair**: code-claim search is project-scoped with `include_all_projects` opt-in — the classifier (not SQL) decides `foreign_repository` / `exact_content_hash_match` suppression; code-claim manifest guard rejects stale/invalid manifests; automatic FTS5 corruption detection and rebuild.
+
 ## Architecture
 
 ```
@@ -24,6 +26,8 @@ Outbox worker (async):
   → _embed_document(text)
   → _qdrant_upsert → memory_wiki_claims_active alias
   → статус: completed / failed (5 попыток)
+  → embedding-вызовы: 3 попытки с экспоненциальным backoff (1s/2s) на 429/5xx;
+    curl-fallback проверяет HTTP-статус (rc=0 на 4xx/5xx больше не считается успехом)
 
 Retrieval pipeline:
   FTS5/BM25 + Qdrant embeddings → hydrate Qdrant-only claims from SQLite → RRF → Voyage/Cohere instruction-aware rerank → configurable diversity → structured XML
@@ -48,6 +52,7 @@ Plaintext returned intentionally by `secret_context_lookup` can still enter the 
 - SQLite 3.35+ (FTS5)
 - Qdrant (optional, for semantic search)
 - OpenRouter API key (only when embeddings or rerank are enabled)
+- `NOUS_API_KEY` (only when `MEMORY_WIKI_EMBED_PROVIDER=nous` — https://inference-api.nousresearch.com)
 - `hermes_trust_core` and `hermes_core_loader` in `{HERMES_HOME}/lib` for the strict security-integrated build
 
 ## Environment variables
@@ -103,20 +108,22 @@ Plaintext returned intentionally by `secret_context_lookup` can still enter the 
 - A cancelled late worker does not acknowledge the revision watermark, so claims that were not injected remain eligible on the next turn.
 
 
-## Recall expansion in v1.18.5
+## Recall expansion (v1.18.5 — historical notes)
+
+> Текущий контракт по умолчанию — **4096D** (`qwen/qwen3-embedding-8b` для `openrouter`/`nous`). Секция ниже описывает поведение, добавленное в v1.18.5; рекомендации по конфигу обновлены под актуальные дефолты.
 
 - Qdrant-only matches are now hydrated from SQLite before scoring. SQLite remains the source of truth; Qdrant contributes IDs and similarity scores.
 - Automatic `prefetch()` now uses configurable claim and character budgets instead of fixed `10` and `12000` limits.
 - The hard three-claims-per-topic diversity cap is configurable and defaults to eight, preserving coherent PPLX result sets while retaining a bounded context.
 - Existing reindex and atomic alias-switch behavior is unchanged. Reindex is still required after changing embedding model or vector dimensions.
 
-Recommended starting values for `perplexity/pplx-embed-v1-4b`:
+Recommended starting values (4096-dim contract):
 
 ```env
-MEMORY_WIKI_EMBED_PROVIDER=openrouter
-MEMORY_WIKI_EMBED_MODEL=perplexity/pplx-embed-v1-4b
-MEMORY_WIKI_EMBED_DIMENSIONS=2560
-MEMORY_WIKI_VECTOR_SIZE=2560
+MEMORY_WIKI_EMBED_PROVIDER=nous            # или openrouter
+MEMORY_WIKI_EMBED_MODEL=qwen/qwen3-embedding-8b
+MEMORY_WIKI_EMBED_DIMENSIONS=4096
+MEMORY_WIKI_VECTOR_SIZE=4096
 MEMORY_WIKI_VECTOR_TOP_K=200
 MEMORY_WIKI_PREFETCH_CLAIM_LIMIT=20
 MEMORY_WIKI_MAX_PREFETCH_CHARS=24000
@@ -139,7 +146,12 @@ git clone https://github.com/sbrejnev988-coder/hermes-memory-wiki.git memory-wik
 #   ~/.hermes/lib/hermes_secret_core.py (pinned by the loader)
 
 # Restart Hermes gateway
-glinomes restart
+hermes gateway restart
+
+# Windows (PowerShell):
+#   cd $env:USERPROFILE\.hermes\plugins
+#   git clone https://github.com/sbrejnev988-coder/hermes-memory-wiki.git memory-wiki
+#   hermes gateway restart
 ```
 
 Before restart, run `python3 -m py_compile __init__.py collapse.py extractor.py decay.py`.
@@ -423,6 +435,16 @@ When the document-vector contract changes (model, dimensions, input limit, docum
 ## Performance
 
 Latency and reindex duration depend on the embedding provider, Qdrant placement, candidate count and hardware. The bounded rerank top-K, cache, circuit breaker and resumable reindex checkpoints are intended to keep degradation controlled; measure on the actual deployment rather than relying on fixed timing estimates.
+
+## Changelog
+
+- **v1.20.8 (2026-08-12)**: docs/contract sync — README 4096-dim contract, `nous` embed provider documented, plugin.yaml version aligned with runtime banner.
+- **r21 (2026-08-11)**: repository-scope hardening + code-claim manifest guard + FTS corruption auto-repair; `pack_context` sees project-scoped code claims with `include_all_projects` opt-in.
+- **nous embed retry (2026-08-09)**: exponential backoff (1s/2s) on inference-api burst 429/5xx; curl fallback now checks HTTP status — fixes 61 claims stuck `failed`.
+- **r19+r20 (2026-08-08)**: token governor (tool-cache 2.4.0, smart initial tool mode ≤24 tools, exact cache with tools); partitioned cache identity `memory-cache-state-v3-r20-partitioned` — per-component revisions bumped on upsert / add_evidence / update_claim / set_status_by_text.
+- **nous embed provider (2026-08-08)**: `NOUS_API_KEY` priority + curl fallback (Cloudflare 1010 bans urllib TLS fingerprint).
+- **v1.20.6 (2026-07-30)**: secret context hardening R5 — readthrough bridge, credential quarantine, document recall sanitization.
+- **v1.20.5 (2026-07-25)**: prefetch hardening R4 — observability, recall audit, active memory prefetch bounds, prefetch fallback.
 
 ## License
 
