@@ -9437,14 +9437,47 @@ class MemoryWikiProvider(MemoryProvider):
         return {'mode':mode,'id':bid,'payload_hash':payload_hash,'counts':counts,'created_claims':created[:100]}
 
     def _apply_user_correction(self,a):
-        corr=normalize_claim(a.get('correction') or ''); target=a.get('target_claim_id') or ''; topic=self._topic_alias(a.get('topic') or 'corrections', corr); changed=[]
+        corr=normalize_claim(a.get('correction') or '')
+        if not corr:
+            raise ValueError('correction is required')
+        target=str(a.get('target_claim_id') or '').strip()
+        topic=self._topic_alias(a.get('topic') or 'corrections', corr)
+        changed=[]
         with self._connect() as c:
             if target:
-                c.execute("UPDATE claims SET status='superseded', updated_at=? WHERE id=?", (now(),target)); changed.append(target)
+                existing=c.execute("SELECT id,status FROM claims WHERE id=?", (target,)).fetchone()
+                if not existing:
+                    raise ValueError(f'target_claim_id not found: {target}')
+                if str(existing['status'] or '') not in ('superseded','deleted'):
+                    cur=c.execute("UPDATE claims SET status='superseded', updated_at=? WHERE id=?", (now(),target))
+                    if int(cur.rowcount or 0) == 1:
+                        changed.append(target)
             else:
-                for r in self._search(corr, 5, True):
-                    if r['status']=='active' and r['confidence']<.95:
-                        c.execute("UPDATE claims SET status='uncertain', updated_at=? WHERE id=?", (now(),r['id'])); changed.append(r['id'])
+                # A correction without an explicit target must never mass-mutate the top-N
+                # retrieval results. Only one strongly related active claim may be marked
+                # uncertain; otherwise the correction is stored without touching old claims.
+                corr_tokens=tokens(corr)
+                candidates=self._search(corr, 5, True, record_retrieval=False)
+                best=None
+                for r in candidates:
+                    if r.get('status')!='active' or float(r.get('confidence') or 0) >= .95:
+                        continue
+                    claim_text=normalize_claim(r.get('claim') or '')
+                    claim_tokens=tokens(claim_text)
+                    if not corr_tokens or not claim_tokens:
+                        continue
+                    overlap=len(corr_tokens & claim_tokens) / max(1, min(len(corr_tokens), len(claim_tokens)))
+                    containment=(claim_text.lower() in corr.lower()) or (corr.lower() in claim_text.lower())
+                    if overlap < .55 and not containment:
+                        continue
+                    candidate=(overlap, float(r.get('score') or 0), r)
+                    if best is None or candidate[:2] > best[:2]:
+                        best=candidate
+                if best is not None:
+                    r=best[2]
+                    cur=c.execute("UPDATE claims SET status='uncertain', updated_at=? WHERE id=? AND status='active'", (now(),r['id']))
+                    if int(cur.rowcount or 0) == 1:
+                        changed.append(r['id'])
         cid=self._add_claim('User correction: '+corr, topic, 'Explicit user correction captured by memory_wiki_apply_user_correction', 'explicit_user_correction', .98, .95)
         return {'claim_id':cid,'updated_old_claims':changed}
 
