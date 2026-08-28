@@ -439,6 +439,12 @@ def _source_id(path: Path) -> str:
     return "docsrc_" + _sha(str(path))[:24]
 
 
+def _evidence_ref(value: Any) -> str:
+    """Return a deterministic, secret-scanner-safe provenance reference."""
+    digest = _sha(str(value or ""))[:32]
+    return "-".join(digest[index:index + 8] for index in range(0, len(digest), 8))
+
+
 def _unit_id(source_id: str, revision_id: str, anchor: str) -> str:
     return "docunit_" + _sha(f"{source_id}\0{revision_id}\0{anchor}")[:28]
 
@@ -514,14 +520,35 @@ def _make_chunks(source: Dict[str, Any], units: List[Dict[str, Any]]) -> List[Di
     return chunks
 
 
-def _archive_claims(conn: sqlite3.Connection, claim_ids: Iterable[str]) -> int:
+def _archive_claims(
+    conn: sqlite3.Connection,
+    claim_ids: Iterable[str],
+    *,
+    retiring_source_ids: Iterable[str] = (),
+) -> int:
+    """Archive unreferenced document claims while preserving shared active chunks."""
     ids = sorted({str(x) for x in claim_ids if str(x)})
     if not ids:
         return 0
-    placeholders = ",".join("?" for _ in ids)
+    retiring = sorted({str(source_id) for source_id in retiring_source_ids if str(source_id)})
+    archivable: list[str] = []
+    for claim_id in ids:
+        if retiring:
+            placeholders = ",".join("?" for _ in retiring)
+            shared = conn.execute(
+                "SELECT 1 FROM document_chunks WHERE embedding_claim_id=? AND active=1 "
+                f"AND source_id NOT IN ({placeholders}) LIMIT 1",
+                [claim_id, *retiring],
+            ).fetchone()
+            if shared:
+                continue
+        archivable.append(claim_id)
+    if not archivable:
+        return 0
+    placeholders = ",".join("?" for _ in archivable)
     cur = conn.execute(
         f"UPDATE claims SET status='archived', updated_at=? WHERE id IN ({placeholders}) AND status='active'",
-        [_now(), *ids],
+        [_now(), *archivable],
     )
     return int(cur.rowcount or 0)
 
@@ -568,7 +595,7 @@ def ingest_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
         ).fetchall()]
         ts = _now()
         with conn:
-            archived = _archive_claims(conn, old_claims)
+            archived = _archive_claims(conn, old_claims, retiring_source_ids={source_id})
             conn.execute(
                 "UPDATE document_sources SET scope_id=?,repository_id=?,updated_at=? WHERE source_id=?",
                 (scope_id, repository_id, ts, source_id),
@@ -605,7 +632,7 @@ def ingest_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
         ).fetchall()]
 
     with conn:
-        archived = _archive_claims(conn, old_claims)
+        archived = _archive_claims(conn, old_claims, retiring_source_ids={source_id})
         conn.execute("UPDATE document_units SET active=0,updated_at=? WHERE source_id=? AND active=1", (ts, source_id))
         conn.execute("UPDATE document_chunks SET active=0,updated_at=? WHERE source_id=? AND active=1", (ts, source_id))
         conn.execute("UPDATE document_edges SET active=0,updated_at=? WHERE source_id=? AND active=1", (ts, source_id))
@@ -781,11 +808,23 @@ def scan_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
                     and str(existing["scope_id"] or "") == requested_scope
                     and str(existing["repository_id"] or "") == requested_repo
                     and str(existing["parser_version"] or "") == _CURRENT_PARSER_VERSION):
-                results.append({
+                unchanged_result = {
                     "status": "unchanged", "source_id": str(existing["source_id"]),
                     "revision_id": str(existing["revision_id"]), "path": str(path),
                     "fast_path": "mtime_size",
-                })
+                }
+                # Auto-embed is explicitly cost-enabled by the caller.  Do not
+                # let the stat fast path strand chunks that were indexed before
+                # embeddings were available or enabled.
+                if bool(args.get("embed", False)):
+                    unchanged_result["embedding"] = embed_pending_documents(
+                        provider,
+                        {
+                            "source_id": str(existing["source_id"]),
+                            "limit": int(args.get("embed_limit") or 200),
+                        },
+                    )
+                results.append(unchanged_result)
                 continue
             if changed_processed >= max_changed:
                 deferred += 1
@@ -895,8 +934,11 @@ def embed_pending_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, An
     created = reused = failed = 0; errors = []
     for raw in rows:
         item = _row(raw)
-        # Reuse an active claim generated for an identical active chunk if one exists.
-        evidence_key = f"document_chunk:{item['source_id']}:{item['content_hash']}"
+        # Evidence participates in the secret firewall, so use grouped hash refs
+        # rather than raw paths, IDs, revisions, or continuous digest strings.
+        evidence_key = "document_chunk_ref:" + _evidence_ref(
+            f"{item['source_id']}\0{item['content_hash']}"
+        )
         prior = conn.execute(
             "SELECT id FROM claims WHERE topic=? AND status='active' AND evidence LIKE ? ORDER BY updated_at DESC LIMIT 1",
             (_TOPIC, f"%{evidence_key}%"),
@@ -905,9 +947,11 @@ def embed_pending_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, An
             if prior:
                 claim_id = str(prior[0]); reused += 1
             else:
+                # The document graph retains raw paths and anchors. Keep the
+                # embedding claim's evidence scanner-safe and deterministic.
                 evidence = (
-                    f"{evidence_key}; path={item['source_path']}; anchors={item['start_anchor']}..{item['end_anchor']}; "
-                    f"revision={item['revision_id']}"
+                    f"{evidence_key}; source_ref:{_evidence_ref(item['source_id'])}; "
+                    f"revision_ref:{_evidence_ref(item['revision_id'])}"
                 )
                 project_id = str(item.get("repository_id") or item.get("scope_id") or "")
                 claim_id = provider._add_claim(
@@ -1021,8 +1065,11 @@ def query_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     _rrf(scores, parts, unit_keys, "fts_unit", 0.95); _rrf(scores, parts, chunk_keys, "fts_chunk", 1.10)
     semantic_count = 0; semantic_error = ""
     try:
+        # Document queries apply their own source/scope filters after claim lookup.
+        # Permit the selected project scope even when it differs from the current
+        # chat project, while ordinary Memory-Wiki recall remains scope-restricted.
         semantic = provider._search(query, limit=min(candidate_limit, 80), include_stale=False, topic=_TOPIC,
-                                    session_id=str(args.get("session_id") or ""))
+                                    session_id=str(args.get("session_id") or ""), include_all_projects=True)
         claim_ids = [str(r.get("id") or "") for r in semantic if str(r.get("id") or "")]
         if claim_ids:
             placeholders = ",".join("?" for _ in claim_ids)
@@ -1203,7 +1250,7 @@ def delete_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     conn = provider._connect(); install_document_graph_schema(conn)
     claim_ids = [str(r[0]) for r in conn.execute("SELECT embedding_claim_id FROM document_chunks WHERE source_id=? AND active=1 AND embedding_claim_id<>''", (source_id,)).fetchall()]
     with conn:
-        archived = _archive_claims(conn, claim_ids)
+        archived = _archive_claims(conn, claim_ids, retiring_source_ids={source_id})
         conn.execute("UPDATE document_sources SET active=0,status='deleted',updated_at=? WHERE source_id=?", (_now(), source_id))
         conn.execute("UPDATE document_units SET active=0,updated_at=? WHERE source_id=?", (_now(), source_id))
         conn.execute("UPDATE document_chunks SET active=0,updated_at=? WHERE source_id=?", (_now(), source_id))

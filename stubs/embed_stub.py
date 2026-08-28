@@ -17,6 +17,7 @@ import threading
 import time
 from collections import Counter
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from socket import SOL_SOCKET, SO_REUSEADDR
 from socketserver import ThreadingMixIn
 from typing import Any
@@ -27,7 +28,14 @@ MIN_VECTOR_SIZE = 8
 MAX_VECTOR_SIZE = 65536
 NGRAM_SIZES = (2, 3, 4)
 MAX_TEXT_LEN = max(256, int(os.environ.get("EMBED_MAX_TEXT_CHARS", "32768")))
-ERROR_LOG = os.environ.get("EMBED_STUB_LOG", "/tmp/embed_stub.log")
+ERROR_LOG = os.environ.get(
+    "EMBED_STUB_LOG",
+    str(
+        Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+        / "memory-wiki"
+        / "embed_stub.log"
+    ),
+)
 
 
 def _bounded_dimension(value: Any, default: int) -> int:
@@ -62,7 +70,9 @@ idf_lock = threading.Lock()
 
 def stub_log(message: str) -> None:
     try:
-        with open(ERROR_LOG, "a", encoding="utf-8") as handle:
+        log_path = Path(ERROR_LOG)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as handle:
             handle.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} EMBED {message}\n")
     except Exception:
         pass

@@ -368,6 +368,9 @@ def _read_zip_xml(zf: zipfile.ZipFile, name: str, max_bytes: int = 32_000_000) -
         data = fh.read(max_bytes + 1)
     if len(data) > max_bytes:
         raise ValueError(f"XML part exceeds {max_bytes} bytes: {name}")
+    xml_upper = data.upper()
+    if b"<!DOCTYPE" in xml_upper or b"<!ENTITY" in xml_upper:
+        raise ValueError("DTD/entity declarations are not allowed in document XML")
     return ET.fromstring(data)
 
 

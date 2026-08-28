@@ -1,4 +1,4 @@
-# Hermes Memory Wiki v1.20.8
+# Hermes Memory Wiki v1.20.9
 
 Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 101 MCP tools.
 
@@ -160,6 +160,39 @@ On first init the plugin creates:
 - `{HERMES_HOME}/memory-wiki/memory_wiki.sqlite3` — SQLite database (source of truth)
 - Qdrant collection `memory_wiki_claims_{manifest_hash_12chars}`
 - Qdrant alias `memory_wiki_claims_active` → physical collection
+
+## Optional external MCP wrapper
+
+The normal Hermes integration is the **exclusive `memory-wiki` memory provider**;
+it is activated by `memory.provider: memory-wiki` and already exposes the native
+tool schemas. Do **not** add the wrapper as another MCP server in that same
+Hermes process unless duplicate tools are intentional.
+
+Use `mcp-wrapper/server.py` only when a different MCP client needs access to
+Memory Wiki. Configure that client to launch the wrapper over stdio and pass
+the active profile paths explicitly (Hermes filters child environments, and the
+Windows profile home is not necessarily `~/.hermes`):
+
+```json
+{
+  "command": "python",
+  "args": ["/absolute/path/to/memory-wiki/mcp-wrapper/server.py"],
+  "env": {
+    "HERMES_HOME": "/absolute/path/to/active/hermes-home",
+    "MW_PLUGIN_PATH": "/absolute/path/to/memory-wiki/__init__.py"
+  }
+}
+```
+
+- Wrapper names are `mw_*` (for example, `memory_wiki_query` becomes
+  `mw_query`); native provider names remain `memory_wiki_*`.
+- `tools/list` rebuilds a **runtime** schema cache at
+  `{HERMES_HOME}/cache/memory-wiki/mcp-tool-schemas.json`; it never rewrites
+  the packaged `mcp-wrapper/tool_schemas.json`. Set `MW_MCP_SCHEMA_CACHE` only
+  when a different runtime-cache location is required.
+- The wrapper implements stdio JSON-RPC initialization, tool discovery and tool
+  calls. Its actual tool schemas are still sourced from
+  `MemoryWikiProvider.get_tool_schemas()`.
 
 ## Key MCP tools
 
@@ -438,6 +471,7 @@ Latency and reindex duration depend on the embedding provider, Qdrant placement,
 
 ## Changelog
 
+- **v1.20.9 (2026-08-28)**: document-index lifecycle, provenance, Windows UTF-8 worker and optional-secret prefetch regressions covered; automatic embedding now drains pre-existing pending chunks; health and MCP handshake versions now match `plugin.yaml`; MCP schema refresh now uses a profile runtime cache (never mutating packaged schemas), returns JSON-RPC parse errors, redacts credential-shaped errors, and works from immutable installs; XML DTD/entity declarations and shared `/tmp` debug logs are rejected/removed; cross-platform pytest CI added.
 - **v1.20.8 (2026-08-12)**: docs/contract sync — README 4096-dim contract, `nous` embed provider documented, plugin.yaml version aligned with runtime banner.
 - **r21 (2026-08-11)**: repository-scope hardening + code-claim manifest guard + FTS corruption auto-repair; `pack_context` sees project-scoped code claims with `include_all_projects` opt-in.
 - **nous embed retry (2026-08-09)**: exponential backoff (1s/2s) on inference-api burst 429/5xx; curl fallback now checks HTTP status — fixes 61 claims stuck `failed`.

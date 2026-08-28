@@ -44,7 +44,9 @@ def main() -> int:
     if len(encoded.encode("utf-8")) > max_output:
         response = {"ok": False, "error": "document worker output exceeds configured limit"}
         encoded = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
-    sys.stdout.write(encoded)
+    # The parent decodes stdout as UTF-8. Write bytes directly so the worker
+    # remains protocol-safe under Windows console code pages such as cp1251.
+    sys.stdout.buffer.write(encoded.encode("utf-8"))
     return 0 if response.get("ok") else 2
 
 if __name__ == "__main__":

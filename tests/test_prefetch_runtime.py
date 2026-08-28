@@ -165,24 +165,28 @@ def test_trusted_preferences_are_real_system_prompt_content() -> None:
         provider.recovery_dir = root / "recovery"
         provider.db_path = root / "memory.sqlite3"
         conn = provider._connect()
-        conn.execute("""CREATE TABLE preference_rules(
-            id TEXT PRIMARY KEY, rule TEXT NOT NULL, priority INTEGER NOT NULL,
-            scope TEXT NOT NULL, source TEXT NOT NULL, status TEXT NOT NULL,
-            created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, hash TEXT NOT NULL UNIQUE
-        )""")
-        rows = [
-            ("pref_system", "Current explicit user instruction wins.", 1000, "global", "system", "active", 1, 1, "h1"),
-            ("pref_user", "Всегда отвечать на русском языке.", 100, "language", "user: Kekl", "active", 1, 2, "h2"),
-            ("pref_auto", "This auto-extracted text must stay untrusted.", 999, "global", "extractor:auto", "active", 1, 3, "h3"),
-        ]
-        conn.executemany("INSERT INTO preference_rules VALUES(?,?,?,?,?,?,?,?,?)", rows)
-        conn.commit()
-        prompt = provider.system_prompt_block()
-        assert "# Trusted User Preference Layer" in prompt
-        assert "Всегда отвечать на русском языке." in prompt
-        assert "Current explicit user instruction wins." in prompt
-        assert "auto-extracted text" not in prompt
-        assert "ordinary recalled claims" in prompt
+        try:
+            conn.execute("""CREATE TABLE preference_rules(
+                id TEXT PRIMARY KEY, rule TEXT NOT NULL, priority INTEGER NOT NULL,
+                scope TEXT NOT NULL, source TEXT NOT NULL, status TEXT NOT NULL,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, hash TEXT NOT NULL UNIQUE
+            )""")
+            rows = [
+                ("pref_system", "Current explicit user instruction wins.", 1000, "global", "system", "active", 1, 1, "h1"),
+                ("pref_user", "Всегда отвечать на русском языке.", 100, "language", "user: Kekl", "active", 1, 2, "h2"),
+                ("pref_auto", "This auto-extracted text must stay untrusted.", 999, "global", "extractor:auto", "active", 1, 3, "h3"),
+            ]
+            conn.executemany("INSERT INTO preference_rules VALUES(?,?,?,?,?,?,?,?,?)", rows)
+            conn.commit()
+            prompt = provider.system_prompt_block()
+            assert "# Trusted User Preference Layer" in prompt
+            assert "Всегда отвечать на русском языке." in prompt
+            assert "Current explicit user instruction wins." in prompt
+            assert "auto-extracted text" not in prompt
+            assert "ordinary recalled claims" in prompt
+        finally:
+            conn.close()
+            provider._conn = None
 
 
 def main() -> None:

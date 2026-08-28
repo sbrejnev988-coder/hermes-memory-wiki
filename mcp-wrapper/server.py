@@ -10,6 +10,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -18,14 +19,32 @@ _PROVIDER = None
 _SCHEMAS: list[dict[str, Any]] | None = None
 _SCHEMA_MAP: dict[str, dict[str, Any]] = {}
 BASE_DIR = Path(__file__).resolve().parent
-SCHEMAS_FILE = BASE_DIR / "tool_schemas.json"
+PACKAGED_SCHEMAS_FILE = BASE_DIR / "tool_schemas.json"
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+SCHEMAS_FILE = Path(
+    os.environ.get(
+        "MW_MCP_SCHEMA_CACHE",
+        str(HERMES_HOME / "cache" / "memory-wiki" / "mcp-tool-schemas.json"),
+    )
+).expanduser()
 PLUGIN_PATH = Path(
     os.environ.get(
         "MW_PLUGIN_PATH",
         str(HERMES_HOME / "plugins" / "memory-wiki" / "__init__.py"),
     )
 ).expanduser()
+
+
+def manifest_version() -> str:
+    """Read the co-located plugin version without importing the provider."""
+    manifest = PLUGIN_PATH.parent / "plugin.yaml"
+    try:
+        for line in manifest.read_text(encoding="utf-8").splitlines():
+            if line.startswith("version:"):
+                return line.partition(":")[2].strip().strip('"\'')
+    except OSError:
+        pass
+    return "unknown"
 
 
 def log(message: str) -> None:
@@ -36,6 +55,23 @@ def log(message: str) -> None:
 def send(data: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(data, ensure_ascii=False, default=str) + "\n")
     sys.stdout.flush()
+
+
+def redact_error_message(message: Any) -> str:
+    """Keep wrapper failures useful without leaking common credential forms."""
+    text = str(message or "")
+    text = re.sub(
+        r"(?i)(authorization\s*:\s*bearer\s+)([^\s,;]+)",
+        r"\1<redacted>",
+        text,
+    )
+    text = re.sub(r"(?i)(\bbearer\s+)([^\s,;]+)", r"\1<redacted>", text)
+    text = re.sub(
+        r"(?i)(\b(?:api[_-]?key|token|password|secret)\s*[:=]\s*)([^\s,;]+)",
+        r"\1<redacted>",
+        text,
+    )
+    return re.sub(r"\b(?:sk|ghp)_[A-Za-z0-9_-]+", "<redacted>", text)[:1000]
 
 
 def ensure_plugin():
@@ -101,17 +137,23 @@ def load_schemas() -> list[dict[str, Any]]:
 
     provider = ensure_plugin()
     raw = provider.get_tool_schemas()
-    schemas = [normalize_schema(item) for item in raw if isinstance(item, dict)]
+    native_schemas = [item for item in raw if isinstance(item, dict)]
+    schemas = [normalize_schema(item) for item in native_schemas]
     schemas = [item for item in schemas if item.get("name")]
     if not schemas:
         raise RuntimeError("MemoryWikiProvider.get_tool_schemas() returned no tools")
 
     temporary = SCHEMAS_FILE.with_suffix(".json.tmp")
-    temporary.write_text(
-        json.dumps(schemas, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    temporary.replace(SCHEMAS_FILE)
+    try:
+        SCHEMAS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            json.dumps(native_schemas, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(SCHEMAS_FILE)
+    except OSError as exc:
+        # Discovery must remain usable for immutable plugin installs.
+        log(f"Schema cache was not persisted: {type(exc).__name__}")
 
     _SCHEMAS = schemas
     _SCHEMA_MAP = {item["name"]: item for item in schemas}
@@ -123,7 +165,7 @@ def error_response(message_id, code: int, message: str) -> None:
     send({
         "jsonrpc": "2.0",
         "id": message_id,
-        "error": {"code": code, "message": str(message)[:1000]},
+        "error": {"code": code, "message": redact_error_message(message)},
     })
 
 
@@ -135,6 +177,7 @@ def main() -> int:
         try:
             request = json.loads(line)
         except json.JSONDecodeError:
+            error_response(None, -32700, "Parse error")
             continue
 
         message_id = request.get("id")
@@ -148,7 +191,7 @@ def main() -> int:
                     "result": {
                         "protocolVersion": "2024-11-05",
                         "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "mw", "version": "1.20.8-fix-r1"},
+                        "serverInfo": {"name": "mw", "version": manifest_version()},
                     },
                 })
             elif method == "notifications/initialized":
@@ -180,8 +223,9 @@ def main() -> int:
             else:
                 error_response(message_id, -32601, f"Unknown method: {method}")
         except Exception as exc:
-            log(f"Error: {type(exc).__name__}: {exc}")
-            error_response(message_id, -32000, f"{type(exc).__name__}: {exc}")
+            safe_error = redact_error_message(f"{type(exc).__name__}: {exc}")
+            log(f"Error: {safe_error}")
+            error_response(message_id, -32000, safe_error)
     return 0
 
 

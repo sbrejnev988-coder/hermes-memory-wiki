@@ -1,4 +1,4 @@
-"""memory-wiki v1.20.8+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.20.9+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -36,6 +36,8 @@ import urllib.error
 from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime, timezone
+
+PLUGIN_VERSION = "1.20.9"
 
 # HERMES-SECURITY-INTEGRATION-20260728: verified, fixed-file and SHA-256-pinned secret-core loader.
 _SECRET_CORE_AVAILABLE = False
@@ -1172,7 +1174,11 @@ CONTEXT_MAX_TOKENS = _env_int("MEMORY_WIKI_CONTEXT_MAX_TOKENS", 4000, 800, 32000
 CONTEXT_MAX_CLAIMS = _env_int("MEMORY_WIKI_CONTEXT_MAX_CLAIMS", 24, 4, 50)
 CONTEXT_MAX_PER_TOPIC = _env_int("MEMORY_WIKI_CONTEXT_MAX_PER_TOPIC", 8, 2, 20)
 DEBUG_MODE = os.environ.get("MEMORY_WIKI_DEBUG", "0") in ("1", "true", "yes")
-DEBUG_LOG = "/tmp/memory_wiki_debug.log"
+DEBUG_LOG = str(
+    Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
+    / "memory-wiki"
+    / "debug.log"
+)
 
 # Query mode detection patterns
 TECH_PATTERNS = re.compile(
@@ -1202,7 +1208,9 @@ def _debug_log(msg: str) -> None:
     """Запись в debug-лог если MEMORY_WIKI_DEBUG=1."""
     if not DEBUG_MODE: return
     try:
-        with open(DEBUG_LOG, "a") as f:
+        log_path = Path(DEBUG_LOG)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}\n")
     except Exception: pass
 
@@ -3258,7 +3266,18 @@ class MemoryWikiProvider(MemoryProvider):
         # second hybrid search and count candidates before Injection Guard.
         plan = self._recall_plan(query, limit=6, preselected_rows=rows)
         env_meta = self._env_metadata_context(query)
-        secrets_meta = self._secret_context(query, limit=3)
+        # Secret metadata is optional for automatic recall. A missing secret-core
+        # integration must not discard an otherwise valid semantic context.
+        try:
+            secrets_meta = self._secret_context(query, limit=3)
+        except RuntimeError as secret_context_exc:
+            if not str(secret_context_exc).startswith("hermes_secret_core_unavailable:"):
+                raise
+            _debug_log(
+                "Secret metadata prefetch skipped because the secret core is unavailable: "
+                f"{secret_context_exc}"
+            )
+            secrets_meta = ""
         code_prefetch = ""
         try:
             code_prefetch = _maybe_prefetch_code_context(
@@ -6919,15 +6938,20 @@ class MemoryWikiProvider(MemoryProvider):
                     "project_id": str(revision_row["project_id"] or "") if revision_row else "",
                     "event_at": int(revision_row["event_at"] or 0) if revision_row else 0,
                 }, conn=c)
-            temporal_result = self._resolve_temporal(
-                topic,
-                claim,
-                cid,
-                conn=c,
-                repository_id=str(p.get("repository_id") or ""),
-                file_path=str(p.get("file_path") or ""),
-                symbol_id=str(p.get("symbol_id") or ""),
-            )
+            # Document chunks are immutable historical artifacts. Their text may
+            # legitimately contain "now uses" / version transitions, which must
+            # not supersede unrelated chunks in the shared document topic.
+            temporal_result = {"action": "insert", "supersedes": []}
+            if str(p.get("source") or "") != "artifact:document-index":
+                temporal_result = self._resolve_temporal(
+                    topic,
+                    claim,
+                    cid,
+                    conn=c,
+                    repository_id=str(p.get("repository_id") or ""),
+                    file_path=str(p.get("file_path") or ""),
+                    symbol_id=str(p.get("symbol_id") or ""),
+                )
             if temporal_result.get("supersedes"):
                 self._apply_supersession(temporal_result["supersedes"], cid, conn=c)
             c.execute(
@@ -8457,7 +8481,7 @@ class MemoryWikiProvider(MemoryProvider):
             "origin_chat_hash": self._chat_hash(self.session_id),
             "project_id": self.project_scope,
         }
-        return {"version":"1.19.0-shared-memory-overlay","health_score":round(score,3),"metrics":metrics,"shared_memory":shared_memory,"issues":issues,"schema_anomalies":schema_anomalies,"low_quality":bad,"bad_topics":topics,"raw_blobs":blobs,"secret_hits":secrets}
+        return {"version":PLUGIN_VERSION,"health_score":round(score,3),"metrics":metrics,"shared_memory":shared_memory,"issues":issues,"schema_anomalies":schema_anomalies,"low_quality":bad,"bad_topics":topics,"raw_blobs":blobs,"secret_hits":secrets}
 
     def _explain_recall(self, query: str, limit: int = 10, topic: Optional[str]=None) -> List[Dict[str, Any]]:
         rows = self._search(query, limit, True, topic); qt=tokens(query); out=[]

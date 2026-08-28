@@ -1,0 +1,33 @@
+name: Test Memory Wiki
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.11"]
+    env:
+      HERMES_HOME: ${{ runner.temp }}/memory-wiki-ci
+      HERMES_SECURITY_STRICT: "0"
+      MEMORY_WIKI_SEMANTIC: "0"
+      MEMORY_WIKI_DOCUMENT_AUTO_SCAN_CACHE: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install test runner
+        run: python -m pip install --disable-pip-version-check pytest
+      - name: Run regression suite
+        run: python -m pytest -q
