@@ -67,11 +67,15 @@ def redact_error_message(message: Any) -> str:
     )
     text = re.sub(r"(?i)(\bbearer\s+)([^\s,;]+)", r"\1<redacted>", text)
     text = re.sub(
-        r"(?i)(\b(?:api[_-]?key|token|password|secret)\s*[:=]\s*)([^\s,;]+)",
+        r"(?i)(\b(?:api[_-]?key|token|password|secret)\s*[:=]\s*)(?:\"[^\"]*\"|\x27[^\x27]*\x27|[^\s,;]+)",
         r"\1<redacted>",
         text,
     )
-    return re.sub(r"\b(?:sk|ghp)_[A-Za-z0-9_-]+", "<redacted>", text)[:1000]
+    return re.sub(
+        r"(?<![A-Za-z0-9_-])(?:sk-(?:proj-)?|sk_|ghp_)[A-Za-z0-9_-]{16,}",
+        "<redacted>",
+        text,
+    )[:1000]
 
 
 def ensure_plugin():
@@ -183,22 +187,35 @@ def main() -> int:
         if not isinstance(request, dict):
             error_response(None, -32600, "Invalid Request")
             continue
+        if request.get("jsonrpc") != "2.0":
+            error_response(request.get("id"), -32600, "Invalid Request")
+            continue
         message_id = request.get("id")
+        is_notification = "id" not in request
+
+        def respond(data: dict[str, Any]) -> None:
+            if not is_notification:
+                send(data)
+
+        def respond_error(code: int, message: str) -> None:
+            if not is_notification:
+                error_response(message_id, code, message)
+
         method = request.get("method")
         if not isinstance(method, str) or not method:
-            error_response(message_id, -32600, "Invalid Request")
+            respond_error(-32600, "Invalid Request")
             continue
         raw_params = request.get("params")
         if raw_params is None:
             params = {}
         elif not isinstance(raw_params, dict):
-            error_response(message_id, -32602, "Invalid params")
+            respond_error(-32602, "Invalid params")
             continue
         else:
             params = raw_params
         try:
             if method == "initialize":
-                send({
+                respond({
                     "jsonrpc": "2.0",
                     "id": message_id,
                     "result": {
@@ -210,7 +227,7 @@ def main() -> int:
             elif method == "notifications/initialized":
                 continue
             elif method == "tools/list":
-                send({
+                respond({
                     "jsonrpc": "2.0",
                     "id": message_id,
                     "result": {"tools": load_schemas()},
@@ -219,11 +236,11 @@ def main() -> int:
                 schemas = load_schemas()
                 tool_name = str(params.get("name") or "")
                 if tool_name not in _SCHEMA_MAP:
-                    error_response(message_id, -32601, f"Unknown tool: {tool_name}")
+                    respond_error(-32601, f"Unknown tool: {tool_name}")
                     continue
                 arguments = params.get("arguments") or {}
                 if not isinstance(arguments, dict):
-                    error_response(message_id, -32602, "Invalid params")
+                    respond_error(-32602, "Invalid params")
                     continue
                 result = ensure_plugin().handle_tool_call(plugin_name(tool_name), arguments)
                 text = (
@@ -231,17 +248,17 @@ def main() -> int:
                     if isinstance(result, (dict, list))
                     else str(result)
                 )
-                send({
+                respond({
                     "jsonrpc": "2.0",
                     "id": message_id,
                     "result": {"content": [{"type": "text", "text": text}]},
                 })
             else:
-                error_response(message_id, -32601, f"Unknown method: {method}")
+                respond_error(-32601, f"Unknown method: {method}")
         except Exception as exc:
             safe_error = redact_error_message(f"{type(exc).__name__}: {exc}")
             log(f"Error: {safe_error}")
-            error_response(message_id, -32000, safe_error)
+            respond_error(-32000, safe_error)
     return 0
 
 

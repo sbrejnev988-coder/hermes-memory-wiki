@@ -1037,6 +1037,10 @@ def maybe_prefetch_code_context(provider: Any, query: str, max_chars: int = 8000
             inferred = repo; break
     if not inferred and len(repos) == 1:
         inferred = repos[0]
+    # Never auto-inject excerpts from every repository when the prompt cannot
+    # bind the request to one repository.
+    if not inferred:
+        return ""
     result = query_code_graph(provider, {"query": q, "repository_id": inferred, "limit": 6, "max_chars_per_hit": 1200})
     if not result.get("results"):
         return ""

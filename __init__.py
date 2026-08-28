@@ -37,7 +37,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-PLUGIN_VERSION = "1.20.11"
+PLUGIN_VERSION = "1.20.12"
 _INTEGRITY_HASH_FIELDS = frozenset({
     "hash", "content_hash", "old_content_hash", "new_content_hash", "file_hash",
     "text_hash", "anchor_hash", "snapshot_hash", "payload_hash",
@@ -7734,19 +7734,55 @@ class MemoryWikiProvider(MemoryProvider):
                     _RERANK_FAILURE_COUNT = 0
             return original
 
-    def _search_fallback(self, query: str, limit=10, include_stale=True, topic: Optional[str]=None) -> List[Dict[str, Any]]:
-        """Fallback search without FTS5 — direct SQL LIKE with scoring."""
-        c=self._connect(); params=[]; limit=max(1,min(limit,500))
-        where=["status='active'"] if not include_stale else ["status!='deleted'"]
-        if topic: where.append("topic=?"); params.append(topic)
+    def _search_fallback(
+        self,
+        query: str,
+        limit=10,
+        include_stale=True,
+        topic: Optional[str]=None,
+        *,
+        session_id: str = "",
+        include_all_projects: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Fail-closed LIKE fallback that preserves the normal recall boundary."""
+        c = self._connect(); params = []; limit = max(1, min(limit, 500))
+        topic_slug = self._topic_alias(topic, "") if topic else ""
+        pid = self.project_scope or current_project_id()
+        strict = os.environ.get("MEMORY_WIKI_STRICT_RECALL", "1").lower() not in ("0", "false", "no")
+        where = ["status='active'"]
+        if not include_all_projects:
+            where.append("(scope!='project' OR project_id=?)")
+            params.append(pid)
+        if strict:
+            where.append("risk!='secret' AND quarantined_at=0 AND trust_class NOT IN ('tool_log','raw_blob','secret') AND type!='source_artifact' AND quality>=0.20")
+        if topic_slug:
+            where.append("topic=?"); params.append(topic_slug)
         like_terms=[t for t in str(query or "").lower().split() if len(t)>2]
         if like_terms:
             like_clauses=["(claim LIKE ? OR topic LIKE ?)" for _ in like_terms]
             where.append("("+" AND ".join(like_clauses)+")")
             for t in like_terms: params.extend([f"%{t}%",f"%{t}%"])
-        sql="SELECT * FROM claims WHERE "+" AND ".join(where)+" ORDER BY salience DESC, updated_at DESC LIMIT ?"
-        params.append(limit)
-        return [self._sanitize_row(r) for r in c.execute(sql, params).fetchall()]
+        sql = "SELECT * FROM claims WHERE " + " AND ".join(where) + " ORDER BY salience DESC, updated_at DESC LIMIT ?"
+        rows = c.execute(sql, [*params, min(500, max(50, limit * 10))]).fetchall()
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            if not self._claim_visible(row, session_id):
+                if not (include_all_projects and str(row["visibility_scope"] or "") == "project"):
+                    continue
+            if str(row["risk"] or "low") == "secret" or int(row["quarantined_at"] or 0) > 0:
+                continue
+            quality = float(row["quality"] if "quality" in row.keys() else claim_quality(row["claim"], row["topic"]))
+            trust_class = str(row["trust_class"] or "fact")
+            if strict and quality < 0.28 and not int(row["pinned"] or 0):
+                continue
+            if strict and trust_class in ("tool_log", "raw_blob", "secret"):
+                continue
+            if not include_stale and self._is_stale(int(row["freshness_at"] or 0)):
+                continue
+            out.append(self._sanitize_row(row))
+            if len(out) >= limit:
+                break
+        return out
 
     def _hydrate_semantic_candidates(
         self,
@@ -7798,7 +7834,14 @@ class MemoryWikiProvider(MemoryProvider):
                 try:
                     self._rebuild_fts()
                 except Exception:
-                    return self._search_fallback(query, limit, include_stale, topic)
+                    return self._search_fallback(
+                        query,
+                        limit,
+                        include_stale,
+                        topic,
+                        session_id=session_id,
+                        include_all_projects=include_all_projects,
+                    )
         candidates: Dict[str, sqlite3.Row] = {}; bm25: Dict[str, float] = {}
         topic_slug = self._topic_alias(topic, "") if topic else ""; pid=self.project_scope or current_project_id()
         # --- Topic hierarchy: expand to parent topics for broader recall ---
