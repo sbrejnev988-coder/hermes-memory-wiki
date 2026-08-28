@@ -23,8 +23,10 @@ def test_release_contract_is_complete_and_version_consistent() -> None:
     release_workflow = ROOT / ".github" / "workflows" / "release.yml"
     assert release_workflow.is_file(), "missing release provenance workflow"
     workflow_text = release_workflow.read_text(encoding="utf-8")
-    assert "actions/attest-build-provenance@v2" in workflow_text, "missing SLSA provenance attestation"
-    assert "actions/attest@v4" in workflow_text, "missing SPDX SBOM attestation"
+    assert "actions/attest-build-provenance@" in workflow_text, "missing SLSA provenance attestation"
+    assert "actions/attest@" in workflow_text, "missing SPDX SBOM attestation"
+    action_refs = re.findall(r"^\s*(?:-\s*)?uses:\s*([^\s]+)", workflow_text, re.M)
+    assert action_refs and all(re.search(r"@[0-9a-f]{40}$", ref) for ref in action_refs), action_refs
     manifest = (ROOT / "plugin.yaml").read_text(encoding="utf-8")
     runtime = (ROOT / "__init__.py").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")

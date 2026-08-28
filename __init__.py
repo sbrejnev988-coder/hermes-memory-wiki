@@ -1,4 +1,4 @@
-"""memory-wiki v1.21.1+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.21.2+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -37,7 +37,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-PLUGIN_VERSION = "1.21.1"
+PLUGIN_VERSION = "1.21.2"
 _INTEGRITY_HASH_FIELDS = frozenset({
     "hash", "content_hash", "old_content_hash", "new_content_hash", "file_hash",
     "text_hash", "anchor_hash", "snapshot_hash", "payload_hash",
@@ -4742,10 +4742,11 @@ class MemoryWikiProvider(MemoryProvider):
         if parsed.get("success") is False or str(parsed.get("status") or "").lower() in {"unchanged", "disabled", "missing"}:
             return {}
         try:
-            checkpoint = self._journal_checkpoint(f"after-{op}")
+            checkpoint = self._journal_checkpoint(f"after-{op}", publish=False)
             if int(checkpoint.get("journal_seq") or 0) != int(after_seq):
+                self._discard_journal_checkpoint(checkpoint)
                 raise RuntimeError("checkpoint sequence does not match completed journal event")
-            return checkpoint
+            return self._publish_journal_checkpoint(checkpoint)
         except Exception as exc:
             self._audit("journal_safety_checkpoint", "error", f"op={op} seq={after_seq} error={type(exc).__name__}: {exc}")
             return {"error": f"{type(exc).__name__}: {exc}"}
@@ -4836,7 +4837,7 @@ class MemoryWikiProvider(MemoryProvider):
                 h.update(chunk)
         return h.hexdigest()
 
-    def _journal_checkpoint(self, name: str = "", include_secret_values: bool = False) -> Dict[str, Any]:
+    def _journal_checkpoint(self, name: str = "", include_secret_values: bool = False, *, publish: bool = True) -> Dict[str, Any]:
         """Write a full logical checkpoint so JSONL replay has a baseline for old rows."""
         self.journal_checkpoints_dir.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime('%Y%m%d_%H%M%S', time.localtime(now()))
@@ -4892,10 +4893,49 @@ class MemoryWikiProvider(MemoryProvider):
         self._fsync_dir(self.journal_checkpoints_dir)
         digest = self._file_sha256(path)
         manifest = {"id": cid, "path": str(path), "sha256": digest, "counts": counts, "journal_seq": payload["journal_seq"], "created_at": payload["created_at"]}
-        atomic_write(path.with_suffix(".manifest.json"), json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        manifest_path = path.with_suffix(".manifest.json")
+        if publish:
+            atomic_write(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+            self._fsync_dir(self.journal_checkpoints_dir)
         self._add_change("journal_checkpoint", cid, f"seq={payload['journal_seq']} sha256={digest}")
         self._audit("journal_checkpoint", "ok", f"{path} seq={payload['journal_seq']}")
-        return {"id": cid, "path": str(path), "sha256": digest, "counts": counts, "journal_seq": payload["journal_seq"], "size": path.stat().st_size}
+        return {"id": cid, "path": str(path), "manifest_path": str(manifest_path), "sha256": digest, "counts": counts, "journal_seq": payload["journal_seq"], "size": path.stat().st_size, "published": bool(publish)}
+
+    def _checkpoint_path_is_local(self, path: Path) -> bool:
+        try:
+            path.resolve(strict=False).relative_to(self.journal_checkpoints_dir.resolve(strict=False))
+            return True
+        except ValueError:
+            return False
+
+    def _publish_journal_checkpoint(self, checkpoint: Dict[str, Any]) -> Dict[str, Any]:
+        path = self._normalize_checkpoint_path(Path(str(checkpoint.get("path") or "")))
+        if not path.name or not self._checkpoint_path_is_local(path) or not path.exists():
+            raise RuntimeError("refusing to publish checkpoint outside local checkpoint directory")
+        manifest_path = path.with_suffix(".manifest.json")
+        manifest = {
+            "id": str(checkpoint.get("id") or path.stem),
+            "path": str(path),
+            "sha256": str(checkpoint.get("sha256") or self._file_sha256(path)),
+            "counts": checkpoint.get("counts") or {},
+            "journal_seq": int(checkpoint.get("journal_seq") or 0),
+        }
+        atomic_write(manifest_path, json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        self._fsync_dir(self.journal_checkpoints_dir)
+        checkpoint["manifest_path"] = str(manifest_path)
+        checkpoint["published"] = True
+        return checkpoint
+
+    def _discard_journal_checkpoint(self, checkpoint: Dict[str, Any]) -> None:
+        path = self._normalize_checkpoint_path(Path(str(checkpoint.get("path") or "")))
+        if not path.name or not self._checkpoint_path_is_local(path):
+            return
+        for candidate in (path, path.with_suffix(".manifest.json"), path.with_suffix(path.suffix + ".tmp")):
+            try:
+                candidate.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self._fsync_dir(self.journal_checkpoints_dir)
 
     def _normalize_checkpoint_path(self, path: Path) -> Path:
         if path.name.endswith(".manifest.json"):
@@ -4903,7 +4943,12 @@ class MemoryWikiProvider(MemoryProvider):
         return path
 
     def _latest_journal_checkpoint(self) -> Optional[Path]:
-        cps = [p for p in self.journal_checkpoints_dir.glob("checkpoint_*.json") if not p.name.endswith(".manifest.json")]
+        # Unpublished safety checkpoints stay invisible until their journal
+        # sequence has been verified against the triggering after-event.
+        cps = [
+            p for p in self.journal_checkpoints_dir.glob("checkpoint_*.json")
+            if not p.name.endswith(".manifest.json") and p.with_suffix(".manifest.json").is_file()
+        ]
         cps = sorted(cps, key=lambda p: p.stat().st_mtime, reverse=True)
         return cps[0] if cps else None
 

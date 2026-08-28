@@ -27,12 +27,15 @@ def test_epub_member_limit_rejects_oversized_chapter() -> None:
         path = Path(tmp) / "large.epub"
         with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.writestr("chapter.xhtml", b"<p>" + b"x" * 4096 + b"</p>")
-        document = module.extract_epub(path, 10, {
-            "max_entries": 10, "max_uncompressed": 100_000,
-            "max_ratio": 1000, "max_member": 1024,
-        })
-    assert document.units == []
-    assert any("too large" in warning.lower() for warning in document.warnings)
+        try:
+            module.extract_epub(path, 10, {
+                "max_entries": 10, "max_uncompressed": 100_000,
+                "max_ratio": 1000, "max_member": 1024,
+            })
+        except ValueError as exc:
+            assert "member" in str(exc).lower()
+        else:
+            raise AssertionError("oversized EPUB chapter was accepted")
 
 
 if __name__ == "__main__":

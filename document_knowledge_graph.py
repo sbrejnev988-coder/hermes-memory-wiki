@@ -1098,6 +1098,17 @@ def ingest_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
         and str(existing["scope_id"] or "") == scope_id
         and str(existing["repository_id"] or "") == repository_id
     )
+    if existing and not same_identity:
+        # Source IDs are path-derived and therefore shared-cache callers can
+        # otherwise relabel another project's source without reading it first.
+        # A scope change is an explicit administrative migration, never a side
+        # effect of ordinary ingestion or content refresh.
+        if not _env_bool("MEMORY_WIKI_DOCUMENT_ALLOW_SCOPE_MIGRATION", False):
+            raise PermissionError(
+                "document source belongs to a different scope; "
+                "set MEMORY_WIKI_DOCUMENT_ALLOW_SCOPE_MIGRATION only for an explicit migration"
+            )
+        _assert_source_access(provider, existing)
     if (existing and same_identity and str(existing["file_hash"] or "") == file_hash
             and str(existing["parser"] or "") == parser
             and str(existing["parser_version"] or "") == parser_version
@@ -1921,7 +1932,11 @@ def ingest_document_inbox(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]
         for entry in entries:
             if len(candidates) >= limit:
                 break
-            if not entry.name.endswith(".json") or ".processing." in entry.name:
+            if (
+                not entry.name.endswith(".json")
+                or ".processing." in entry.name
+                or entry.name.endswith((".processed.json", ".rejected.json", ".ignored.json"))
+            ):
                 continue
             try:
                 info = entry.stat(follow_symlinks=False)

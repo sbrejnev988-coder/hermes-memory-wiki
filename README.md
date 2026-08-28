@@ -1,4 +1,4 @@
-# Hermes Memory Wiki v1.21.1
+# Hermes Memory Wiki v1.21.2
 
 Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 101 MCP tools.
 
@@ -409,6 +409,7 @@ Operational notes:
 - Optional turn-start ingestion is controlled by `MEMORY_WIKI_DOCUMENT_AUTO_SCAN_CACHE=1`; it is bounded, skips files younger than two seconds, never prunes missing files, and does not create embeddings unless `MEMORY_WIKI_DOCUMENT_AUTO_EMBED=1`.
 - Automatic ingestion is **default-deny for visibility**: set `MEMORY_WIKI_DOCUMENT_AUTO_SCOPE_ID` (and normally the matching repository ID) before enabling it. Global automatic ingestion needs the separate explicit `MEMORY_WIKI_DOCUMENT_ALLOW_GLOBAL_AUTO=1` override.
 - Normal document APIs are bound to `MEMORY_WIKI_DOCUMENT_ACCESS_SCOPE_ID` / `MEMORY_WIKI_DOCUMENT_ACCESS_REPOSITORY_ID` (or the provider project scope). Cross-scope requests are denied unless `MEMORY_WIKI_DOCUMENT_ALLOW_CROSS_SCOPE=1` is intentionally set.
+- Reassigning an already indexed path to another scope additionally requires `MEMORY_WIKI_DOCUMENT_ALLOW_SCOPE_MIGRATION=1`; ordinary ingestion never transfers source ownership.
 - Ingestion parses only a per-invocation snapshot copied from a no-link/no-reparse descriptor. Scans have entry, directory, depth, candidate and wall-time budgets; documents, manifests and parser-worker output are size-bounded.
 - `memory_wiki_document_scan` reports missing previously indexed files; deletion is applied only with `prune_missing=true`.
 - Automatic prompt-time document prefetch is restricted to global-scope material. Scoped material must be queried with an explicit scope.
@@ -508,6 +509,7 @@ Latency and reindex duration depend on the embedding provider, Qdrant placement,
 
 ## Changelog
 
+- **v1.21.2 (2026-08-28)**: Closed the final post-release audit findings: terminal inbox manifests are exactly-once, configured ZIP member limits now fail closed for OOXML/ODF/EPUB, cross-scope source relabeling requires an explicit migration gate, and unpublished raced checkpoints cannot become recovery baselines. Every GitHub Action ref is now pinned to an immutable commit SHA.
 - **v1.21.1 (2026-08-28)**: Release workflow now emits a separate SLSA build-provenance attestation in addition to the SPDX SBOM attestation; v1.21.0 remains immutable but lacks that provenance predicate.
 - **v1.21.0 (2026-08-28)**: Document ingestion now snapshots no-link/no-reparse handles before parsing; automatic scans are cache-only, scope-bound, streaming and bounded by traversal budgets. Parser workers use bounded concurrent stdout/stderr readers, isolated Windows Job Object CPU/memory limits, and kill-on-close cleanup. Inbox manifests are atomically claimed and size/document-count capped; document APIs deny cross-scope access by default. Journal recovery checkpoints completed document/code mutations and blocks incomplete before/error events. Release metadata now includes MIT licensing, `pyproject.toml`, `uv.lock`, SPDX SBOM generation and an attested tag-release workflow.
 - **v1.20.12 (2026-08-28)**: FTS-recovery LIKE fallback now enforces visibility, project, quarantine, secret-risk and quality gates; ambiguous automatic code-graph prefetch no longer queries every repository. MCP validates JSON-RPC 2.0 envelopes, keeps notifications silent, and redacts `sk-proj-*` and quoted secret values in errors.

@@ -356,12 +356,14 @@ def _zip_guard(zf: zipfile.ZipFile, *, max_entries: int, max_uncompressed: int,
         total += int(info.file_size)
         if total > max_uncompressed:
             raise ValueError(f"archive expands beyond {max_uncompressed} bytes")
-        compressed = max(1, int(info.compress_size))
-        if int(info.file_size) > 1024 * 1024 and int(info.file_size) / compressed > max_ratio:
-            raise ValueError(f"suspicious compression ratio for {info.filename}")
         name = info.filename.replace("\\", "/")
         if name.startswith("/") or "../" in f"/{name}":
             raise ValueError(f"unsafe archive path: {name}")
+        if max_member is not None and int(info.file_size) > max_member:
+            raise ValueError(f"archive member exceeds configured limit ({max_member} bytes): {info.filename}")
+        compressed = max(1, int(info.compress_size))
+        if int(info.file_size) > 1024 * 1024 and int(info.file_size) / compressed > max_ratio:
+            raise ValueError(f"suspicious compression ratio for {info.filename}")
 
 
 def _read_zip_xml(zf: zipfile.ZipFile, name: str, max_bytes: int = 32_000_000) -> ET.Element:
