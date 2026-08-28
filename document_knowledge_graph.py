@@ -1075,7 +1075,26 @@ def build_document_recovery_reference(
             for item in value:
                 collect(item, action)
 
-    collect(response, "delete" if operation == "memory_wiki_document_delete" else "ingest")
+    captured_actions = None
+    if operation == "memory_wiki_document_scan":
+        capture_id = str(request.get("__journal_capture_id") or "")
+        captures = getattr(provider, "_document_scan_recovery_captures", None)
+        if capture_id and isinstance(captures, dict):
+            captured_actions = captures.pop(capture_id, None)
+    if captured_actions is None:
+        collect(response, "delete" if operation == "memory_wiki_document_delete" else "ingest")
+    else:
+        for entry in captured_actions:
+            if not isinstance(entry, (tuple, list)) or len(entry) != 2:
+                raise RuntimeError("invalid captured document scan recovery action")
+            action, source_id = str(entry[0]), str(entry[1]).strip()
+            if not source_id:
+                raise RuntimeError("captured document scan action has no source id")
+            chosen = "delete" if action == "delete" else "ingest"
+            refs[(chosen, source_id)] = _document_source_recovery_reference(
+                provider, source_id, action=chosen,
+                embed=embed_requested and chosen == "ingest", embed_limit=embed_limit,
+            )
     return {
         "schema": _DOCUMENT_RECOVERY_SCHEMA,
         "kind": "document_sources",
@@ -1568,7 +1587,17 @@ def scan_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     max_changed = max(1, min(int(args.get("max_changed") or max_files), max_files))
     changed_processed = 0
     deferred = 0
-    results = []; errors = []
+    results = []; errors = []; recovery_actions: List[Tuple[str, str]] = []
+
+    def capture_action(result: Dict[str, Any], action: str = "ingest") -> None:
+        source_id = str(result.get("source_id") or "").strip()
+        if not source_id:
+            return
+        # A pure unchanged scan has no durable mutation after the checkpoint.
+        # With requested embedding it can add derived claims and must replay.
+        if action == "ingest" and str(result.get("status") or "").lower() == "unchanged" and not bool(args.get("embed", False)):
+            return
+        recovery_actions.append(("delete" if action == "delete" else "ingest", source_id))
     for path in candidates:
         try:
             stat = path.stat()
@@ -1596,13 +1625,16 @@ def scan_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
                         },
                     )
                 results.append(unchanged_result)
+                capture_action(unchanged_result)
                 continue
             if changed_processed >= max_changed:
                 deferred += 1
                 continue
             item_args = dict(args); item_args["path"] = str(path)
             item_args["embed"] = bool(args.get("embed", False))
-            results.append(ingest_document(provider, item_args))
+            ingest_result = ingest_document(provider, item_args)
+            results.append(ingest_result)
+            capture_action(ingest_result)
             changed_processed += 1
         except Exception as exc:
             errors.append({"path": str(path), "error": f"{type(exc).__name__}: {exc}"})
@@ -1628,9 +1660,15 @@ def scan_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     if bool(args.get("prune_missing", False)) and missing_sources:
         for item in missing_sources:
             try:
-                pruned.append(delete_document(provider, {"source_id": item["source_id"]}))
+                prune_result = delete_document(provider, {"source_id": item["source_id"]})
+                pruned.append(prune_result)
+                capture_action(prune_result, "delete")
             except Exception as exc:
                 errors.append({"path": item["path"], "error": f"prune {type(exc).__name__}: {exc}"})
+    capture_id = str(args.get("__journal_capture_id") or "")
+    captures = getattr(provider, "_document_scan_recovery_captures", None)
+    if capture_id and isinstance(captures, dict):
+        captures[capture_id] = recovery_actions
     return {
         "root": str(root), "discovered": len(candidates),
         "indexed": sum(1 for r in results if r.get("status") == "indexed"),

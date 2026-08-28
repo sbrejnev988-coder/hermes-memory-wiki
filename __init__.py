@@ -1,4 +1,4 @@
-"""memory-wiki v1.22.1+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.22.2+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -37,7 +37,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-PLUGIN_VERSION = "1.22.1"
+PLUGIN_VERSION = "1.22.2"
 _INTEGRITY_HASH_FIELDS = frozenset({
     "hash", "content_hash", "old_content_hash", "new_content_hash", "file_hash",
     "text_hash", "anchor_hash", "snapshot_hash", "payload_hash", "root_sha256", "sha256",
@@ -4000,6 +4000,7 @@ class MemoryWikiProvider(MemoryProvider):
         # Inbox mutation is available only through memory_wiki_code_graph_ingest_inbox,
         # so every completed event has an explicit journal boundary.
         a = dict(args or {})
+        _journal_capture_id = str(a.pop("__journal_capture_id", "") or "")
 
         # Secret value writes, migrations and scrub passes are local-admin only.
         # Fail closed even if a caller bypasses tools/list and invokes a hidden
@@ -4034,8 +4035,29 @@ class MemoryWikiProvider(MemoryProvider):
         if self._conn is None:
             self._connect(); self._migrate()
         if (not _journaled_skip) and (not _retry_after_reconnect) and (not _journal_replay) and self._should_journal_tool(tool_name, a):
-            result, _journal = self._journal_operation(tool_name, a, lambda: self.handle_tool_call(tool_name, {**a, "__journaled_skip": True}, **kwargs))
-            return result
+            journal_args = dict(a)
+            inner_args = {**a, "__journaled_skip": True}
+            capture_id = ""
+            if tool_name == "memory_wiki_document_scan":
+                capture_id = "docscan_" + uuid.uuid4().hex
+                captures = getattr(self, "_document_scan_recovery_captures", None)
+                if not isinstance(captures, dict):
+                    captures = {}
+                    self._document_scan_recovery_captures = captures
+                captures[capture_id] = None
+                journal_args["__journal_capture_id"] = capture_id
+                inner_args["__journal_capture_id"] = capture_id
+            try:
+                result, _journal = self._journal_operation(
+                    tool_name, journal_args,
+                    lambda: self.handle_tool_call(tool_name, inner_args, **kwargs),
+                )
+                return result
+            finally:
+                if capture_id:
+                    captures = getattr(self, "_document_scan_recovery_captures", None)
+                    if isinstance(captures, dict):
+                        captures.pop(capture_id, None)
         try:
             if tool_name == "memory_wiki_query":
                 rows = self._search(a.get("query",""), int(a.get("limit",10)), bool(a.get("include_stale",True)), a.get("topic"))
@@ -4339,7 +4361,9 @@ class MemoryWikiProvider(MemoryProvider):
             if tool_name == "memory_wiki_reindex": return tool_result(success=True, **self._reindex(int(a.get("limit",0) or 0), bool(a.get("force", False))))
             if tool_name == "memory_wiki_debug_search": return tool_result(success=True, **self._debug_search(a.get("query",""), int(a.get("limit",10)), a.get("topic")))
             if tool_name == "memory_wiki_document_ingest": return tool_result(success=True, **_document_ingest(self, a))
-            if tool_name == "memory_wiki_document_scan": return tool_result(success=True, **_document_scan(self, a))
+            if tool_name == "memory_wiki_document_scan":
+                scan_args = {**a, "__journal_capture_id": _journal_capture_id} if _journal_capture_id else a
+                return tool_result(success=True, **_document_scan(self, scan_args))
             if tool_name == "memory_wiki_document_embed_pending": return tool_result(success=True, **_document_embed_pending(self, a))
             if tool_name == "memory_wiki_document_query": return tool_result(success=True, **_document_query(self, a))
             if tool_name == "memory_wiki_document_source": return tool_result(success=True, **_document_source(self, a))
@@ -5232,8 +5256,9 @@ class MemoryWikiProvider(MemoryProvider):
     def _journal_status(self, verify: bool = True, limit: int = 5) -> Dict[str, Any]:
         self.journal_dir.mkdir(parents=True, exist_ok=True)
         meta = self._read_journal_meta()
-        total = valid = invalid = hash_errors = 0
+        total = valid = invalid = hash_errors = sequence_errors = 0
         last_hash = ""
+        last_seq = 0
         last_events: List[Dict[str, Any]] = []
         if self.journal_path.exists():
             for ev in self._iter_journal_events():
@@ -5241,12 +5266,19 @@ class MemoryWikiProvider(MemoryProvider):
                 if ev.get("_error"):
                     invalid += 1; last_events.append(ev); continue
                 valid += 1
+                try:
+                    event_seq = int(ev.get("seq") or 0)
+                except (TypeError, ValueError):
+                    event_seq = -1
+                if event_seq != last_seq + 1:
+                    sequence_errors += 1
+                last_seq = event_seq
                 if verify:
                     claimed_hash = str(ev.get("hash") or "")
                     prev_hash = str(ev.get("prev_hash") or "")
                     no_hash = dict(ev); no_hash.pop("hash", None); no_hash.pop("_lineno", None)
                     calc = sha(json.dumps(no_hash, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
-                    if claimed_hash != calc or (valid > 1 and prev_hash != last_hash):
+                    if claimed_hash != calc or (valid == 1 and prev_hash) or (valid > 1 and prev_hash != last_hash):
                         hash_errors += 1
                     last_hash = claimed_hash
                 last_events.append({k: ev.get(k) for k in ("seq", "ts", "phase", "op", "hash", "prev_hash")})
@@ -5262,6 +5294,7 @@ class MemoryWikiProvider(MemoryProvider):
             "events_valid": valid,
             "events_invalid": invalid,
             "hash_errors": hash_errors,
+            "sequence_errors": sequence_errors,
             "last_events": last_events,
         }
 
@@ -5439,8 +5472,15 @@ class MemoryWikiProvider(MemoryProvider):
         c = self._connect(); applied: Dict[str, int] = {}
         table_payload = payload.get("tables") or {}
         existing = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        # Checkpoints are JSON-serialized with sorted keys, so dictionary order
+        # cannot safely encode foreign-key dependencies. Restore the canonical
+        # producer order instead, then append any forward-compatible extras.
+        ordered_tables = [table for table in self._checkpoint_tables() if table in table_payload]
+        ordered_tables.extend(sorted(table for table in table_payload if table not in ordered_tables))
         with c:
-            for table, rows in table_payload.items():
+            c.execute("PRAGMA defer_foreign_keys=ON")
+            for table in ordered_tables:
+                rows = table_payload.get(table) or []
                 if table not in existing or table.endswith("_fts"):
                     continue
                 cols = self._cols(table)
@@ -5499,12 +5539,15 @@ class MemoryWikiProvider(MemoryProvider):
             "memory_wiki_backup", "memory_wiki_export_bundle"
         }
         journal_integrity = self._journal_status(verify=True, limit=5)
-        if int(journal_integrity.get("events_invalid") or 0) or int(journal_integrity.get("hash_errors") or 0):
+        if (int(journal_integrity.get("events_invalid") or 0)
+                or int(journal_integrity.get("hash_errors") or 0)
+                or int(journal_integrity.get("sequence_errors") or 0)):
             incomplete.append({
                 "op": "journal_integrity",
                 "phase": "invalid",
                 "events_invalid": int(journal_integrity.get("events_invalid") or 0),
                 "hash_errors": int(journal_integrity.get("hash_errors") or 0),
+                "sequence_errors": int(journal_integrity.get("sequence_errors") or 0),
             })
         for ev in self._iter_journal_events():
             if ev.get("_error"):
@@ -5530,8 +5573,10 @@ class MemoryWikiProvider(MemoryProvider):
             if phase != "after":
                 incomplete.append(ev)
                 continue
-            if pending_before.get(event_key):
-                pending_before[event_key].pop(0)
+            if not pending_before.get(event_key):
+                incomplete.append({"seq": seq, "op": op, "phase": "orphan_after"})
+                continue
+            pending_before[event_key].pop(0)
             if op in recovery_ignorable:
                 ignored.append(ev)
                 continue

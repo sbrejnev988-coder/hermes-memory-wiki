@@ -50,16 +50,17 @@ def test_recovery_fails_closed_for_unreplayable_post_checkpoint_document_mutatio
                 checkpoint = provider._journal_checkpoint("before-document-ingest")
                 assert not provider._should_journal_tool("memory_wiki_semantic_status", {})
                 provider._append_journal_event(
-                    "memory_wiki_semantic_status",
-                    {},
-                    phase="after",
-                    result={"success": True},
+                    "memory_wiki_semantic_status", {}, phase="before"
                 )
                 provider._append_journal_event(
-                    "memory_wiki_document_ingest",
-                    {"path": str(Path(tmp) / "document.txt")},
-                    phase="after",
-                    result={"success": True},
+                    "memory_wiki_semantic_status", {}, phase="after", result={"success": True}
+                )
+                document_payload = {"path": str(Path(tmp) / "document.txt")}
+                provider._append_journal_event(
+                    "memory_wiki_document_ingest", document_payload, phase="before"
+                )
+                provider._append_journal_event(
+                    "memory_wiki_document_ingest", document_payload, phase="after", result={"success": True}
                 )
 
                 plan = provider._rebuild_from_journal(apply=False, checkpoint=checkpoint["path"])

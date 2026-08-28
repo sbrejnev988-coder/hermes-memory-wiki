@@ -48,6 +48,9 @@ _PEM_BLOCK_RE = re.compile(
     r"-----END (?P=label)-----",
     re.IGNORECASE,
 )
+_SENSITIVE_EVENT_KEY_RE = re.compile(
+    r"(?i)(?:^|[_-])(?:api[_-]?key|token|password|passwd|secret|authorization|credential|private[_-]?key)(?:$|[_-])"
+)
 
 
 def _now() -> int:
@@ -114,11 +117,13 @@ def sanitize_code_graph_event_for_recovery(event: Dict[str, Any]) -> Dict[str, A
     if not isinstance(event, dict):
         raise ValueError("code graph recovery event must be an object")
 
-    def scrub(value: Any) -> Any:
+    def scrub(value: Any, key: str = "") -> Any:
+        if _SENSITIVE_EVENT_KEY_RE.search(str(key or "")):
+            return "<REDACTED_KEYED_VALUE>"
         if isinstance(value, dict):
-            return {str(key): scrub(item) for key, item in value.items()}
+            return {str(child_key): scrub(item, str(child_key)) for child_key, item in value.items()}
         if isinstance(value, list):
-            return [scrub(item) for item in value]
+            return [scrub(item, key) for item in value]
         if isinstance(value, str):
             return _clean_text(value, 40_000)
         if isinstance(value, (int, float, bool)) or value is None:
