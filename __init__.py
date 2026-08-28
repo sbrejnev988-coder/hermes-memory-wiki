@@ -1,4 +1,4 @@
-"""memory-wiki v1.21.2+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.22.0+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -37,10 +37,10 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-PLUGIN_VERSION = "1.21.2"
+PLUGIN_VERSION = "1.22.0"
 _INTEGRITY_HASH_FIELDS = frozenset({
     "hash", "content_hash", "old_content_hash", "new_content_hash", "file_hash",
-    "text_hash", "anchor_hash", "snapshot_hash", "payload_hash",
+    "text_hash", "anchor_hash", "snapshot_hash", "payload_hash", "root_sha256", "sha256",
 })
 _INTEGRITY_SHA256_RE = re.compile(r"(?:sha256:)?[0-9a-fA-F]{64}")
 _GIT_COMMIT_RE = re.compile(r"[0-9a-fA-F]{7,64}")
@@ -151,6 +151,7 @@ try:
         code_graph_status as _code_graph_status,
         embed_pending_chunks as _embed_pending_chunks,
         maybe_prefetch_code_context as _maybe_prefetch_code_context,
+        sanitize_code_graph_event_for_recovery as _sanitize_code_graph_event_for_recovery,
     )
 except ImportError:
     try:
@@ -163,6 +164,7 @@ except ImportError:
             code_graph_status as _code_graph_status,
             embed_pending_chunks as _embed_pending_chunks,
             maybe_prefetch_code_context as _maybe_prefetch_code_context,
+            sanitize_code_graph_event_for_recovery as _sanitize_code_graph_event_for_recovery,
         )
     except ImportError as _code_graph_import_exc:
         _CODE_GRAPH_IMPORT_ERROR = f"{type(_code_graph_import_exc).__name__}: {_code_graph_import_exc}"
@@ -171,6 +173,7 @@ except ImportError:
         def _install_code_graph_schema(conn): return None
         _ingest_code_graph_event = _query_code_graph = _code_line_context = _code_graph_neighbors = _code_graph_status = _embed_pending_chunks = _code_graph_unavailable
         def _maybe_prefetch_code_context(*args, **kwargs): return ""
+        def _sanitize_code_graph_event_for_recovery(event): return dict(event) if isinstance(event, dict) else event
 
 # HERMES-DOCUMENT-KNOWLEDGE-GRAPH-v0.4.0: universal structured document ingestion.
 try:
@@ -186,6 +189,9 @@ try:
         document_status as _document_status,
         delete_document as _document_delete,
         ingest_document_inbox as _document_ingest_inbox,
+        build_document_recovery_reference as _build_document_recovery_reference,
+        replay_document_recovery_reference as _replay_document_recovery_reference,
+        document_cache_scan_journal_ready as _document_cache_scan_journal_ready,
         maybe_ingest_document_cache as _maybe_ingest_document_cache,
         maybe_prefetch_document_context as _maybe_prefetch_document_context,
     )
@@ -203,6 +209,10 @@ except ImportError:
             document_status as _document_status,
             delete_document as _document_delete,
             ingest_document_inbox as _document_ingest_inbox,
+            build_document_recovery_reference as _build_document_recovery_reference,
+            replay_document_recovery_reference as _replay_document_recovery_reference,
+            document_cache_scan_journal_ready as _document_cache_scan_journal_ready,
+            maybe_ingest_document_cache as _maybe_ingest_document_cache,
             maybe_prefetch_document_context as _maybe_prefetch_document_context,
         )
     except ImportError as _document_graph_import_exc:
@@ -210,7 +220,8 @@ except ImportError:
         def _document_graph_unavailable(*args, **kwargs):
             raise RuntimeError(f"document_knowledge_graph unavailable: {_DOCUMENT_GRAPH_IMPORT_ERROR}")
         def _install_document_graph_schema(conn): return None
-        _document_ingest = _document_scan = _document_embed_pending = _document_query = _document_source = _document_unit_context = _document_neighbors = _document_status = _document_delete = _document_ingest_inbox = _document_graph_unavailable
+        _document_ingest = _document_scan = _document_embed_pending = _document_query = _document_source = _document_unit_context = _document_neighbors = _document_status = _document_delete = _document_ingest_inbox = _build_document_recovery_reference = _replay_document_recovery_reference = _document_graph_unavailable
+        def _document_cache_scan_journal_ready(*args, **kwargs): return False
         def _maybe_ingest_document_cache(*args, **kwargs): return {"status": "unavailable"}
         def _maybe_prefetch_document_context(*args, **kwargs): return ""
 
@@ -2646,6 +2657,7 @@ class MemoryWikiProvider(MemoryProvider):
         self.db_path = self.root / "memory_wiki.sqlite3"
         self.spool_dir = self.root / "spool"
         self.recovery_dir = self.root / "recovery"
+        self.recovery_artifacts_dir = self.root / "recovery-artifacts"
         self.journal_dir = self.root / "journal"
         self.journal_checkpoints_dir = self.journal_dir / "checkpoints"
         self.journal_path = self.journal_dir / "events.current.jsonl"
@@ -2709,6 +2721,7 @@ class MemoryWikiProvider(MemoryProvider):
             self.db_path = self.root / "memory_wiki.sqlite3"
             self.spool_dir = self.root / "spool"
             self.recovery_dir = self.root / "recovery"
+            self.recovery_artifacts_dir = self.root / "recovery-artifacts"
             self.journal_dir = self.root / "journal"
             self.journal_checkpoints_dir = self.journal_dir / "checkpoints"
             self.journal_path = self.journal_dir / "events.current.jsonl"
@@ -2719,6 +2732,7 @@ class MemoryWikiProvider(MemoryProvider):
         self.snapshots_dir.mkdir(parents=True, exist_ok=True)
         self.spool_dir.mkdir(parents=True, exist_ok=True)
         self.recovery_dir.mkdir(parents=True, exist_ok=True)
+        self.recovery_artifacts_dir.mkdir(parents=True, exist_ok=True)
         self.journal_dir.mkdir(parents=True, exist_ok=True)
         coordination_root = self.home / "context-coordination"
         for rel in (
@@ -3110,7 +3124,15 @@ class MemoryWikiProvider(MemoryProvider):
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
         self.turn = int(turn_number or self.turn or 0)
         try:
-            cache_scan = _maybe_ingest_document_cache(self)
+            auto_scan_enabled = _document_cache_scan_journal_ready(self)
+            if auto_scan_enabled:
+                cache_scan, _journal = self._journal_operation(
+                    "memory_wiki_document_scan",
+                    {"automatic": True, "source": "attachment-cache"},
+                    lambda: _maybe_ingest_document_cache(self),
+                )
+            else:
+                cache_scan = _maybe_ingest_document_cache(self)
             if cache_scan.get("status") == "scanned" and (
                 cache_scan.get("indexed") or cache_scan.get("metadata_only")
                 or cache_scan.get("unsupported") or cache_scan.get("failed")
@@ -4556,6 +4578,394 @@ class MemoryWikiProvider(MemoryProvider):
             return False
         return True
 
+    @staticmethod
+    def _reference_recovery_ops() -> set[str]:
+        """Mutations whose normal tool payloads can contain source/code material."""
+        return {
+            "memory_wiki_document_ingest", "memory_wiki_document_scan",
+            "memory_wiki_document_embed_pending", "memory_wiki_document_delete",
+            "memory_wiki_document_ingest_inbox",
+            "memory_wiki_code_claim_add",
+            "memory_wiki_code_graph_ingest_inbox",
+            "memory_wiki_patch_outcome_add", "memory_wiki_invalidate_revision",
+            "memory_wiki_code_graph_embed_pending",
+            "memory_wiki_reindex",
+        }
+
+    def _journal_payload_for_operation(self, op: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Replace source/code-bearing inputs with an opaque before/after pairing."""
+        if op not in self._reference_recovery_ops():
+            return payload
+        return {
+            "schema": "memory_wiki_journal_pair/v1",
+            "operation_id": "jop_" + uuid.uuid4().hex,
+            "operation": op,
+        }
+
+    @staticmethod
+    def _journal_result_dict(result: Any) -> Dict[str, Any]:
+        if isinstance(result, str):
+            try:
+                result = json.loads(result)
+            except Exception:
+                return {}
+        return dict(result) if isinstance(result, dict) else {}
+
+    def _journal_result_summary(self, result: Any) -> Dict[str, Any]:
+        """Keep only non-content facts next to a recovery reference."""
+        parsed = self._journal_result_dict(result)
+        allowed = {
+            "success", "status", "source_id", "revision_id", "repository_id",
+            "processed", "indexed", "unchanged", "failed", "deleted", "deduplicated",
+            "invalidated", "pending_before", "pending_after", "created", "reused",
+            "count", "chunks", "units", "edges", "snapshot_hash", "event_id",
+        }
+        return {key: parsed[key] for key in allowed if key in parsed}
+
+    def _build_recovery_reference(self, op: str, request: Dict[str, Any], result: Any) -> Dict[str, Any]:
+        if op.startswith("memory_wiki_document_"):
+            return _build_document_recovery_reference(self, op, request, result)
+        if op == "memory_wiki_code_claim_add":
+            return self._code_claim_recovery_reference(request)
+        if op == "memory_wiki_patch_outcome_add":
+            return self._patch_outcome_recovery_reference(request)
+        if op == "memory_wiki_invalidate_revision":
+            return self._invalidate_revision_recovery_reference(request)
+        if op == "memory_wiki_code_graph_embed_pending":
+            return {
+                "schema": "code_recovery_reference/v1",
+                "kind": "code_graph_embed",
+                "repository_id": str(request.get("repository_id") or ""),
+                "limit": max(1, min(int(request.get("limit") or 1000), 10_000)),
+            }
+        if op == "memory_wiki_reindex":
+            return {
+                "schema": "derived_recovery_reference/v1",
+                "kind": "semantic_reindex",
+                "limit": max(0, min(int(request.get("limit") or 0), 1_000_000)),
+                "force": bool(request.get("force", False)),
+            }
+        if op == "memory_wiki_code_graph_ingest_inbox":
+            response = self._journal_result_dict(result)
+            artifacts = response.get("recovery_artifacts") or []
+            if not isinstance(artifacts, list) or len(artifacts) > 1000:
+                raise RuntimeError("invalid Code Shrinker recovery artifacts")
+            if not artifacts:
+                return {"schema": "code_recovery_reference/v1", "kind": "noop"}
+            return {
+                "schema": "code_recovery_reference/v1",
+                "kind": "code_graph_inbox",
+                "artifacts": [dict(item) for item in artifacts if isinstance(item, dict)],
+            }
+        raise RuntimeError(f"no recovery reference builder registered for {op}")
+
+    def _journal_after_result(self, op: str, request: Dict[str, Any], result: Any) -> Any:
+        if op not in self._reference_recovery_ops():
+            return result
+        return {
+            "schema": "memory_wiki_journal_after/v1",
+            "summary": self._journal_result_summary(result),
+            "recovery": self._build_recovery_reference(op, request, result),
+        }
+
+    @staticmethod
+    def _recovery_artifact_relative_path(value: Any) -> Path:
+        raw = str(value or "").strip()
+        if not raw or "\\" in raw or raw.startswith("/"):
+            raise ValueError("unsafe recovery artifact locator")
+        relative = Path(*raw.split("/"))
+        if not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+            raise ValueError("unsafe recovery artifact locator")
+        return relative
+
+    def _recovery_artifact_path(self, relative: Path) -> Path:
+        root_lexical = self.recovery_artifacts_dir
+        try:
+            root_info = root_lexical.lstat()
+        except FileNotFoundError:
+            root_info = None
+        if root_info is not None:
+            root_attrs = int(getattr(root_info, "st_file_attributes", 0) or 0)
+            if stat.S_ISLNK(root_info.st_mode) or root_attrs & int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)):
+                raise ValueError("recovery artifact root is a symlink or reparse point")
+        root = root_lexical.resolve(strict=False)
+        candidate_lexical = root_lexical / relative
+        # Never follow a caller-created symlink/reparse point while locating a
+        # recovery artifact. Hash verification alone would not stop an external
+        # path from being selected through an in-root link.
+        current = root_lexical
+        for part in relative.parts:
+            current = current / part
+            try:
+                info = current.lstat()
+            except FileNotFoundError:
+                break
+            attrs = int(getattr(info, "st_file_attributes", 0) or 0)
+            if stat.S_ISLNK(info.st_mode) or attrs & int(getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)):
+                raise ValueError("recovery artifact path traverses a symlink or reparse point")
+        candidate = candidate_lexical.resolve(strict=False)
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("recovery artifact escapes its trusted root") from exc
+        return candidate
+
+    def _record_recovery_artifact(
+        self, *, kind: str, sha256: str, size_bytes: int, relative_locator: str, schema_version: str
+    ) -> None:
+        """Audit artifact availability without copying its source/code payload into SQLite."""
+        with self._connect() as conn:
+            conn.execute(
+                """INSERT INTO recovery_artifacts(
+                       sha256,kind,relative_locator,size_bytes,schema_version,created_at,last_verified_at)
+                   VALUES(?,?,?,?,?,?,?)
+                   ON CONFLICT(sha256) DO UPDATE SET
+                       kind=excluded.kind,relative_locator=excluded.relative_locator,
+                       size_bytes=excluded.size_bytes,schema_version=excluded.schema_version,
+                       last_verified_at=excluded.last_verified_at""",
+                (sha256, kind, relative_locator, int(size_bytes), schema_version, now(), now()),
+            )
+
+    def _store_recovery_artifact(self, kind: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Persist a local immutable request artifact; journal stores only its hash/ref."""
+        if not re.fullmatch(r"[a-z0-9_-]{1,80}", str(kind or "")):
+            raise ValueError("invalid recovery artifact kind")
+        safe_payload = self._json_safe(
+            payload, 256_000, redact_value_fields=False, preserve_sha256_fields=True,
+        )
+        canonical_payload = json.dumps(safe_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if any(marker in canonical_payload for marker in ("<POSSIBLE_SECRET_REDACTED>", "<REDACTED>", "<redacted>")):
+            raise RuntimeError("refusing to retain a recovery artifact containing redacted secret material")
+        envelope = {
+            "schema": "code_recovery_artifact/v1",
+            "kind": kind,
+            "payload": safe_payload,
+        }
+        raw = json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        if len(raw) > 1_000_000:
+            raise ValueError("recovery artifact exceeds 1 MiB")
+        digest = hashlib.sha256(raw).hexdigest()
+        relative = Path(kind) / f"{digest}.json"
+        path = self._recovery_artifact_path(relative)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            if self._file_sha256(path) != digest:
+                raise RuntimeError("existing recovery artifact digest mismatch")
+        else:
+            atomic_write(path, raw.decode("utf-8"))
+            # The profile directory is already user-scoped on Windows; tighten
+            # POSIX artifacts as an additional defense in depth measure.
+            if os.name != "nt":
+                try:
+                    os.chmod(path, 0o600)
+                except OSError:
+                    pass
+            self._fsync_dir(path.parent)
+        size_bytes = path.stat().st_size
+        self._record_recovery_artifact(
+            kind=kind, sha256=digest, size_bytes=size_bytes,
+            relative_locator=relative.as_posix(), schema_version="code_recovery_artifact/v1",
+        )
+        return {
+            "schema": "code_recovery_artifact/v1",
+            "kind": kind,
+            "sha256": digest,
+            "size_bytes": size_bytes,
+        }
+
+    def _load_recovery_artifact(self, reference: Dict[str, Any], *, expected_kind: str) -> Dict[str, Any]:
+        if str(reference.get("schema") or "") != "code_recovery_artifact/v1":
+            raise ValueError("unsupported recovery artifact schema")
+        if str(reference.get("kind") or "") != expected_kind:
+            raise ValueError("recovery artifact kind mismatch")
+        digest = str(reference.get("sha256") or "").lower()
+        if not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("invalid recovery artifact digest")
+        path = self._recovery_artifact_path(Path(expected_kind) / f"{digest}.json")
+        if not path.is_file() or int(path.stat().st_size) != int(reference.get("size_bytes") or -1):
+            raise RuntimeError("recovery artifact is missing or changed")
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != digest:
+            raise RuntimeError("recovery artifact digest mismatch")
+        try:
+            envelope = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            raise RuntimeError("recovery artifact is not valid UTF-8 JSON") from exc
+        if not isinstance(envelope, dict) or str(envelope.get("schema") or "") != "code_recovery_artifact/v1":
+            raise RuntimeError("recovery artifact envelope is invalid")
+        if str(envelope.get("kind") or "") != expected_kind or not isinstance(envelope.get("payload"), dict):
+            raise RuntimeError("recovery artifact payload is invalid")
+        return dict(envelope["payload"])
+
+    def _code_claim_recovery_reference(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        allowed = (
+            "claim", "topic", "repository_id", "commit_sha", "file_path", "symbol_id",
+            "symbol_revision", "content_hash", "claim_type", "confidence", "salience",
+            "evidence", "source_event_id", "producer", "phase_sep_version",
+            "visibility_scope", "event_at", "event_timezone",
+        )
+        artifact = self._store_recovery_artifact(
+            "code_claim_request", {key: request[key] for key in allowed if key in request}
+        )
+        return {
+            "schema": "code_recovery_reference/v1",
+            "kind": "code_claim",
+            "artifact": artifact,
+        }
+
+    def _patch_outcome_recovery_reference(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        allowed = (
+            "patch_id", "outcome", "repository_id", "commit_sha", "old_content_hash",
+            "new_content_hash", "validation_report", "changed_files", "changed_symbols",
+            "rollback_steps", "source_event_id", "producer", "phase_sep_version",
+        )
+        artifact = self._store_recovery_artifact(
+            "patch_outcome_request", {key: request[key] for key in allowed if key in request}
+        )
+        return {
+            "schema": "code_recovery_reference/v1",
+            "kind": "patch_outcome",
+            "artifact": artifact,
+        }
+
+    @staticmethod
+    def _invalidate_revision_recovery_reference(request: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "schema": "code_recovery_reference/v1",
+            "kind": "revision_invalidation",
+            "repository_id": str(request.get("repository_id") or ""),
+            "symbol_id": str(request.get("symbol_id") or ""),
+            "file_path": str(request.get("file_path") or ""),
+            "new_commit_sha": str(request.get("new_commit_sha") or ""),
+            "new_content_hash": str(request.get("new_content_hash") or ""),
+        }
+
+    def _replay_code_recovery_reference(self, reference: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(reference, dict) or str(reference.get("schema") or "") != "code_recovery_reference/v1":
+            raise ValueError("unsupported code recovery reference")
+        kind = str(reference.get("kind") or "")
+        if kind == "noop":
+            return {"status": "noop"}
+        if kind == "code_claim":
+            payload = self._load_recovery_artifact(dict(reference.get("artifact") or {}), expected_kind="code_claim_request")
+            result = self._code_claim_add(payload)
+            if not result.get("id") and not result.get("review_id"):
+                raise RuntimeError("code claim recovery produced no durable result")
+            return result
+        if kind == "patch_outcome":
+            payload = self._load_recovery_artifact(
+                dict(reference.get("artifact") or {}), expected_kind="patch_outcome_request"
+            )
+            result = self._patch_outcome_add(payload)
+            if not result.get("id") and not result.get("review_id"):
+                raise RuntimeError("patch outcome recovery produced no durable result")
+            return result
+        if kind == "revision_invalidation":
+            payload = {
+                key: reference.get(key, "")
+                for key in ("repository_id", "symbol_id", "file_path", "new_commit_sha", "new_content_hash")
+            }
+            return self._invalidate_revision(payload)
+        if kind == "code_graph_embed":
+            repository_id = str(reference.get("repository_id") or "").strip()
+            if not repository_id:
+                raise ValueError("code graph embedding recovery requires repository_id")
+            return _embed_pending_chunks(self, {
+                "repository_id": repository_id,
+                "limit": max(1, min(int(reference.get("limit") or 1000), 10_000)),
+            })
+        if kind == "code_graph_inbox":
+            artifacts = reference.get("artifacts") or []
+            if not isinstance(artifacts, list) or not artifacts or len(artifacts) > 1000:
+                raise ValueError("invalid Code Shrinker recovery artifact list")
+            results = []
+            for artifact in artifacts:
+                event = self._load_code_graph_inbox_artifact(dict(artifact or {}))
+                event_type = str(event.get("type") or "")
+                if event_type == "code_graph_snapshot":
+                    results.append(_ingest_code_graph_event(self, event))
+                elif event_type == "patch_applied":
+                    results.append(self._apply_code_shrinker_patch_event(event))
+                else:
+                    raise RuntimeError("unsupported Code Shrinker recovery event type")
+            return {"status": "replayed", "processed": len(results), "results": results}
+        raise ValueError("unsupported code recovery reference kind")
+
+    def _store_code_graph_inbox_artifact(self, event: Dict[str, Any], raw: bytes) -> Dict[str, Any]:
+        """Retain a producer event verbatim outside JSONL under its content hash."""
+        if not isinstance(event, dict) or not raw:
+            raise ValueError("invalid Code Shrinker recovery artifact")
+        event_type = str(event.get("type") or "")
+        producer = str(event.get("producer") or "")
+        event_id = str(event.get("event_id") or "").strip()
+        if event_type not in {"code_graph_snapshot", "patch_applied"} or producer not in {"mcp-code-shrinker", "code-shrinker"} or not event_id:
+            raise ValueError("unsupported Code Shrinker recovery event")
+        max_bytes = max(64 * 1024, min(int(os.environ.get("MEMORY_WIKI_CODE_RECOVERY_ARTIFACT_MAX_BYTES", 64 * 1024 * 1024)), 256 * 1024 * 1024))
+        if len(raw) > max_bytes:
+            raise ValueError("Code Shrinker recovery artifact exceeds configured size")
+        digest = hashlib.sha256(raw).hexdigest()
+        path = self._recovery_artifact_path(Path("code-graph-inbox") / f"{digest}.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            if self._file_sha256(path) != digest:
+                raise RuntimeError("existing Code Shrinker artifact digest mismatch")
+        else:
+            tmp = path.with_suffix(path.suffix + f".{os.getpid()}.{threading.get_ident()}.tmp")
+            with open(tmp, "wb") as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+            if os.name != "nt":
+                try:
+                    os.chmod(path, 0o600)
+                except OSError:
+                    pass
+            self._fsync_dir(path.parent)
+        size_bytes = path.stat().st_size
+        self._record_recovery_artifact(
+            kind="code_graph_inbox", sha256=digest, size_bytes=size_bytes,
+            relative_locator=f"code-graph-inbox/{digest}.json", schema_version="code_graph_inbox_artifact/v1",
+        )
+        return {
+            "schema": "code_graph_inbox_artifact/v1",
+            "event_type": event_type,
+            "event_version": int(event.get("event_version") or 0),
+            "producer": producer,
+            "event_id": str(event.get("event_id") or ""),
+            "repository_id": str(event.get("repository_id") or ""),
+            "commit_sha": str(event.get("commit_sha") or ""),
+            "sha256": digest,
+            "size_bytes": size_bytes,
+        }
+
+    def _load_code_graph_inbox_artifact(self, reference: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(reference, dict) or str(reference.get("schema") or "") != "code_graph_inbox_artifact/v1":
+            raise ValueError("unsupported Code Shrinker recovery artifact reference")
+        event_type = str(reference.get("event_type") or "")
+        producer = str(reference.get("producer") or "")
+        digest = str(reference.get("sha256") or "").lower()
+        if event_type not in {"code_graph_snapshot", "patch_applied"} or producer not in {"mcp-code-shrinker", "code-shrinker"} or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("invalid Code Shrinker recovery artifact reference")
+        path = self._recovery_artifact_path(Path("code-graph-inbox") / f"{digest}.json")
+        if not path.is_file() or int(path.stat().st_size) != int(reference.get("size_bytes") or -1):
+            raise RuntimeError("Code Shrinker recovery artifact is missing or changed")
+        raw = path.read_bytes()
+        if hashlib.sha256(raw).hexdigest() != digest:
+            raise RuntimeError("Code Shrinker recovery artifact digest mismatch")
+        try:
+            event = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            raise RuntimeError("Code Shrinker recovery artifact is not valid UTF-8 JSON") from exc
+        if not isinstance(event, dict) or str(event.get("type") or "") != event_type or str(event.get("producer") or "") != producer:
+            raise RuntimeError("Code Shrinker recovery artifact metadata mismatch")
+        if int(event.get("event_version") or 0) != int(reference.get("event_version") or 0):
+            raise RuntimeError("Code Shrinker recovery artifact version mismatch")
+        for field in ("event_id", "repository_id", "commit_sha"):
+            if str(event.get(field) or "") != str(reference.get(field) or ""):
+                raise RuntimeError(f"Code Shrinker recovery artifact {field} mismatch")
+        return event
+
     def _spool_event(self, op: str, payload: Dict[str, Any]) -> str:
         self.spool_dir.mkdir(parents=True, exist_ok=True)
         ts = now()
@@ -4691,7 +5101,7 @@ class MemoryWikiProvider(MemoryProvider):
                     "phase": phase,
                     "op": short(op, 120),
                     "payload": self._json_safe(payload, preserve_sha256_fields=True),
-                    "result": self._json_safe(result or {}),
+                    "result": self._json_safe(result or {}, preserve_sha256_fields=True),
                     "error": short(redact_secrets(error), 1200) if error else "",
                     "prev_hash": prev_hash,
                     "db_path": str(self.db_path),
@@ -4752,14 +5162,50 @@ class MemoryWikiProvider(MemoryProvider):
             return {"error": f"{type(exc).__name__}: {exc}"}
 
     def _journal_operation(self, op: str, payload: Dict[str, Any], fn) -> Tuple[Any, Dict[str, Any]]:
-        """Journal-before, execute, journal-after. Failed applies remain replayable."""
-        before = self._append_journal_event(op, payload, phase="before")
+        """Journal-before, execute, journal-after with content-free sensitive refs."""
+        journal_payload = self._journal_payload_for_operation(op, payload)
+        before = self._append_journal_event(op, journal_payload, phase="before")
         try:
             result = fn()
         except Exception as e:
-            self._append_journal_event(op, payload, phase="error", error=str(e), result={"before_seq": before.get("seq")})
+            error_text = (
+                f"{type(e).__name__}: sensitive mutation failed"
+                if op in self._reference_recovery_ops() else str(e)
+            )
+            self._append_journal_event(
+                op, journal_payload, phase="error", error=error_text, result={"before_seq": before.get("seq")}
+            )
             raise
-        after = self._append_journal_event(op, payload, phase="after", result=result)
+        tool_result = self._journal_result_dict(result)
+        if tool_result.get("success") is False:
+            detail = str(tool_result.get("error") or "tool returned failure")
+            error_text = (
+                "tool returned failure for sensitive mutation"
+                if op in self._reference_recovery_ops() else short(redact_secrets(detail), 1200)
+            )
+            error_event = self._append_journal_event(
+                op, journal_payload, phase="error", error=error_text, result={"before_seq": before.get("seq")}
+            )
+            return result, {"before": before, "error": error_event, "checkpoint": {}}
+        try:
+            after_result = self._journal_after_result(op, payload, result)
+        except Exception as exc:
+            capture_error = (
+                "recovery reference capture failed for sensitive mutation"
+                if op in self._reference_recovery_ops()
+                else f"recovery reference capture failed: {type(exc).__name__}: {exc}"
+            )
+            self._append_journal_event(
+                op,
+                journal_payload,
+                phase="error",
+                error=capture_error,
+                result={"before_seq": before.get("seq")},
+            )
+            raise RuntimeError(
+                f"mutation completed but its recovery reference could not be captured: {type(exc).__name__}"
+            ) from exc
+        after = self._append_journal_event(op, journal_payload, phase="after", result=after_result)
         checkpoint = self._checkpoint_after_journal_mutation(op, result, int(after.get("seq") or 0))
         return result, {"before": before, "after": after, "checkpoint": checkpoint}
 
@@ -4821,7 +5267,7 @@ class MemoryWikiProvider(MemoryProvider):
             "meta", "claims", "evidence", "contradictions", "review_queue", "memory_changes", "memory_mutations",
             "source_policies", "preference_rules", "secret_index", "post_task_log", "backups", "decisions", "mistakes",
             "project_profiles", "task_capsules", "entities", "relations", "recall_events", "topic_aliases",
-            "source_artifacts", "retrieval_eval_cases", "secret_quarantine", "sync_bundles", "audit_log",
+            "source_artifacts", "recovery_artifacts", "retrieval_eval_cases", "secret_quarantine", "sync_bundles", "audit_log",
             # Durable code/document graph records are not derivable from claims alone.
             # FTS tables are intentionally excluded: they are rebuilt from these rows.
             "code_claim_metadata", "code_graph_repositories", "code_graph_files", "code_graph_symbols",
@@ -4876,7 +5322,7 @@ class MemoryWikiProvider(MemoryProvider):
         meta = self._read_journal_meta()
         payload = {
             "id": cid,
-            "version": "1.4.0-journal",
+            "version": "1.5.0-journal",
             "created_at": now(),
             "name": raw,
             "journal_seq": int(meta.get("seq") or 0),
@@ -4942,6 +5388,40 @@ class MemoryWikiProvider(MemoryProvider):
             return path.with_name(path.name[:-len(".manifest.json")] + ".json")
         return path
 
+    def _load_verified_checkpoint(self, path: Path) -> Dict[str, Any]:
+        """Read a published local checkpoint only after checking its manifest."""
+        checkpoint_path = self._normalize_checkpoint_path(path)
+        if not checkpoint_path.name or not self._checkpoint_path_is_local(checkpoint_path):
+            raise ValueError("checkpoint must be inside the local checkpoint directory")
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError("checkpoint file does not exist")
+        manifest_path = checkpoint_path.with_suffix(".manifest.json")
+        if not manifest_path.is_file():
+            raise RuntimeError("checkpoint manifest is missing")
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise RuntimeError("checkpoint or manifest is not valid JSON") from exc
+        if not isinstance(manifest, dict) or not isinstance(payload, dict):
+            raise RuntimeError("checkpoint or manifest must be a JSON object")
+        expected_sha = str(manifest.get("sha256") or "").lower()
+        actual_sha = self._file_sha256(checkpoint_path)
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha) or expected_sha != actual_sha:
+            raise RuntimeError("checkpoint manifest digest mismatch")
+        manifest_path_value = str(manifest.get("path") or "")
+        if manifest_path_value:
+            try:
+                if self._normalize_checkpoint_path(Path(manifest_path_value)).resolve(strict=False) != checkpoint_path.resolve(strict=False):
+                    raise RuntimeError("checkpoint manifest path mismatch")
+            except OSError as exc:
+                raise RuntimeError("checkpoint manifest path is invalid") from exc
+        if str(manifest.get("id") or "") != str(payload.get("id") or ""):
+            raise RuntimeError("checkpoint manifest id mismatch")
+        if int(manifest.get("journal_seq") or 0) != int(payload.get("journal_seq") or 0):
+            raise RuntimeError("checkpoint manifest sequence mismatch")
+        return payload
+
     def _latest_journal_checkpoint(self) -> Optional[Path]:
         # Unpublished safety checkpoints stay invisible until their journal
         # sequence has been verified against the triggering after-event.
@@ -4987,6 +5467,13 @@ class MemoryWikiProvider(MemoryProvider):
             "memory_wiki_repair", "memory_wiki_write_firewall", "memory_wiki_undo_last", "memory_wiki_transaction",
             "memory_wiki_compile_topic", "memory_wiki_import_bundle", "memory_wiki_scrub_secrets",
             "memory_wiki_migrate_secrets_from_claims", "memory_wiki_code_claim_add",
+            "memory_wiki_code_graph_ingest_inbox",
+            "memory_wiki_patch_outcome_add", "memory_wiki_invalidate_revision",
+            "memory_wiki_code_graph_embed_pending",
+            "memory_wiki_reindex",
+            "memory_wiki_document_ingest", "memory_wiki_document_scan",
+            "memory_wiki_document_embed_pending", "memory_wiki_document_delete",
+            "memory_wiki_document_ingest_inbox",
         }
 
     def _rebuild_from_journal(self, apply: bool = False, checkpoint: str = "", max_events: int = 0) -> Dict[str, Any]:
@@ -4994,8 +5481,8 @@ class MemoryWikiProvider(MemoryProvider):
         cp_path = self._normalize_checkpoint_path(Path(checkpoint).expanduser()) if checkpoint else self._latest_journal_checkpoint()
         checkpoint_payload: Dict[str, Any] = {}
         checkpoint_seq = 0
-        if cp_path and cp_path.exists():
-            checkpoint_payload = json.loads(cp_path.read_text(encoding="utf-8"))
+        if cp_path:
+            checkpoint_payload = self._load_verified_checkpoint(cp_path)
             checkpoint_seq = int(checkpoint_payload.get("journal_seq") or 0)
         candidates = []
         unrecoverable = []
@@ -5008,6 +5495,14 @@ class MemoryWikiProvider(MemoryProvider):
         recovery_ignorable = self._nonmutating_journal_tools() | {
             "memory_wiki_backup", "memory_wiki_export_bundle"
         }
+        journal_integrity = self._journal_status(verify=True, limit=5)
+        if int(journal_integrity.get("events_invalid") or 0) or int(journal_integrity.get("hash_errors") or 0):
+            incomplete.append({
+                "op": "journal_integrity",
+                "phase": "invalid",
+                "events_invalid": int(journal_integrity.get("events_invalid") or 0),
+                "hash_errors": int(journal_integrity.get("hash_errors") or 0),
+            })
         for ev in self._iter_journal_events():
             if ev.get("_error"):
                 incomplete.append(ev)
@@ -5040,6 +5535,16 @@ class MemoryWikiProvider(MemoryProvider):
             if op not in replayable:
                 unrecoverable.append(ev)
                 continue
+            if op in self._reference_recovery_ops():
+                after_result = ev.get("result") if isinstance(ev.get("result"), dict) else {}
+                recovery_ref = after_result.get("recovery") if isinstance(after_result, dict) else None
+                if not isinstance(recovery_ref, dict):
+                    unrecoverable.append({**ev, "recovery_error": "missing_recovery_reference"})
+                    continue
+                summary = after_result.get("summary") if isinstance(after_result, dict) else {}
+                if isinstance(summary, dict) and int(summary.get("failed") or 0) > 0:
+                    incomplete.append({"seq": seq, "op": op, "phase": "partial_failure"})
+                    continue
             if max_events and len(candidates) >= max_events:
                 incomplete.append({"seq": seq, "op": op, "phase": "replay_limit"})
                 continue
@@ -5086,6 +5591,9 @@ class MemoryWikiProvider(MemoryProvider):
                 p.unlink()
         replayed = skipped = failed = 0
         errors: List[Dict[str, Any]] = []
+        deferred_reindex_refs: List[Dict[str, Any]] = []
+        previous_recovery_active = bool(getattr(self, "_journal_recovery_active", False))
+        self._journal_recovery_active = True
         try:
             if original_conn is not None:
                 try: original_conn.close()
@@ -5099,11 +5607,29 @@ class MemoryWikiProvider(MemoryProvider):
                 op = str(ev.get("op") or "")
                 payload = dict(ev.get("payload") or {})
                 try:
-                    raw = self.handle_tool_call(op, {**payload, "__journal_replay": True})
-                    try:
-                        parsed = json.loads(raw)
-                    except Exception:
-                        parsed = {"success": False, "raw": raw[:500]}
+                    if op == "memory_wiki_reindex":
+                        after_result = ev.get("result") if isinstance(ev.get("result"), dict) else {}
+                        recovery_ref = after_result.get("recovery") if isinstance(after_result, dict) else None
+                        if not isinstance(recovery_ref, dict) or str(recovery_ref.get("schema") or "") != "derived_recovery_reference/v1" or str(recovery_ref.get("kind") or "") != "semantic_reindex":
+                            raise RuntimeError("invalid deferred semantic reindex reference")
+                        deferred_reindex_refs.append(dict(recovery_ref))
+                        parsed = {"success": True, "status": "deferred_until_after_swap"}
+                    elif op.startswith("memory_wiki_document_"):
+                        after_result = ev.get("result") if isinstance(ev.get("result"), dict) else {}
+                        recovery_ref = after_result.get("recovery") if isinstance(after_result, dict) else None
+                        replay_result = _replay_document_recovery_reference(self, dict(recovery_ref or {}))
+                        parsed = {"success": True, **dict(replay_result or {})}
+                    elif op in {"memory_wiki_code_claim_add", "memory_wiki_code_graph_ingest_inbox", "memory_wiki_patch_outcome_add", "memory_wiki_invalidate_revision", "memory_wiki_code_graph_embed_pending"}:
+                        after_result = ev.get("result") if isinstance(ev.get("result"), dict) else {}
+                        recovery_ref = after_result.get("recovery") if isinstance(after_result, dict) else None
+                        replay_result = self._replay_code_recovery_reference(dict(recovery_ref or {}))
+                        parsed = {"success": True, **dict(replay_result or {})}
+                    else:
+                        raw = self.handle_tool_call(op, {**payload, "__journal_replay": True})
+                        try:
+                            parsed = json.loads(raw)
+                        except Exception:
+                            parsed = {"success": False, "raw": raw[:500]}
                     if parsed.get("success") is False:
                         failed += 1; errors.append({"seq": ev.get("seq"), "op": op, "error": parsed.get("error") or parsed})
                     else:
@@ -5137,8 +5663,32 @@ class MemoryWikiProvider(MemoryProvider):
                 if rp.exists():
                     os.replace(rp, Path(str(original_db) + suffix))
             self._connect(); self._migrate(); self._rebuild_fts(); self._render_all(); self._render_active_dashboard()
-            self._audit("journal_rebuild", "ok", f"checkpoint={cp_path} replayed={replayed} failed={failed}")
-            return {**plan, "applied": True, "safety_backup": safety, "rebuilt_db": str(original_db), "replayed": replayed, "failed": failed, "skipped": skipped, "errors": errors[:20]}
+            self._journal_recovery_active = previous_recovery_active
+            outbox_recovery_error = ""
+            if SEMANTIC_ENABLED:
+                try:
+                    _start_outbox_worker(str(self.db_path))
+                    _wake_outbox_worker(str(self.db_path))
+                except Exception as exc:
+                    outbox_recovery_error = f"{type(exc).__name__}: {exc}"
+            # Semantic collections are external derived state. Never mutate them while
+            # replaying a temporary SQLite database; re-run the recorded intent only
+            # after the verified durable DB has been swapped into place.
+            derived_reindex: List[Dict[str, Any]] = []
+            derived_reindex_failures: List[Dict[str, Any]] = []
+            for reference in deferred_reindex_refs:
+                try:
+                    outcome = self._reindex(
+                        int(reference.get("limit") or 0), bool(reference.get("force", False))
+                    )
+                    derived_reindex.append(dict(outcome or {}))
+                    if not bool((outcome or {}).get("ok", False)):
+                        derived_reindex_failures.append({"reference": reference, "result": dict(outcome or {})})
+                except Exception as exc:
+                    derived_reindex_failures.append({"reference": reference, "error": f"{type(exc).__name__}: {exc}"})
+            audit_status = "ok" if not derived_reindex_failures and not outbox_recovery_error else "partial"
+            self._audit("journal_rebuild", audit_status, f"checkpoint={cp_path} replayed={replayed} failed={failed} deferred_reindex={len(deferred_reindex_refs)}")
+            return {**plan, "applied": True, "safety_backup": safety, "rebuilt_db": str(original_db), "replayed": replayed, "failed": failed, "skipped": skipped, "errors": errors[:20], "derived_reindex": derived_reindex, "derived_reindex_failures": derived_reindex_failures, "outbox_recovery_error": outbox_recovery_error}
         except Exception:
             try:
                 if self._conn is not None:
@@ -5147,6 +5697,7 @@ class MemoryWikiProvider(MemoryProvider):
                 pass
             self._conn = None
             self.db_path = original_db
+            self._journal_recovery_active = previous_recovery_active
             self._connect(); self._migrate()
             raise
 
@@ -5165,6 +5716,15 @@ class MemoryWikiProvider(MemoryProvider):
         c = self._connect()
         with c:
             c.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
+            c.execute("""CREATE TABLE IF NOT EXISTS recovery_artifacts(
+                sha256 TEXT PRIMARY KEY,
+                kind TEXT NOT NULL,
+                relative_locator TEXT NOT NULL,
+                size_bytes INTEGER NOT NULL,
+                schema_version TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                last_verified_at INTEGER NOT NULL DEFAULT 0
+            )""")
             c.execute("""CREATE TABLE IF NOT EXISTS claims(
                 id TEXT PRIMARY KEY, claim TEXT NOT NULL, topic TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',
                 confidence REAL NOT NULL DEFAULT .70, salience REAL NOT NULL DEFAULT .70, source TEXT NOT NULL DEFAULT '', evidence TEXT NOT NULL DEFAULT '',
@@ -6554,6 +7114,73 @@ class MemoryWikiProvider(MemoryProvider):
             result["post_commit_failures"] = post_commit_failures
         return result
 
+    def _apply_code_shrinker_patch_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply one validated patch event; shared by live inbox and recovery."""
+        if int(event.get("event_version") or 0) != 1 or str(event.get("type") or "") != "patch_applied":
+            raise ValueError("unsupported patch event type/version")
+        event_id = str(event.get("event_id") or "").strip()
+        repository_id = str(event.get("repository_id") or "").strip()
+        patch_id = str(event.get("patch_id") or "").strip()
+        if not event_id or not repository_id or not patch_id:
+            raise ValueError("event_id, repository_id and patch_id are required")
+        per_file = event.get("per_file") or []
+        if not isinstance(per_file, list):
+            raise ValueError("per_file must be an array")
+        changed_files = event.get("changed_files") or [
+            item.get("file_path") for item in per_file if isinstance(item, dict)
+        ]
+        changed_symbols = event.get("changed_symbols") or []
+        old_hash = str(event.get("old_content_hash") or "")
+        new_hash = str(event.get("new_content_hash") or "")
+        if len(per_file) == 1 and isinstance(per_file[0], dict):
+            old_hash = old_hash or str(per_file[0].get("old_content_hash") or "")
+            new_hash = new_hash or str(per_file[0].get("new_content_hash") or "")
+        outcome_result = self._patch_outcome_add({
+            "patch_id": patch_id,
+            "outcome": str(event.get("outcome") or "applied"),
+            "repository_id": repository_id,
+            "commit_sha": str(event.get("commit_sha") or ""),
+            "old_content_hash": old_hash,
+            "new_content_hash": new_hash,
+            "validation_report": event.get("validation_report") or {},
+            "changed_files": changed_files,
+            "changed_symbols": changed_symbols,
+            "rollback_steps": str(event.get("rollback_steps") or ""),
+            "source_event_id": event_id,
+            "producer": "mcp-code-shrinker",
+            "phase_sep_version": "2",
+        })
+        invalidations = []
+        for item in per_file:
+            if not isinstance(item, dict):
+                continue
+            file_path = str(item.get("file_path") or "").strip()
+            if not file_path:
+                continue
+            invalidations.append(self._invalidate_revision({
+                "repository_id": repository_id,
+                "file_path": file_path,
+                "new_commit_sha": str(event.get("commit_sha") or ""),
+                "new_content_hash": str(item.get("new_content_hash") or ""),
+            }))
+        if not per_file:
+            for file_path in changed_files:
+                if str(file_path or "").strip():
+                    invalidations.append(self._invalidate_revision({
+                        "repository_id": repository_id,
+                        "file_path": file_path,
+                        "new_commit_sha": str(event.get("commit_sha") or ""),
+                        "new_content_hash": new_hash,
+                    }))
+        return {
+            "event_id": event_id,
+            "repository_id": repository_id,
+            "patch_id": patch_id,
+            "deduplicated": bool(outcome_result.get("deduplicated")),
+            "outcome": outcome_result,
+            "invalidations": invalidations,
+        }
+
     def _drain_code_shrinker_events(self, limit: int = 100) -> Dict[str, Any]:
         """Consume atomic patch events produced by mcp-code-shrinker.
 
@@ -6567,6 +7194,7 @@ class MemoryWikiProvider(MemoryProvider):
         for path in (inbox, done, dead):
             path.mkdir(parents=True, exist_ok=True)
         processed = deduplicated = failed = 0
+        recovery_artifacts: List[Dict[str, Any]] = []
         for event_path in sorted(inbox.glob("*.json"))[:max(1, min(int(limit), 1000))]:
             claimed = event_path.with_name(
                 f".{event_path.name}.processing.{os.getpid()}.{threading.get_ident()}"
@@ -6579,7 +7207,13 @@ class MemoryWikiProvider(MemoryProvider):
                 _debug_log(f"Could not claim integration event {event_path}: {exc}")
                 continue
             try:
-                raw = claimed.read_text(encoding="utf-8")
+                max_artifact_bytes = max(64 * 1024, min(int(os.environ.get("MEMORY_WIKI_CODE_RECOVERY_ARTIFACT_MAX_BYTES", 64 * 1024 * 1024)), 256 * 1024 * 1024))
+                if int(claimed.stat().st_size) > max_artifact_bytes:
+                    raise ValueError("Code Shrinker event exceeds recovery artifact limit")
+                raw_bytes = claimed.read_bytes()
+                if len(raw_bytes) > max_artifact_bytes:
+                    raise ValueError("Code Shrinker event exceeds recovery artifact limit")
+                raw = raw_bytes.decode("utf-8")
                 event = json.loads(raw)
                 if not isinstance(event, dict):
                     raise ValueError("event must be an object")
@@ -6590,77 +7224,24 @@ class MemoryWikiProvider(MemoryProvider):
                 producer = str(event.get("producer") or "")
                 if producer not in {"mcp-code-shrinker", "code-shrinker"}:
                     raise ValueError("unexpected producer")
+                event = _sanitize_code_graph_event_for_recovery(event)
+                raw_bytes = json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                artifact_ref = self._store_code_graph_inbox_artifact(event, raw_bytes)
                 if event_type == "code_graph_snapshot":
                     graph_result = _ingest_code_graph_event(self, event)
                     if graph_result.get("deduplicated"):
                         deduplicated += 1
                     destination = done / event_path.name
                     os.replace(claimed, destination)
+                    recovery_artifacts.append(artifact_ref)
                     processed += 1
                     continue
-                if event_version != 1 or event_type != "patch_applied":
-                    raise ValueError("unsupported event type/version combination")
-                event_id = str(event.get("event_id") or "").strip()
-                repository_id = str(event.get("repository_id") or "").strip()
-                patch_id = str(event.get("patch_id") or "").strip()
-                if not event_id or not repository_id or not patch_id:
-                    raise ValueError("event_id, repository_id and patch_id are required")
-
-                per_file = event.get("per_file") or []
-                if not isinstance(per_file, list):
-                    raise ValueError("per_file must be an array")
-                changed_files = event.get("changed_files") or [
-                    item.get("file_path") for item in per_file if isinstance(item, dict)
-                ]
-                changed_symbols = event.get("changed_symbols") or []
-                old_hash = str(event.get("old_content_hash") or "")
-                new_hash = str(event.get("new_content_hash") or "")
-                if len(per_file) == 1 and isinstance(per_file[0], dict):
-                    old_hash = old_hash or str(per_file[0].get("old_content_hash") or "")
-                    new_hash = new_hash or str(per_file[0].get("new_content_hash") or "")
-
-                outcome_result = self._patch_outcome_add({
-                    "patch_id": patch_id,
-                    "outcome": str(event.get("outcome") or "applied"),
-                    "repository_id": repository_id,
-                    "commit_sha": str(event.get("commit_sha") or ""),
-                    "old_content_hash": old_hash,
-                    "new_content_hash": new_hash,
-                    "validation_report": event.get("validation_report") or {},
-                    "changed_files": changed_files,
-                    "changed_symbols": changed_symbols,
-                    "rollback_steps": str(event.get("rollback_steps") or ""),
-                    "source_event_id": event_id,
-                    "producer": "mcp-code-shrinker",
-                    "phase_sep_version": "2",
-                })
-                if outcome_result.get("deduplicated"):
+                patch_result = self._apply_code_shrinker_patch_event(event)
+                if patch_result.get("deduplicated"):
                     deduplicated += 1
-
-                invalidations = []
-                for item in per_file:
-                    if not isinstance(item, dict):
-                        continue
-                    file_path = str(item.get("file_path") or "").strip()
-                    if not file_path:
-                        continue
-                    invalidations.append(self._invalidate_revision({
-                        "repository_id": repository_id,
-                        "file_path": file_path,
-                        "new_commit_sha": str(event.get("commit_sha") or ""),
-                        "new_content_hash": str(item.get("new_content_hash") or ""),
-                    }))
-                if not per_file:
-                    for file_path in changed_files:
-                        if str(file_path or "").strip():
-                            invalidations.append(self._invalidate_revision({
-                                "repository_id": repository_id,
-                                "file_path": file_path,
-                                "new_commit_sha": str(event.get("commit_sha") or ""),
-                                "new_content_hash": new_hash,
-                            }))
                 destination = done / event_path.name
                 os.replace(claimed, destination)
+                recovery_artifacts.append(artifact_ref)
                 processed += 1
             except Exception as exc:
                 failed += 1
@@ -6680,6 +7261,7 @@ class MemoryWikiProvider(MemoryProvider):
             "processed": processed,
             "deduplicated": deduplicated,
             "failed": failed,
+            "recovery_artifacts": recovery_artifacts[:1000],
         }
 
     @staticmethod
@@ -7302,7 +7884,7 @@ class MemoryWikiProvider(MemoryProvider):
                     )
             except Exception as log_exc:
                 _debug_log(f"post-commit failure logging failed for {cid}: {log_exc}")
-        if SEMANTIC_ENABLED:
+        if SEMANTIC_ENABLED and not bool(getattr(self, "_journal_recovery_active", False)):
             _start_outbox_worker(str(self.db_path))
             _wake_outbox_worker(str(self.db_path))
         return failures

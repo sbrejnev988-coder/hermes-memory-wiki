@@ -62,6 +62,7 @@ def test_failed_journal_replay_keeps_original_database() -> None:
                 provider._iter_journal_events = lambda: iter(
                     [{"phase": "after", "seq": 1, "op": "memory_wiki_add_claim", "payload": {}}]
                 )
+                provider._journal_status = lambda **_kwargs: {"events_invalid": 0, "hash_errors": 0}
                 provider._replayable_journal_ops = lambda: {"memory_wiki_add_claim"}
                 provider.handle_tool_call = lambda *_a, **_k: json.dumps({"success": False, "error": "synthetic replay failure"})
 

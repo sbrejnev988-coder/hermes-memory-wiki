@@ -46,7 +46,7 @@ except ImportError:
     )
 
 SCHEMA_VERSION = 2
-MODULE_VERSION = "0.5.0"
+MODULE_VERSION = "0.6.0"
 _CURRENT_PARSER_VERSION = f"{_EXTRACTOR_VERSION}:secret-policy-{_SECRET_POLICY_VERSION}"
 _TOPIC = "document-intelligence"
 _TOKEN_RE = re.compile(r"[\w./:@#$+\-]+", re.UNICODE)
@@ -936,6 +936,154 @@ def _source_id(path: Path) -> str:
     return "docsrc_" + _sha(str(path))[:24]
 
 
+# Recovery references deliberately contain provenance and integrity data only.
+# Document text, parser metadata, warnings, units, chunks and embeddings remain
+# outside the append-only journal.  A recovery must reopen the original
+# allowlisted source and verify this reference before re-parsing it.
+_DOCUMENT_RECOVERY_SCHEMA = "document_source_ref/v1"
+
+
+def _document_recovery_root_sha256(root: Path) -> str:
+    """Stable non-secret identifier for an allowlisted root, not its path."""
+    try:
+        canonical = root.resolve(strict=True)
+    except OSError:
+        canonical = _absolute_unresolved(root)
+    return _sha("document-recovery-root/v1\0" + os.path.normcase(str(canonical)))
+
+
+def _document_recovery_root(root_sha256: str) -> Path:
+    matches = [root for root in _roots() if _document_recovery_root_sha256(root) == str(root_sha256 or "")]
+    if len(matches) != 1:
+        raise RuntimeError("document recovery root is missing or ambiguous")
+    return matches[0]
+
+
+def _document_recovery_relative_path(value: Any) -> Path:
+    raw = str(value or "").strip()
+    if not raw or "\\" in raw:
+        raise ValueError("document recovery locator must be a non-empty POSIX relative path")
+    relative = Path(*raw.split("/"))
+    if relative.is_absolute() or not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
+        raise ValueError("unsafe document recovery locator")
+    return relative
+
+
+def _document_source_recovery_reference(
+    provider: Any,
+    source_id: str,
+    *,
+    action: str,
+    embed: bool = False,
+    embed_limit: int = 200,
+) -> Dict[str, Any]:
+    """Build a content-free replay reference for one durable document source."""
+    conn = provider._connect()
+    install_document_graph_schema(conn)
+    row = conn.execute("SELECT * FROM document_sources WHERE source_id=?", (str(source_id),)).fetchone()
+    if not row:
+        raise RuntimeError("document recovery source is missing from durable graph")
+    source = _row(row)
+    source_path = _absolute_unresolved(str(source.get("source_path") or ""))
+    root, relative = _lexical_root_for_path(source_path)
+    if not relative.parts:
+        raise RuntimeError("document recovery source may not be an allowlist root")
+    unit_count = int(conn.execute(
+        "SELECT COUNT(*) FROM document_units WHERE source_id=? AND active=1", (source_id,)
+    ).fetchone()[0])
+    chunk_count = int(conn.execute(
+        "SELECT COUNT(*) FROM document_chunks WHERE source_id=? AND active=1", (source_id,)
+    ).fetchone()[0])
+    edge_count = int(conn.execute(
+        "SELECT COUNT(*) FROM document_edges WHERE source_id=? AND active=1", (source_id,)
+    ).fetchone()[0])
+    return {
+        "schema": _DOCUMENT_RECOVERY_SCHEMA,
+        "kind": "document_source",
+        "action": "delete" if action == "delete" else "ingest",
+        "source_id": str(source_id),
+        "root_sha256": _document_recovery_root_sha256(root),
+        "relative_path": relative.as_posix(),
+        "file_hash": str(source.get("file_hash") or ""),
+        "scope_id": str(source.get("scope_id") or ""),
+        "repository_id": str(source.get("repository_id") or ""),
+        "parser": str(source.get("parser") or ""),
+        "parser_version": str(source.get("parser_version") or ""),
+        "revision_id": str(source.get("revision_id") or ""),
+        "source_status": str(source.get("status") or ""),
+        "active": int(source.get("active") or 0),
+        "embed": bool(embed) if action != "delete" else False,
+        "embed_limit": max(1, min(int(embed_limit or 200), 10_000)),
+        "unit_count": unit_count,
+        "chunk_count": chunk_count,
+        "edge_count": edge_count,
+        "module_version": MODULE_VERSION,
+        "schema_version": SCHEMA_VERSION,
+    }
+
+
+def _document_recovery_result_dict(result: Any) -> Dict[str, Any]:
+    if isinstance(result, str):
+        try:
+            result = json.loads(result)
+        except Exception:
+            return {}
+    return dict(result) if isinstance(result, dict) else {}
+
+
+def build_document_recovery_reference(
+    provider: Any,
+    operation: str,
+    request: Dict[str, Any],
+    result: Any,
+) -> Dict[str, Any]:
+    """Create journal-safe references for document mutations after they commit."""
+    response = _document_recovery_result_dict(result)
+    if response.get("success") is False:
+        return {"schema": _DOCUMENT_RECOVERY_SCHEMA, "kind": "noop", "operation": operation}
+    if operation == "memory_wiki_document_embed_pending":
+        return {
+            "schema": _DOCUMENT_RECOVERY_SCHEMA,
+            "kind": "document_embed",
+            "source_id": str(response.get("source_id") or request.get("source_id") or ""),
+            "scope_id": str(response.get("scope_id") or request.get("scope_id") or ""),
+            "repository_id": str(response.get("repository_id") or request.get("repository_id") or ""),
+            "limit": max(1, min(int(request.get("limit") or 500), 10_000)),
+        }
+
+    refs: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    embed_requested = bool(request.get("embed", False)) or (
+        bool(request.get("automatic", False)) and _env_bool("MEMORY_WIKI_DOCUMENT_AUTO_EMBED", False)
+    )
+    embed_limit = max(1, min(int(request.get("embed_limit") or 200), 10_000))
+
+    def collect(value: Any, action: str = "ingest") -> None:
+        if isinstance(value, dict):
+            source_id = str(value.get("source_id") or "").strip()
+            if source_id:
+                chosen = "delete" if action == "delete" or str(value.get("status") or "").lower() == "deleted" else "ingest"
+                refs[(chosen, source_id)] = _document_source_recovery_reference(
+                    provider, source_id, action=chosen,
+                    embed=embed_requested and chosen == "ingest", embed_limit=embed_limit,
+                )
+            for key in ("results", "processed", "pruned"):
+                nested = value.get(key)
+                if isinstance(nested, list):
+                    for item in nested:
+                        collect(item, "delete" if key == "pruned" else action)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item, action)
+
+    collect(response, "delete" if operation == "memory_wiki_document_delete" else "ingest")
+    return {
+        "schema": _DOCUMENT_RECOVERY_SCHEMA,
+        "kind": "document_sources",
+        "operation": operation,
+        "references": list(refs.values()),
+    }
+
+
 def _evidence_ref(value: Any) -> str:
     """Return a deterministic, secret-scanner-safe provenance reference."""
     digest = _sha(str(value or ""))[:32]
@@ -1499,6 +1647,26 @@ def scan_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def document_cache_scan_journal_ready(provider: Any) -> bool:
+    """Return whether an automatic cache turn can mutate durable graph state.
+
+    This is intentionally a side-effect-free preflight used only to avoid
+    appending journal before/after pairs for disabled, missing or cooldown scans.
+    ``maybe_ingest_document_cache`` repeats every security check before it acts.
+    """
+    if not _env_bool("MEMORY_WIKI_DOCUMENT_AUTO_SCAN_CACHE", False):
+        return False
+    root = _document_cache_root()
+    if not root.exists() or not root.is_dir() or root.is_symlink():
+        return False
+    cooldown = _env_int("MEMORY_WIKI_DOCUMENT_AUTO_SCAN_SECONDS", 15, 1, 3600)
+    last = float(getattr(provider, "_memory_wiki_document_cache_scan_at", 0.0) or 0.0)
+    if last and time.monotonic() - last < cooldown:
+        return False
+    scope_id = os.environ.get("MEMORY_WIKI_DOCUMENT_AUTO_SCOPE_ID", "").strip()
+    return bool(scope_id or _env_bool("MEMORY_WIKI_DOCUMENT_ALLOW_GLOBAL_AUTO", False))
+
+
 def maybe_ingest_document_cache(provider: Any, *, force: bool = False) -> Dict[str, Any]:
     """Optionally ingest new/changed Hermes attachment-cache files in bounded batches.
 
@@ -1913,6 +2081,109 @@ def delete_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
         conn.execute("DELETE FROM document_units_fts WHERE source_id=?", (source_id,))
         conn.execute("DELETE FROM document_chunks_fts WHERE source_id=?", (source_id,))
     return {"status": "deleted", "source_id": source_id, "archived_claims": archived}
+
+
+def _replay_document_source_reference(provider: Any, reference: Dict[str, Any]) -> Dict[str, Any]:
+    if str(reference.get("schema") or "") != _DOCUMENT_RECOVERY_SCHEMA:
+        raise ValueError("unsupported document recovery reference schema")
+    source_id = str(reference.get("source_id") or "").strip()
+    action = str(reference.get("action") or "").strip().lower()
+    expected_hash = str(reference.get("file_hash") or "").strip().lower()
+    expected_revision = str(reference.get("revision_id") or "").strip()
+    if not source_id or action not in {"ingest", "delete"} or not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+        raise ValueError("invalid document recovery source reference")
+    if int(reference.get("schema_version") or 0) != SCHEMA_VERSION or str(reference.get("module_version") or "") != MODULE_VERSION:
+        raise RuntimeError("document recovery module/schema version changed")
+
+    conn = provider._connect()
+    install_document_graph_schema(conn)
+    if action == "delete":
+        current = conn.execute(
+            "SELECT source_id,file_hash,revision_id,active FROM document_sources WHERE source_id=?", (source_id,)
+        ).fetchone()
+        if not current:
+            return {"status": "already_deleted", "source_id": source_id}
+        if str(current["file_hash"] or "").lower() != expected_hash or (
+            expected_revision and str(current["revision_id"] or "") != expected_revision
+        ):
+            raise RuntimeError("document delete recovery reference does not match current source revision")
+        if not int(current["active"] or 0):
+            return {"status": "already_deleted", "source_id": source_id}
+        result = delete_document(provider, {"source_id": source_id})
+        return {"status": "deleted", "source_id": source_id, "result": result}
+
+    root = _document_recovery_root(str(reference.get("root_sha256") or ""))
+    path = _absolute_unresolved(root / _document_recovery_relative_path(reference.get("relative_path")))
+    result = ingest_document(provider, {
+        "path": str(path),
+        "scope_id": str(reference.get("scope_id") or ""),
+        "repository_id": str(reference.get("repository_id") or ""),
+        "embed": False,
+    })
+    if str(result.get("source_id") or "") != source_id:
+        raise RuntimeError("document recovery source identity changed")
+    if str(result.get("file_hash") or "").lower() != expected_hash:
+        raise RuntimeError("document recovery source hash changed")
+    if str(result.get("parser") or "") != str(reference.get("parser") or ""):
+        raise RuntimeError("document recovery parser changed")
+    row = conn.execute(
+        "SELECT revision_id,parser_version,active FROM document_sources WHERE source_id=?", (source_id,)
+    ).fetchone()
+    if not row or not int(row["active"] or 0):
+        raise RuntimeError("document recovery did not restore an active source")
+    if expected_revision and str(row["revision_id"] or "") != expected_revision:
+        raise RuntimeError("document recovery revision changed")
+    if str(row["parser_version"] or "") != str(reference.get("parser_version") or ""):
+        raise RuntimeError("document recovery parser version changed")
+    actual_counts = {
+        "unit_count": int(conn.execute("SELECT COUNT(*) FROM document_units WHERE source_id=? AND active=1", (source_id,)).fetchone()[0]),
+        "chunk_count": int(conn.execute("SELECT COUNT(*) FROM document_chunks WHERE source_id=? AND active=1", (source_id,)).fetchone()[0]),
+        "edge_count": int(conn.execute("SELECT COUNT(*) FROM document_edges WHERE source_id=? AND active=1", (source_id,)).fetchone()[0]),
+    }
+    expected_counts = {key: int(reference.get(key) or 0) for key in actual_counts}
+    if actual_counts != expected_counts:
+        raise RuntimeError("document recovery structural counts changed")
+    embedding = {}
+    if bool(reference.get("embed", False)):
+        embedding = embed_pending_documents(provider, {
+            "source_id": source_id,
+            "scope_id": str(reference.get("scope_id") or ""),
+            "repository_id": str(reference.get("repository_id") or ""),
+            "limit": max(1, min(int(reference.get("embed_limit") or 200), 10_000)),
+        })
+        if int(embedding.get("failed") or 0):
+            raise RuntimeError("inline document embedding recovery failed")
+    return {"status": "restored", "source_id": source_id, **actual_counts, "embedding": embedding}
+
+
+def replay_document_recovery_reference(provider: Any, reference: Dict[str, Any]) -> Dict[str, Any]:
+    """Replay a content-free document mutation reference against a temporary DB."""
+    if not isinstance(reference, dict) or str(reference.get("schema") or "") != _DOCUMENT_RECOVERY_SCHEMA:
+        raise ValueError("unsupported document recovery reference")
+    kind = str(reference.get("kind") or "")
+    if kind == "noop":
+        return {"status": "noop"}
+    if kind == "document_embed":
+        result = embed_pending_documents(provider, {
+            "source_id": str(reference.get("source_id") or ""),
+            "scope_id": str(reference.get("scope_id") or ""),
+            "repository_id": str(reference.get("repository_id") or ""),
+            "limit": max(1, min(int(reference.get("limit") or 500), 10_000)),
+        })
+        if int(result.get("failed") or 0):
+            raise RuntimeError("document embedding recovery failed")
+        return {"status": "embedded", **result}
+    if kind != "document_sources":
+        raise ValueError("unsupported document recovery reference kind")
+    refs = reference.get("references") or []
+    if not isinstance(refs, list) or len(refs) > 1000:
+        raise ValueError("invalid document recovery references")
+    restored = []
+    for item in refs:
+        if not isinstance(item, dict):
+            raise ValueError("invalid document recovery reference item")
+        restored.append(_replay_document_source_reference(provider, item))
+    return {"status": "replayed", "sources": restored, "count": len(restored)}
 
 
 def _inbox_dir() -> Path:

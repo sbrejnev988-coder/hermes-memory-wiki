@@ -104,6 +104,30 @@ def _clean_text(value: Any, limit: int = 12000) -> str:
     return text[: max(0, limit)]
 
 
+def sanitize_code_graph_event_for_recovery(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a replayable event containing only the graph's redacted text view.
+
+    Code Shrinker is the source of truth for exact source.  Recovery artifacts
+    need enough structure to rebuild the local graph, but must never become a
+    second vault of unredacted code or credentials.
+    """
+    if not isinstance(event, dict):
+        raise ValueError("code graph recovery event must be an object")
+
+    def scrub(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {str(key): scrub(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        if isinstance(value, str):
+            return _clean_text(value, 40_000)
+        if isinstance(value, (int, float, bool)) or value is None:
+            return value
+        return _clean_text(str(value), 40_000)
+
+    return scrub(event)
+
+
 def _fts_query(query: str) -> str:
     tokens = []
     for token in _TOKEN_RE.findall(str(query or "")):

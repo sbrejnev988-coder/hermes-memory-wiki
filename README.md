@@ -1,4 +1,4 @@
-# Hermes Memory Wiki v1.21.2
+# Hermes Memory Wiki v1.22.0
 
 Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 101 MCP tools.
 
@@ -387,7 +387,7 @@ MEMORY_WIKI_VECTOR_SIZE=4096
 Для провайдера `nous` API-ключ берётся из `NOUS_API_KEY` (приоритет) или `MEMORY_WIKI_EMBED_API_KEY`. inference-api блокирует Python urllib по TLS-отпечатку (Cloudflare 1010 `browser_signature_banned`), поэтому запросы идут через системный `curl` — он доступен в Termux, proot, Linux, macOS и Windows 10+. Модель проверяется через `GET /models?output_modalities=embeddings`; если её нет в списке, endpoint probing эмбеддингом.
 
 
-## Document indexing support (v1.21.0)
+## Document indexing support (v1.22.0)
 
 The document graph distinguishes **discovered**, **metadata-only**, **unsupported**, **encrypted**, and **content-indexed** files. A supported extension no longer implies that body text was extracted.
 
@@ -473,6 +473,11 @@ The transactional outbox ensures claim writes and index tasks are atomic:
 - If process crashes after COMMIT → all 4 parts persisted
 - Outbox worker picks up pending tasks on next run
 - Completed document/code graph mutations create a post-`after` logical checkpoint containing durable graph rows but no raw source bodies. Recovery replays supported events only; unsupported, incomplete `before`, or error events fail closed before any live-database swap.
+- Post-checkpoint document writes are replayed from `document_source_ref/v1`: an allowlist-root fingerprint, relative locator, source hash, parser version, scope and structural counts. JSONL contains neither document text nor absolute source paths. Missing, changed, parser-incompatible or out-of-scope sources block the swap.
+- Code graph snapshots and patch events are retained as content-addressed, sanitized immutable artifacts under `memory-wiki/recovery-artifacts/`; JSONL stores only artifact digest, size, producer/version and non-content identity metadata. Artifact hash mismatch or absence blocks the swap.
+- Document/code embedding batches recompute against the temporary recovery DB with external outbox workers suppressed. After a verified swap, the outbox is woken against the live DB; a recorded semantic reindex runs only after that swap and reports any external failure without replacing a valid recovered database.
+- Recovery verifies the entire append-only journal hash chain before planning or applying events.
+- A recovery checkpoint must be a published file under the local checkpoint directory; its manifest path, ID, sequence and SHA-256 digest are verified before the temporary DB is built.
 
 ### After Qdrant/OpenRouter outage
 - FTS5 search continues working without Qdrant
@@ -509,6 +514,7 @@ Latency and reindex duration depend on the embedding provider, Qdrant placement,
 
 ## Changelog
 
+- **v1.22.0 (2026-08-29)**: Adds content-free event-specific recovery for document ingest/scan/inbox/delete/embedding and automatic attachment-cache ingestion. Code graph snapshots/patches replay from sanitized SHA-256 immutable artifacts; direct code claims and patch outcomes use verified request artifacts; revision invalidations replay from identifier/hash references. The journal payloads hide source paths/text, chain integrity is verified before rebuild, code/document embedding work stays local to the temporary DB, and semantic reindexing runs only after a verified live-DB swap.
 - **v1.21.2 (2026-08-28)**: Closed the final post-release audit findings: terminal inbox manifests are exactly-once, configured ZIP member limits now fail closed for OOXML/ODF/EPUB, cross-scope source relabeling requires an explicit migration gate, and unpublished raced checkpoints cannot become recovery baselines. Every GitHub Action ref is now pinned to an immutable commit SHA.
 - **v1.21.1 (2026-08-28)**: Release workflow now emits a separate SLSA build-provenance attestation in addition to the SPDX SBOM attestation; v1.21.0 remains immutable but lacks that provenance predicate.
 - **v1.21.0 (2026-08-28)**: Document ingestion now snapshots no-link/no-reparse handles before parsing; automatic scans are cache-only, scope-bound, streaming and bounded by traversal budgets. Parser workers use bounded concurrent stdout/stderr readers, isolated Windows Job Object CPU/memory limits, and kill-on-close cleanup. Inbox manifests are atomically claimed and size/document-count capped; document APIs deny cross-scope access by default. Journal recovery checkpoints completed document/code mutations and blocks incomplete before/error events. Release metadata now includes MIT licensing, `pyproject.toml`, `uv.lock`, SPDX SBOM generation and an attested tag-release workflow.
