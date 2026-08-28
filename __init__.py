@@ -1,4 +1,4 @@
-"""memory-wiki v1.22.2+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.22.3+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -37,7 +37,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-PLUGIN_VERSION = "1.22.2"
+PLUGIN_VERSION = "1.22.3"
 _INTEGRITY_HASH_FIELDS = frozenset({
     "hash", "content_hash", "old_content_hash", "new_content_hash", "file_hash",
     "text_hash", "anchor_hash", "snapshot_hash", "payload_hash", "root_sha256", "sha256",
@@ -8847,6 +8847,9 @@ class MemoryWikiProvider(MemoryProvider):
         shadow = "claims_fts_rebuild"
         try:
             with c:
+                # FTS replacement drops/renames shared tables. Serialize concurrent
+                # provider initialization across independent Windows processes.
+                c.execute("BEGIN EXCLUSIVE")
                 self._drop_index_sync_triggers(c)
                 c.execute(f"DROP TABLE IF EXISTS {shadow}")
                 c.execute(

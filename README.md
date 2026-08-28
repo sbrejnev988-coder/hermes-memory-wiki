@@ -1,4 +1,4 @@
-# Hermes Memory Wiki v1.22.2
+# Hermes Memory Wiki v1.22.3
 
 Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 101 MCP tools.
 
@@ -387,7 +387,7 @@ MEMORY_WIKI_VECTOR_SIZE=4096
 Для провайдера `nous` API-ключ берётся из `NOUS_API_KEY` (приоритет) или `MEMORY_WIKI_EMBED_API_KEY`. inference-api блокирует Python urllib по TLS-отпечатку (Cloudflare 1010 `browser_signature_banned`), поэтому запросы идут через системный `curl` — он доступен в Termux, proot, Linux, macOS и Windows 10+. Модель проверяется через `GET /models?output_modalities=embeddings`; если её нет в списке, endpoint probing эмбеддингом.
 
 
-## Document indexing support (v1.22.2)
+## Document indexing support (v1.22.3)
 
 The document graph distinguishes **discovered**, **metadata-only**, **unsupported**, **encrypted**, and **content-indexed** files. A supported extension no longer implies that body text was extracted.
 
@@ -514,6 +514,7 @@ Latency and reindex duration depend on the embedding provider, Qdrant placement,
 
 ## Changelog
 
+- **v1.22.3 (2026-08-29)**: Fixes the final Windows validation gaps: missing-source pruning now compares both lexical and canonical Windows path identities, and FTS rebuild obtains an exclusive SQLite transaction so concurrent provider initialization cannot race table replacement. Supersedes the immutable but Windows-CI-failed `v1.22.2` tag.
 - **v1.22.2 (2026-08-29)**: Corrects five late recovery-audit blockers. Document scans now capture every source action beyond display caps and include `prune_missing` deletions; journal recovery rejects truncated prefixes and orphan `after` events; keyed Code Shrinker metadata secrets are redacted before artifact retention; and checkpoint restores use dependency-safe table order. Supersedes the immutable but unsafe `v1.22.1` tag.
 - **v1.22.1 (2026-08-29)**: Fixes a post-release privacy regression: complex tool results (including document inbox paths) are no longer copied into journal summaries. Sensitive recovery-reference capture errors are redacted, and recovery now verifies a published local checkpoint manifest's path, ID, sequence and SHA-256 before any swap. Supersedes the immutable but CI-failed `v1.22.0` tag.
 - **v1.22.0 (2026-08-29)**: Adds content-free event-specific recovery for document ingest/scan/inbox/delete/embedding and automatic attachment-cache ingestion. Code graph snapshots/patches replay from sanitized SHA-256 immutable artifacts; direct code claims and patch outcomes use verified request artifacts; revision invalidations replay from identifier/hash references. The journal payloads hide source paths/text, chain integrity is verified before rebuild, code/document embedding work stays local to the temporary DB, and semantic reindexing runs only after a verified live-DB swap.

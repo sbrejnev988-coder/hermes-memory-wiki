@@ -1646,12 +1646,23 @@ def scan_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
         for row in conn.execute(
             "SELECT source_id,source_path,display_name FROM document_sources WHERE active=1"
         ).fetchall():
-            source_path = Path(str(row["source_path"] or "")).resolve(strict=False)
+            source_path = _absolute_unresolved(str(row["source_path"] or ""))
+            # Compare both lexical spellings and resolved identities. Windows can
+            # mix 8.3 and long-path forms, and a missing leaf cannot use samefile.
+            raw_root = _absolute_unresolved(root)
             try:
-                source_path.relative_to(root)
+                source_path.relative_to(raw_root)
+                under_scan_root = True
             except ValueError:
+                try:
+                    source_path.resolve(strict=False).relative_to(root.resolve(strict=True))
+                    under_scan_root = True
+                except (OSError, ValueError):
+                    under_scan_root = False
+            if not under_scan_root:
                 continue
-            if str(source_path) not in candidate_paths and not source_path.exists():
+            resolved_source_path = source_path.resolve(strict=False)
+            if str(resolved_source_path) not in candidate_paths and not source_path.exists():
                 missing_sources.append({
                     "source_id": str(row["source_id"]), "path": str(source_path),
                     "display_name": str(row["display_name"] or source_path.name),
