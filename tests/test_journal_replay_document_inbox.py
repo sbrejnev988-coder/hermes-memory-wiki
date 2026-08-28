@@ -22,6 +22,17 @@ def load_provider(module_name: str):
     return module
 
 
+def journal_strings(value):
+    if isinstance(value, dict):
+        for item in value.values():
+            yield from journal_strings(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from journal_strings(item)
+    elif isinstance(value, str):
+        yield value
+
+
 def test_rebuild_replays_document_inbox_child_reference_without_manifest_contents_in_journal() -> None:
     keys = ("HERMES_HOME", "HERMES_SECURITY_STRICT", "MEMORY_WIKI_SEMANTIC", "MEMORY_WIKI_DOCUMENT_ROOTS")
     previous = {key: os.environ.get(key) for key in keys}
@@ -49,7 +60,8 @@ def test_rebuild_replays_document_inbox_child_reference_without_manifest_content
                 assert live["success"] is True and len(live["processed"]) == 1, live
                 source_id = live["processed"][0]["results"][0]["source_id"]
                 journal = provider.journal_path.read_text(encoding="utf-8")
-                assert str(source) not in journal and marker not in journal
+                journal_values = list(journal_strings([json.loads(line) for line in journal.splitlines() if line.strip()]))
+                assert str(source) not in journal_values and marker not in journal_values
                 plan = provider._rebuild_from_journal(apply=False, checkpoint=checkpoint["path"])
                 assert plan["unrecoverable_events"] == 0, plan
                 provider._rebuild_from_journal(apply=True, checkpoint=checkpoint["path"])

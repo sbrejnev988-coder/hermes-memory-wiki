@@ -1,4 +1,4 @@
-"""memory-wiki v1.22.0+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.22.1+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -37,7 +37,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-PLUGIN_VERSION = "1.22.0"
+PLUGIN_VERSION = "1.22.1"
 _INTEGRITY_HASH_FIELDS = frozenset({
     "hash", "content_hash", "old_content_hash", "new_content_hash", "file_hash",
     "text_hash", "anchor_hash", "snapshot_hash", "payload_hash", "root_sha256", "sha256",
@@ -4620,7 +4620,10 @@ class MemoryWikiProvider(MemoryProvider):
             "invalidated", "pending_before", "pending_after", "created", "reused",
             "count", "chunks", "units", "edges", "snapshot_hash", "event_id",
         }
-        return {key: parsed[key] for key in allowed if key in parsed}
+        return {
+            key: value for key in allowed
+            if key in parsed and isinstance((value := parsed[key]), (str, int, float, bool, type(None)))
+        }
 
     def _build_recovery_reference(self, op: str, request: Dict[str, Any], result: Any) -> Dict[str, Any]:
         if op.startswith("memory_wiki_document_"):
