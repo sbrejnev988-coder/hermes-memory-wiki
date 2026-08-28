@@ -1,4 +1,4 @@
-# Hermes Memory Wiki v1.21.0
+# Hermes Memory Wiki v1.21.1
 
 Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 101 MCP tools.
 
@@ -508,6 +508,7 @@ Latency and reindex duration depend on the embedding provider, Qdrant placement,
 
 ## Changelog
 
+- **v1.21.1 (2026-08-28)**: Release workflow now emits a separate SLSA build-provenance attestation in addition to the SPDX SBOM attestation; v1.21.0 remains immutable but lacks that provenance predicate.
 - **v1.21.0 (2026-08-28)**: Document ingestion now snapshots no-link/no-reparse handles before parsing; automatic scans are cache-only, scope-bound, streaming and bounded by traversal budgets. Parser workers use bounded concurrent stdout/stderr readers, isolated Windows Job Object CPU/memory limits, and kill-on-close cleanup. Inbox manifests are atomically claimed and size/document-count capped; document APIs deny cross-scope access by default. Journal recovery checkpoints completed document/code mutations and blocks incomplete before/error events. Release metadata now includes MIT licensing, `pyproject.toml`, `uv.lock`, SPDX SBOM generation and an attested tag-release workflow.
 - **v1.20.12 (2026-08-28)**: FTS-recovery LIKE fallback now enforces visibility, project, quarantine, secret-risk and quality gates; ambiguous automatic code-graph prefetch no longer queries every repository. MCP validates JSON-RPC 2.0 envelopes, keeps notifications silent, and redacts `sk-proj-*` and quoted secret values in errors.
 - **v1.20.11 (2026-08-28)**: journal recovery now serializes writers across Windows processes, avoids journaling read-only probes, preserves non-secret `value` fields and SHA-256 content identifiers, checkpoints durable code/document graph tables, replays post-checkpoint code claims with metadata, and refuses to swap the live DB when it encounters an unsupported completed mutation. PEM-shaped code content is redacted before SQLite/FTS persistence; MCP now rejects non-object JSON-RPC requests without terminating stdio.

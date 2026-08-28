@@ -48,6 +48,10 @@ jobs:
           python -m venv .release-venv
           .release-venv/bin/python -m pip install dist/*.whl
           .release-venv/bin/python -c "import memory_wiki; assert callable(memory_wiki.register)"
+      - name: Attest SLSA build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/*"
       - name: Attest artifacts and SBOM
         uses: actions/attest@v4
         with:

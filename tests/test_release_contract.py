@@ -20,7 +20,11 @@ def test_release_contract_is_complete_and_version_consistent() -> None:
     assert (ROOT / "packaging" / "generate_sbom.py").is_file(), "missing SBOM generator"
     assert (ROOT / "packaging" / "build_native_bundle.py").is_file(), "missing native bundle builder"
     assert (ROOT / "packaging" / "check_reproducible.py").is_file(), "missing reproducibility gate"
-    assert (ROOT / ".github" / "workflows" / "release.yml").is_file(), "missing release provenance workflow"
+    release_workflow = ROOT / ".github" / "workflows" / "release.yml"
+    assert release_workflow.is_file(), "missing release provenance workflow"
+    workflow_text = release_workflow.read_text(encoding="utf-8")
+    assert "actions/attest-build-provenance@v2" in workflow_text, "missing SLSA provenance attestation"
+    assert "actions/attest@v4" in workflow_text, "missing SPDX SBOM attestation"
     manifest = (ROOT / "plugin.yaml").read_text(encoding="utf-8")
     runtime = (ROOT / "__init__.py").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
