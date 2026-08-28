@@ -1,4 +1,4 @@
-# Hermes Memory Wiki v1.20.10
+# Hermes Memory Wiki v1.21.0
 
 Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 101 MCP tools.
 
@@ -387,13 +387,13 @@ MEMORY_WIKI_VECTOR_SIZE=4096
 Для провайдера `nous` API-ключ берётся из `NOUS_API_KEY` (приоритет) или `MEMORY_WIKI_EMBED_API_KEY`. inference-api блокирует Python urllib по TLS-отпечатку (Cloudflare 1010 `browser_signature_banned`), поэтому запросы идут через системный `curl` — он доступен в Termux, proot, Linux, macOS и Windows 10+. Модель проверяется через `GET /models?output_modalities=embeddings`; если её нет в списке, endpoint probing эмбеддингом.
 
 
-## Document indexing support (v1.20.3)
+## Document indexing support (v1.21.0)
 
 The document graph distinguishes **discovered**, **metadata-only**, **unsupported**, **encrypted**, and **content-indexed** files. A supported extension no longer implies that body text was extracted.
 
 | Format family | Body indexing | Requirements / limitations |
 |---|---|---|
-| TXT, Markdown, JSON/JSONL, XML/HTML, CSV/TSV, RTF, config/log/source-like text | Native | Standard-library parser; CSV/TSV is streamed and bounded. |
+| TXT, Markdown, JSON/JSONL, XML/HTML, CSV/TSV, RTF, config/log/source-like text | Native | Standard-library parser with file-size, unit and worker memory/output limits. |
 | DOCX/DOCM/DOTX, XLSX/XLSM/XLTX, PPTX/PPTM/POTX | Native | OOXML ZIP/XML parser; macros are not executed. XLSX sheet names are resolved through workbook relationships. |
 | ODT/ODS/ODP/ODG and templates | Native | ODF ZIP/XML parser. |
 | EML, EPUB | Native | Addressable headers/body/chapters where available. |
@@ -407,6 +407,9 @@ Operational notes:
 - Hermes attachment files are expected under `${HERMES_HOME:-~/.hermes}/cache/documents`. This directory is allowlisted by default.
 - `memory_wiki_document_scan({})` scans that attachment cache when `root` is omitted. An explicit `root` remains available for other allowlisted directories.
 - Optional turn-start ingestion is controlled by `MEMORY_WIKI_DOCUMENT_AUTO_SCAN_CACHE=1`; it is bounded, skips files younger than two seconds, never prunes missing files, and does not create embeddings unless `MEMORY_WIKI_DOCUMENT_AUTO_EMBED=1`.
+- Automatic ingestion is **default-deny for visibility**: set `MEMORY_WIKI_DOCUMENT_AUTO_SCOPE_ID` (and normally the matching repository ID) before enabling it. Global automatic ingestion needs the separate explicit `MEMORY_WIKI_DOCUMENT_ALLOW_GLOBAL_AUTO=1` override.
+- Normal document APIs are bound to `MEMORY_WIKI_DOCUMENT_ACCESS_SCOPE_ID` / `MEMORY_WIKI_DOCUMENT_ACCESS_REPOSITORY_ID` (or the provider project scope). Cross-scope requests are denied unless `MEMORY_WIKI_DOCUMENT_ALLOW_CROSS_SCOPE=1` is intentionally set.
+- Ingestion parses only a per-invocation snapshot copied from a no-link/no-reparse descriptor. Scans have entry, directory, depth, candidate and wall-time budgets; documents, manifests and parser-worker output are size-bounded.
 - `memory_wiki_document_scan` reports missing previously indexed files; deletion is applied only with `prune_missing=true`.
 - Automatic prompt-time document prefetch is restricted to global-scope material. Scoped material must be queried with an explicit scope.
 - Changing `scope_id` or `repository_id` on an unchanged file updates the stored identity and queues fresh embeddings instead of silently returning `unchanged`.
@@ -417,6 +420,10 @@ Recommended configuration for Hermes/Termux attachments:
 
 ```bash
 MEMORY_WIKI_DOCUMENT_CACHE_DIR=/root/.hermes/cache/documents
+MEMORY_WIKI_DOCUMENT_AUTO_SCOPE_ID=hermes-state-db
+MEMORY_WIKI_DOCUMENT_AUTO_REPOSITORY_ID=hermes-state-db
+MEMORY_WIKI_DOCUMENT_ACCESS_SCOPE_ID=hermes-state-db
+MEMORY_WIKI_DOCUMENT_ACCESS_REPOSITORY_ID=hermes-state-db
 MEMORY_WIKI_DOCUMENT_AUTO_SCAN_CACHE=1
 MEMORY_WIKI_DOCUMENT_AUTO_SCAN_SECONDS=15
 MEMORY_WIKI_DOCUMENT_AUTO_SCAN_MAX_FILES=200
@@ -428,6 +435,34 @@ MEMORY_WIKI_DOCUMENT_AUTO_EMBED=0
 
 If `HERMES_HOME=/root/.hermes`, the explicit cache-dir line is optional.
 
+**Windows (active default profile):** do not use `/root/.hermes/...`. The cache defaults to `C:\Users\Kekl\AppData\Local\hermes\cache\documents`, so the cache-dir setting is optional. Persist only non-secret settings for future Desktop/gateway processes:
+
+```powershell
+setx MEMORY_WIKI_DOCUMENT_AUTO_SCOPE_ID "hermes-state-db"
+setx MEMORY_WIKI_DOCUMENT_AUTO_REPOSITORY_ID "hermes-state-db"
+setx MEMORY_WIKI_DOCUMENT_ACCESS_SCOPE_ID "hermes-state-db"
+setx MEMORY_WIKI_DOCUMENT_ACCESS_REPOSITORY_ID "hermes-state-db"
+setx MEMORY_WIKI_DOCUMENT_AUTO_SCAN_CACHE "1"
+setx MEMORY_WIKI_DOCUMENT_AUTO_SCAN_SECONDS "15"
+setx MEMORY_WIKI_DOCUMENT_AUTO_SCAN_MAX_FILES "200"
+setx MEMORY_WIKI_DOCUMENT_AUTO_SCAN_MAX_CHANGED "3"
+setx MEMORY_WIKI_DOCUMENT_AUTO_MIN_AGE_SECONDS "2"
+setx MEMORY_WIKI_DOCUMENT_AUTO_EMBED "0"
+```
+
+`setx` affects only new processes. Fully restart the Desktop/backend after setting these values, then place a non-sensitive test document in the cache and verify it with `memory_wiki_document_status` and a scoped `memory_wiki_document_query`.
+
+### Strict security gate
+
+Keep `HERMES_SECURITY_STRICT=0` only as the explicitly accepted temporary fallback while the official signed `hermes_trust_core` (and its documented dependencies) are unavailable. Switch it back **only after** the signed artifact has been installed into the active profile and a fresh strict process passes both plugin import/doctor and a read-only Memory Wiki health probe:
+
+```powershell
+setx HERMES_SECURITY_STRICT "1"
+hermes gateway restart
+```
+
+`setx` alone never reloads an already-open Desktop chat. If strict import/doctor fails, leave the previous setting in place; do not fabricate a trust-core substitute or force a strict restart.
+
 ## Recovery
 
 ### After process crash during write
@@ -436,6 +471,7 @@ The transactional outbox ensures claim writes and index tasks are atomic:
 - If process crashes before COMMIT → nothing saved (rollback)
 - If process crashes after COMMIT → all 4 parts persisted
 - Outbox worker picks up pending tasks on next run
+- Completed document/code graph mutations create a post-`after` logical checkpoint containing durable graph rows but no raw source bodies. Recovery replays supported events only; unsupported, incomplete `before`, or error events fail closed before any live-database swap.
 
 ### After Qdrant/OpenRouter outage
 - FTS5 search continues working without Qdrant
@@ -472,6 +508,7 @@ Latency and reindex duration depend on the embedding provider, Qdrant placement,
 
 ## Changelog
 
+- **v1.21.0 (2026-08-28)**: Document ingestion now snapshots no-link/no-reparse handles before parsing; automatic scans are cache-only, scope-bound, streaming and bounded by traversal budgets. Parser workers use bounded concurrent stdout/stderr readers, isolated Windows Job Object CPU/memory limits, and kill-on-close cleanup. Inbox manifests are atomically claimed and size/document-count capped; document APIs deny cross-scope access by default. Journal recovery checkpoints completed document/code mutations and blocks incomplete before/error events. Release metadata now includes MIT licensing, `pyproject.toml`, `uv.lock`, SPDX SBOM generation and an attested tag-release workflow.
 - **v1.20.12 (2026-08-28)**: FTS-recovery LIKE fallback now enforces visibility, project, quarantine, secret-risk and quality gates; ambiguous automatic code-graph prefetch no longer queries every repository. MCP validates JSON-RPC 2.0 envelopes, keeps notifications silent, and redacts `sk-proj-*` and quoted secret values in errors.
 - **v1.20.11 (2026-08-28)**: journal recovery now serializes writers across Windows processes, avoids journaling read-only probes, preserves non-secret `value` fields and SHA-256 content identifiers, checkpoints durable code/document graph tables, replays post-checkpoint code claims with metadata, and refuses to swap the live DB when it encounters an unsupported completed mutation. PEM-shaped code content is redacted before SQLite/FTS persistence; MCP now rejects non-object JSON-RPC requests without terminating stdio.
 - **v1.20.10 (2026-08-28)**: fail-closed journal replay preserves the live database when any replayed event fails; all auxiliary code/document/secret context now crosses the recall guard; quoted and Bearer-style labelled document secrets are fully redacted; secret-context auto-discovery no longer crosses Hermes profile boundaries.

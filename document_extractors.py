@@ -344,7 +344,8 @@ def _xml_local(tag: str) -> str:
     return tag.rsplit("}", 1)[-1]
 
 
-def _zip_guard(zf: zipfile.ZipFile, *, max_entries: int, max_uncompressed: int, max_ratio: int) -> None:
+def _zip_guard(zf: zipfile.ZipFile, *, max_entries: int, max_uncompressed: int,
+               max_ratio: int, max_member: int | None = None) -> None:
     infos = zf.infolist()
     if len(infos) > max_entries:
         raise ValueError(f"archive has {len(infos)} entries; limit={max_entries}")
@@ -375,6 +376,24 @@ def _read_zip_xml(zf: zipfile.ZipFile, name: str, max_bytes: int = 32_000_000) -
     if b"<!DOCTYPE" in xml_upper or b"<!ENTITY" in xml_upper:
         raise ValueError("DTD/entity declarations are not allowed in document XML")
     return ET.fromstring(data)
+
+
+def _read_zip_member(zf: zipfile.ZipFile, name: str, max_bytes: int) -> bytes:
+    info = zf.getinfo(name)
+    if int(info.file_size) > max_bytes:
+        raise ValueError(f"archive member too large: {name}")
+    chunks: List[bytes] = []
+    total = 0
+    with zf.open(info) as fh:
+        while True:
+            block = fh.read(min(1024 * 1024, max_bytes + 1))
+            if not block:
+                break
+            total += len(block)
+            if total > max_bytes:
+                raise ValueError(f"archive member exceeds {max_bytes} bytes: {name}")
+            chunks.append(block)
+    return b"".join(chunks)
 
 
 def _mime_for(path: Path) -> str:
@@ -496,6 +515,9 @@ def extract_docx(path: Path, max_units: int, zip_limits: Dict[str, int]) -> Extr
         body = next((e for e in root.iter() if _xml_local(e.tag) == "body"), root)
         para_no = table_no = 0
         for child in list(body):
+            if len(units) >= max_units:
+                warnings.append("max_units reached")
+                break
             local = _xml_local(child.tag)
             if local == "p":
                 text = "".join(t.text or "" for t in child.iter() if _xml_local(t.tag) in {"t", "tab", "br"})
@@ -515,6 +537,9 @@ def extract_docx(path: Path, max_units: int, zip_limits: Dict[str, int]) -> Extr
                 row_no = 0
                 table_header: List[str] = []
                 for tr in (e for e in child.iter() if _xml_local(e.tag) == "tr"):
+                    if len(units) >= max_units:
+                        warnings.append("max_units reached")
+                        break
                     row_no += 1
                     raw_cells = []
                     for tc in (e for e in list(tr) if _xml_local(e.tag) == "tc"):
@@ -609,9 +634,15 @@ def extract_xlsx(path: Path, max_units: int, max_cells: int, zip_limits: Dict[st
         sheet_names = [name for name, _ in sheet_parts]
         cells_seen = 0
         for s_idx, (sheet_name, part_name) in enumerate(sheet_parts, 1):
+            if len(units) >= max_units:
+                warnings.append("max_units reached")
+                break
             root = _read_zip_xml(zf, part_name)
             units.append(_unit("sheet", f"sheet:{s_idx}", sheet_name, title=sheet_name, ordinal=len(units)+1,
                                locator={"sheet": sheet_name, "sheet_index": s_idx}))
+            if len(units) >= max_units:
+                warnings.append("max_units reached")
+                break
             sheet_header: List[str] = []
             for row in (e for e in root.iter() if _xml_local(e.tag) == "row"):
                 row_num = int(row.attrib.get("r") or 0)
@@ -674,22 +705,31 @@ def extract_pptx(path: Path, max_units: int, zip_limits: Dict[str, int]) -> Extr
         slide_files = sorted((n for n in zf.namelist() if re.match(r"ppt/slides/slide\d+\.xml$", n)),
                              key=lambda n: int(re.search(r"(\d+)", n).group(1)))
         for s_idx, name in enumerate(slide_files, 1):
+            if len(units) >= max_units:
+                warnings.append("max_units reached")
+                break
             root = _read_zip_xml(zf, name)
             shape_no = 0
             slide_texts = []
+            shape_units: List[Unit] = []
+            # Reserve one unit for the slide-level structural summary.
+            shape_budget = max(0, max_units - len(units) - 1)
             for shape in (e for e in root.iter() if _xml_local(e.tag) in {"sp", "graphicFrame"}):
+                if len(shape_units) >= shape_budget:
+                    break
                 texts = [t.text or "" for t in shape.iter() if _xml_local(t.tag) == "t" and (t.text or "").strip()]
                 if not texts:
                     continue
                 shape_no += 1
                 text = clean_text("\n".join(texts)).strip()
                 slide_texts.append(text)
-                units.append(_unit("slide_shape", f"slide:{s_idx}/shape:{shape_no}", text,
-                                   parent=f"slide:{s_idx}", ordinal=len(units)+1,
-                                   locator={"slide": s_idx, "shape": shape_no}))
-            units.insert(max(0, len(units)-shape_no), _unit("slide", f"slide:{s_idx}", "\n".join(slide_texts),
-                         title=(slide_texts[0][:160] if slide_texts else f"Slide {s_idx}"), ordinal=s_idx,
-                         locator={"slide": s_idx}))
+                shape_units.append(_unit("slide_shape", f"slide:{s_idx}/shape:{shape_no}", text,
+                                         parent=f"slide:{s_idx}", ordinal=len(units) + len(shape_units) + 2,
+                                         locator={"slide": s_idx, "shape": shape_no}))
+            units.append(_unit("slide", f"slide:{s_idx}", "\n".join(slide_texts),
+                               title=(slide_texts[0][:160] if slide_texts else f"Slide {s_idx}"), ordinal=len(units)+1,
+                               locator={"slide": s_idx}))
+            units.extend(shape_units)
             notes = f"ppt/notesSlides/notesSlide{s_idx}.xml"
             if notes in zf.namelist() and len(units) < max_units:
                 try:
@@ -745,9 +785,12 @@ def extract_eml(path: Path, data: bytes, max_units: int) -> ExtractedDocument:
     title = str(msg.get("subject") or path.stem)
     units: List[Unit] = []
     headers = {k: str(msg.get(k) or "") for k in ("from", "to", "cc", "date", "message-id", "subject")}
-    units.append(_unit("email_headers", "headers", "\n".join(f"{k}: {v}" for k, v in headers.items() if v), title=title, ordinal=1))
+    if max_units > 0:
+        units.append(_unit("email_headers", "headers", "\n".join(f"{k}: {v}" for k, v in headers.items() if v), title=title, ordinal=1))
     part_no = 0
     for part in msg.walk():
+        if len(units) >= max_units:
+            break
         if part.is_multipart():
             continue
         part_no += 1
@@ -780,7 +823,7 @@ def extract_epub(path: Path, max_units: int, zip_limits: Dict[str, int]) -> Extr
         html_files = [n for n in zf.namelist() if n.lower().endswith((".xhtml", ".html", ".htm"))]
         for file_no, name in enumerate(html_files, 1):
             try:
-                raw = zf.read(name)
+                raw = _read_zip_member(zf, name, int(zip_limits.get("max_member") or min(16 * 1024 * 1024, zip_limits["max_uncompressed"])))
                 text, _ = decode_text(raw)
                 hp = _VisibleHTML(); hp.feed(text); hp.finish()
                 for block_no, (kind, block) in enumerate(hp.blocks, 1):
@@ -790,7 +833,7 @@ def extract_epub(path: Path, max_units: int, zip_limits: Dict[str, int]) -> Extr
                     if len(units) >= max_units:
                         break
             except Exception as exc:
-                warnings.append(f"{name}: {type(exc).__name__}")
+                warnings.append(f"{name}: {type(exc).__name__}: {str(exc)[:240]}")
             if len(units) >= max_units:
                 break
     return ExtractedDocument("stdlib-epub", "application/epub+zip", path.stem, units, warnings=warnings)
@@ -941,6 +984,7 @@ def extract_document(path: Path, options: Optional[Dict[str, Any]] = None) -> Di
         "max_entries": max(10, min(int(options.get("zip_max_entries", 50_000)), 1_000_000)),
         "max_uncompressed": max_bytes * max(1, min(int(options.get("zip_expansion_factor", 8)), 100)),
         "max_ratio": max(5, min(int(options.get("zip_max_ratio", 200)), 10_000)),
+        "max_member": max(1_024 * 1_024, min(int(options.get("zip_max_member", 16 * 1024 * 1024)), max_bytes)),
     }
     ext = path.suffix.lower()
     data = path.read_bytes() if ext in TEXT_EXTENSIONS | EMAIL_EXTENSIONS | GOOGLE_POINTER_EXTENSIONS else b""

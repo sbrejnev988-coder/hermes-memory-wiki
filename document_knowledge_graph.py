@@ -15,12 +15,16 @@ untrusted derivative and is wrapped accordingly before prompt injection.
 from __future__ import annotations
 
 import hashlib
+import heapq
 import json
 import os
 import re
 import sqlite3
+import stat
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 from collections import defaultdict, deque
 from pathlib import Path
@@ -146,7 +150,9 @@ def _fts_query(query: str) -> str:
 
 
 def _hermes_home() -> Path:
-    return Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser().resolve(strict=False)
+    # Preserve the configured lexical spelling. Windows Path.resolve() can expand
+    # an 8.3 path alias and break descriptor-relative allowlist matching.
+    return Path(os.path.abspath(os.fspath(Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser())))
 
 
 def _document_cache_root() -> Path:
@@ -155,8 +161,8 @@ def _document_cache_root() -> Path:
         or os.environ.get("HERMES_DOCUMENT_CACHE_DIR", "").strip()
     )
     if configured:
-        return Path(configured).expanduser().resolve(strict=False)
-    return (_hermes_home() / "cache" / "documents").resolve(strict=False)
+        return _absolute_unresolved(configured)
+    return _absolute_unresolved(_hermes_home() / "cache" / "documents")
 
 
 def _roots() -> List[Path]:
@@ -165,19 +171,19 @@ def _roots() -> List[Path]:
         raw = [p for p in configured.split(os.pathsep) if p.strip()]
     else:
         home = _hermes_home()
-        # Hermes stores user-provided attachments here. Keep it first so an omitted
-        # scan root resolves to the actual attachment cache rather than workspace.
-        raw = [
-            str(_document_cache_root()),
-            str(home / "workspace"),
-            str(home / "documents"),
-            str(home / "uploads"),
-        ]
+        # Default-deny broad filesystem scanning: automatic and omitted-root
+        # scans see Hermes attachment cache only. Additional roots require an
+        # explicit MEMORY_WIKI_DOCUMENT_ROOTS allowlist.
+        raw = [str(_document_cache_root())]
     roots: List[Path] = []
     seen: set[str] = set()
     for item in raw:
         try:
-            root = Path(item).expanduser().resolve(strict=False)
+            # Keep the original absolute spelling for descriptor-relative open
+            # traversal. On Windows ``Path.resolve`` can expand an 8.3 alias
+            # (RUNNER~1 -> runneradmin), making a legitimate raw child fail a
+            # lexical containment check before it is securely opened.
+            root = _absolute_unresolved(item)
         except Exception:
             continue
         key = os.path.normcase(str(root))
@@ -188,33 +194,328 @@ def _roots() -> List[Path]:
     return roots
 
 
+def _document_access_scope(provider: Any, requested_scope: str = "", requested_repository: str = "", *, allow_global: bool = False) -> Tuple[str, str]:
+    """Bind document operations to the configured provider/profile scope.
+
+    ``scope_id`` and ``repository_id`` are labels in the database, not proof of
+    authorization by themselves. The active provider/project or explicit
+    environment policy is the authority for ordinary document operations.
+    """
+    configured_scope = (
+        os.environ.get("MEMORY_WIKI_DOCUMENT_ACCESS_SCOPE_ID", "").strip()
+        or str(getattr(provider, "project_scope", "") or "").strip()
+    )
+    configured_repository = (
+        os.environ.get("MEMORY_WIKI_DOCUMENT_ACCESS_REPOSITORY_ID", "").strip()
+        or configured_scope
+    )
+    scope = str(requested_scope or "").strip() or configured_scope
+    repository = str(requested_repository or "").strip() or (configured_repository if scope else "")
+    if not scope and not allow_global:
+        raise PermissionError(
+            "document access scope is required; configure MEMORY_WIKI_DOCUMENT_ACCESS_SCOPE_ID"
+        )
+    if not _env_bool("MEMORY_WIKI_DOCUMENT_ALLOW_CROSS_SCOPE", False):
+        if configured_scope and scope and scope != configured_scope:
+            raise PermissionError("document scope is outside the active provider scope")
+        if configured_repository and repository and repository != configured_repository:
+            raise PermissionError("document repository is outside the active provider scope")
+    return scope, repository
+
+
+def _assert_source_access(provider: Any, row: Any) -> None:
+    """Reject source-ID operations when the row belongs to another scope."""
+    item = _row(row)
+    source_scope = str(item.get("scope_id") or "").strip()
+    source_repository = str(item.get("repository_id") or "").strip()
+    if not source_scope and not source_repository:
+        # Explicitly global documents are handled by the global-only prefetch path.
+        return
+    _document_access_scope(provider, source_scope, source_repository)
+
+
+def _absolute_unresolved(value: Any) -> Path:
+    """Normalize a user spelling without following links or reparse points."""
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("document path is required")
+    return Path(os.path.abspath(os.fspath(Path(text).expanduser())))
+
+
+def _is_link_or_reparse(info: os.stat_result) -> bool:
+    if stat.S_ISLNK(info.st_mode):
+        return True
+    if os.name == "nt":
+        return bool(int(getattr(info, "st_file_attributes", 0) or 0) & 0x0400)
+    return False
+
+
+def _reject_link_or_reparse_components(path: Path) -> None:
+    """Reject every existing component, not merely a symlink final leaf."""
+    absolute = _absolute_unresolved(path)
+    anchor = Path(absolute.anchor)
+    current = anchor
+    parts = absolute.parts[1:] if absolute.anchor else absolute.parts
+    for part in parts:
+        current = current / part
+        try:
+            info = current.lstat()
+        except FileNotFoundError:
+            # The caller decides whether a missing leaf is permitted.
+            break
+        except OSError as exc:
+            raise ValueError(f"document path is unavailable: {current}") from exc
+        if _is_link_or_reparse(info):
+            raise ValueError("path must not traverse a symlink or reparse point")
+
+
+def _path_within_allowed_roots(path: Path) -> bool:
+    actual = Path(path).resolve(strict=False)
+    for root in _roots():
+        try:
+            actual.relative_to(root.resolve(strict=False))
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _lexical_root_for_path(path: Path, *, allow_root: bool = False) -> Tuple[Path, Path]:
+    """Choose an allowlisted root, tolerating equivalent Windows 8.3 spellings."""
+    raw_path = _absolute_unresolved(path)
+    roots = _roots()
+    for root in roots:
+        try:
+            relative = raw_path.relative_to(root)
+        except ValueError:
+            continue
+        if relative.parts or allow_root:
+            return root, relative
+    # A process can receive a long child path while HERMES_HOME is an 8.3 alias
+    # (or vice versa). Canonicalize only for equivalence, then still use the
+    # original root descriptor for the no-follow component walk.
+    try:
+        canonical_path = raw_path.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"document path is unavailable: {raw_path}") from exc
+    for root in roots:
+        try:
+            relative = canonical_path.relative_to(root.resolve(strict=True))
+        except (ValueError, OSError):
+            continue
+        if relative.parts or allow_root:
+            return root, relative
+    raise ValueError(f"path outside MEMORY_WIKI_DOCUMENT_ROOTS: {path}")
+
+
 def _scan_root(args: Dict[str, Any]) -> Path:
     root_value = args.get("root") or args.get("path")
-    if root_value:
-        return Path(str(root_value)).expanduser().resolve(strict=True)
-    cache_root = _document_cache_root()
-    if not cache_root.exists():
+    raw = _absolute_unresolved(root_value) if root_value else _absolute_unresolved(_document_cache_root())
+    _reject_link_or_reparse_components(raw)
+    try:
+        info = raw.lstat()
+    except OSError as exc:
         raise ValueError(
             "scan root omitted and Hermes document cache does not exist: "
-            f"{cache_root}; pass root explicitly or set MEMORY_WIKI_DOCUMENT_CACHE_DIR"
-        )
-    return cache_root.resolve(strict=True)
+            f"{raw}; pass root explicitly or set MEMORY_WIKI_DOCUMENT_CACHE_DIR"
+        ) from exc
+    if not stat.S_ISDIR(info.st_mode):
+        raise ValueError("scan root must be a real directory, not a symlink or file")
+    resolved = raw.resolve(strict=True)
+    if not _path_within_allowed_roots(resolved):
+        raise ValueError(f"scan root outside MEMORY_WIKI_DOCUMENT_ROOTS: {resolved}")
+    return raw
 
 
 def _allowed_path(value: Any, *, must_exist: bool = True) -> Path:
-    path = Path(str(value or "")).expanduser().resolve(strict=must_exist)
-    if must_exist and (path.is_symlink() or not path.is_file()):
-        raise ValueError("path must be a regular non-symlink file")
-    allowed = _roots()
-    if not allowed:
-        raise ValueError("MEMORY_WIKI_DOCUMENT_ROOTS has no valid roots")
-    for root in allowed:
+    """Validate a regular-file path without accepting link/reparse traversal."""
+    raw = _absolute_unresolved(value)
+    _reject_link_or_reparse_components(raw)
+    if must_exist:
         try:
-            path.relative_to(root)
-            return path
-        except ValueError:
+            initial = raw.lstat()
+        except OSError as exc:
+            raise ValueError(f"document path is unavailable: {raw}") from exc
+        if _is_link_or_reparse(initial) or not stat.S_ISREG(initial.st_mode):
+            raise ValueError("path must be a regular non-link file")
+    resolved = raw.resolve(strict=must_exist)
+    if must_exist and (not resolved.is_file() or not _path_within_allowed_roots(resolved)):
+        raise ValueError(f"path outside MEMORY_WIKI_DOCUMENT_ROOTS: {resolved}")
+    _lexical_root_for_path(raw)
+    return raw
+
+
+def _open_posix_directory(path: Path) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        raise RuntimeError("platform lacks O_NOFOLLOW; refusing unsafe document traversal")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow | getattr(os, "O_CLOEXEC", 0)
+    anchor = path.anchor or os.path.sep
+    fd = os.open(anchor, flags)
+    try:
+        for part in path.parts[1:] if path.anchor else path.parts:
+            next_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _open_posix_allowed_file(path: Path, root: Path, relative: Path) -> int:
+    root_fd = _open_posix_directory(root)
+    try:
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        flags = os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0)
+        current_fd = root_fd
+        for index, part in enumerate(relative.parts):
+            is_final = index == len(relative.parts) - 1
+            part_flags = flags if is_final else flags | getattr(os, "O_DIRECTORY", 0)
+            next_fd = os.open(part, part_flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except Exception:
+        try:
+            os.close(root_fd)
+        except OSError:
             pass
-    raise ValueError(f"path outside MEMORY_WIKI_DOCUMENT_ROOTS: {path}")
+        raise
+
+
+def _windows_final_path_from_handle(handle: int) -> Path:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    get_final = kernel32.GetFinalPathNameByHandleW
+    get_final.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD]
+    get_final.restype = wintypes.DWORD
+    required = get_final(handle, None, 0, 0)
+    if not required:
+        raise ctypes.WinError(ctypes.get_last_error())
+    buffer = ctypes.create_unicode_buffer(required + 1)
+    written = get_final(handle, buffer, len(buffer), 0)
+    if not written or written >= len(buffer):
+        raise ctypes.WinError(ctypes.get_last_error())
+    text = buffer.value
+    if text.startswith("\\\\?\\UNC\\"):
+        text = "\\\\" + text[8:]
+    elif text.startswith("\\\\?\\"):
+        text = text[4:]
+    return Path(text).resolve(strict=False)
+
+
+def _open_windows_allowed_file(path: Path) -> int:
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", wintypes.DWORD), ("ftCreationTime", wintypes.FILETIME),
+            ("ftLastAccessTime", wintypes.FILETIME), ("ftLastWriteTime", wintypes.FILETIME),
+            ("dwVolumeSerialNumber", wintypes.DWORD), ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD), ("nNumberOfLinks", wintypes.DWORD),
+            ("nFileIndexHigh", wintypes.DWORD), ("nFileIndexLow", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                            wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    create_file.restype = wintypes.HANDLE
+    get_info = kernel32.GetFileInformationByHandle
+    get_info.argtypes = [wintypes.HANDLE, ctypes.POINTER(BY_HANDLE_FILE_INFORMATION)]
+    get_info.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    handle = create_file(str(path), 0x80000000, 0x00000001, None, 3, 0x08200080, None)
+    invalid = ctypes.c_void_p(-1).value
+    if handle == invalid:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        info = BY_HANDLE_FILE_INFORMATION()
+        if not get_info(handle, ctypes.byref(info)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if info.dwFileAttributes & 0x00000410:  # DIRECTORY or REPARSE_POINT
+            raise ValueError("opened document is a directory or reparse point")
+        actual = _windows_final_path_from_handle(handle)
+        if not _path_within_allowed_roots(actual):
+            raise ValueError("opened document target escaped allowed roots")
+        return msvcrt.open_osfhandle(handle, os.O_RDONLY | getattr(os, "O_BINARY", 0))
+    except Exception:
+        close_handle(handle)
+        raise
+
+
+def _open_allowed_file(path: Path) -> int:
+    root, relative = _lexical_root_for_path(path)
+    if os.name == "nt":
+        return _open_windows_allowed_file(path)
+    return _open_posix_allowed_file(path, root, relative)
+
+
+def _snapshot_allowed_file(path: Path, *, max_bytes: int) -> Tuple[Path, Dict[str, Any]]:
+    """Copy one validated descriptor to a private immutable parser snapshot.
+
+    The worker only receives this snapshot. Thus an attacker cannot swap the
+    user-controlled path between validation, hashing and parsing.
+    """
+    fd = _open_allowed_file(path)
+    snapshot_path: Optional[Path] = None
+    try:
+        opened = os.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode):
+            raise ValueError("document descriptor is not a regular file")
+        if int(opened.st_size) > max_bytes:
+            raise ValueError(f"document exceeds configured maximum bytes: {opened.st_size}")
+        snapshots = _hermes_home() / "memory-wiki" / "document-snapshots"
+        snapshots.mkdir(parents=True, exist_ok=True)
+        try:
+            os.chmod(snapshots, 0o700)
+        except OSError:
+            pass
+        snapshot_dir = Path(tempfile.mkdtemp(prefix="doc-", dir=str(snapshots)))
+        try:
+            os.chmod(snapshot_dir, 0o700)
+        except OSError:
+            pass
+        snapshot_path = snapshot_dir / f"source{path.suffix.lower()[:16]}"
+        snapshot_fd = os.open(
+            str(snapshot_path),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
+            0o600,
+        )
+        digest = hashlib.sha256()
+        copied = 0
+        try:
+            with os.fdopen(fd, "rb", closefd=False) as source, os.fdopen(snapshot_fd, "wb") as target:
+                while True:
+                    block = source.read(1024 * 1024)
+                    if not block:
+                        break
+                    copied += len(block)
+                    if copied > max_bytes:
+                        raise ValueError("document changed beyond configured maximum while snapshotting")
+                    digest.update(block)
+                    target.write(block)
+                target.flush()
+                os.fsync(target.fileno())
+        except Exception:
+            snapshot_path.unlink(missing_ok=True)
+            raise
+        return snapshot_path, {
+            "size_bytes": copied,
+            "mtime_ns": int(getattr(opened, "st_mtime_ns", 0) or 0),
+            "file_hash": digest.hexdigest(),
+            "snapshot_dir": str(snapshot_dir),
+        }
+    finally:
+        os.close(fd)
 
 
 def install_document_graph_schema(conn: sqlite3.Connection) -> None:
@@ -372,26 +673,13 @@ def _worker_options(args: Dict[str, Any]) -> Dict[str, Any]:
         "zip_max_entries": _env_int("MEMORY_WIKI_DOCUMENT_ZIP_MAX_ENTRIES", 50_000, 10, 1_000_000),
         "zip_expansion_factor": _env_int("MEMORY_WIKI_DOCUMENT_ZIP_EXPANSION", 8, 1, 100),
         "zip_max_ratio": _env_int("MEMORY_WIKI_DOCUMENT_ZIP_MAX_RATIO", 200, 5, 10_000),
+        "zip_max_member": _env_int("MEMORY_WIKI_DOCUMENT_ZIP_MAX_MEMBER_BYTES", 16 * 1024 * 1024, 1024 * 1024, 256 * 1024 * 1024),
         "ocr": bool(args.get("ocr", _env_bool("MEMORY_WIKI_DOCUMENT_OCR", False))),
         "ocr_language": str(args.get("ocr_language") or os.environ.get("MEMORY_WIKI_DOCUMENT_OCR_LANGUAGE", "eng+rus")),
         "ocr_min_native_chars": _env_int("MEMORY_WIKI_DOCUMENT_OCR_MIN_NATIVE_CHARS", 40, 0, 10_000),
         "external_timeout": _env_int("MEMORY_WIKI_DOCUMENT_EXTERNAL_TIMEOUT", 90, 5, 900),
         "tika_url": str(os.environ.get("MEMORY_WIKI_TIKA_URL", "")),
     }
-
-
-def _worker_preexec() -> None:  # pragma: no cover - Unix only
-    try:
-        import resource
-        memory_mb = _env_int("MEMORY_WIKI_DOCUMENT_WORKER_MEMORY_MB", 1024, 128, 16_384)
-        cpu_seconds = _env_int("MEMORY_WIKI_DOCUMENT_WORKER_CPU_SECONDS", 120, 5, 3600)
-        output_mb = _env_int("MEMORY_WIKI_DOCUMENT_WORKER_OUTPUT_MB", 512, 8, 4096)
-        resource.setrlimit(resource.RLIMIT_AS, (memory_mb * 1024 * 1024, memory_mb * 1024 * 1024))
-        resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 1))
-        resource.setrlimit(resource.RLIMIT_FSIZE, (output_mb * 1024 * 1024, output_mb * 1024 * 1024))
-        resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
-    except Exception:
-        pass
 
 
 def _worker_env(worker: Path) -> Dict[str, str]:
@@ -404,6 +692,7 @@ def _worker_env(worker: Path) -> Dict[str, str]:
     for key in (
         "MEMORY_WIKI_TESSERACT_BIN", "MEMORY_WIKI_OCR_PSM",
         "MEMORY_WIKI_DOCUMENT_WORKER_INPUT_MAX", "MEMORY_WIKI_DOCUMENT_WORKER_OUTPUT_MB",
+        "MEMORY_WIKI_DOCUMENT_WORKER_MEMORY_MB", "MEMORY_WIKI_DOCUMENT_WORKER_CPU_SECONDS",
         "MEMORY_WIKI_DOCUMENT_WORKER_DEBUG",
     ):
         if key in os.environ:
@@ -412,24 +701,232 @@ def _worker_env(worker: Path) -> Dict[str, str]:
     return env
 
 
+def _terminate_worker_tree(proc: subprocess.Popen[Any]) -> None:
+    """Terminate the parser and descendants after timeout or output overflow."""
+    if proc.poll() is not None:
+        return
+    try:
+        if os.name == "posix":
+            import signal
+            os.killpg(proc.pid, signal.SIGKILL)
+        elif os.name == "nt":
+            # /T covers grandchildren when a parser delegates to an external
+            # office/OCR binary. This is the safe fallback when no Job Object is
+            # available in the host Python build.
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=10, check=False,
+            )
+        else:
+            proc.kill()
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _worker_launch_kwargs(worker: Path, *, platform: Optional[str] = None) -> Dict[str, Any]:
+    """Build launch settings without unsafe fork-time hooks in the gateway."""
+    name = platform or os.name
+    kwargs: Dict[str, Any] = {"env": _worker_env(worker)}
+    if name == "posix":
+        kwargs["start_new_session"] = True
+    elif name == "nt":
+        kwargs["creationflags"] = int(getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    return kwargs
+
+
+def _windows_worker_limit_config() -> Dict[str, int]:
+    """Return the non-negotiable Job Object limits for a Windows parser."""
+    process_memory = _env_int("MEMORY_WIKI_DOCUMENT_WORKER_MEMORY_MB", 1024, 128, 16_384) * 1024 * 1024
+    cpu_seconds = _env_int("MEMORY_WIKI_DOCUMENT_WORKER_CPU_SECONDS", 120, 5, 3600)
+    process_time = cpu_seconds * 10_000_000  # Windows LARGE_INTEGER is 100 ns.
+    return {
+        "JOB_OBJECT_LIMIT_PROCESS_TIME": 0x00000002,
+        "JOB_OBJECT_LIMIT_PROCESS_MEMORY": 0x00000100,
+        "JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE": 0x00002000,
+        "limit_flags": 0x00000002 | 0x00000100 | 0x00002000,
+        "process_memory_bytes": process_memory,
+        "process_time_100ns": process_time,
+    }
+
+
+def _assign_windows_worker_job(proc: subprocess.Popen[Any]) -> Any:
+    """Attach an isolated worker to a kill-on-close, CPU/memory-capped Job."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    class LARGE_INTEGER(ctypes.Structure):
+        _fields_ = [("QuadPart", ctypes.c_longlong)]
+
+    class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", LARGE_INTEGER), ("PerJobUserTimeLimit", LARGE_INTEGER),
+            ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class IO_COUNTERS(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_ulonglong) for name in (
+            "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+            "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+        )]
+
+    class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION),
+            ("IoInfo", IO_COUNTERS), ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t), ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_job = kernel32.CreateJobObjectW
+    create_job.argtypes = [wintypes.LPVOID, wintypes.LPCWSTR]
+    create_job.restype = wintypes.HANDLE
+    set_info = kernel32.SetInformationJobObject
+    set_info.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD]
+    set_info.restype = wintypes.BOOL
+    assign = kernel32.AssignProcessToJobObject
+    assign.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    assign.restype = wintypes.BOOL
+    close = kernel32.CloseHandle
+    close.argtypes = [wintypes.HANDLE]
+    close.restype = wintypes.BOOL
+
+    job = create_job(None, None)
+    if not job:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        limits = _windows_worker_limit_config()
+        info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+        info.BasicLimitInformation.LimitFlags = limits["limit_flags"]
+        info.BasicLimitInformation.PerProcessUserTimeLimit.QuadPart = limits["process_time_100ns"]
+        info.ProcessMemoryLimit = limits["process_memory_bytes"]
+        if not set_info(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        handle = getattr(proc, "_handle", None)
+        if handle is None or not assign(job, handle):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return (job, close)
+    except Exception:
+        close(job)
+        raise
+
+
+def _close_windows_worker_job(job: Any) -> None:
+    if job:
+        handle, close = job
+        try:
+            close(handle)
+        except Exception:
+            pass
+
+
 def _extract(path: Path, args: Dict[str, Any]) -> Dict[str, Any]:
     worker = Path(__file__).with_name("document_worker.py")
     timeout = _env_int("MEMORY_WIKI_DOCUMENT_WORKER_TIMEOUT", 180, 10, 1800)
     request = _json({"path": str(path), "options": _worker_options(args)}).encode("utf-8")
-    kwargs: Dict[str, Any] = {}
-    if os.name == "posix":
-        kwargs["preexec_fn"] = _worker_preexec
-    proc = subprocess.run(
-        [sys.executable, str(worker)], input=request, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        timeout=timeout, check=False, env=_worker_env(worker), **kwargs,
-    )
     max_out = _env_int("MEMORY_WIKI_DOCUMENT_WORKER_OUTPUT_MB", 512, 8, 4096) * 1024 * 1024
-    if len(proc.stdout) > max_out:
-        raise RuntimeError("document worker output exceeds configured limit")
+    kwargs = _worker_launch_kwargs(worker)
+    proc = subprocess.Popen(
+        [sys.executable, str(worker)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        **kwargs,
+    )
+    worker_job = None
     try:
-        response = json.loads(proc.stdout.decode("utf-8"))
+        if os.name == "nt":
+            worker_job = _assign_windows_worker_job(proc)
     except Exception as exc:
-        raise RuntimeError(f"document worker returned invalid JSON: {proc.stderr.decode('utf-8','replace')[-1500:]}") from exc
+        _terminate_worker_tree(proc)
+        raise RuntimeError(f"unable to establish Windows document worker sandbox: {type(exc).__name__}: {exc}") from exc
+    streams = {"stdout": proc.stdout, "stderr": proc.stderr}
+    buffers: Dict[str, List[bytes]] = {"stdout": [], "stderr": []}
+    sizes = {"stdout": 0, "stderr": 0}
+    overflow = threading.Event()
+    lock = threading.Lock()
+    timed_out = False
+
+    def read_bounded(name: str, stream: Any) -> None:
+        try:
+            while True:
+                block = stream.read(64 * 1024)
+                if not block:
+                    return
+                kill = False
+                with lock:
+                    remaining = max_out - sizes[name]
+                    if remaining > 0:
+                        buffers[name].append(block[:remaining])
+                        sizes[name] += min(len(block), remaining)
+                    if len(block) > remaining:
+                        overflow.set()
+                        kill = True
+                if kill:
+                    _terminate_worker_tree(proc)
+                    return
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    readers = [
+        threading.Thread(target=read_bounded, args=(name, stream), daemon=True)
+        for name, stream in streams.items() if stream is not None
+    ]
+    try:
+        for reader in readers:
+            reader.start()
+        assert proc.stdin is not None
+        proc.stdin.write(request)
+        proc.stdin.close()
+        deadline = time.monotonic() + timeout
+        while proc.poll() is None:
+            if overflow.is_set():
+                _terminate_worker_tree(proc)
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                _terminate_worker_tree(proc)
+                break
+            time.sleep(0.02)
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            _terminate_worker_tree(proc)
+            proc.wait(timeout=10)
+    finally:
+        try:
+            if proc.stdin is not None:
+                proc.stdin.close()
+        except Exception:
+            pass
+        for reader in readers:
+            reader.join(timeout=10)
+        if proc.poll() is None:
+            _terminate_worker_tree(proc)
+        _close_windows_worker_job(worker_job)
+
+    stdout = b"".join(buffers["stdout"])
+    stderr = b"".join(buffers["stderr"])
+    if overflow.is_set():
+        raise RuntimeError("document worker output exceeds configured limit")
+    if timed_out:
+        raise RuntimeError(f"document worker exceeded timeout ({timeout}s)")
+    if proc.returncode:
+        raise RuntimeError(f"document worker failed ({proc.returncode}): {stderr.decode('utf-8', 'replace')[-1500:]}")
+    try:
+        response = json.loads(stdout.decode("utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"document worker returned invalid JSON: {stderr.decode('utf-8','replace')[-1500:]}") from exc
     if not response.get("ok"):
         raise RuntimeError(str(response.get("error") or "document worker failed"))
     return dict(response["document"])
@@ -555,11 +1052,41 @@ def _archive_claims(
 
 def ingest_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     path = _allowed_path(args.get("path"))
-    scope_id = str(args.get("scope_id") or "").strip()
-    repository_id = str(args.get("repository_id") or "").strip()
+    scope_id, repository_id = _document_access_scope(
+        provider,
+        str(args.get("scope_id") or ""),
+        str(args.get("repository_id") or ""),
+    )
     source_id = _source_id(path)
+    snapshot, snapshot_meta = _snapshot_allowed_file(
+        path,
+        max_bytes=int(_worker_options(args)["max_bytes"]),
+    )
+    try:
+        payload = _extract(snapshot, args)
+    finally:
+        snapshot.unlink(missing_ok=True)
+        snapshot_dir = Path(str(snapshot_meta.get("snapshot_dir") or ""))
+        if str(snapshot_dir):
+            try:
+                snapshot_dir.rmdir()
+            except OSError:
+                # The snapshot is already gone; a stale empty directory is not
+                # authoritative and can be removed by maintenance.
+                pass
+    worker_hash = str(payload.get("file_hash") or "")
+    if worker_hash and worker_hash != str(snapshot_meta["file_hash"]):
+        raise RuntimeError("document worker hash does not match validated snapshot")
+    # Preserve source identity and metadata rather than the disposable snapshot
+    # filename observed by the isolated worker.
+    payload["file_name"] = path.name
+    payload["extension"] = path.suffix.lower()
+    if str(payload.get("title") or "").strip() == snapshot.stem:
+        payload["title"] = path.stem
+    payload["file_hash"] = str(snapshot_meta["file_hash"])
+    payload["mtime_ns"] = int(snapshot_meta["mtime_ns"])
+    payload["file_size"] = int(snapshot_meta["size_bytes"])
     conn = provider._connect(); install_document_graph_schema(conn)
-    payload = _extract(path, args)
     file_hash = str(payload.get("file_hash") or "")
     parser = str(payload.get("parser") or "")
     parser_version = str(payload.get("parser_version") or "")
@@ -735,54 +1262,135 @@ def ingest_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _discover_document_candidates(
+    root: Path,
+    *,
+    recursive: bool,
+    max_files: int,
+    includes: set[str],
+    excludes: set[str],
+    newest_first: bool,
+    min_age_seconds: float,
+    max_entries: int,
+    max_directories: int,
+    max_depth: int,
+    max_seconds: float,
+) -> Tuple[List[Path], Dict[str, Any]]:
+    """Stream a bounded, no-reparse filesystem traversal for document scans."""
+    started = time.monotonic()
+    deadline = started + max_seconds
+    entries_seen = directories_seen = reparse_skipped = ignored_skipped = 0
+    traversal_truncated = candidate_truncated = False
+    heap: List[Tuple[int, str, Path]] = []
+    candidates: List[Path] = []
+    stack: List[Tuple[Path, int]] = [(root, 0)]
+    now_ns = time.time_ns()
+
+    while stack:
+        if time.monotonic() >= deadline:
+            traversal_truncated = True
+            break
+        directory, depth = stack.pop()
+        try:
+            iterator = os.scandir(directory)
+        except OSError:
+            continue
+        with iterator:
+            for entry in iterator:
+                if time.monotonic() >= deadline or entries_seen >= max_entries:
+                    traversal_truncated = True
+                    break
+                entries_seen += 1
+                try:
+                    info = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if _is_link_or_reparse(info):
+                    reparse_skipped += 1
+                    continue
+                if stat.S_ISDIR(info.st_mode):
+                    directories_seen += 1
+                    if entry.name in excludes:
+                        ignored_skipped += 1
+                        continue
+                    if recursive and depth < max_depth and directories_seen <= max_directories:
+                        stack.append((Path(entry.path), depth + 1))
+                    elif recursive:
+                        traversal_truncated = True
+                    continue
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                ext = Path(entry.name).suffix.lower()
+                if ext not in _SUPPORTED_EXTENSIONS or (includes and ext not in includes):
+                    continue
+                if min_age_seconds and now_ns - int(getattr(info, "st_mtime_ns", 0) or 0) < int(min_age_seconds * 1_000_000_000):
+                    continue
+                path = Path(entry.path)
+                if newest_first:
+                    item = (int(getattr(info, "st_mtime_ns", 0) or 0), str(path).casefold(), path)
+                    if len(heap) < max_files:
+                        heapq.heappush(heap, item)
+                    elif item[:2] > heap[0][:2]:
+                        heapq.heapreplace(heap, item)
+                        candidate_truncated = True
+                    else:
+                        candidate_truncated = True
+                else:
+                    candidates.append(path)
+                    if len(candidates) >= max_files:
+                        candidate_truncated = True
+                        break
+            if traversal_truncated or (candidate_truncated and not newest_first):
+                break
+        if traversal_truncated or (candidate_truncated and not newest_first):
+            break
+    if newest_first:
+        candidates = [item[2] for item in sorted(heap, key=lambda item: item[:2], reverse=True)]
+    else:
+        candidates.sort(key=lambda item: str(item).casefold())
+    return candidates, {
+        "entries_seen": entries_seen,
+        "directories_seen": directories_seen,
+        "reparse_skipped": reparse_skipped,
+        "ignored_skipped": ignored_skipped,
+        "traversal_truncated": traversal_truncated,
+        "candidate_truncated": candidate_truncated,
+        "scan_seconds": round(time.monotonic() - started, 6),
+    }
+
+
 def scan_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     root = _scan_root(args)
     if not root.is_dir() or root.is_symlink():
         raise ValueError("scan root must be a regular directory")
-    # Verify directory is itself beneath an allowed root.
-    probe = None
-    for allowed in _roots():
-        try:
-            root.relative_to(allowed); probe = root; break
-        except ValueError:
-            pass
-    if probe is None:
-        raise ValueError(f"scan root outside MEMORY_WIKI_DOCUMENT_ROOTS: {root}")
+    # Resolve lexical/canonical aliases before traversal; _scan_root already
+    # rejects reparse traversal and every file is secure-opened again at ingest.
+    try:
+        _lexical_root_for_path(root, allow_root=True)
+    except ValueError as exc:
+        raise ValueError(f"scan root outside MEMORY_WIKI_DOCUMENT_ROOTS: {root}") from exc
     recursive = bool(args.get("recursive", True))
     max_files = max(1, min(int(args.get("max_files") or _env_int("MEMORY_WIKI_DOCUMENT_SCAN_MAX_FILES", 5000, 1, 100_000)), 100_000))
     includes = {str(x).lower() if str(x).startswith(".") else "." + str(x).lower() for x in (args.get("extensions") or [])}
     excludes = set(_DEFAULT_IGNORES) | {str(x) for x in (args.get("exclude_dirs") or [])}
-    candidates: List[Path] = []
-    iterator = root.rglob("*") if recursive else root.glob("*")
-    ordered = list(iterator)
-    if bool(args.get("newest_first", False)):
-        def _mtime(item: Path) -> int:
-            try:
-                return int(item.stat().st_mtime_ns)
-            except OSError:
-                return -1
-        ordered.sort(key=_mtime, reverse=True)
-    else:
-        ordered.sort(key=lambda item: str(item).casefold())
     min_age_seconds = max(0.0, float(args.get("min_age_seconds") or 0.0))
-    now_ns = time.time_ns()
-    for path in ordered:
-        if any(part in excludes for part in path.parts):
-            continue
-        if path.is_symlink() or not path.is_file():
-            continue
-        ext = path.suffix.lower()
-        if ext not in _SUPPORTED_EXTENSIONS or (includes and ext not in includes):
-            continue
-        if min_age_seconds:
-            try:
-                if now_ns - int(path.stat().st_mtime_ns) < int(min_age_seconds * 1_000_000_000):
-                    continue
-            except OSError:
-                continue
-        candidates.append(path)
-        if len(candidates) >= max_files:
-            break
+    max_entries = max(1, min(int(args.get("max_entries") or _env_int("MEMORY_WIKI_DOCUMENT_SCAN_MAX_ENTRIES", max_files * 20, 1, 1_000_000)), 1_000_000))
+    max_directories = max(1, min(int(args.get("max_directories") or _env_int("MEMORY_WIKI_DOCUMENT_SCAN_MAX_DIRECTORIES", max_files * 4, 1, 100_000)), 100_000))
+    max_depth = max(0, min(int(args.get("max_depth") or _env_int("MEMORY_WIKI_DOCUMENT_SCAN_MAX_DEPTH", 32, 0, 256)), 256))
+    max_seconds = max(0.1, min(float(args.get("scan_max_seconds") or _env_float("MEMORY_WIKI_DOCUMENT_SCAN_MAX_SECONDS", 30.0, 0.1, 600.0)), 600.0))
+    candidates, discovery = _discover_document_candidates(
+        root,
+        recursive=recursive,
+        max_files=max_files,
+        includes=includes,
+        excludes=excludes,
+        newest_first=bool(args.get("newest_first", False)),
+        min_age_seconds=min_age_seconds,
+        max_entries=max_entries,
+        max_directories=max_directories,
+        max_depth=max_depth,
+        max_seconds=max_seconds,
+    )
 
     conn = provider._connect(); install_document_graph_schema(conn)
     existing_by_path = {
@@ -791,9 +1399,13 @@ def scan_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
             "FROM document_sources WHERE active=1"
         ).fetchall()
     }
-    requested_scope = str(args.get("scope_id") or "").strip()
-    requested_repo = str(args.get("repository_id") or "").strip()
-    stat_fast_path = bool(args.get("stat_fast_path", False))
+    requested_scope, requested_repo = _document_access_scope(
+        provider,
+        str(args.get("scope_id") or ""),
+        str(args.get("repository_id") or ""),
+    )
+    # Timestamp/size equality is only a performance hint for explicitly trusted immutable stores.
+    stat_fast_path = bool(args.get("stat_fast_path", False)) and _env_bool("MEMORY_WIKI_DOCUMENT_ALLOW_STAT_FAST_PATH", False)
     max_changed = max(1, min(int(args.get("max_changed") or max_files), max_files))
     changed_processed = 0
     deferred = 0
@@ -835,7 +1447,7 @@ def scan_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
             changed_processed += 1
         except Exception as exc:
             errors.append({"path": str(path), "error": f"{type(exc).__name__}: {exc}"})
-    truncated = len(candidates) >= max_files
+    truncated = bool(discovery["traversal_truncated"] or discovery["candidate_truncated"])
     candidate_paths = {str(path.resolve(strict=False)) for path in candidates}
     missing_sources: List[Dict[str, Any]] = []
     if recursive and not includes and not truncated:
@@ -872,6 +1484,7 @@ def scan_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
         "deferred_changed": deferred,
         "missing_sources": missing_sources[:200], "results": results[:200], "errors": errors[:200],
         "truncated": truncated,
+        **discovery,
     }
 
 
@@ -892,6 +1505,14 @@ def maybe_ingest_document_cache(provider: Any, *, force: bool = False) -> Dict[s
     last = float(getattr(provider, "_memory_wiki_document_cache_scan_at", 0.0) or 0.0)
     if not force and last and now - last < cooldown:
         return {"status": "cooldown", "root": str(root), "retry_after": max(0.0, cooldown - (now - last))}
+    scope_id = os.environ.get("MEMORY_WIKI_DOCUMENT_AUTO_SCOPE_ID", "").strip()
+    repository_id = os.environ.get("MEMORY_WIKI_DOCUMENT_AUTO_REPOSITORY_ID", "").strip() or scope_id
+    if not scope_id and not _env_bool("MEMORY_WIKI_DOCUMENT_ALLOW_GLOBAL_AUTO", False):
+        return {
+            "status": "blocked_missing_scope",
+            "root": str(root),
+            "reason": "set MEMORY_WIKI_DOCUMENT_AUTO_SCOPE_ID or explicitly allow global auto ingestion",
+        }
     setattr(provider, "_memory_wiki_document_cache_scan_at", now)
     result = scan_documents(provider, {
         "root": str(root),
@@ -899,12 +1520,12 @@ def maybe_ingest_document_cache(provider: Any, *, force: bool = False) -> Dict[s
         "max_files": _env_int("MEMORY_WIKI_DOCUMENT_AUTO_SCAN_MAX_FILES", 200, 1, 5000),
         "max_changed": _env_int("MEMORY_WIKI_DOCUMENT_AUTO_SCAN_MAX_CHANGED", 3, 1, 100),
         "newest_first": True,
-        "stat_fast_path": True,
+        "stat_fast_path": _env_bool("MEMORY_WIKI_DOCUMENT_AUTO_TRUST_STAT_FAST_PATH", False),
         "min_age_seconds": _env_float("MEMORY_WIKI_DOCUMENT_AUTO_MIN_AGE_SECONDS", 2.0, 0.0, 300.0),
         "ocr": _env_bool("MEMORY_WIKI_DOCUMENT_OCR", False),
         "embed": _env_bool("MEMORY_WIKI_DOCUMENT_AUTO_EMBED", False),
-        "scope_id": os.environ.get("MEMORY_WIKI_DOCUMENT_AUTO_SCOPE_ID", "").strip(),
-        "repository_id": os.environ.get("MEMORY_WIKI_DOCUMENT_AUTO_REPOSITORY_ID", "").strip(),
+        "scope_id": scope_id,
+        "repository_id": repository_id,
         "prune_missing": False,
     })
     result["status"] = "scanned"
@@ -914,8 +1535,11 @@ def maybe_ingest_document_cache(provider: Any, *, force: bool = False) -> Dict[s
 
 def embed_pending_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     source_id = str(args.get("source_id") or "").strip()
-    scope_id = str(args.get("scope_id") or "").strip()
-    repository_id = str(args.get("repository_id") or "").strip()
+    scope_id, repository_id = _document_access_scope(
+        provider,
+        str(args.get("scope_id") or ""),
+        str(args.get("repository_id") or ""),
+    )
     limit = max(1, min(int(args.get("limit") or 500), 10_000))
     conn = provider._connect(); install_document_graph_schema(conn)
     clauses = ["c.active=1", "c.embedding_claim_id=''", "s.active=1"]
@@ -1013,9 +1637,15 @@ def query_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     query = str(args.get("query") or "").strip()
     if not query: raise ValueError("query is required")
     source_id = str(args.get("source_id") or "").strip()
-    scope_id = str(args.get("scope_id") or "").strip()
-    repository_id = str(args.get("repository_id") or "").strip()
     global_only = bool(args.get("global_only", False))
+    if global_only:
+        scope_id, repository_id = "", ""
+    else:
+        scope_id, repository_id = _document_access_scope(
+            provider,
+            str(args.get("scope_id") or ""),
+            str(args.get("repository_id") or ""),
+        )
     extension = str(args.get("extension") or "").lower().strip()
     if extension and not extension.startswith("."): extension = "." + extension
     limit = max(1, min(int(args.get("limit") or 12), 50))
@@ -1147,6 +1777,7 @@ def document_source(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     else:
         raise ValueError("source_id or path is required")
     if not row: raise ValueError("document source not found")
+    _assert_source_access(provider, row)
     out = _row(row)
     for key in ("metadata_json", "warnings_json"):
         raw = out.pop(key, "")
@@ -1168,6 +1799,9 @@ def document_unit_context(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]
     radius = max(0, min(int(args.get("radius") or 5), 100))
     if not source_id: raise ValueError("source_id is required")
     conn = provider._connect(); install_document_graph_schema(conn)
+    source = conn.execute("SELECT scope_id,repository_id FROM document_sources WHERE source_id=? AND active=1", (source_id,)).fetchone()
+    if not source: raise ValueError("document source not found")
+    _assert_source_access(provider, source)
     if unit_id:
         target = conn.execute("SELECT ordinal FROM document_units WHERE source_id=? AND unit_id=? AND active=1", (source_id, unit_id)).fetchone()
     elif anchor:
@@ -1195,6 +1829,9 @@ def document_neighbors(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     hops = max(1, min(int(args.get("hops") or 1), 3)); limit = max(1, min(int(args.get("limit") or 100), 1000))
     if not source_id or not anchor: raise ValueError("source_id and anchor are required")
     conn = provider._connect(); install_document_graph_schema(conn)
+    source = conn.execute("SELECT scope_id,repository_id FROM document_sources WHERE source_id=? AND active=1", (source_id,)).fetchone()
+    if not source: raise ValueError("document source not found")
+    _assert_source_access(provider, source)
     queue = deque([(anchor, 0)]); seen = {anchor}; found = []
     while queue and len(found) < limit:
         node, depth = queue.popleft()
@@ -1212,7 +1849,11 @@ def document_neighbors(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
 
 def document_status(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     conn = provider._connect(); install_document_graph_schema(conn)
-    scope_id = str(args.get("scope_id") or "").strip(); repository_id = str(args.get("repository_id") or "").strip()
+    scope_id, repository_id = _document_access_scope(
+        provider,
+        str(args.get("scope_id") or ""),
+        str(args.get("repository_id") or ""),
+    )
     clauses = ["active=1"]; params: List[Any] = []
     if scope_id: clauses.append("scope_id=?"); params.append(scope_id)
     if repository_id: clauses.append("repository_id=?"); params.append(repository_id)
@@ -1248,6 +1889,9 @@ def delete_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     source_id = str(args.get("source_id") or "").strip()
     if not source_id: raise ValueError("source_id is required")
     conn = provider._connect(); install_document_graph_schema(conn)
+    source = conn.execute("SELECT scope_id,repository_id FROM document_sources WHERE source_id=? AND active=1", (source_id,)).fetchone()
+    if not source: raise ValueError("document source not found")
+    _assert_source_access(provider, source)
     claim_ids = [str(r[0]) for r in conn.execute("SELECT embedding_claim_id FROM document_chunks WHERE source_id=? AND active=1 AND embedding_claim_id<>''", (source_id,)).fetchall()]
     with conn:
         archived = _archive_claims(conn, claim_ids, retiring_source_ids={source_id})
@@ -1266,21 +1910,77 @@ def _inbox_dir() -> Path:
 
 
 def ingest_document_inbox(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
-    limit = max(1, min(int(args.get("limit") or 25), 1000)); inbox = _inbox_dir(); inbox.mkdir(parents=True, exist_ok=True)
-    processed = []; errors = []
-    for event_path in sorted(inbox.glob("*.json"))[:limit]:
-        try:
-            event = json.loads(event_path.read_text(encoding="utf-8"))
-            if event.get("event_type") != "document_manifest":
+    limit = max(1, min(int(args.get("limit") or 25), 1000))
+    max_manifest_bytes = _env_int("MEMORY_WIKI_DOCUMENT_INBOX_MAX_BYTES", 1_000_000, 4096, 16_000_000)
+    max_documents = _env_int("MEMORY_WIKI_DOCUMENT_INBOX_MAX_DOCUMENTS", 25, 1, 1000)
+    inbox = _inbox_dir()
+    inbox.mkdir(parents=True, exist_ok=True)
+    _reject_link_or_reparse_components(inbox)
+    candidates: List[Path] = []
+    with os.scandir(inbox) as entries:
+        for entry in entries:
+            if len(candidates) >= limit:
+                break
+            if not entry.name.endswith(".json") or ".processing." in entry.name:
                 continue
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if _is_link_or_reparse(info) or not stat.S_ISREG(info.st_mode):
+                continue
+            candidates.append(Path(entry.path))
+    candidates.sort(key=lambda item: item.name.casefold())
+    processed: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    for event_path in candidates:
+        claimed = event_path.with_name(f"{event_path.stem}.processing.{os.getpid()}.{time.time_ns()}.json")
+        try:
+            # Atomic rename claims the manifest before reading so another gateway
+            # process cannot ingest the same event concurrently.
+            os.replace(event_path, claimed)
+        except OSError:
+            continue
+        try:
+            info = claimed.lstat()
+            if _is_link_or_reparse(info) or not stat.S_ISREG(info.st_mode):
+                raise ValueError("manifest must be a regular non-link file")
+            if int(info.st_size) > max_manifest_bytes:
+                raise ValueError(f"manifest exceeds maximum {max_manifest_bytes} bytes")
+            with claimed.open("rb") as handle:
+                raw = handle.read(max_manifest_bytes + 1)
+            if len(raw) > max_manifest_bytes:
+                raise ValueError(f"manifest exceeds maximum {max_manifest_bytes} bytes")
+            event = json.loads(raw.decode("utf-8"))
+            if not isinstance(event, dict):
+                raise ValueError("manifest must be a JSON object")
+            if event.get("event_type") != "document_manifest":
+                ignored = event_path.with_suffix(".ignored.json")
+                os.replace(claimed, ignored)
+                continue
+            documents = event.get("documents") or []
+            if not isinstance(documents, list):
+                raise ValueError("manifest documents must be an array")
+            if len(documents) > max_documents:
+                raise ValueError(f"manifest documents exceeds maximum {max_documents}")
             results = []
-            for item in list(event.get("documents") or []):
-                item_args = {"path": item.get("path"), "scope_id": event.get("scope_id") or "",
-                             "repository_id": event.get("repository_id") or "", "embed": False}
+            for item in documents:
+                if not isinstance(item, dict):
+                    raise ValueError("manifest document entries must be objects")
+                item_args = {
+                    "path": item.get("path"), "scope_id": event.get("scope_id") or "",
+                    "repository_id": event.get("repository_id") or "", "embed": False,
+                }
                 results.append(ingest_document(provider, item_args))
-            done = event_path.with_suffix(".processed.json"); event_path.replace(done)
+            done = event_path.with_suffix(".processed.json")
+            os.replace(claimed, done)
             processed.append({"event": done.name, "documents": len(results), "results": results[:100]})
         except Exception as exc:
+            rejected = event_path.with_suffix(".rejected.json")
+            try:
+                os.replace(claimed, rejected)
+            except OSError:
+                pass
             errors.append({"event": event_path.name, "error": f"{type(exc).__name__}: {exc}"})
     return {"inbox": str(inbox), "processed": processed, "errors": errors}
 

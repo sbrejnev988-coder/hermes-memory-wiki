@@ -24,6 +24,8 @@ def load_module(module_name: str):
 
 
 class Provider:
+    project_scope = "auto-embed-scope"
+
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
 
@@ -34,7 +36,7 @@ class Provider:
 def test_auto_embed_processes_pending_unchanged_source() -> None:
     previous = {
         key: os.environ.get(key)
-        for key in ("HERMES_HOME", "MEMORY_WIKI_DOCUMENT_ROOTS")
+        for key in ("HERMES_HOME", "MEMORY_WIKI_DOCUMENT_ROOTS", "MEMORY_WIKI_DOCUMENT_ALLOW_STAT_FAST_PATH")
     }
     try:
         with tempfile.TemporaryDirectory(prefix="mw-auto-embed-") as tmp:
@@ -46,6 +48,7 @@ def test_auto_embed_processes_pending_unchanged_source() -> None:
             stat = document.stat()
             os.environ["HERMES_HOME"] = str(home)
             os.environ["MEMORY_WIKI_DOCUMENT_ROOTS"] = str(root)
+            os.environ["MEMORY_WIKI_DOCUMENT_ALLOW_STAT_FAST_PATH"] = "1"
             module = load_module("memory_wiki_auto_embed_unchanged_test")
             conn = sqlite3.connect(":memory:")
             conn.row_factory = sqlite3.Row
@@ -53,11 +56,11 @@ def test_auto_embed_processes_pending_unchanged_source() -> None:
             source_id = "docsrc_pending"
             conn.execute(
                 """INSERT INTO document_sources(
-                    source_id,source_path,display_name,mtime_ns,size_bytes,parser_version,
+                    source_id,scope_id,repository_id,source_path,display_name,mtime_ns,size_bytes,parser_version,
                     revision_id,status,active,created_at,updated_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
-                    source_id, str(document.resolve()), document.name, stat.st_mtime_ns,
+                    source_id, "auto-embed-scope", "auto-embed-scope", str(document.resolve()), document.name, stat.st_mtime_ns,
                     stat.st_size, module._CURRENT_PARSER_VERSION, "docrev_pending", "ok", 1, 1, 1,
                 ),
             )

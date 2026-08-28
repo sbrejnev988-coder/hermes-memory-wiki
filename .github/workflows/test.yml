@@ -27,7 +27,12 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install test runner
-        run: python -m pip install --disable-pip-version-check pytest
+      - uses: astral-sh/setup-uv@v6
+      - name: Verify locked release contract
+        run: |
+          uv lock --check
+          python packaging/verify_release.py
       - name: Run regression suite
-        run: python -m pytest -q
+        run: uv run --with pytest python -m pytest -q
+      - name: Build wheel
+        run: uv build --wheel

@@ -18,8 +18,38 @@ try:
 except ImportError:
     from document_extractors import extract_document
 
+
+def _limit(name: str, default: int, low: int, high: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(low, min(value, high))
+
+
+def _apply_resource_limits() -> None:
+    """Install parser limits inside the worker before it reads untrusted input."""
+    if os.name != "posix":
+        return
+    try:
+        import resource
+    except ImportError:  # pragma: no cover - nonstandard POSIX Python
+        return
+    memory_mb = _limit("MEMORY_WIKI_DOCUMENT_WORKER_MEMORY_MB", 1024, 128, 16_384)
+    cpu_seconds = _limit("MEMORY_WIKI_DOCUMENT_WORKER_CPU_SECONDS", 120, 5, 3600)
+    output_mb = _limit("MEMORY_WIKI_DOCUMENT_WORKER_OUTPUT_MB", 512, 8, 4096)
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (memory_mb * 1024 * 1024, memory_mb * 1024 * 1024))
+        resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 1))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (output_mb * 1024 * 1024, output_mb * 1024 * 1024))
+        resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
+    except OSError as exc:
+        raise RuntimeError(f"unable to install document worker resource limits: {exc}") from exc
+
+
 def main() -> int:
     try:
+        _apply_resource_limits()
         raw = sys.stdin.buffer.read(int(os.environ.get("MEMORY_WIKI_DOCUMENT_WORKER_INPUT_MAX", "1048576")) + 1)
         if len(raw) > int(os.environ.get("MEMORY_WIKI_DOCUMENT_WORKER_INPUT_MAX", "1048576")):
             raise ValueError("worker input exceeds configured limit")

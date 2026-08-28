@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-memory-wiki"
+version = "1.21.0"
+description = "Security-hardened active-memory wiki provider for Hermes Agent"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "sbrejnev988-coder" }]
+keywords = ["hermes", "memory", "knowledge-graph", "mcp", "qdrant"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+dependencies = []
+
+[project.entry-points."hermes_agent.memory_providers"]
+memory-wiki = "memory_wiki:register"
+
+[project.urls]
+Homepage = "https://github.com/sbrejnev988-coder/hermes-memory-wiki"
+Repository = "https://github.com/sbrejnev988-coder/hermes-memory-wiki"
+Issues = "https://github.com/sbrejnev988-coder/hermes-memory-wiki/issues"
+
+[tool.setuptools]
+packages = ["memory_wiki"]
+package-dir = { memory_wiki = "." }
+include-package-data = true
+
+[tool.setuptools.exclude-package-data]
+"*" = ["*.pyc", "__pycache__/*", "**/__pycache__/*"]
+
+[tool.setuptools.package-data]
+memory_wiki = [
+  "plugin.yaml",
+  "mcp-wrapper/*.py",
+  "mcp-wrapper/*.json",
+  "context-coordination/*.py",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

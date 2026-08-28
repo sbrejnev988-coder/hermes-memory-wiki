@@ -19,6 +19,8 @@ spec.loader.exec_module(mod)
 
 
 class Provider:
+    project_scope = "scope"
+
     def __init__(self, conn: sqlite3.Connection) -> None:
         self.conn = conn
         self.evidence: list[str] = []
@@ -42,11 +44,11 @@ def test_embedding_evidence_uses_safe_refs_not_token_like_provenance() -> None:
         conn.execute("CREATE TABLE claims(id TEXT, topic TEXT, status TEXT, evidence TEXT, updated_at INTEGER)")
         conn.execute(
             """INSERT INTO document_sources(
-                source_id, source_path, display_name, extension, title, file_hash,
+                source_id, scope_id, repository_id, source_path, display_name, extension, title, file_hash,
                 parser, parser_version, revision_id, status, active, created_at, updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                source_id, "C:/Users/Kekl/AppData/Local/hermes/documents/session.md",
+                source_id, "scope", "scope", "C:/Users/Kekl/AppData/Local/hermes/documents/session.md",
                 "session.md", ".md", "session", "hash", "stdlib-text", "test",
                 revision_id, "ok", 1, 1, 1,
             ),
@@ -59,7 +61,7 @@ def test_embedding_evidence_uses_safe_refs_not_token_like_provenance() -> None:
                 active, updated_at
             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                "docchunk_test", source_id, revision_id, "scope", "repo",
+                "docchunk_test", source_id, revision_id, "scope", "scope",
                 "heading:1", "heading:1", "semantic", "session", "safe text",
                 "safe text", content_hash, "", 2, 1, 1,
             ),

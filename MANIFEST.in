@@ -1,0 +1,9 @@
+# Source distribution and wheel hygiene: never package local execution artifacts.
+global-exclude *.py[cod]
+global-exclude __pycache__
+recursive-exclude * __pycache__ *
+prune build
+prune dist
+prune .venv
+prune .release-venv
+prune .pytest_cache

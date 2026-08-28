@@ -1,0 +1,60 @@
+name: Release Memory Wiki
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    name: Build, attest, and publish
+    runs-on: ubuntu-latest
+    env:
+      HERMES_HOME: .hermes-release
+      HERMES_SECURITY_STRICT: "0"
+      MEMORY_WIKI_SEMANTIC: "0"
+      MEMORY_WIKI_DOCUMENT_AUTO_SCAN_CACHE: "0"
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+      - name: Verify immutable release contract
+        run: |
+          uv lock --check
+          python packaging/verify_release.py --tag "${GITHUB_REF_NAME}"
+          test "$(git tag --points-at HEAD | grep -Fx "${GITHUB_REF_NAME}")" = "${GITHUB_REF_NAME}"
+      - name: Run regression suite
+        run: |
+          uv run --with pytest python -m pytest -q
+      - name: Build reproducible artifacts
+        run: |
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          python packaging/check_reproducible.py --source-date-epoch "${SOURCE_DATE_EPOCH}"
+          uv build --wheel
+          python packaging/build_native_bundle.py --tree-ish "${GITHUB_SHA}"
+          python packaging/generate_sbom.py --output dist/sbom.spdx.json
+          sha256sum dist/* > dist/SHA256SUMS
+      - name: Verify wheel installs in a clean virtual environment
+        run: |
+          python -m venv .release-venv
+          .release-venv/bin/python -m pip install dist/*.whl
+          .release-venv/bin/python -c "import memory_wiki; assert callable(memory_wiki.register)"
+      - name: Attest artifacts and SBOM
+        uses: actions/attest@v4
+        with:
+          subject-path: "dist/*"
+          sbom-path: "dist/sbom.spdx.json"
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* --title "${GITHUB_REF_NAME}" --generate-notes

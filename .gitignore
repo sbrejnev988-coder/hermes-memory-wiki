@@ -12,3 +12,11 @@ __pycache__/
 *.py[cod]
 *.sqlite*
 *.bak*
+
+# Python/release build outputs (published by GitHub Releases, never committed)
+build/
+dist/
+*.egg-info/
+.venv/
+.release-venv/
+.pytest_cache/

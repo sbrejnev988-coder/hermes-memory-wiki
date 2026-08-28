@@ -1,4 +1,4 @@
-"""memory-wiki v1.20.10+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.21.0+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -37,7 +37,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-PLUGIN_VERSION = "1.20.12"
+PLUGIN_VERSION = "1.21.0"
 _INTEGRITY_HASH_FIELDS = frozenset({
     "hash", "content_hash", "old_content_hash", "new_content_hash", "file_hash",
     "text_hash", "anchor_hash", "snapshot_hash", "payload_hash",
@@ -2739,10 +2739,8 @@ class MemoryWikiProvider(MemoryProvider):
         self._register_consumer(self.session_id)
         self._rebuild_fts()
         self._sync_env_metadata()
-        try:
-            self._drain_code_shrinker_events(limit=100)
-        except Exception as exc:
-            _debug_log(f"Code Shrinker event drain failed during initialize: {type(exc).__name__}: {exc}")
+        # Code Shrinker inbox ingestion is an explicit, journaled tool action.
+        # Initialization must not mutate code/document graph state.
         self._render_all()
         if SEMANTIC_ENABLED:
             _start_outbox_worker(str(self.db_path))
@@ -3977,10 +3975,8 @@ class MemoryWikiProvider(MemoryProvider):
             {"name":"memory_wiki_patch_outcome_add","description":"Record the outcome of a patch application with structured validation and revision metadata.","parameters":{"type":"object","properties":{"patch_id":{"type":"string","minLength":1,"maxLength":256},"outcome":{"type":"string","minLength":1,"maxLength":128},"repository_id":{"type":"string","minLength":1,"maxLength":300},"commit_sha":{"type":"string","default":"","maxLength":64,"pattern":"^(?:[0-9a-fA-F]{7,64})?$"},"old_content_hash":{"type":"string","default":"","pattern":"^(?:sha256:)?[0-9a-fA-F]{64}$"},"new_content_hash":{"type":"string","default":"","pattern":"^(?:sha256:)?[0-9a-fA-F]{64}$"},"validation_report":{"type":"object"},"changed_files":{"type":"array","maxItems":200,"items":{"type":"string","maxLength":1024}},"changed_symbols":{"type":"array","maxItems":500,"items":{"type":"string","maxLength":512}},"rollback_steps":{"type":"string","default":"","maxLength":20000},"source_event_id":{"type":"string","default":"","maxLength":512},"producer":{"type":"string","default":"mcp-code-shrinker","maxLength":100},"phase_sep_version":{"type":"string","default":"2","maxLength":32}},"required":["patch_id","outcome","repository_id"],"additionalProperties":False}},]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
-        try:
-            self._drain_code_shrinker_events(limit=25)
-        except Exception as exc:
-            _debug_log(f"Code Shrinker event drain failed before {tool_name}: {type(exc).__name__}: {exc}")
+        # Inbox mutation is available only through memory_wiki_code_graph_ingest_inbox,
+        # so every completed event has an explicit journal boundary.
         a = dict(args or {})
 
         # Secret value writes, migrations and scrub passes are local-admin only.
@@ -4723,6 +4719,37 @@ class MemoryWikiProvider(MemoryProvider):
                 finally:
                     lock_fh.close()
 
+    def _checkpoint_after_journal_mutation(self, op: str, result: Any, after_seq: int) -> Dict[str, Any]:
+        """Checkpoint durable graph state after a successful non-replayable mutation.
+
+        Journal payloads intentionally do not contain raw document/code bodies.
+        A post-after-event logical checkpoint provides a recoverable baseline
+        without copying those bodies into JSONL events.
+        """
+        checkpoint_ops = {
+            "memory_wiki_document_ingest", "memory_wiki_document_scan",
+            "memory_wiki_document_embed_pending", "memory_wiki_document_delete",
+            "memory_wiki_document_ingest_inbox", "memory_wiki_code_graph_ingest_inbox",
+            "memory_wiki_code_graph_embed_pending", "memory_wiki_code_claim_add",
+            "memory_wiki_patch_outcome_add", "memory_wiki_invalidate_revision",
+        }
+        if op not in checkpoint_ops or os.environ.get("MEMORY_WIKI_JOURNAL_SAFETY_CHECKPOINTS", "1").strip().lower() in {"", "0", "false", "no", "off"}:
+            return {}
+        try:
+            parsed = json.loads(result) if isinstance(result, str) else dict(result or {})
+        except Exception:
+            parsed = {}
+        if parsed.get("success") is False or str(parsed.get("status") or "").lower() in {"unchanged", "disabled", "missing"}:
+            return {}
+        try:
+            checkpoint = self._journal_checkpoint(f"after-{op}")
+            if int(checkpoint.get("journal_seq") or 0) != int(after_seq):
+                raise RuntimeError("checkpoint sequence does not match completed journal event")
+            return checkpoint
+        except Exception as exc:
+            self._audit("journal_safety_checkpoint", "error", f"op={op} seq={after_seq} error={type(exc).__name__}: {exc}")
+            return {"error": f"{type(exc).__name__}: {exc}"}
+
     def _journal_operation(self, op: str, payload: Dict[str, Any], fn) -> Tuple[Any, Dict[str, Any]]:
         """Journal-before, execute, journal-after. Failed applies remain replayable."""
         before = self._append_journal_event(op, payload, phase="before")
@@ -4732,7 +4759,8 @@ class MemoryWikiProvider(MemoryProvider):
             self._append_journal_event(op, payload, phase="error", error=str(e), result={"before_seq": before.get("seq")})
             raise
         after = self._append_journal_event(op, payload, phase="after", result=result)
-        return result, {"before": before, "after": after}
+        checkpoint = self._checkpoint_after_journal_mutation(op, result, int(after.get("seq") or 0))
+        return result, {"before": before, "after": after, "checkpoint": checkpoint}
 
     def _iter_journal_events(self) -> Iterable[Dict[str, Any]]:
         if not self.journal_path.exists():
@@ -4927,6 +4955,8 @@ class MemoryWikiProvider(MemoryProvider):
         candidates = []
         unrecoverable = []
         ignored = []
+        incomplete = []
+        pending_before: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
         replayable = self._replayable_journal_ops()
         # These may journal a bookkeeping/artifact side effect but do not add
         # durable knowledge that a SQLite recovery must recreate.
@@ -4934,21 +4964,43 @@ class MemoryWikiProvider(MemoryProvider):
             "memory_wiki_backup", "memory_wiki_export_bundle"
         }
         for ev in self._iter_journal_events():
-            if ev.get("_error") or ev.get("phase") != "after":
+            if ev.get("_error"):
+                incomplete.append(ev)
                 continue
             seq = int(ev.get("seq") or 0)
             op = str(ev.get("op") or "")
             if seq <= checkpoint_seq:
                 continue
+            payload_key = json.dumps(ev.get("payload") or {}, ensure_ascii=False, sort_keys=True, default=str)
+            event_key = (op, payload_key)
+            phase = str(ev.get("phase") or "")
+            if phase == "before":
+                pending_before.setdefault(event_key, []).append(ev)
+                continue
+            if phase == "error":
+                if pending_before.get(event_key):
+                    pending_before[event_key].pop(0)
+                # A failing mutation can have committed a partial external or
+                # database side effect. Never assume it is safe to replay over.
+                incomplete.append(ev)
+                continue
+            if phase != "after":
+                incomplete.append(ev)
+                continue
+            if pending_before.get(event_key):
+                pending_before[event_key].pop(0)
             if op in recovery_ignorable:
                 ignored.append(ev)
                 continue
             if op not in replayable:
                 unrecoverable.append(ev)
                 continue
-            candidates.append(ev)
             if max_events and len(candidates) >= max_events:
-                break
+                incomplete.append({"seq": seq, "op": op, "phase": "replay_limit"})
+                continue
+            candidates.append(ev)
+        for pending in pending_before.values():
+            incomplete.extend(pending)
         plan = {
             "apply": apply,
             "checkpoint": str(cp_path) if cp_path else "",
@@ -4958,19 +5010,24 @@ class MemoryWikiProvider(MemoryProvider):
             "unrecoverable_events": len(unrecoverable),
             "unrecoverable_ops": {},
             "ignored_events": len(ignored),
+            "incomplete_events": len(incomplete),
+            "incomplete_ops": {},
         }
         for ev in candidates:
             plan["ops"][ev.get("op")] = plan["ops"].get(ev.get("op"), 0) + 1
         for ev in unrecoverable:
             plan["unrecoverable_ops"][ev.get("op")] = plan["unrecoverable_ops"].get(ev.get("op"), 0) + 1
+        for ev in incomplete:
+            plan["incomplete_ops"][ev.get("op")] = plan["incomplete_ops"].get(ev.get("op"), 0) + 1
         if not apply:
             return plan
-        if unrecoverable:
+        if unrecoverable or incomplete:
+            blocked = [*unrecoverable, *incomplete]
             sample = ", ".join(
-                f"{ev.get('op')}@{ev.get('seq')}" for ev in unrecoverable[:5]
+                f"{ev.get('op')}@{ev.get('seq')}" for ev in blocked[:5]
             )
             raise RuntimeError(
-                "journal contains completed mutations that recovery cannot replay; "
+                "journal contains unrecoverable or incomplete mutations that recovery cannot replay; "
                 f"live database left unchanged ({sample})"
             )
         safety = self._backup("pre-journal-rebuild safety backup") if self.db_path.exists() else {}
