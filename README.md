@@ -1,4 +1,4 @@
-# Hermes Memory Wiki v1.20.9
+# Hermes Memory Wiki v1.20.10
 
 Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 101 MCP tools.
 
@@ -43,6 +43,7 @@ Memory Wiki keeps `secret_index` as its local safe metadata index, but it can no
 - The bridge invokes only `secret_context_search`; it never calls lookup/reveal itself.
 - Disable read-through with `MEMORY_WIKI_SECRET_CONTEXT_BRIDGE=0`.
 - Set an explicit plugin path with `MEMORY_WIKI_SECRET_CONTEXT_PLUGIN=/root/.hermes/plugins/<plugin>/__init__.py`.
+- Automatic plugin discovery stays inside the active Hermes profile. A plugin in a different profile is used only through that explicit path setting.
 
 Plaintext returned intentionally by `secret_context_lookup` can still enter the model's tool history. For login flows, a domain-bound executor that consumes a secret reference directly remains safer than revealing plaintext to the model.
 
@@ -471,6 +472,7 @@ Latency and reindex duration depend on the embedding provider, Qdrant placement,
 
 ## Changelog
 
+- **v1.20.10 (2026-08-28)**: fail-closed journal replay preserves the live database when any replayed event fails; all auxiliary code/document/secret context now crosses the recall guard; quoted and Bearer-style labelled document secrets are fully redacted; secret-context auto-discovery no longer crosses Hermes profile boundaries.
 - **v1.20.9 (2026-08-28)**: document-index lifecycle, provenance, Windows UTF-8 worker and optional-secret prefetch regressions covered; automatic embedding now drains pre-existing pending chunks; health and MCP handshake versions now match `plugin.yaml`; MCP schema refresh now uses a profile runtime cache (never mutating packaged schemas), returns JSON-RPC parse errors, redacts credential-shaped errors, and works from immutable installs; XML DTD/entity declarations and shared `/tmp` debug logs are rejected/removed; cross-platform pytest CI added.
 - **v1.20.8 (2026-08-12)**: docs/contract sync — README 4096-dim contract, `nous` embed provider documented, plugin.yaml version aligned with runtime banner.
 - **r21 (2026-08-11)**: repository-scope hardening + code-claim manifest guard + FTS corruption auto-repair; `pack_context` sees project-scoped code claims with `include_all_projects` opt-in.

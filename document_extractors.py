@@ -76,7 +76,10 @@ _SECRET_ASSIGN_RE = re.compile(
     r"token|токен|секрет|authorization|авторизац(?:ия|ии)|"
     r"private[ _-]?key|приватн(?:ый|ого)[ _-]?ключ|ssh[ _-]?key"
     r")\b\s*(?:[:=|]|[-–—]>?|\s{1,4})\s*)"
-    r"(?P<quote>[\"']?)(?P<value>[^\s|,;\"']{4,})(?P=quote)"
+    r"(?:"
+    r"(?P<quote>[\"'])(?P<quoted>[^\"']{4,})(?P=quote)"
+    r"|(?:bearer\s+)?(?P<bare>[^\s|,;\"']{4,})"
+    r")"
 )
 _PROVIDER_SECRET_PATTERNS = [
     ("openai", re.compile(r"(?<![A-Za-z0-9])[s]k-(?:proj-)?[A-Za-z0-9_-]{16,}")),

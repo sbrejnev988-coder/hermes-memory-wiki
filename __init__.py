@@ -1,4 +1,4 @@
-"""memory-wiki v1.20.9+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.20.10+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -37,7 +37,7 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-PLUGIN_VERSION = "1.20.9"
+PLUGIN_VERSION = "1.20.10"
 
 # HERMES-SECURITY-INTEGRATION-20260728: verified, fixed-file and SHA-256-pinned secret-core loader.
 _SECRET_CORE_AVAILABLE = False
@@ -3393,8 +3393,45 @@ class MemoryWikiProvider(MemoryProvider):
                 f"topic={r.get('topic','')}: {inspected.get('content','')}",
             ))
 
-        trusted_blocks = [block for block in (env_meta, secrets_meta) if block]
-        knowledge_blocks = [block for block in (code_prefetch, document_prefetch) if block]
+        def _guard_auxiliary_block(text: Any, *, source: str, mem_type: str) -> str:
+            """Apply the same fail-closed recall guard to non-claim context."""
+            raw = str(text or "")
+            if not raw:
+                return ""
+            checked = self._inspect_recall_text(
+                raw,
+                source=source,
+                mem_type=mem_type,
+                item_id=source,
+                audit=True,
+                max_len=min(MAX_PREFETCH_CHARS, 24_000),
+            )
+            if checked.get("status") == "safe" and checked.get("content"):
+                return str(checked["content"])
+            diag["quarantined"] += 1
+            diag["auxiliary_quarantined"] += 1
+            if checked.get("status") == "runtime_failure_quarantined":
+                diag["runtime_failures"] += 1
+            if checked.get("guard_disagreement"):
+                diag["guard_disagreements"] += 1
+            return ""
+
+        trusted_blocks = [
+            block
+            for block in (
+                _guard_auxiliary_block(env_meta, source="environment_metadata", mem_type="metadata"),
+                _guard_auxiliary_block(secrets_meta, source="secret_metadata", mem_type="secret_metadata"),
+            )
+            if block
+        ]
+        knowledge_blocks = [
+            block
+            for block in (
+                _guard_auxiliary_block(code_prefetch, source="code_graph_prefetch", mem_type="code_context"),
+                _guard_auxiliary_block(document_prefetch, source="document_graph_prefetch", mem_type="document_context"),
+            )
+            if block
+        ]
         has_safe_payload = bool(claim_blocks or delta_blocks or trusted_blocks or knowledge_blocks)
         anomaly = bool(
             diag["quarantined"] or diag["runtime_failures"] or
@@ -4832,6 +4869,10 @@ class MemoryWikiProvider(MemoryProvider):
                         replayed += 1
                 except Exception as e:
                     failed += 1; errors.append({"seq": ev.get("seq"), "op": op, "error": str(e)})
+            if failed:
+                raise RuntimeError(
+                    f"journal replay failed for {failed} event(s); live database left unchanged"
+                )
             self._rebuild_fts(); self._render_all(); self._render_active_dashboard()
             qc = self._connect().execute("PRAGMA quick_check").fetchone()[0]
             if qc != "ok":

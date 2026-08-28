@@ -137,10 +137,10 @@ def _candidate_files(home: Path) -> Iterable[Path]:
         p = Path(explicit).expanduser()
         yield p / "__init__.py" if p.is_dir() else p
         return
+    # Hermes profiles are intentionally isolated.  Cross-profile discovery can
+    # import inactive-profile plugin code into the current provider; callers who
+    # intentionally need a non-default location must set the explicit path above.
     roots = [home / "plugins"]
-    profiles = home / "profiles"
-    if profiles.is_dir():
-        roots.extend(p / "plugins" for p in profiles.iterdir() if p.is_dir())
     for root in roots:
         if not root.is_dir():
             continue
