@@ -180,9 +180,22 @@ def main() -> int:
             error_response(None, -32700, "Parse error")
             continue
 
+        if not isinstance(request, dict):
+            error_response(None, -32600, "Invalid Request")
+            continue
         message_id = request.get("id")
         method = request.get("method")
-        params = request.get("params") or {}
+        if not isinstance(method, str) or not method:
+            error_response(message_id, -32600, "Invalid Request")
+            continue
+        raw_params = request.get("params")
+        if raw_params is None:
+            params = {}
+        elif not isinstance(raw_params, dict):
+            error_response(message_id, -32602, "Invalid params")
+            continue
+        else:
+            params = raw_params
         try:
             if method == "initialize":
                 send({
@@ -209,6 +222,9 @@ def main() -> int:
                     error_response(message_id, -32601, f"Unknown tool: {tool_name}")
                     continue
                 arguments = params.get("arguments") or {}
+                if not isinstance(arguments, dict):
+                    error_response(message_id, -32602, "Invalid params")
+                    continue
                 result = ensure_plugin().handle_tool_call(plugin_name(tool_name), arguments)
                 text = (
                     json.dumps(result, ensure_ascii=False, default=str)

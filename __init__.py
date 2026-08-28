@@ -37,7 +37,25 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-PLUGIN_VERSION = "1.20.10"
+PLUGIN_VERSION = "1.20.11"
+_INTEGRITY_HASH_FIELDS = frozenset({
+    "hash", "content_hash", "old_content_hash", "new_content_hash", "file_hash",
+    "text_hash", "anchor_hash", "snapshot_hash", "payload_hash",
+})
+_INTEGRITY_SHA256_RE = re.compile(r"(?:sha256:)?[0-9a-fA-F]{64}")
+_GIT_COMMIT_RE = re.compile(r"[0-9a-fA-F]{7,64}")
+
+
+def _is_integrity_identifier(field: str, value: Any) -> bool:
+    """Allow listed non-secret identifiers must survive journal serialization."""
+    if not isinstance(value, str):
+        return False
+    candidate = value.strip()
+    if str(field).lower() == "commit_sha":
+        return bool(_GIT_COMMIT_RE.fullmatch(candidate))
+    return str(field).lower() in _INTEGRITY_HASH_FIELDS and bool(
+        _INTEGRITY_SHA256_RE.fullmatch(candidate)
+    )
 
 # HERMES-SECURITY-INTEGRATION-20260728: verified, fixed-file and SHA-256-pinned secret-core loader.
 _SECRET_CORE_AVAILABLE = False
@@ -1923,6 +1941,11 @@ try:
     import fcntl  # POSIX advisory locks; unavailable on some non-Unix runtimes.
 except Exception:  # pragma: no cover - Android/proot normally has fcntl, fallback stays safe intra-process.
     fcntl = None
+
+try:
+    import msvcrt  # Windows byte-range locks for inter-process journal serialization.
+except Exception:  # pragma: no cover - unavailable outside Windows.
+    msvcrt = None
 
 try:
     from agent.memory_provider import MemoryProvider
@@ -4477,26 +4500,41 @@ class MemoryWikiProvider(MemoryProvider):
                 pass
         return copied
 
+    @staticmethod
+    def _nonmutating_journal_tools() -> set[str]:
+        """Tool calls that neither change durable knowledge nor need replay."""
+        return {
+            "memory_wiki_query", "memory_wiki_query_secrets", "memory_wiki_recall_plan",
+            "memory_wiki_active_dashboard", "memory_wiki_list_backups", "memory_wiki_dashboard",
+            "memory_wiki_get_page", "memory_wiki_graph_query", "memory_wiki_pack_context",
+            "memory_wiki_memory_diff", "memory_wiki_preference_layer", "memory_wiki_health",
+            "memory_wiki_evaluate_retrieval", "memory_wiki_explain_recall", "memory_wiki_lint_claim",
+            "memory_wiki_why_believe", "memory_wiki_secret_quarantine", "memory_wiki_recent_changes",
+            "memory_wiki_get_project_context", "memory_wiki_source_policy", "memory_wiki_export",
+            "memory_wiki_audit_log", "memory_wiki_mutation_log", "memory_wiki_journal_status",
+            "memory_wiki_semantic_status", "memory_wiki_debug_search", "memory_wiki_compare_search",
+            "memory_wiki_query_mode", "memory_wiki_decay_scan", "memory_wiki_decay_stats",
+            "memory_wiki_context_sanitize", "memory_wiki_is_social_close",
+            "memory_wiki_summarize_topic", "memory_wiki_claim_history", "memory_wiki_secrecy_report",
+            "memory_wiki_document_query", "memory_wiki_document_source", "memory_wiki_document_unit_context",
+            "memory_wiki_document_neighbors", "memory_wiki_document_status",
+            "memory_wiki_code_graph_status", "memory_wiki_code_graph_query", "memory_wiki_code_line_context",
+            "memory_wiki_code_graph_neighbors", "memory_wiki_code_claim_query", "memory_wiki_symbol_history",
+            "memory_wiki_repository_context",
+        }
+
     def _should_journal_tool(self, tool_name: str, args: Dict[str, Any]) -> bool:
         """Journal durable mutations, not ordinary reads or dry-run suggestions."""
         if not str(tool_name or "").startswith("memory_wiki_"):
             return False
-        read_only = {
-            "memory_wiki_query", "memory_wiki_query_secrets", "memory_wiki_recall_plan", "memory_wiki_active_dashboard",
-            "memory_wiki_doctor", "memory_wiki_list_backups", "memory_wiki_dashboard", "memory_wiki_get_page",
-            "memory_wiki_health", "memory_wiki_evaluate_retrieval", "memory_wiki_explain_recall", "memory_wiki_lint_claim",
-            "memory_wiki_why_believe", "memory_wiki_secret_quarantine", "memory_wiki_recent_changes",
-            "memory_wiki_memory_diff", "memory_wiki_preference_layer", "memory_wiki_get_project_context",
-            "memory_wiki_source_policy", "memory_wiki_export", "memory_wiki_audit_log", "memory_wiki_mutation_log",
-            "memory_wiki_journal_status",
-            "memory_wiki_document_query", "memory_wiki_document_source", "memory_wiki_document_unit_context",
-            "memory_wiki_document_neighbors", "memory_wiki_document_status",
-        }
+        read_only = self._nonmutating_journal_tools()
         if tool_name in read_only:
             return False
         if tool_name == "memory_wiki_rebuild_from_journal":
             return False
         if tool_name == "memory_wiki_journal_checkpoint":
+            return False
+        if tool_name == "memory_wiki_doctor" and not bool(args.get("repair", False)):
             return False
         if tool_name == "memory_wiki_repair" and bool(args.get("dry_run", True)):
             return False
@@ -4530,7 +4568,14 @@ class MemoryWikiProvider(MemoryProvider):
         atomic_write(path, json.dumps({"id":sid,"op":op,"payload":payload,"created_at":ts,"last_io_error":self._last_io_error}, ensure_ascii=False, indent=2) + "\n")
         return str(path)
 
-    def _json_safe(self, obj: Any, max_chars: int = 12000) -> Any:
+    def _json_safe(
+        self,
+        obj: Any,
+        max_chars: int = 12000,
+        *,
+        redact_value_fields: bool = True,
+        preserve_sha256_fields: bool = False,
+    ) -> Any:
         """Return a deterministic, redacted, JSON-serializable value for journal/backups."""
         if isinstance(obj, sqlite3.Row):
             obj = self._sanitize_row(obj)
@@ -4540,13 +4585,36 @@ class MemoryWikiProvider(MemoryProvider):
             out: Dict[str, Any] = {}
             for k, v in obj.items():
                 key = str(k)
-                if key.lower() in ("value", "password", "token", "api_key", "private_key"):
+                key_lower = key.lower()
+                if (
+                    preserve_sha256_fields
+                    and _is_integrity_identifier(key_lower, v)
+                ):
+                    # Content hashes are non-secret integrity identifiers. Keeping
+                    # them intact is necessary to replay code-linked mutations.
+                    out[key] = v.strip()
+                elif key_lower in ("password", "token", "api_key", "private_key") or (
+                    redact_value_fields and key.lower() == "value"
+                ):
                     out[key] = "<redacted>" if v else ""
                 else:
-                    out[key] = self._json_safe(v, max_chars)
+                    out[key] = self._json_safe(
+                        v,
+                        max_chars,
+                        redact_value_fields=redact_value_fields,
+                        preserve_sha256_fields=preserve_sha256_fields,
+                    )
             return out
         if isinstance(obj, (list, tuple, set)):
-            return [self._json_safe(v, max_chars) for v in list(obj)[:500]]
+            return [
+                self._json_safe(
+                    v,
+                    max_chars,
+                    redact_value_fields=redact_value_fields,
+                    preserve_sha256_fields=preserve_sha256_fields,
+                )
+                for v in list(obj)[:500]
+            ]
         if isinstance(obj, bytes):
             return "<bytes:%d>" % len(obj)
         if isinstance(obj, (int, float, bool)) or obj is None:
@@ -4590,10 +4658,33 @@ class MemoryWikiProvider(MemoryProvider):
         self.journal_checkpoints_dir.mkdir(parents=True, exist_ok=True)
         ts = now()
         with self._lock:
-            lock_fh = open(self.journal_lock_path, "a+", encoding="utf-8")
+            # This lock protects journal meta's seq/hash read-modify-write cycle.
+            # RLock alone only serializes threads in this provider instance; use an
+            # OS-level lock so independent Hermes/Desktop/MCP processes cannot emit
+            # duplicate sequences or fork the hash chain on Windows.
+            lock_fh = open(self.journal_lock_path, "a+b")
+            lock_kind = ""
             try:
                 if fcntl is not None:
                     fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+                    lock_kind = "fcntl"
+                elif msvcrt is not None:
+                    lock_fh.seek(0, os.SEEK_END)
+                    if lock_fh.tell() == 0:
+                        lock_fh.write(b"\0")
+                        lock_fh.flush()
+                        os.fsync(lock_fh.fileno())
+                    deadline = time.monotonic() + 15.0
+                    while True:
+                        try:
+                            lock_fh.seek(0)
+                            msvcrt.locking(lock_fh.fileno(), msvcrt.LK_NBLCK, 1)
+                            lock_kind = "msvcrt"
+                            break
+                        except OSError:
+                            if time.monotonic() >= deadline:
+                                raise RuntimeError("timed out acquiring inter-process journal lock")
+                            time.sleep(0.025)
                 meta = self._read_journal_meta()
                 seq = int(meta.get("seq") or 0) + 1
                 prev_hash = str(meta.get("last_hash") or "")
@@ -4603,7 +4694,7 @@ class MemoryWikiProvider(MemoryProvider):
                     "ts": ts,
                     "phase": phase,
                     "op": short(op, 120),
-                    "payload": self._json_safe(payload),
+                    "payload": self._json_safe(payload, preserve_sha256_fields=True),
                     "result": self._json_safe(result or {}),
                     "error": short(redact_secrets(error), 1200) if error else "",
                     "prev_hash": prev_hash,
@@ -4624,8 +4715,11 @@ class MemoryWikiProvider(MemoryProvider):
                 return {"seq": seq, "hash": event_hash, "path": str(self.journal_path)}
             finally:
                 try:
-                    if fcntl is not None:
+                    if lock_kind == "fcntl":
                         fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+                    elif lock_kind == "msvcrt":
+                        lock_fh.seek(0)
+                        msvcrt.locking(lock_fh.fileno(), msvcrt.LK_UNLCK, 1)
                 finally:
                     lock_fh.close()
 
@@ -4699,6 +4793,12 @@ class MemoryWikiProvider(MemoryProvider):
             "source_policies", "preference_rules", "secret_index", "post_task_log", "backups", "decisions", "mistakes",
             "project_profiles", "task_capsules", "entities", "relations", "recall_events", "topic_aliases",
             "source_artifacts", "retrieval_eval_cases", "secret_quarantine", "sync_bundles", "audit_log",
+            # Durable code/document graph records are not derivable from claims alone.
+            # FTS tables are intentionally excluded: they are rebuilt from these rows.
+            "code_claim_metadata", "code_graph_repositories", "code_graph_files", "code_graph_symbols",
+            "code_graph_chunks", "code_graph_lines", "code_graph_edges", "code_graph_events",
+            "document_graph_meta", "document_sources", "document_revisions", "document_units",
+            "document_chunks", "document_edges", "document_events",
         ]
 
     def _file_sha256(self, path: Path) -> str:
@@ -4727,11 +4827,18 @@ class MemoryWikiProvider(MemoryProvider):
                     d = dict(r)
                     for k, v in list(d.items()):
                         if isinstance(v, str):
-                            d[k] = redact_secrets(scrub_memory_artifacts(v))
+                            d[k] = v.strip() if _is_integrity_identifier(str(k), v) else redact_secrets(scrub_memory_artifacts(v))
                     if table == "secret_index":
                         d["value"] = ""
                         d["value_redacted_in_checkpoint"] = True
-                    rows.append(self._json_safe(d, 16000))
+                    rows.append(
+                        self._json_safe(
+                            d,
+                            16000,
+                            redact_value_fields=False,
+                            preserve_sha256_fields=True,
+                        )
+                    )
                 tables[table] = rows
                 counts[table] = len(rows)
             except Exception as e:
@@ -4806,7 +4913,7 @@ class MemoryWikiProvider(MemoryProvider):
             "memory_wiki_immune_scan", "memory_wiki_compress_topic", "memory_wiki_resolve_by_policy",
             "memory_wiki_repair", "memory_wiki_write_firewall", "memory_wiki_undo_last", "memory_wiki_transaction",
             "memory_wiki_compile_topic", "memory_wiki_import_bundle", "memory_wiki_scrub_secrets",
-            "memory_wiki_migrate_secrets_from_claims",
+            "memory_wiki_migrate_secrets_from_claims", "memory_wiki_code_claim_add",
         }
 
     def _rebuild_from_journal(self, apply: bool = False, checkpoint: str = "", max_events: int = 0) -> Dict[str, Any]:
@@ -4818,22 +4925,54 @@ class MemoryWikiProvider(MemoryProvider):
             checkpoint_payload = json.loads(cp_path.read_text(encoding="utf-8"))
             checkpoint_seq = int(checkpoint_payload.get("journal_seq") or 0)
         candidates = []
+        unrecoverable = []
+        ignored = []
         replayable = self._replayable_journal_ops()
+        # These may journal a bookkeeping/artifact side effect but do not add
+        # durable knowledge that a SQLite recovery must recreate.
+        recovery_ignorable = self._nonmutating_journal_tools() | {
+            "memory_wiki_backup", "memory_wiki_export_bundle"
+        }
         for ev in self._iter_journal_events():
             if ev.get("_error") or ev.get("phase") != "after":
                 continue
             seq = int(ev.get("seq") or 0)
             op = str(ev.get("op") or "")
-            if seq <= checkpoint_seq or op not in replayable:
+            if seq <= checkpoint_seq:
+                continue
+            if op in recovery_ignorable:
+                ignored.append(ev)
+                continue
+            if op not in replayable:
+                unrecoverable.append(ev)
                 continue
             candidates.append(ev)
             if max_events and len(candidates) >= max_events:
                 break
-        plan = {"apply": apply, "checkpoint": str(cp_path) if cp_path else "", "checkpoint_seq": checkpoint_seq, "events_to_replay": len(candidates), "ops": {}}
+        plan = {
+            "apply": apply,
+            "checkpoint": str(cp_path) if cp_path else "",
+            "checkpoint_seq": checkpoint_seq,
+            "events_to_replay": len(candidates),
+            "ops": {},
+            "unrecoverable_events": len(unrecoverable),
+            "unrecoverable_ops": {},
+            "ignored_events": len(ignored),
+        }
         for ev in candidates:
             plan["ops"][ev.get("op")] = plan["ops"].get(ev.get("op"), 0) + 1
+        for ev in unrecoverable:
+            plan["unrecoverable_ops"][ev.get("op")] = plan["unrecoverable_ops"].get(ev.get("op"), 0) + 1
         if not apply:
             return plan
+        if unrecoverable:
+            sample = ", ".join(
+                f"{ev.get('op')}@{ev.get('seq')}" for ev in unrecoverable[:5]
+            )
+            raise RuntimeError(
+                "journal contains completed mutations that recovery cannot replay; "
+                f"live database left unchanged ({sample})"
+            )
         safety = self._backup("pre-journal-rebuild safety backup") if self.db_path.exists() else {}
         original_db = self.db_path
         original_conn = self._conn

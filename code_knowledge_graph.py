@@ -42,6 +42,12 @@ _CODE_HINT = re.compile(
     re.IGNORECASE,
 )
 _TOKEN_RE = re.compile(r"[\w./:@#$+-]+", re.UNICODE)
+_PEM_BLOCK_RE = re.compile(
+    r"-----BEGIN (?P<label>[A-Z0-9][A-Z0-9 _-]{0,79})-----"
+    r"[\s\S]{0,200000}?"
+    r"-----END (?P=label)-----",
+    re.IGNORECASE,
+)
 
 
 def _now() -> int:
@@ -86,6 +92,9 @@ def _canonical_path(path: str) -> str:
 def _clean_text(value: Any, limit: int = 12000) -> str:
     text = str(value or "").replace("\x00", "")
     # The exporter already redacts likely secrets. Fail closed for common key forms.
+    # PEM blocks are often multiline and do not have assignment syntax, so redact
+    # them before materializing code text in SQLite/FTS or derived checkpoints.
+    text = _PEM_BLOCK_RE.sub("<REDACTED_PEM_BLOCK>", text)
     text = re.sub(
         r"(?i)\b(api[_-]?key|token|password|passwd|secret|authorization)\b\s*[:=]\s*"
         r"([\"']?)[^\s,;\"']{8,}\2",
