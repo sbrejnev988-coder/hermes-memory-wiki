@@ -18,7 +18,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         python-version: ["3.11"]
     env:
-      HERMES_HOME: ${{ runner.temp }}/memory-wiki-ci
+      HERMES_HOME: .hermes-ci
       HERMES_SECURITY_STRICT: "0"
       MEMORY_WIKI_SEMANTIC: "0"
       MEMORY_WIKI_DOCUMENT_AUTO_SCAN_CACHE: "0"
