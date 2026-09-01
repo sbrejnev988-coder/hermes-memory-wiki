@@ -933,8 +933,10 @@ if RERANK_API_STYLE == "auto":
 # bounded candidate set to control latency, cost and prompt-injection exposure.
 RERANK_TOP_K = _rerank_env_int("MEMORY_WIKI_RERANK_TOP_K", 30, 5, 100)
 RERANK_MIN_CANDIDATES = _rerank_env_int("MEMORY_WIKI_RERANK_MIN_CANDIDATES", 8, 3, RERANK_TOP_K)
-# The external provider gets 8s from Hermes. Keep one rerank attempt inside a 3s hard cap.
-RERANK_TIMEOUT = min(3.0, _rerank_env_float("MEMORY_WIKI_RERANK_TIMEOUT", 3.0, 0.25, 3.0))
+# Keep a rerank attempt inside the prompt-time budget while honoring the supported
+# four-second configuration ceiling. The network helper trims this further when a
+# shorter prefetch deadline is active.
+RERANK_TIMEOUT = _rerank_env_float("MEMORY_WIKI_RERANK_TIMEOUT", 3.0, 0.25, 4.0)
 RERANK_CACHE_TTL = _rerank_env_int("MEMORY_WIKI_RERANK_CACHE_TTL", 1800, 0, 86400)
 RERANK_CACHE_MAX = _rerank_env_int("MEMORY_WIKI_RERANK_CACHE_MAX", 256, 16, 4096)
 RERANK_CIRCUIT_FAILURES = _rerank_env_int("MEMORY_WIKI_RERANK_CIRCUIT_FAILURES", 3, 1, 20)
@@ -8312,7 +8314,18 @@ class MemoryWikiProvider(MemoryProvider):
             for row in prefix
         ]
         rerank_query = _build_rerank_query(q, query_mode)
-        document_fingerprint = sha("\n---candidate---\n".join(documents))
+        # Cached rerank results are attached by stable row ID, so the cache key must
+        # represent the candidate *set* rather than the incidental retrieval order.
+        # FTS/Qdrant ties can legitimately arrive in a different order on a repeated
+        # query; hashing that order used to cause needless remote rerank requests.
+        canonical_documents = sorted(
+            (str(row.get("id") or ""), document)
+            for row, document in zip(prefix, documents)
+        )
+        document_fingerprint = sha("\n---candidate---\n".join(
+            f"id={candidate_id}\n{document}"
+            for candidate_id, document in canonical_documents
+        ))
         cache_seed = "\n".join((
             f"model={RERANK_MODEL}",
             f"url={RERANK_URL}",
@@ -8551,7 +8564,7 @@ class MemoryWikiProvider(MemoryProvider):
         _debug_log(f"SEMANTIC hydrated={hydrated} requested={len(claim_ids)}")
         return hydrated
 
-    def _search(self, query: str, limit=10, include_stale=True, topic: Optional[str]=None, session_id: str="", retrieval_mode: str="hybrid", record_retrieval: bool=True, include_all_projects: bool=False) -> List[Dict[str, Any]]:
+    def _search(self, query: str, limit=10, include_stale=True, topic: Optional[str]=None, session_id: str="", retrieval_mode: str="hybrid", record_retrieval: bool=True, include_all_projects: bool=False, apply_rerank: bool=True) -> List[Dict[str, Any]]:
         limit = max(1, min(int(limit or 10), 50)); q = query or ""; qt = tokens(q); c = self._connect()
         retrieval_mode = str(retrieval_mode or "hybrid").strip().lower()
         if retrieval_mode not in {"hybrid", "fts", "vector"}:
@@ -8689,7 +8702,7 @@ class MemoryWikiProvider(MemoryProvider):
             score = sum(parts.values())
             d = self._sanitize_row(r); d["score"] = round(score, 4); d["score_parts"] = {k: round(v,4) for k,v in parts.items() if abs(v) > 0.0001}; scored.append(d)
         scored.sort(key=lambda x: x["score"], reverse=True)
-        if retrieval_mode == "hybrid" and not _prefetch_budget_expired(0.20):
+        if retrieval_mode == "hybrid" and apply_rerank and not _prefetch_budget_expired(0.20):
             scored = self._rerank_rows(q, scored, query_mode)
         scored = self._apply_diversity(scored, query_mode)
         ids = [x["id"] for x in scored[:limit]]

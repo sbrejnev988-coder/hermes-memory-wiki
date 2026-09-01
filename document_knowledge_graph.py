@@ -1926,8 +1926,12 @@ def query_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
         # Document queries apply their own source/scope filters after claim lookup.
         # Permit the selected project scope even when it differs from the current
         # chat project, while ordinary Memory-Wiki recall remains scope-restricted.
+        # This lookup only maps semantic claim hits back to document chunks. It must
+        # not mutate claim recall statistics or spend a second remote rerank before
+        # the document-candidate rerank below.
         semantic = provider._search(query, limit=min(candidate_limit, 80), include_stale=False, topic=_TOPIC,
-                                    session_id=str(args.get("session_id") or ""), include_all_projects=True)
+                                    session_id=str(args.get("session_id") or ""), include_all_projects=True,
+                                    record_retrieval=False, apply_rerank=False)
         claim_ids = [str(r.get("id") or "") for r in semantic if str(r.get("id") or "")]
         if claim_ids:
             placeholders = ",".join("?" for _ in claim_ids)
@@ -1970,17 +1974,37 @@ def query_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     reranked = False; rerank_error = ""
     if len(candidates) >= 3 and _env_bool("MEMORY_WIKI_DOCUMENT_RERANK", True) and hasattr(provider, "_rerank_rows"):
         pseudo = []; mapping: Dict[str, Dict[str, Any]] = {}
-        for idx, item in enumerate(candidates):
-            rid = f"docgraph:{idx}:{item.get('candidate_type')}:{item.get('id')}"
+        for item in candidates:
+            candidate_type = str(item.get("candidate_type") or "document")
+            candidate_id = str(item.get("id") or "")
+            # Stable IDs let the provider cache survive harmless FTS/Qdrant tie-order
+            # changes between otherwise identical document queries.
+            rid = f"docgraph:{candidate_type}:{candidate_id}"
             pseudo.append({"id": rid, "claim": item.get("embedding_text") or item.get("excerpt") or "",
                            "status": "active", "risk": "low", "trust_class": "document",
                            "score": item["score"], "score_parts": {}, "updated_at": int(item.get("updated_at") or 0)})
             mapping[rid] = item
         try:
             rr = provider._rerank_rows(query, pseudo, "technical")
-            ordered = [mapping[str(r.get("id"))] for r in rr if str(r.get("id")) in mapping]
-            used = {id(x) for x in ordered}; ordered.extend(x for x in candidates if id(x) not in used)
-            candidates = ordered; reranked = any("rerank_rank" in r for r in rr)
+            ordered: List[Dict[str, Any]] = []
+            used_rids = set()
+            for row in rr:
+                rid = str(row.get("id") or "")
+                item = mapping.get(rid)
+                if not item or rid in used_rids:
+                    continue
+                enriched = dict(item)
+                for field in ("rerank_rank", "rerank_score"):
+                    if field in row:
+                        enriched[field] = row[field]
+                ordered.append(enriched)
+                used_rids.add(rid)
+            ordered.extend(item for rid, item in mapping.items() if rid not in used_rids)
+            candidates = ordered
+            reranked = any(
+                "rerank_rank" in row and str(row.get("id") or "") in mapping
+                for row in rr
+            )
         except Exception as exc:
             rerank_error = f"{type(exc).__name__}: {exc}"
     return {

@@ -14,7 +14,7 @@ os.environ["MEMORY_WIKI_RERANK_ENABLED"] = "1"
 os.environ["MEMORY_WIKI_RERANK_API_KEY"] = "test-only"
 os.environ["MEMORY_WIKI_RERANK_MIN_CANDIDATES"] = "3"
 os.environ["MEMORY_WIKI_RERANK_TOP_K"] = "5"
-os.environ["MEMORY_WIKI_RERANK_TIMEOUT"] = "9"
+os.environ["MEMORY_WIKI_RERANK_TIMEOUT"] = "4"
 os.environ["MEMORY_WIKI_RERANK_RETRY_COUNT"] = "4"
 os.environ["MEMORY_WIKI_PREFETCH_DEADLINE_SECONDS"] = "5.5"
 os.environ["MEMORY_WIKI_EMBED_PROVIDER"] = "openrouter"
@@ -66,7 +66,7 @@ def sample_rows() -> list[dict]:
 def test_runtime_caps() -> None:
     assert 5.0 <= mod.PREFETCH_DEADLINE_SECONDS <= 6.0
     assert mod.RERANK_RETRY_COUNT == 1
-    assert mod.RERANK_TIMEOUT <= 3.0
+    assert mod.RERANK_TIMEOUT == 4.0
 
 
 def test_health_stale_while_revalidate() -> None:
@@ -156,6 +156,57 @@ def test_reranker_timeout_is_single_attempt_and_fail_open() -> None:
     assert 0 < calls[0] <= 0.45
 
 
+def test_reranker_cache_uses_candidate_set_not_input_order() -> None:
+    provider = mod.MemoryWikiProvider()
+    rows = sample_rows()
+    calls = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps({
+                "results": [
+                    {"index": index, "relevance_score": 1.0 - index / 10.0}
+                    for index in range(len(rows))
+                ],
+                "usage": {"cost": 0.01, "search_units": len(rows)},
+            }).encode("utf-8")
+
+    def fake_urlopen(_request, timeout=0):
+        calls.append(float(timeout))
+        return Response()
+
+    original_urlopen = mod.urllib.request.urlopen
+    original_stats = dict(mod._RERANK_STATS)
+    original_enabled = mod.RERANK_ENABLED
+    mod.urllib.request.urlopen = fake_urlopen
+    mod._RERANK_CACHE.clear()
+    mod._RERANK_STATS.update({
+        "requests": 0, "successes": 0, "failures": 0, "cache_hits": 0,
+        "skipped": 0, "search_units": 0, "cost_usd": 0.0,
+        "last_latency_ms": 0, "last_error": "",
+    })
+    setattr(mod, "RERANK_ENABLED", True)
+    try:
+        first = provider._rerank_rows("Explain cache stability", rows, "semantic")
+        second = provider._rerank_rows("Explain cache stability", list(reversed(rows)), "semantic")
+        assert len(calls) == 1
+        assert mod._RERANK_STATS["cache_hits"] == 1
+        assert [row["id"] for row in second] == [row["id"] for row in first]
+        assert all("rerank_rank" in row for row in second)
+    finally:
+        mod.urllib.request.urlopen = original_urlopen
+        mod._RERANK_CACHE.clear()
+        mod._RERANK_STATS.clear()
+        mod._RERANK_STATS.update(original_stats)
+        setattr(mod, "RERANK_ENABLED", original_enabled)
+
+
 def test_trusted_preferences_are_real_system_prompt_content() -> None:
     with tempfile.TemporaryDirectory(prefix="mw-pref-system-") as tmp:
         root = Path(tmp)
@@ -197,6 +248,7 @@ def main() -> None:
         test_hybrid_failure_falls_back_to_local_fts,
         test_prefetch_row_fixture_matches_current_renderer_contract,
         test_reranker_timeout_is_single_attempt_and_fail_open,
+        test_reranker_cache_uses_candidate_set_not_input_order,
         test_trusted_preferences_are_real_system_prompt_content,
     ]
     for test in tests:

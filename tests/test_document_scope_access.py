@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -35,6 +36,14 @@ def test_document_status_and_source_lookup_cannot_cross_provider_scope() -> None
     module = load_module()
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
+    access_keys = (
+        "MEMORY_WIKI_DOCUMENT_ACCESS_SCOPE_ID",
+        "MEMORY_WIKI_DOCUMENT_ACCESS_REPOSITORY_ID",
+        "MEMORY_WIKI_DOCUMENT_ALLOW_CROSS_SCOPE",
+    )
+    prior_env = {key: os.environ.get(key) for key in access_keys}
+    for key in access_keys:
+        os.environ[key] = ""
     try:
         provider = Provider(conn)
         module.install_document_graph_schema(conn)
@@ -88,6 +97,11 @@ def test_document_status_and_source_lookup_cannot_cross_provider_scope() -> None
             else:
                 raise AssertionError("cross-scope source operation was allowed")
     finally:
+        for key, value in prior_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         conn.close()
 
 

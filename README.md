@@ -68,7 +68,7 @@ Plaintext returned intentionally by `secret_context_lookup` can still enter the 
 | `MEMORY_WIKI_QDRANT_COLLECTION` | `memory_wiki_claims` | Collection name prefix |
 | `MEMORY_WIKI_VECTOR_SIZE` | `4096` | Qdrant vector size; the local stub and provider response are validated against it |
 | `MEMORY_WIKI_RERANK_ENABLED` | `false` | Enable second-stage reranking |
-| `MEMORY_WIKI_RERANK_TIMEOUT` | `3.0` | Per-request rerank timeout; runtime hard-caps it at 3 seconds |
+| `MEMORY_WIKI_RERANK_TIMEOUT` | `3.0` | Per-request rerank timeout; accepts 0.25–4.0 seconds and is additionally trimmed by a shorter active prefetch budget |
 | `MEMORY_WIKI_RERANK_RETRY_COUNT` | `1` | Compatibility setting; prompt-time reranking is always single-attempt |
 | `MEMORY_WIKI_RERANK_MODEL` | `voyageai/rerank-2.5` | Reranker model ID |
 | `MEMORY_WIKI_RERANK_API_STYLE` | `auto` | `openrouter` or direct `voyage` payload style |
