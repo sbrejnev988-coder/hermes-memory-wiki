@@ -2,7 +2,7 @@
 
 The bridge never persists or intentionally exposes plaintext secrets. It first
 tries the installed plugin search handler, then independently reads safe metadata
-from ``~/.hermes/vault/secrets_registry.json`` so a SQLite-only plugin index cannot
+from ``~/.hermes/secret-vault/secrets_registry.json`` so a SQLite-only plugin index
 make vault-only records invisible.
 """
 from __future__ import annotations
@@ -292,6 +292,22 @@ def _pick(item: Dict[str, Any], *keys: str, default: Any = "") -> Any:
     return default
 
 
+def _safe_policy_metadata(value: Any) -> Dict[str, Any]:
+    """Permit only executor/approval policy through the read-through bridge."""
+    if not isinstance(value, dict):
+        return {"allowed_executors": [], "require_user_approval": True}
+    raw_executors = value.get("allowed_executors")
+    if isinstance(raw_executors, (list, tuple, set)):
+        executors = [_redact_string(item, 64) for item in list(raw_executors)[:50]]
+        executors = [item for item in executors if item]
+    else:
+        executors = []
+    return {
+        "allowed_executors": list(dict.fromkeys(executors)),
+        "require_user_approval": bool(value.get("require_user_approval", True)),
+    }
+
+
 def _normalize_match(raw: Any) -> Optional[Dict[str, Any]]:
     if isinstance(raw, str):
         raw = {"context_key": raw, "name": raw}
@@ -305,16 +321,19 @@ def _normalize_match(raw: Any) -> Optional[Dict[str, Any]]:
         return None
     secret_id = str(_pick(safe, "secret_id", "id", default="")).strip()
     stable_id = secret_id if secret_id.startswith("sec_") else "ctx_" + hashlib.sha256(lookup_key.encode("utf-8", "replace")).hexdigest()[:12]
-    subject = _redact_string(_pick(safe, "subject", "service", "server", "name", default=lookup_key), 300)
-    scope = _redact_string(_pick(safe, "scope", "namespace", "environment", "context_key", default=lookup_key), 300)
-    locator = _redact_string(_pick(safe, "locator", "host", "url", "endpoint"), 500)
-    purpose = _redact_string(_pick(safe, "purpose", "description"), 500)
+    # Read-through results may come from an older plugin. Treat only its stable
+    # reference and explicitly allowed policy as metadata; hosts, logins, target
+    # locators and descriptions never cross into Memory Wiki/model context.
+    subject = lookup_key
+    scope = lookup_key
+    locator = ""
+    purpose = ""
     secret_type = _redact_string(_pick(safe, "secret_type", "type", default="credential"), 80)
-    username = _redact_string(_pick(safe, "username", "user", "login", "email"), 300)
+    username = ""
     origin = _redact_string(_pick(safe, "origin", default="secret_context"), 80)
     source = _redact_string(_pick(safe, "source", default="secret_context_plugin"), 120)
     aliases = safe.get("aliases") if isinstance(safe.get("aliases"), list) else []
-    policy = safe.get("policy") if isinstance(safe.get("policy"), dict) else {}
+    policy = _safe_policy_metadata(safe.get("policy"))
     return {
         "id": stable_id,
         "lookup_key": lookup_key,
@@ -363,7 +382,8 @@ def search_safe_secret_context(query: str, limit: int = 10, home: Optional[Path]
                 dedup = (str(item.get("lookup_key") or ""), str(item.get("id") or ""))
                 if dedup in seen:
                     continue
-                seen.add(dedup); out.append(item)
+                seen.add(dedup)
+                out.append(item)
                 if len(out) >= limit:
                     return out
 
@@ -380,7 +400,8 @@ def search_safe_secret_context(query: str, limit: int = 10, home: Optional[Path]
         dedup = (str(item.get("lookup_key") or ""), str(item.get("id") or ""))
         if dedup in seen:
             continue
-        seen.add(dedup); out.append(item)
+        seen.add(dedup)
+        out.append(item)
         if len(out) >= limit:
             break
     return out

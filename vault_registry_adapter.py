@@ -1,9 +1,8 @@
-"""Safe adapter for Hermes plaintext secret registries.
+"""Safe adapter for Hermes metadata-only secret registries.
 
-Search operations expose only metadata. Exact lookup may return the original
-record and is intended only for the dedicated ``secret_context_lookup`` tool.
-Nothing in this module writes to SQLite, FTS, Qdrant, logs, or markdown.
-"""
+Search and exact lookup expose only safe identifiers and policy metadata. Nothing
+in this module writes to SQLite, FTS, Qdrant, logs, or markdown, and it never
+returns a private registry field."""
 from __future__ import annotations
 
 import hashlib
@@ -13,7 +12,7 @@ import re
 import stat
 import threading
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 _MAX_REGISTRY_BYTES = 16 * 1024 * 1024
 _CACHE_LOCK = threading.RLock()
@@ -73,7 +72,14 @@ def _truthy(name: str, default: bool = False) -> bool:
 
 
 def _home(home: Optional[Path] = None) -> Path:
-    return Path(home or os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")).expanduser()
+    if home is not None:
+        return Path(home).expanduser()
+    configured = os.environ.get("HERMES_HOME")
+    if configured:
+        return Path(configured).expanduser()
+    if os.name == "nt" and os.environ.get("LOCALAPPDATA"):
+        return Path(os.environ["LOCALAPPDATA"]) / "hermes"
+    return Path.home() / ".hermes"
 
 
 def registry_path(home: Optional[Path] = None) -> Path:
@@ -84,7 +90,10 @@ def registry_path(home: Optional[Path] = None) -> Path:
         or os.environ.get("HERMES_VAULT_REGISTRY")
         or ""
     ).strip()
-    return Path(explicit).expanduser() if explicit else _home(home) / "vault" / "secrets_registry.json"
+    # The new DPAPI store owns a separate metadata-only registry. Legacy
+    # $HERMES_HOME/vault registries are never read implicitly because they may
+    # predate the no-plaintext registry contract.
+    return Path(explicit).expanduser() if explicit else _home(home) / "secret-vault" / "secrets_registry.json"
 
 
 def _is_sensitive_key(key: Any) -> bool:
@@ -210,22 +219,20 @@ def _safe_string(value: Any, max_chars: int = 500) -> str:
     return text if len(text) <= max_chars else text[:max_chars] + "…"
 
 
-def _safe_policy(value: Any, depth: int = 0) -> Any:
-    if depth > 4:
-        return "<truncated>"
-    if isinstance(value, dict):
-        out: Dict[str, Any] = {}
-        for raw_key, raw_value in list(value.items())[:50]:
-            key = str(raw_key)[:120]
-            out[key] = "<redacted>" if _is_sensitive_key(key) else _safe_policy(raw_value, depth + 1)
-        return out
-    if isinstance(value, (list, tuple, set)):
-        return [_safe_policy(item, depth + 1) for item in list(value)[:50]]
-    if isinstance(value, (str, bytes)):
-        return _safe_string(value.decode("utf-8", "replace") if isinstance(value, bytes) else value, 300)
-    if isinstance(value, (int, float, bool)) or value is None:
-        return value
-    return _safe_string(value, 300)
+def _safe_policy(value: Any, depth: int = 0) -> Dict[str, Any]:
+    """Return the small policy subset that is safe for model-visible metadata."""
+    _ = depth
+    if not isinstance(value, dict):
+        return {}
+    executors = value.get("allowed_executors")
+    if isinstance(executors, (list, tuple, set)):
+        allowed = [_safe_string(item, 64) for item in list(executors)[:50] if _safe_string(item, 64)]
+    else:
+        allowed = []
+    return {
+        "allowed_executors": list(dict.fromkeys(allowed)),
+        "require_user_approval": bool(value.get("require_user_approval", True)),
+    }
 
 
 def _field(record: Dict[str, Any], *keys: str, default: Any = "") -> Any:
@@ -237,26 +244,25 @@ def _field(record: Dict[str, Any], *keys: str, default: Any = "") -> Any:
 
 
 def _has_secret_value(record: Any) -> bool:
-    if not isinstance(record, dict):
-        return record not in (None, "", False)
-    for key, value in record.items():
-        if _is_sensitive_key(key) and value not in (None, "", False, [], {}):
-            return True
-        if isinstance(value, dict) and _has_secret_value(value):
-            return True
-    return False
+    # The secure vault publishes an explicit Boolean. Never inspect legacy value
+    # fields merely to infer this bit: that would load private material into the
+    # Memory Wiki process for no retrieval benefit.
+    return isinstance(record, dict) and record.get("has_value") is True
 
 
 def safe_metadata(lookup_key: str, raw: Any) -> Dict[str, Any]:
     record = raw if isinstance(raw, dict) else {}
     key = _record_identifier(record, lookup_key) or lookup_key
     aliases = _aliases(record)
-    subject = _safe_string(_field(record, "subject", "title", "label", "service", "server", "name", default=key), 300)
-    scope = _safe_string(_field(record, "scope", "namespace", "environment", default=key), 300)
-    locator = _safe_string(_field(record, "locator", "host", "hostname", "url", "endpoint"), 500)
-    purpose = _safe_string(_field(record, "purpose", "description"), 500)
+    # Only registry-controlled identifiers and type/status policy may cross this
+    # boundary. In particular, do not trust a legacy registry's title, host,
+    # login, locator or free-form description as safe metadata.
+    subject = key
+    scope = key
+    locator = ""
+    purpose = ""
     secret_type = _safe_string(_field(record, "secret_type", "type", default="credential"), 100)
-    username = _safe_string(_field(record, "username", "user", "login", "email"), 300)
+    username = ""
     policy_raw = _field(record, "policy", default={})
     stable = str(_field(record, "secret_id", "id", default=""))
     stable_id = stable if stable.startswith("sec_") else "ctx_" + hashlib.sha256(key.encode("utf-8", "replace")).hexdigest()[:12]
@@ -316,61 +322,31 @@ def search_registry_metadata(query: str, limit: int = 10, home: Optional[Path] =
 
 
 def lookup_registry_exact(lookup_key: str, home: Optional[Path] = None) -> Optional[Dict[str, Any]]:
-    """Return the exact raw registry record for the dedicated reveal tool only."""
+    """Return metadata for one record; never return private registry fields."""
     key = str(lookup_key or "").strip()
     if not key:
         return None
     payload, error, _ = _load_registry(home)
     if error or payload is None:
         return None
-    key_l = key.lower()
-    exact: Optional[Tuple[str, Any]] = None
-    alias_match: Optional[Tuple[str, Any]] = None
+    key_l = key.casefold()
     for candidate_key, raw in _iter_records(payload):
-        candidate_l = str(candidate_key).lower()
-        if candidate_l == key_l:
-            exact = (candidate_key, raw)
-            break
-        if isinstance(raw, dict) and key_l in {alias.lower() for alias in _aliases(raw)}:
-            alias_match = (candidate_key, raw)
-    selected = exact or alias_match
-    if selected is None:
-        return None
-    canonical, raw = selected
-    if isinstance(raw, dict):
-        result = dict(raw)
-        result.setdefault("lookup_key", canonical)
-        return result
-    return {"lookup_key": canonical, "value": raw}
-
-
-def _sensitive_values_from(node: Any, key: str = "", depth: int = 0) -> Iterator[str]:
-    if depth > 8:
-        return
-    if isinstance(node, dict):
-        for raw_key, value in node.items():
-            child_key = str(raw_key)
-            if _is_sensitive_key(child_key):
-                if isinstance(value, str) and len(value) >= 4:
-                    yield value
-                elif isinstance(value, (int, float)):
-                    yield str(value)
-                elif isinstance(value, dict):
-                    yield from _sensitive_values_from(value, child_key, depth + 1)
-            elif isinstance(value, (dict, list, tuple)):
-                yield from _sensitive_values_from(value, child_key, depth + 1)
-        return
-    if isinstance(node, (list, tuple)):
-        for value in node:
-            yield from _sensitive_values_from(value, key, depth + 1)
+        meta = safe_metadata(candidate_key, raw)
+        identifiers = {
+            str(candidate_key).casefold(),
+            str(meta.get("id") or "").casefold(),
+            str(meta.get("lookup_key") or "").casefold(),
+            *(str(alias).casefold() for alias in meta.get("aliases") or []),
+        }
+        if key_l in identifiers:
+            return meta
+    return None
 
 
 def known_secret_values(home: Optional[Path] = None, max_values: int = 2000) -> List[str]:
-    payload, error, _ = _load_registry(home)
-    if error or payload is None:
-        return []
-    values = sorted(set(_sensitive_values_from(payload)), key=len, reverse=True)
-    return values[:max_values]
+    """Return no plaintext values: registry data is metadata-only by design."""
+    _ = (home, max_values)
+    return []
 
 
 def redact_known_values(text: Any, home: Optional[Path] = None) -> str:

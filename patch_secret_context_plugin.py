@@ -11,11 +11,11 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 TARGET_TOOLS = {"secret_context_lookup", "secret_context_search"}
 WRAPPER = "_hermes_vault_registry_tool_handler"
-MARKER = "# HERMES-SECRET-CONTEXT-VAULT-REGISTRY-r7"
+MARKER = "# HERMES-SECRET-CONTEXT-VAULT-REGISTRY-r8"
 HELPER = r'''
-# HERMES-SECRET-CONTEXT-VAULT-REGISTRY-r7
-# Registry fallback with robust adapter discovery. Search returns safe metadata;
-# exact lookup may reveal a record because it is the dedicated reveal tool.
+# HERMES-SECRET-CONTEXT-VAULT-REGISTRY-r8
+# Registry fallback with robust adapter discovery. Both search and exact lookup
+# return metadata-only records; private fields must use a local executor.
 def _hermes_vault_registry_adapter():
     import importlib.util as _importlib_util
     import os as _os
@@ -352,6 +352,7 @@ def _remove_legacy_helper(text: str) -> str:
     for marker in (
         "# HERMES-SECRET-CONTEXT-VAULT-REGISTRY-r6",
         "# HERMES-SECRET-CONTEXT-VAULT-REGISTRY-r7",
+        "# HERMES-SECRET-CONTEXT-VAULT-REGISTRY-r8",
     ):
         pos = text.find(marker)
         if pos >= 0:
