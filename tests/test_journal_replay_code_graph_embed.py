@@ -32,7 +32,7 @@ def test_rebuild_recomputes_code_graph_embedding_batch_from_reference() -> None:
             provider = module.MemoryWikiProvider()
             provider.initialize("code-embed-replay", hermes_home=tmp, agent_context="test")
             calls = []
-            module._embed_pending_chunks = lambda prov, args: calls.append((str(prov.db_path), dict(args))) or {
+            module._embed_pending_chunks = lambda prov, args, **_kwargs: calls.append((str(prov.db_path), dict(args))) or {
                 "repository_id": args["repository_id"], "pending_before": 1, "pending_after": 0,
             }
             try:

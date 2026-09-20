@@ -2,11 +2,15 @@
 *.db-wal
 *.db-shm
 .env
+.env.*
 vault/
 secrets/
 *.bak
 *.tmp
 cache/
+backup/
+backups/
+profiles/
 
 __pycache__/
 *.py[cod]

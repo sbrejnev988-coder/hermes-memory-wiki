@@ -20,13 +20,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
+import threading
 import time
 from collections import defaultdict
-from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from contextlib import nullcontext
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 SCHEMA_VERSION = 1
 EVENT_VERSION = 2
@@ -51,6 +53,42 @@ _PEM_BLOCK_RE = re.compile(
 _SENSITIVE_EVENT_KEY_RE = re.compile(
     r"(?i)(?:^|[_-])(?:api[_-]?key|token|password|passwd|secret|authorization|credential|private[_-]?key)(?:$|[_-])"
 )
+_OPAQUE_GRAPH_ID_RE = re.compile(r"redacted-graph-id-[0-9a-f]{64}\Z")
+_OPAQUE_GRAPH_ID_PREFIX = "redacted-graph-id-"
+# v1 was the first deterministic identity redaction domain.  A token that
+# merely *looks* like one is not evidence that this module minted it, so v2
+# is a one-way provenance migration for every pre-registry opaque value.
+_GRAPH_IDENTITY_PROVENANCE_VERSION = 2
+_GRAPH_IDENTITY_MIGRATION_VERSION = 2
+_GRAPH_IDENTITY_PROVENANCE_TABLE = "code_graph_identity_provenance"
+_GRAPH_IDENTITY_MIGRATIONS_TABLE = "code_graph_identity_migrations"
+_GRAPH_INTEGRITY_FIELDS = frozenset({
+    "anchor_hash", "commit_sha", "content_hash", "file_hash", "graph_payload_hash",
+    "new_content_hash", "old_content_hash", "payload_hash", "snapshot_hash", "text_hash",
+})
+_GRAPH_IDENTITY_FIELDS = frozenset({
+    "changed_files", "changed_symbols", "chunk_id", "deleted_files", "edge_id", "event_id",
+    "file_path", "line_id", "patch_id", "producer", "repository_id", "source_file",
+    "source_event_id", "source_id", "symbol_id", "target_file", "target_id",
+})
+# A provider connection is deliberately shared between some Hermes worker
+# threads.  SQLite serializes independent connections, but two callers cannot
+# safely start overlapping top-level transactions on the *same* connection.
+# Keep the short graph lifecycle transaction single-file in-process; BEGIN
+# IMMEDIATE below provides the corresponding cross-provider/process boundary.
+_GRAPH_INGEST_LOCK = threading.RLock()
+
+
+def _provider_claim_lock(provider: Any):
+    """Return the provider claim lock, or a no-op context for small test doubles.
+
+    Graph embedding must always take this in-process lock before taking a
+    private SQLite writer.  Ordinary claim writes take the same lock before
+    their SQLite mutations; reversing that order causes a 30-second SQLite
+    busy wait/deadlock under concurrent embedding.
+    """
+    lock = getattr(provider, "_lock", None)
+    return lock if hasattr(lock, "__enter__") and hasattr(lock, "__exit__") else nullcontext()
 
 
 def _now() -> int:
@@ -59,6 +97,15 @@ def _now() -> int:
 
 def _sha(value: str) -> str:
     return hashlib.sha256(str(value or "").encode("utf-8", "replace")).hexdigest()
+
+
+def _opaque_graph_id_v1(value: Any) -> str:
+    return _OPAQUE_GRAPH_ID_PREFIX + _sha("identity-v1\0" + str(value or ""))
+
+
+def _opaque_graph_id_v2(value: Any) -> str:
+    """Return the deterministic migration alias for one legacy opaque ID."""
+    return _OPAQUE_GRAPH_ID_PREFIX + _sha("identity-v2\0" + str(value or ""))
 
 
 def _json(value: Any) -> str:
@@ -86,9 +133,9 @@ def _canonical_path(path: str) -> str:
     while value.startswith("./"):
         value = value[2:]
     if not value or value.startswith("/") or value == ".." or value.startswith("../"):
-        raise ValueError(f"invalid repository-relative path: {path!r}")
+        raise ValueError("invalid repository-relative path")
     if any(part == ".." for part in value.split("/")):
-        raise ValueError(f"path traversal rejected: {path!r}")
+        raise ValueError("repository-relative path traversal rejected")
     return value
 
 
@@ -107,7 +154,739 @@ def _clean_text(value: Any, limit: int = 12000) -> str:
     return text[: max(0, limit)]
 
 
-def sanitize_code_graph_event_for_recovery(event: Dict[str, Any]) -> Dict[str, Any]:
+def _redact_graph_text(value: Any, limit: int, redactor: Optional[Callable[[str], str]] = None) -> str:
+    """Bounded graph text with the provider's complete secret redactor applied.
+
+    ``code_knowledge_graph`` remains usable by tiny standalone test providers,
+    so the local PEM/assignment guard is retained as a fail-closed fallback.
+    The installed provider passes ``redact_secrets`` through a method, avoiding
+    a circular import while covering all of Memory Wiki's credential patterns.
+    """
+    text = _clean_text(str(value or "").replace("\x00", ""), max(0, limit))
+    if callable(redactor):
+        try:
+            text = str(redactor(text)).replace("\x00", "")
+        except Exception:
+            pass
+    return _clean_text(text, limit)
+
+
+def _redact_graph_identity(
+    value: Any,
+    redactor: Optional[Callable[[str], str]] = None,
+    *,
+    preserve_opaque_id: bool = False,
+) -> str:
+    """Keep graph joins stable without retaining a secret-bearing identifier.
+
+    File paths and graph IDs are relational keys, so replacing every secret with
+    one generic marker could merge unrelated files or nodes.  When the normal
+    text redactor changes one, replace the *whole* identity with a deterministic
+    opaque token instead.  All references to the same raw identity therefore
+    still join, while SQLite, recovery records and public results never retain
+    the sensitive spelling.
+    """
+    raw = str(value or "").replace("\x00", "")
+    # The opaque form deliberately includes a 64-hex digest.  Its spelling is
+    # not proof of provenance: a producer or ordinary caller can imitate it.
+    # Preserve it only when the caller has already established that this is a
+    # persisted graph key or a verified recovery artifact; raw ingress treats
+    # an imitation as ordinary input and deterministically maps it again.
+    if _OPAQUE_GRAPH_ID_RE.fullmatch(raw):
+        # Never delegate this case to the generic secret redactor.  Small test
+        # providers and future redactor changes may leave the spelling intact;
+        # in that case a caller-controlled imitation would otherwise become a
+        # durable/public graph key.  ``preserve_opaque_id`` is used only after
+        # the caller has independently checked the exact ID in the provenance
+        # registry below.
+        return raw if preserve_opaque_id else _opaque_graph_id_v1(raw)
+    safe = _redact_graph_text(raw, 40_000, redactor)
+    if safe == raw:
+        return raw
+    return _opaque_graph_id_v1(raw)
+
+
+def _is_graph_integrity_digest(key: str, value: Any) -> bool:
+    """Only preserve syntactically valid generated digests verbatim.
+
+    Producer metadata called ``snapshot_hash``/``file_hash`` is otherwise just
+    free-form text.  Exempting it solely because of the field name would let a
+    credential bypass the graph redactor.
+    """
+    text = str(value or "").strip()
+    lower_key = str(key or "").lower()
+    if lower_key == "commit_sha":
+        return bool(re.fullmatch(r"[0-9a-fA-F]{7,64}", text))
+    return bool(re.fullmatch(r"(?:sha256:)?[0-9a-fA-F]{64}", text))
+
+
+def _provider_graph_redactor(provider: Any) -> Optional[Callable[[str], str]]:
+    candidate = getattr(provider, "_redact_code_graph_text", None)
+    return candidate if callable(candidate) else None
+
+
+def _opaque_graph_id_provenance_version(
+    conn: Optional[sqlite3.Connection], value: Any,
+) -> int:
+    """Return the exact locally-minted provenance version for one opaque ID.
+
+    The regular expression deliberately has no authority here: an event
+    producer can copy the format.  This small durable registry is the only
+    source of truth used by checkpoint, recovery and public-output exceptions.
+    """
+    candidate = str(value or "").strip()
+    if conn is None or not _OPAQUE_GRAPH_ID_RE.fullmatch(candidate):
+        return 0
+    try:
+        row = conn.execute(
+            f"SELECT provenance_version FROM {_GRAPH_IDENTITY_PROVENANCE_TABLE} "
+            "WHERE opaque_id=?",
+            (candidate,),
+        ).fetchone()
+    except sqlite3.Error:
+        return 0
+    try:
+        return int(row[0]) if row is not None else 0
+    except (TypeError, ValueError, IndexError):
+        return 0
+
+
+def _graph_identity_migration_complete(conn: Optional[sqlite3.Connection]) -> bool:
+    if conn is None:
+        return False
+    try:
+        row = conn.execute(
+            f"SELECT 1 FROM {_GRAPH_IDENTITY_MIGRATIONS_TABLE} "
+            "WHERE migration_version=? LIMIT 1",
+            (_GRAPH_IDENTITY_MIGRATION_VERSION,),
+        ).fetchone()
+    except sqlite3.Error:
+        return False
+    return row is not None
+
+
+def _register_opaque_graph_id_provenance(
+    conn: Optional[sqlite3.Connection], values: Sequence[str], *, version: int,
+) -> None:
+    """Record only IDs that this process just deterministically minted."""
+    if conn is None:
+        return
+    rows = sorted({
+        str(value or "").strip()
+        for value in values
+        if _OPAQUE_GRAPH_ID_RE.fullmatch(str(value or "").strip())
+    })
+    if not rows:
+        return
+    try:
+        conn.executemany(
+            f"INSERT INTO {_GRAPH_IDENTITY_PROVENANCE_TABLE}("
+            "opaque_id,provenance_version,created_at) VALUES(?,?,?) "
+            "ON CONFLICT(opaque_id) DO UPDATE SET "
+            "provenance_version=MAX(provenance_version,excluded.provenance_version)",
+            [(value, int(version), _now()) for value in rows],
+        )
+    except sqlite3.Error:
+        # Schema installation is best-effort for tiny graph-only test doubles.
+        # Callers retain fail-closed redaction when the registry is unavailable.
+        return
+
+
+def register_code_graph_identity_provenance(
+    conn: sqlite3.Connection, values: Sequence[str], *, version: Optional[int] = None,
+) -> None:
+    """Provider-facing atomic registration helper for code-claim/patch writes."""
+    _register_opaque_graph_id_provenance(
+        conn,
+        values,
+        version=(
+            int(version)
+            if version is not None
+            else (
+                _GRAPH_IDENTITY_PROVENANCE_VERSION
+                if _graph_identity_migration_complete(conn) else 1
+            )
+        ),
+    )
+
+
+def code_graph_identity_provenance_version(conn: Optional[sqlite3.Connection]) -> int:
+    """Return the version to bind to a newly persisted recovery artifact."""
+    return (
+        _GRAPH_IDENTITY_PROVENANCE_VERSION
+        if _graph_identity_migration_complete(conn) else 1
+    )
+
+
+def collect_code_graph_event_opaque_ids(event: Dict[str, Any]) -> frozenset[str]:
+    """Collect only schema identity-field tokens, never incidental text."""
+    found: set[str] = set()
+
+    def collect(value: Any, key: str = "") -> None:
+        if isinstance(value, dict):
+            for child_key, child_value in value.items():
+                collect(child_value, str(child_key))
+        elif isinstance(value, list):
+            for child in value:
+                collect(child, key)
+        elif (
+            str(key or "").lower() in _GRAPH_IDENTITY_FIELDS
+            and _OPAQUE_GRAPH_ID_RE.fullmatch(str(value or "").strip())
+        ):
+            found.add(str(value).strip())
+
+    if isinstance(event, dict):
+        collect(event)
+    return frozenset(found)
+
+
+def _provider_graph_connection(provider: Any) -> Optional[sqlite3.Connection]:
+    connect = getattr(provider, "_connect", None)
+    if not callable(connect):
+        return None
+    try:
+        return connect()
+    except Exception:
+        return None
+
+
+def _canonicalize_live_graph_identity(
+    value: Any,
+    *,
+    redactor: Optional[Callable[[str], str]],
+    conn: Optional[sqlite3.Connection],
+    trusted_opaque_id: bool,
+) -> str:
+    """Resolve an ingress/query key to the current durable graph identity.
+
+    A trusted recovery artifact can retain an opaque spelling only when that
+    exact value appears in the local provenance registry.  Old v1 artifacts
+    remain replayable: once v2 migration is complete their deterministic v2
+    alias is used instead.
+    """
+    raw = str(value or "").replace("\x00", "")
+    provenance_version = _opaque_graph_id_provenance_version(conn, raw)
+    if trusted_opaque_id and _OPAQUE_GRAPH_ID_RE.fullmatch(raw):
+        if provenance_version >= _GRAPH_IDENTITY_PROVENANCE_VERSION:
+            return raw
+        # A recovered v1 event is already the redacted representation of a
+        # source-side key.  It must advance to the exact v2 alias after the
+        # migration, not be treated as fresh user input and hashed a second
+        # time.  Before migration, only a registry-backed v1 key may remain
+        # stable; an unknown legacy/artifact spelling is re-keyed below.
+        if _graph_identity_migration_complete(conn):
+            return _opaque_graph_id_v2(raw)
+        if provenance_version > 0:
+            return raw
+    safe = _redact_graph_identity(
+        raw,
+        redactor,
+        preserve_opaque_id=bool(trusted_opaque_id and provenance_version > 0),
+    )
+    if not _OPAQUE_GRAPH_ID_RE.fullmatch(safe):
+        return safe
+    # A pre-v2 generated ID is intentionally remapped with all legacy IDs.
+    # A raw source-side secret still derives its former v1 value first, so its
+    # v2 alias is stable across query, replay and later live ingestion.
+    if _graph_identity_migration_complete(conn):
+        return _opaque_graph_id_v2(safe)
+    return safe
+
+
+def _migrate_stored_graph_identity(
+    value: Any,
+    *,
+    redactor: Optional[Callable[[str], str]],
+    conn: Optional[sqlite3.Connection],
+) -> str:
+    """Re-key a persisted identity unless it is an exact v2-minted value."""
+    raw = str(value or "").replace("\x00", "")
+    if _OPAQUE_GRAPH_ID_RE.fullmatch(raw):
+        if _opaque_graph_id_provenance_version(conn, raw) >= _GRAPH_IDENTITY_PROVENANCE_VERSION:
+            return raw
+        return _opaque_graph_id_v2(raw)
+    safe = _redact_graph_identity(raw, redactor, preserve_opaque_id=False)
+    if _OPAQUE_GRAPH_ID_RE.fullmatch(safe):
+        if _opaque_graph_id_provenance_version(conn, safe) >= _GRAPH_IDENTITY_PROVENANCE_VERSION:
+            return safe
+        return _opaque_graph_id_v2(safe)
+    return safe
+
+
+def _graph_lookup_identity(
+    provider: Any, value: Any, *, trusted_opaque_id: bool = False,
+    conn: Optional[sqlite3.Connection] = None,
+) -> str:
+    """Map a caller's raw graph key to the safe form used by storage."""
+    return _canonicalize_live_graph_identity(
+        value,
+        redactor=_provider_graph_redactor(provider),
+        conn=conn if conn is not None else _provider_graph_connection(provider),
+        trusted_opaque_id=trusted_opaque_id,
+    )
+
+
+def _sanitize_graph_event_for_storage(
+    event: Dict[str, Any],
+    redactor: Optional[Callable[[str], str]] = None,
+    *,
+    preserve_opaque_ids: bool = False,
+    identity_mapper: Optional[Callable[[Any], str]] = None,
+) -> Tuple[Dict[str, Any], bool]:
+    """Recursively redact free-form graph event data before it reaches SQLite.
+
+    Integrity identifiers stay opaque and exact: lifecycle hashes were computed
+    from the producer's raw source before this pass, so redacted secret rotation
+    cannot collapse two revisions into one graph row.
+    """
+    changed = False
+
+    def scrub(value: Any, key: str = "") -> Any:
+        nonlocal changed
+        lower_key = str(key or "").lower()
+        if _SENSITIVE_EVENT_KEY_RE.search(lower_key) and lower_key != "token_estimate":
+            # Do not rely on pattern recognition for a value whose field name
+            # itself declares it secret: short credentials and opaque tokens
+            # otherwise evade a text-only redactor.
+            if value != "<REDACTED_KEYED_VALUE>":
+                changed = True
+            return "<REDACTED_KEYED_VALUE>"
+        if isinstance(value, dict):
+            return {str(child_key): scrub(child_value, str(child_key)) for child_key, child_value in value.items()}
+        if isinstance(value, list):
+            return [scrub(item, key) for item in value]
+        if isinstance(value, str):
+            if lower_key in _GRAPH_INTEGRITY_FIELDS and _is_graph_integrity_digest(lower_key, value):
+                return value
+            if lower_key in _GRAPH_IDENTITY_FIELDS:
+                safe = (
+                    identity_mapper(value)
+                    if callable(identity_mapper)
+                    else _redact_graph_identity(
+                        value,
+                        redactor,
+                        preserve_opaque_id=preserve_opaque_ids,
+                    )
+                )
+                if safe != value:
+                    changed = True
+                return safe
+            safe = _redact_graph_text(value, 40_000, redactor)
+            if safe != value:
+                changed = True
+            return safe
+        if isinstance(value, (int, float, bool)) or value is None:
+            return value
+        safe = _redact_graph_text(value, 40_000, redactor)
+        if safe != str(value):
+            changed = True
+        return safe
+
+    return scrub(event), changed
+
+
+def _safe_graph_output(
+    provider: Any, value: Any, key: str = "", *,
+    _conn: Optional[sqlite3.Connection] = None,
+) -> Any:
+    """Redact legacy rows at the public/model boundary as defense in depth."""
+    if _conn is None:
+        _conn = _provider_graph_connection(provider)
+    lower_key = str(key or "").lower()
+    if _SENSITIVE_EVENT_KEY_RE.search(lower_key) and lower_key != "token_estimate":
+        return "<REDACTED_KEYED_VALUE>"
+    if isinstance(value, dict):
+        return {
+            str(child_key): _safe_graph_output(
+                provider, child_value, str(child_key), _conn=_conn,
+            )
+            for child_key, child_value in value.items()
+        }
+    if isinstance(value, list):
+        return [_safe_graph_output(provider, item, key, _conn=_conn) for item in value]
+    if isinstance(value, str):
+        if lower_key in _GRAPH_INTEGRITY_FIELDS and _is_graph_integrity_digest(lower_key, value):
+            return value
+        if lower_key in _GRAPH_IDENTITY_FIELDS:
+            # Output never trusts the spelling alone.  This also prevents a
+            # legacy row from leaking through before maintenance/checkpoint
+            # gets a chance to rewrite it transactionally.
+            return _migrate_stored_graph_identity(
+                value,
+                redactor=_provider_graph_redactor(provider),
+                conn=_conn,
+            )
+        return _redact_graph_text(value, 40_000, _provider_graph_redactor(provider))
+    return value
+
+
+def _canonicalize_sanitized_graph_event_identities(
+    event: Dict[str, Any],
+    conn: Optional[sqlite3.Connection],
+    *,
+    trusted_opaque_ids: bool,
+) -> Tuple[Dict[str, Any], set[str]]:
+    """Apply the v2 alias to an already-redacted event before SQLite writes.
+
+    The first redaction pass must happen before opening the writer because it
+    is part of event-payload validation.  This second, connection-aware pass
+    is deliberately narrow: it decides whether an already-safe opaque key is
+    a registered v2 key, a replayable v1 key, or an untrusted legacy spelling.
+    """
+    minted: set[str] = set()
+    migration_complete = _graph_identity_migration_complete(conn)
+
+    def remap(value: Any, key: str = "") -> Any:
+        lower_key = str(key or "").lower()
+        if isinstance(value, dict):
+            return {str(child_key): remap(child_value, str(child_key)) for child_key, child_value in value.items()}
+        if isinstance(value, list):
+            return [remap(item, key) for item in value]
+        if not isinstance(value, str) or lower_key not in _GRAPH_IDENTITY_FIELDS:
+            return value
+        candidate = value.strip()
+        if not _OPAQUE_GRAPH_ID_RE.fullmatch(candidate):
+            return value
+        provenance_version = _opaque_graph_id_provenance_version(conn, candidate)
+        if trusted_opaque_ids and provenance_version >= _GRAPH_IDENTITY_PROVENANCE_VERSION:
+            minted.add(candidate)
+            return candidate
+        if migration_complete:
+            # A v1 artifact whose provenance row was restored is upgraded to
+            # its deterministic v2 alias; an unverified legacy spelling gets
+            # the same fail-closed treatment.
+            mapped = _opaque_graph_id_v2(candidate)
+        elif not trusted_opaque_ids:
+            # Normal ingress already ran this value through
+            # _redact_graph_identity(... preserve_opaque_id=False).  Thus an
+            # opaque candidate here is the v1 alias just minted from raw
+            # source input (including a raw imitation), not a producer token
+            # that may be enrolled verbatim.
+            mapped = candidate
+        elif provenance_version > 0:
+            # A hash-bound recovery artifact may seed an exact v1 registry
+            # row before the v2 migration runs. Keep that proven legacy key
+            # stable until the one-way upgrade boundary.
+            mapped = candidate
+        else:
+            # A digest-valid artifact proves bytes, not that its producer
+            # minted a token-shaped field. Never let an old artifact (or a
+            # poisoned pre-registry row) enroll its spelling as provenance.
+            mapped = _opaque_graph_id_v1(candidate)
+        minted.add(mapped)
+        return mapped
+
+    return remap(event), minted
+
+
+def canonicalize_code_graph_recovery_event(
+    provider: Any, event: Dict[str, Any], *, trusted_opaque_ids: bool = True,
+) -> Dict[str, Any]:
+    """Return a persisted recovery event with current exact-ID aliases.
+
+    Call this after the corresponding live graph/patch write has registered
+    its minted identities.  It keeps artifact metadata and replay inputs on the
+    same v2 namespace without treating a syntactic producer token as trusted.
+    """
+    if not isinstance(event, dict):
+        raise ValueError("code graph recovery event must be an object")
+    conn, owns_conn = _open_graph_reader_connection(provider)
+    try:
+        canonical, _ = _canonicalize_sanitized_graph_event_identities(
+            dict(event), conn, trusted_opaque_ids=trusted_opaque_ids,
+        )
+        return canonical
+    finally:
+        _close_graph_writer_connection(conn, owns_conn)
+
+
+def _redact_graph_storage_value(
+    value: Any,
+    redactor: Optional[Callable[[str], str]] = None,
+    *,
+    identity_mapper: Optional[Callable[[Any], str]] = None,
+    key: str = "value",
+) -> str:
+    """Redact one persisted text column, including structured JSON fields."""
+    original = str(value or "")
+    try:
+        parsed = json.loads(original)
+    except (TypeError, ValueError):
+        return _redact_graph_text(original, 40_000, redactor)
+    root_key = str(key or "value")
+    safe, changed = _sanitize_graph_event_for_storage(
+        {root_key: parsed},
+        redactor,
+        preserve_opaque_ids=False,
+        identity_mapper=identity_mapper,
+    )
+    if not changed:
+        return original
+    return _json(safe.get(root_key))
+
+
+def _scrub_patch_outcome_storage_value(
+    provider: Any,
+    field: str,
+    value: Any,
+    *,
+    redactor: Optional[Callable[[str], str]],
+    identity_mapper: Optional[Callable[[Any], str]],
+) -> str:
+    """Apply the provider's patch-report firewall to legacy durable rows.
+
+    ``validation_report_json`` is not a graph event: its arbitrary JSON keys
+    are diagnostics and may themselves contain credentials.  The live patch
+    path owns the canonical sanitizer, so maintenance uses that exact helper
+    rather than the generic graph scrubber (which deliberately preserves JSON
+    keys for relational graph records).
+    """
+    original = str(value or "")
+    text_sanitizer = getattr(provider, "_safe_patch_text", None)
+    report_sanitizer = getattr(provider, "_safe_patch_validation_report", None)
+    if not callable(text_sanitizer) or not callable(report_sanitizer):
+        # Do not pretend generic key-preserving graph cleanup made this safe.
+        # The shipped provider always supplies these helpers; an incompatible
+        # test double must fail closed instead of retaining a raw legacy row.
+        raise RuntimeError("patch outcome scrub requires provider patch sanitizers")
+    if field == "outcome":
+        return str(text_sanitizer(original, 128))
+    if field == "rollback_steps":
+        return str(text_sanitizer(original, 20_000))
+    if field == "validation_report_json":
+        try:
+            parsed = json.loads(original)
+        except (TypeError, ValueError):
+            return str(text_sanitizer(original, 12_000))
+        safe = report_sanitizer(parsed)
+        if safe == parsed:
+            return original
+        return _json(safe)
+    return _redact_graph_storage_value(
+        original,
+        redactor,
+        identity_mapper=identity_mapper,
+        key=(field[:-5] if field.endswith("_json") else field),
+    )
+
+
+def _public_graph_candidate(provider: Any, candidate: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove internal full-text columns before returning a graph search hit."""
+    omitted = {"chunk_text", "embedding_text", "search_text", "contract_json", "imports_json"}
+    return _safe_graph_output(
+        provider, {key: value for key, value in candidate.items() if key not in omitted}
+    )
+
+
+def _graph_event_list(event: Dict[str, Any], field: str) -> List[Any]:
+    """Return a graph row list, rejecting shapes that could erase a full snapshot."""
+    value = event.get(field)
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"code graph {field} must be a list")
+    return value
+
+
+def _graph_event_int(value: Any, field: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"code graph {field} must be an integer") from exc
+
+
+def _graph_event_nonnegative_int(value: Any, field: str) -> int:
+    return max(0, _graph_event_int(value, field))
+
+
+def _graph_event_confidence(value: Any, field: str) -> float:
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"code graph {field} must be a finite number") from exc
+    if not math.isfinite(confidence):
+        raise ValueError(f"code graph {field} must be a finite number")
+    return max(0.0, min(confidence, 1.0))
+
+
+def _normalize_code_graph_event(event: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate every graph-write conversion before claims or rows can change.
+
+    A full snapshot treats omitted files as deleted. Consequently malformed
+    collection shapes and row values must be rejected before revision
+    invalidation; silently skipping them can otherwise archive valid claims and
+    replace the graph with a partial view.
+    """
+    normalized = dict(event)
+
+    files: List[Dict[str, Any]] = []
+    for index, raw in enumerate(_graph_event_list(event, "files")):
+        if not isinstance(raw, dict):
+            raise ValueError(f"code graph files[{index}] must be an object")
+        item = dict(raw)
+        item["file_path"] = _canonical_path(item.get("file_path") or "")
+        item["line_count"] = _graph_event_nonnegative_int(
+            item.get("line_count") or 0, f"files[{index}].line_count"
+        )
+        files.append(item)
+    normalized["files"] = files
+
+    symbols: List[Dict[str, Any]] = []
+    for index, raw in enumerate(_graph_event_list(event, "symbols")):
+        if not isinstance(raw, dict):
+            raise ValueError(f"code graph symbols[{index}] must be an object")
+        item = dict(raw)
+        symbol_id = str(item.get("symbol_id") or "").strip()[:512]
+        item["symbol_id"] = symbol_id
+        if symbol_id:
+            item["file_path"] = _canonical_path(item.get("file_path") or "")
+            item["start_line"] = _graph_event_nonnegative_int(
+                item.get("start_line") or 0, f"symbols[{index}].start_line"
+            )
+            item["end_line"] = _graph_event_nonnegative_int(
+                item.get("end_line") or 0, f"symbols[{index}].end_line"
+            )
+            supplied_hash = str(item.get("content_hash") or "").strip().lower().removeprefix("sha256:")
+            if re.fullmatch(r"[0-9a-f]{64}", supplied_hash):
+                item["content_hash"] = supplied_hash
+            else:
+                raw_search = " ".join((
+                    str(item.get("search_text") or ""), str(item.get("qualified_name") or item.get("name") or ""),
+                    str(item.get("signature") or ""), _json(item.get("contract") or {}),
+                ))
+                item["content_hash"] = _sha(raw_search.replace("\x00", ""))
+        symbols.append(item)
+    normalized["symbols"] = symbols
+
+    chunks: List[Dict[str, Any]] = []
+    chunk_limit = _env_int("MEMORY_WIKI_CODE_GRAPH_CHUNK_MAX_CHARS", 12000, 1000, 40000)
+    for index, raw in enumerate(_graph_event_list(event, "chunks")):
+        if not isinstance(raw, dict):
+            raise ValueError(f"code graph chunks[{index}] must be an object")
+        item = dict(raw)
+        chunk_id = str(item.get("chunk_id") or "").strip()[:512]
+        item["chunk_id"] = chunk_id
+        if chunk_id:
+            item["file_path"] = _canonical_path(item.get("file_path") or "")
+            item["start_line"] = _graph_event_nonnegative_int(
+                item.get("start_line") or 0, f"chunks[{index}].start_line"
+            )
+            item["end_line"] = _graph_event_nonnegative_int(
+                item.get("end_line") or 0, f"chunks[{index}].end_line"
+            )
+            raw_chunk_text = str(item.get("chunk_text") or "").replace("\x00", "")[:chunk_limit]
+            chunk_text = _clean_text(raw_chunk_text, chunk_limit)
+            supplied_hash = str(item.get("content_hash") or "").strip().lower().removeprefix("sha256:")
+            item["content_hash"] = (
+                supplied_hash if re.fullmatch(r"[0-9a-f]{64}", supplied_hash)
+                else _sha(raw_chunk_text)
+            )
+            item["token_estimate"] = _graph_event_nonnegative_int(
+                item.get("token_estimate") or max(1, len(chunk_text) // 4),
+                f"chunks[{index}].token_estimate",
+            )
+        chunks.append(item)
+    normalized["chunks"] = chunks
+
+    # The writer deliberately caps line ingestion. Dropping excess entries
+    # here preserves that behavior while eliminating a validation-to-use gap.
+    max_lines = _env_int("MEMORY_WIKI_CODE_GRAPH_MAX_LINES_PER_EVENT", 750000, 0, 5000000)
+    lines: List[Dict[str, Any]] = []
+    for index, raw in enumerate(_graph_event_list(event, "lines")[:max_lines]):
+        if not isinstance(raw, dict):
+            raise ValueError(f"code graph lines[{index}] must be an object")
+        item = dict(raw)
+        item["file_path"] = _canonical_path(item.get("file_path") or "")
+        item["line_no"] = _graph_event_int(item.get("line_no") or 0, f"lines[{index}].line_no")
+        supplied_hash = str(item.get("text_hash") or "").strip().lower().removeprefix("sha256:")
+        item["text_hash"] = (
+            supplied_hash if re.fullmatch(r"[0-9a-f]{64}", supplied_hash)
+            else _sha(str(item.get("line_text") or "").replace("\x00", "")[:2000])
+        )
+        lines.append(item)
+    normalized["lines"] = lines
+
+    edges: List[Dict[str, Any]] = []
+    for index, raw in enumerate(_graph_event_list(event, "edges")):
+        if not isinstance(raw, dict):
+            raise ValueError(f"code graph edges[{index}] must be an object")
+        item = dict(raw)
+        source_id = str(item.get("source_id") or "").strip()[:700]
+        target_id = str(item.get("target_id") or "").strip()[:700]
+        item["source_id"] = source_id
+        item["target_id"] = target_id
+        if source_id and target_id:
+            source_file = str(item.get("source_file") or "").strip()
+            target_file = str(item.get("target_file") or "").strip()
+            item["source_file"] = _canonical_path(source_file) if source_file else ""
+            item["target_file"] = _canonical_path(target_file) if target_file else ""
+            item["source_line"] = _graph_event_nonnegative_int(
+                item.get("source_line") or 0, f"edges[{index}].source_line"
+            )
+            item["confidence"] = _graph_event_confidence(
+                item.get("confidence") or 0.5, f"edges[{index}].confidence"
+            )
+        edges.append(item)
+    normalized["edges"] = edges
+
+    deleted_files: List[str] = []
+    for index, value in enumerate(_graph_event_list(event, "deleted_files")):
+        if str(value or "").strip():
+            try:
+                deleted_files.append(_canonical_path(value))
+            except ValueError as exc:
+                raise ValueError(f"invalid deleted_files[{index}]: {exc}") from exc
+    normalized["deleted_files"] = deleted_files
+
+    # A snapshot may carry semantic rows without a separate file inventory
+    # (older producers commonly sent line-only events).  Materialize a stable
+    # placeholder file for every such path before the lifecycle transaction.
+    # That gives the next full snapshot a durable ownership record to compare
+    # and prevents a later empty snapshot from silently leaving its claims
+    # alive.  Explicit file rows remain authoritative for hashes/metadata.
+    declared_paths = {str(item["file_path"]) for item in files}
+    for collection, identity in ((symbols, "symbol_id"), (chunks, "chunk_id")):
+        for item in collection:
+            if not str(item.get(identity) or ""):
+                continue
+            path = str(item.get("file_path") or "")
+            if path and path not in declared_paths:
+                files.append({"file_path": path, "file_hash": "", "line_count": 0})
+                declared_paths.add(path)
+    for item in lines:
+        path = str(item.get("file_path") or "")
+        if path and path not in declared_paths:
+            files.append({"file_path": path, "file_hash": "", "line_count": 0})
+            declared_paths.add(path)
+    normalized["files"] = files
+
+    # These conversions happen after claim invalidation in the writer, so make
+    # them deterministic before the lifecycle mutation begins as well.
+    if normalized.get("generated_at"):
+        normalized["generated_at"] = _graph_event_int(normalized["generated_at"], "generated_at")
+    return normalized
+
+
+def normalized_code_graph_event_payload_hash(event: Dict[str, Any]) -> str:
+    """Return the exact v3 digest used for a live graph-event reservation.
+
+    Recovery artifacts retain only a redacted event view.  The live writer
+    therefore captures this opaque digest before redaction and seals it into a
+    separately hash-bound artifact envelope.  Keeping the calculation here
+    prevents the producer and recovery paths from drifting in normalization
+    details (path cleanup, derived text hashes, and synthetic file rows).
+    """
+    if not isinstance(event, dict):
+        raise ValueError("code graph event must be an object")
+    return _sha(_json(_normalize_code_graph_event(event)))
+
+
+def sanitize_code_graph_event_for_recovery(
+    event: Dict[str, Any],
+    redactor: Optional[Callable[[str], str]] = None,
+    *,
+    preserve_opaque_ids: bool = False,
+) -> Dict[str, Any]:
     """Return a replayable event containing only the graph's redacted text view.
 
     Code Shrinker is the source of truth for exact source.  Recovery artifacts
@@ -117,18 +896,52 @@ def sanitize_code_graph_event_for_recovery(event: Dict[str, Any]) -> Dict[str, A
     if not isinstance(event, dict):
         raise ValueError("code graph recovery event must be an object")
 
+    def safe_dict_key(value: Any, existing: Dict[str, Any]) -> str:
+        """Redact a producer-controlled JSON key without changing dispatch.
+
+        Graph event payloads normally use schema-defined object names, but an
+        arbitrary extra property can otherwise make its raw name durable in a
+        recovery artifact.  The caller still recurses with the original name
+        below, so key-sensitive validation/identity handling retains its
+        established semantics.
+        """
+        key = _redact_graph_text(value, 256, redactor) or "<redacted_key>"
+        if key not in existing:
+            return key
+        suffix = 2
+        candidate = f"{key}_{suffix}"
+        while candidate in existing:
+            suffix += 1
+            candidate = f"{key}_{suffix}"
+        return candidate
+
     def scrub(value: Any, key: str = "") -> Any:
-        if _SENSITIVE_EVENT_KEY_RE.search(str(key or "")):
+        if _SENSITIVE_EVENT_KEY_RE.search(str(key or "")) and str(key or "").lower() not in {"token_estimate"}:
             return "<REDACTED_KEYED_VALUE>"
         if isinstance(value, dict):
-            return {str(child_key): scrub(item, str(child_key)) for child_key, item in value.items()}
+            out: Dict[str, Any] = {}
+            for child_key, item in value.items():
+                raw_key = str(child_key)
+                out[safe_dict_key(raw_key, out)] = scrub(item, raw_key)
+            return out
         if isinstance(value, list):
             return [scrub(item, key) for item in value]
         if isinstance(value, str):
-            return _clean_text(value, 40_000)
+            if (
+                str(key or "").lower() in _GRAPH_INTEGRITY_FIELDS
+                and _is_graph_integrity_digest(str(key or "").lower(), value)
+            ):
+                return value
+            if str(key or "").lower() in _GRAPH_IDENTITY_FIELDS:
+                return _redact_graph_identity(
+                    value,
+                    redactor,
+                    preserve_opaque_id=preserve_opaque_ids,
+                )
+            return _redact_graph_text(value, 40_000, redactor)
         if isinstance(value, (int, float, bool)) or value is None:
             return value
-        return _clean_text(str(value), 40_000)
+        return _redact_graph_text(value, 40_000, redactor)
 
     return scrub(event)
 
@@ -202,6 +1015,8 @@ def install_code_graph_schema(conn: sqlite3.Connection) -> None:
             end_line INTEGER NOT NULL DEFAULT 0,
             content_hash TEXT NOT NULL DEFAULT '',
             embedding_claim_id TEXT NOT NULL DEFAULT '',
+            graph_event_id TEXT NOT NULL DEFAULT '',
+            graph_payload_hash TEXT NOT NULL DEFAULT '',
             token_estimate INTEGER NOT NULL DEFAULT 0,
             chunk_text TEXT NOT NULL DEFAULT '',
             embedding_text TEXT NOT NULL DEFAULT '',
@@ -241,10 +1056,24 @@ def install_code_graph_schema(conn: sqlite3.Connection) -> None:
             event_id TEXT PRIMARY KEY,
             repository_id TEXT NOT NULL,
             payload_hash TEXT NOT NULL,
+            payload_hash_version INTEGER NOT NULL DEFAULT 1,
             snapshot_mode TEXT NOT NULL DEFAULT 'full',
             status TEXT NOT NULL DEFAULT 'completed',
             stats_json TEXT NOT NULL DEFAULT '{}',
             created_at INTEGER NOT NULL
+        );
+        -- A matching digest-shaped token is user-controlled input until this
+        -- registry says this exact value was minted by graph ingress/migration.
+        CREATE TABLE IF NOT EXISTS code_graph_identity_provenance(
+            opaque_id TEXT PRIMARY KEY,
+            provenance_version INTEGER NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        -- One durable marker makes raw source identity -> v1 -> v2 aliasing
+        -- deterministic after the legacy-store migration has completed.
+        CREATE TABLE IF NOT EXISTS code_graph_identity_migrations(
+            migration_version INTEGER PRIMARY KEY,
+            completed_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_cgf_repo_path ON code_graph_files(repository_id,file_path);
         CREATE INDEX IF NOT EXISTS idx_cgs_repo_file ON code_graph_symbols(repository_id,file_path,start_line);
@@ -262,6 +1091,27 @@ def install_code_graph_schema(conn: sqlite3.Connection) -> None:
         columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(code_graph_lines)").fetchall()}
         if "anchor_hash" not in columns:
             conn.execute("ALTER TABLE code_graph_lines ADD COLUMN anchor_hash TEXT NOT NULL DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        event_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(code_graph_events)").fetchall()}
+        if "payload_hash_version" not in event_columns:
+            # Existing rows used a producer-supplied snapshot hash.  Keep that
+            # marker so replays of a pre-upgrade, already-committed event remain
+            # compatible while all new rows bind to the canonical payload.
+            conn.execute("ALTER TABLE code_graph_events ADD COLUMN payload_hash_version INTEGER NOT NULL DEFAULT 1")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        chunk_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(code_graph_chunks)").fetchall()}
+        if "graph_event_id" not in chunk_columns:
+            conn.execute("ALTER TABLE code_graph_chunks ADD COLUMN graph_event_id TEXT NOT NULL DEFAULT ''")
+        if "graph_payload_hash" not in chunk_columns:
+            conn.execute("ALTER TABLE code_graph_chunks ADD COLUMN graph_payload_hash TEXT NOT NULL DEFAULT ''")
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_cgc_snapshot ON "
+            "code_graph_chunks(repository_id,graph_event_id,graph_payload_hash)"
+        )
     except sqlite3.OperationalError:
         pass
     try:
@@ -283,6 +1133,102 @@ def install_code_graph_schema(conn: sqlite3.Connection) -> None:
     except sqlite3.OperationalError:
         # Minimal SQLite builds remain usable through LIKE fallback.
         pass
+
+
+def _open_graph_writer_connection(provider: Any) -> Tuple[sqlite3.Connection, bool]:
+    """Open a private SQLite writer for graph lifecycle operations.
+
+    ``MemoryWikiProvider._connect()`` is deliberately shared by worker threads.
+    A top-level transaction on that connection can be committed accidentally by
+    an unrelated provider method which calls ``commit()`` (for example audit
+    logging).  Graph ingestion therefore never owns its atomic lifecycle on
+    that shared handle when the database is file-backed.  SQLite's write lock
+    on this private connection serializes other providers/processes as well.
+
+    Tiny standalone test providers may use ``:memory:`` databases.  Such a
+    database cannot be reopened as an equivalent connection, so retain the
+    legacy handle only for that non-persistent fallback.
+    """
+    shared = provider._connect()
+    raw_path = getattr(provider, "db_path", "")
+    path = str(raw_path or "")
+    if not path:
+        try:
+            for row in shared.execute("PRAGMA database_list").fetchall():
+                if str(row[1] or "") == "main":
+                    path = str(row[2] or "")
+                    break
+        except sqlite3.Error:
+            path = ""
+    if not path or path == ":memory:" or path.startswith("file::memory:"):
+        return shared, False
+
+    writer = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
+    writer.row_factory = sqlite3.Row
+    try:
+        writer.execute("PRAGMA busy_timeout=30000")
+        writer.execute("PRAGMA foreign_keys=ON")
+        writer.execute("PRAGMA temp_store=MEMORY")
+        writer.execute("PRAGMA synchronous=FULL")
+        # Journal mode belongs to the database, so this read verifies the
+        # private connection joins the provider's WAL/DELETE mode without
+        # attempting a mode-changing PRAGMA while another writer is active.
+        writer.execute("PRAGMA journal_mode").fetchone()
+        # Migrations are intentionally completed before BEGIN IMMEDIATE.
+        # They never share the lifecycle transaction being protected below.
+        install_code_graph_schema(writer)
+        if writer.in_transaction:
+            writer.commit()
+    except Exception:
+        writer.close()
+        raise
+    return writer, True
+
+
+def _open_graph_reader_connection(provider: Any) -> Tuple[sqlite3.Connection, bool]:
+    """Open a private read handle without running DDL on a request path.
+
+    Provider initialization and graph ingestion install the schema.  Read
+    tools must not execute ``executescript`` on the provider's shared handle:
+    Python's SQLite driver commits that connection's pending transaction before
+    a script.  A private reader also keeps ordinary queries available against
+    the last committed WAL snapshot while a graph writer is in progress.
+    """
+    shared = provider._connect()
+    raw_path = getattr(provider, "db_path", "")
+    path = str(raw_path or "")
+    if not path:
+        try:
+            for row in shared.execute("PRAGMA database_list").fetchall():
+                if str(row[1] or "") == "main":
+                    path = str(row[2] or "")
+                    break
+        except sqlite3.Error:
+            path = ""
+    if not path or path == ":memory:" or path.startswith("file::memory:"):
+        return shared, False
+    reader = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
+    reader.row_factory = sqlite3.Row
+    try:
+        reader.execute("PRAGMA busy_timeout=30000")
+        reader.execute("PRAGMA foreign_keys=ON")
+        reader.execute("PRAGMA temp_store=MEMORY")
+        reader.execute("PRAGMA query_only=ON")
+        reader.execute("SELECT 1").fetchone()
+    except Exception:
+        reader.close()
+        raise
+    return reader, True
+
+
+def _close_graph_writer_connection(conn: sqlite3.Connection, owned: bool) -> None:
+    if not owned:
+        return
+    try:
+        if conn.in_transaction:
+            conn.rollback()
+    finally:
+        conn.close()
 
 
 def _delete_fts_for_files(conn: sqlite3.Connection, repository_id: str, files: Sequence[str]) -> None:
@@ -317,7 +1263,15 @@ def _delete_files(conn: sqlite3.Connection, repository_id: str, files: Sequence[
     )
 
 
-def _insert_graph_rows(conn: sqlite3.Connection, event: Dict[str, Any], repository_id: str, ts: int) -> Dict[str, int]:
+def _insert_graph_rows(
+    conn: sqlite3.Connection,
+    event: Dict[str, Any],
+    repository_id: str,
+    ts: int,
+    *,
+    graph_event_id: str = "",
+    graph_payload_hash: str = "",
+) -> Dict[str, int]:
     counts = {"files": 0, "symbols": 0, "chunks": 0, "lines": 0, "edges": 0}
     for raw in event.get("files") or []:
         if not isinstance(raw, dict):
@@ -387,11 +1341,13 @@ def _insert_graph_rows(conn: sqlite3.Connection, event: Dict[str, Any], reposito
         conn.execute(
             """INSERT OR REPLACE INTO code_graph_chunks(
                repository_id,chunk_id,file_path,symbol_id,qualified_name,chunk_kind,start_line,end_line,
-               content_hash,embedding_claim_id,token_estimate,chunk_text,embedding_text,search_text,updated_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+               content_hash,embedding_claim_id,graph_event_id,graph_payload_hash,
+               token_estimate,chunk_text,embedding_text,search_text,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (repository_id, chunk_id, path, str(raw.get("symbol_id") or "")[:512], qname,
              str(raw.get("chunk_kind") or "semantic")[:80], max(0, int(raw.get("start_line") or 0)),
              max(0, int(raw.get("end_line") or 0)), content_hash, embedding_claim_id,
+             str(graph_event_id or ""), str(graph_payload_hash or "")[:80],
              max(0, int(raw.get("token_estimate") or max(1, len(chunk_text) // 4))),
              chunk_text, embed_text, search_text, ts),
         )
@@ -464,16 +1420,34 @@ def _insert_graph_rows(conn: sqlite3.Connection, event: Dict[str, Any], reposito
     return counts
 
 
-def _embed_graph_chunks(provider: Any, repository_id: str, commit_sha: str, event_id: str,
-                        file_filter: Sequence[str], *, unit_limit: Optional[int] = None,
-                        pending_only: bool = False) -> Dict[str, Any]:
+def _embed_graph_chunks(
+    provider: Any,
+    repository_id: str,
+    commit_sha: str,
+    event_id: str,
+    file_filter: Sequence[str],
+    *,
+    unit_limit: Optional[int] = None,
+    pending_only: bool = False,
+    expected_event_id: str = "",
+    expected_payload_hash: str = "",
+) -> Dict[str, Any]:
+    """Create/reuse claims only for chunks still owned by this snapshot.
+
+    The graph state commits before embedding intentionally starts.  A newer
+    snapshot can therefore replace a chunk while an older embedding task is
+    waiting.  Each claim/link operation obtains its own private BEGIN IMMEDIATE
+    transaction and rechecks the persisted snapshot marker under the write
+    lock.  This prevents either a stale claim or a stale link from becoming
+    visible for a newer chunk.
+    """
     if not _env_bool("MEMORY_WIKI_CODE_GRAPH_EMBED", True):
         return {"enabled": False, "processed": 0, "created": 0, "reused": 0, "failed": 0}
     limit = (_env_int("MEMORY_WIKI_CODE_GRAPH_EMBED_MAX_UNITS", 2000, 0, 10000)
              if unit_limit is None else max(0, min(int(unit_limit), 10000)))
     if limit <= 0 or not hasattr(provider, "_code_claim_add"):
         return {"enabled": False, "processed": 0, "created": 0, "reused": 0, "failed": 0}
-    conn = provider._connect()
+    conn, owns_conn = _open_graph_writer_connection(provider)
     where = ["repository_id=?"]
     params: List[Any] = [repository_id]
     if file_filter:
@@ -482,83 +1456,209 @@ def _embed_graph_chunks(provider: Any, repository_id: str, commit_sha: str, even
         params.extend(file_filter)
     if pending_only:
         where.append("embedding_claim_id=''")
-    rows = conn.execute(
-        "SELECT chunk_id,file_path,symbol_id,qualified_name,start_line,end_line,content_hash,embedding_claim_id,embedding_text "
-        "FROM code_graph_chunks WHERE " + " AND ".join(where) +
-        " ORDER BY CASE WHEN symbol_id<>'' THEN 0 ELSE 1 END, token_estimate DESC LIMIT ?",
-        [*params, limit],
-    ).fetchall()
-    stats = {"enabled": True, "processed": 0, "created": 0, "reused": 0, "failed": 0, "errors": []}
+    if expected_event_id:
+        where.append("graph_event_id=?")
+        params.append(expected_event_id)
+    if expected_payload_hash:
+        where.append("graph_payload_hash=?")
+        params.append(expected_payload_hash)
+    try:
+        rows = conn.execute(
+            "SELECT chunk_id,file_path,symbol_id,qualified_name,start_line,end_line,content_hash,embedding_claim_id,"
+            "embedding_text,graph_event_id,graph_payload_hash "
+            "FROM code_graph_chunks WHERE " + " AND ".join(where) +
+            " ORDER BY CASE WHEN symbol_id<>'' THEN 0 ELSE 1 END, token_estimate DESC LIMIT ?",
+            [*params, limit],
+        ).fetchall()
+    finally:
+        _close_graph_writer_connection(conn, owns_conn)
+
+    stats = {
+        "enabled": True, "processed": 0, "created": 0, "reused": 0,
+        "failed": 0, "skipped_stale": 0, "errors": [],
+    }
+    post_commit_callbacks: List[Tuple[str, str, str]] = []
     for row in rows:
-        item = dict(row)
+        candidate = dict(row)
         stats["processed"] += 1
+        callbacks: List[Tuple[str, str, str]] = []
+        label = candidate.get("qualified_name") or candidate.get("symbol_id") or "top-level"
+        claim = (
+            f"Code semantic chunk in repository {repository_id}. "
+            f"File {candidate['file_path']} lines {candidate['start_line']}-{candidate['end_line']}; "
+            f"symbol {label}.\n{candidate['embedding_text']}"
+        )[:7800]
+        snapshot_event_id = str(candidate.get("graph_event_id") or event_id or "manual-backfill")
+        source_event_id = "kg:" + _sha(
+            "\0".join((repository_id, snapshot_event_id, str(candidate["chunk_id"]), str(candidate["content_hash"])))
+        )
+        claim_args = {
+            "claim": claim,
+            "topic": "code-intelligence",
+            "repository_id": repository_id,
+            "commit_sha": commit_sha,
+            "file_path": candidate["file_path"],
+            "symbol_id": candidate["symbol_id"] or candidate["chunk_id"],
+            "symbol_revision": candidate["content_hash"][:32],
+            "content_hash": candidate["content_hash"],
+            "claim_type": "code_graph_chunk",
+            "confidence": 0.88,
+            "salience": 0.78,
+            "evidence": f"Code Shrinker graph event {snapshot_event_id}; chunk={candidate['chunk_id']}",
+            "source_event_id": source_event_id,
+            "producer": "mcp-code-shrinker-knowledge-graph",
+            "phase_sep_version": "kg-v2",
+        }
+        conn = None
+        owns_conn = False
         try:
-            existing = ""
-            if item.get("embedding_claim_id"):
-                found = conn.execute(
-                    "SELECT c.id FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id "
-                    "WHERE c.id=? AND c.status='active' AND m.repository_id=? AND m.content_hash=?",
-                    (item["embedding_claim_id"], repository_id, item["content_hash"]),
-                ).fetchone()
-                existing = str(found[0]) if found else ""
-            if not existing:
-                found = conn.execute(
-                    "SELECT c.id FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id "
-                    "WHERE c.status='active' AND m.repository_id=? AND m.file_path=? AND m.symbol_id=? "
-                    "AND m.content_hash=? AND m.claim_type='code_graph_chunk' ORDER BY c.updated_at DESC LIMIT 1",
-                    (repository_id, item["file_path"], item["symbol_id"], item["content_hash"]),
-                ).fetchone()
-                existing = str(found[0]) if found else ""
-            if existing:
-                conn.execute(
-                    "UPDATE code_graph_chunks SET embedding_claim_id=? WHERE repository_id=? AND chunk_id=?",
-                    (existing, repository_id, item["chunk_id"]),
+            # _prepare_claim may quarantine a secret, queue review, or update
+            # an index through the shared provider connection.  It must happen
+            # before this worker takes its private SQLite write lock.  Taking
+            # the provider lock first establishes the same lock order as every
+            # ordinary claim write: provider lock -> SQLite writer.
+            with _provider_claim_lock(provider):
+                prepared_code_claim = provider._prepare_code_claim(
+                    claim_args, trusted_opaque_graph_ids=True,
                 )
-                conn.commit()
-                stats["reused"] += 1
-                continue
-            label = item.get("qualified_name") or item.get("symbol_id") or "top-level"
-            claim = (
-                f"Code semantic chunk in repository {repository_id}. "
-                f"File {item['file_path']} lines {item['start_line']}-{item['end_line']}; "
-                f"symbol {label}.\n{item['embedding_text']}"
-            )[:7800]
-            result = provider._code_claim_add({
-                "claim": claim,
-                "topic": "code-intelligence",
-                "repository_id": repository_id,
-                "commit_sha": commit_sha,
-                "file_path": item["file_path"],
-                "symbol_id": item["symbol_id"] or item["chunk_id"],
-                "symbol_revision": item["content_hash"][:32],
-                "content_hash": item["content_hash"],
-                "claim_type": "code_graph_chunk",
-                "confidence": 0.88,
-                "salience": 0.78,
-                "evidence": f"Code Shrinker graph event {event_id}; chunk={item['chunk_id']}",
-                "source_event_id": f"kg:{repository_id}:{item['chunk_id']}:{item['content_hash']}",
-                "producer": "mcp-code-shrinker-knowledge-graph",
-                "phase_sep_version": "kg-v1",
-            })
-            claim_id = str(result.get("id") or "")
-            if claim_id:
-                conn.execute(
-                    "UPDATE code_graph_chunks SET embedding_claim_id=? WHERE repository_id=? AND chunk_id=?",
-                    (claim_id, repository_id, item["chunk_id"]),
-                )
-                conn.commit()
-                stats["created"] += 1
-            else:
-                stats["failed"] += 1
+                conn, owns_conn = _open_graph_writer_connection(provider)
+                try:
+                    conn.execute("BEGIN IMMEDIATE")
+                    predicates = [
+                        "repository_id=?", "chunk_id=?", "content_hash=?",
+                        "graph_event_id=?", "graph_payload_hash=?",
+                    ]
+                    predicate_params: List[Any] = [
+                        repository_id, candidate["chunk_id"], candidate["content_hash"],
+                        candidate.get("graph_event_id") or "", candidate.get("graph_payload_hash") or "",
+                    ]
+                    current = conn.execute(
+                        "SELECT chunk_id,file_path,symbol_id,qualified_name,start_line,end_line,content_hash,"
+                        "embedding_claim_id,embedding_text,graph_event_id,graph_payload_hash "
+                        "FROM code_graph_chunks WHERE " + " AND ".join(predicates),
+                        predicate_params,
+                    ).fetchone()
+                    if current is None:
+                        conn.rollback()
+                        stats["skipped_stale"] += 1
+                        continue
+                    item = dict(current)
+                    # A plan prepared before the writer lock is valid only for
+                    # precisely the snapshot row it was derived from.
+                    if any(item.get(key) != candidate.get(key) for key in (
+                        "file_path", "symbol_id", "qualified_name", "start_line", "end_line", "embedding_text",
+                    )):
+                        conn.rollback()
+                        stats["skipped_stale"] += 1
+                        continue
+                    current_repo = conn.execute(
+                        "SELECT commit_sha FROM code_graph_repositories WHERE repository_id=?",
+                        (repository_id,),
+                    ).fetchone()
+                    current_commit_sha = str(current_repo[0] or "") if current_repo else ""
+                    if current_commit_sha != str(commit_sha or ""):
+                        conn.rollback()
+                        stats["skipped_stale"] += 1
+                        continue
+                    existing = ""
+                    if item.get("embedding_claim_id"):
+                        found = conn.execute(
+                            "SELECT c.id FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id "
+                            "WHERE c.id=? AND c.status IN ('active','current') AND m.repository_id=? "
+                            "AND m.file_path=? AND m.symbol_id=? AND m.content_hash=? "
+                            "AND m.claim_type='code_graph_chunk'",
+                            (item["embedding_claim_id"], repository_id, item["file_path"],
+                             item["symbol_id"] or item["chunk_id"], item["content_hash"]),
+                        ).fetchone()
+                        existing = str(found[0]) if found else ""
+                    if not existing:
+                        found = conn.execute(
+                            "SELECT c.id FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id "
+                            "WHERE c.status IN ('active','current') AND m.repository_id=? AND m.file_path=? "
+                            "AND m.symbol_id=? AND m.content_hash=? AND m.claim_type='code_graph_chunk' "
+                            "ORDER BY c.updated_at DESC LIMIT 1",
+                            (repository_id, item["file_path"], item["symbol_id"] or item["chunk_id"], item["content_hash"]),
+                        ).fetchone()
+                        existing = str(found[0]) if found else ""
+                    if existing:
+                        linked = conn.execute(
+                            "UPDATE code_graph_chunks SET embedding_claim_id=? WHERE " + " AND ".join(predicates),
+                            [existing, *predicate_params],
+                        )
+                        if linked.rowcount != 1:
+                            raise RuntimeError("snapshot-bound embedding link was superseded")
+                        conn.commit()
+                        stats["reused"] += 1
+                        continue
+
+                    result = provider._code_claim_add(
+                        claim_args,
+                        conn=conn,
+                        after_commit_callbacks=callbacks,
+                        _prepared_code_claim=prepared_code_claim,
+                        trusted_opaque_graph_ids=True,
+                    )
+                    claim_id = str(result.get("id") or "")
+                    if not claim_id:
+                        conn.rollback()
+                        stats["failed"] += 1
+                        continue
+                    active = conn.execute(
+                        "SELECT 1 FROM claims WHERE id=? AND status IN ('active','current')",
+                        (claim_id,),
+                    ).fetchone()
+                    if active is None:
+                        raise RuntimeError("embedding claim is not active")
+                    linked = conn.execute(
+                        "UPDATE code_graph_chunks SET embedding_claim_id=? WHERE " + " AND ".join(predicates),
+                        [claim_id, *predicate_params],
+                    )
+                    if linked.rowcount != 1:
+                        raise RuntimeError("snapshot-bound embedding link was superseded")
+                    conn.commit()
+                    post_commit_callbacks.extend(callbacks)
+                    stats["created"] += 1
+                except Exception:
+                    if conn.in_transaction:
+                        conn.rollback()
+                    raise
+                finally:
+                    _close_graph_writer_connection(conn, owns_conn)
+                    conn = None
         except Exception as exc:  # one malformed unit must not abort the snapshot
+            if conn is not None and conn.in_transaction:
+                conn.rollback()
             stats["failed"] += 1
             if len(stats["errors"]) < 12:
-                stats["errors"].append(f"{item.get('chunk_id')}: {type(exc).__name__}: {exc}")
+                stats["errors"].append(f"{candidate.get('chunk_id')}: {type(exc).__name__}: {exc}")
+        finally:
+            if conn is not None:
+                _close_graph_writer_connection(conn, owns_conn)
+
+    for claim_id, topic, claim in post_commit_callbacks:
+        try:
+            provider._after_claim_commit(claim_id, topic, claim)
+        except Exception as exc:
+            if len(stats["errors"]) < 12:
+                stats["errors"].append(f"{claim_id}: post_commit {type(exc).__name__}: {exc}")
     return stats
 
 
-def ingest_code_graph_event(provider: Any, event: Dict[str, Any]) -> Dict[str, Any]:
-    """Apply a Code Shrinker full or delta graph event idempotently."""
+def ingest_code_graph_event(
+    provider: Any,
+    event: Dict[str, Any],
+    *,
+    trusted_opaque_ids: bool = False,
+    recovery_payload_hash: str = "",
+    recovery_payload_hash_version: int = 0,
+    recovery_artifact_reference: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Apply a Code Shrinker full or delta graph event idempotently.
+
+    Only replay of a previously verified recovery artifact may retain an
+    existing opaque spelling.  Live producer input is always re-evaluated so
+    a caller cannot forge provenance by choosing the opaque-ID format.
+    """
     if not isinstance(event, dict):
         raise ValueError("code graph event must be an object")
     if int(event.get("event_version") or 0) != EVENT_VERSION:
@@ -570,119 +1670,344 @@ def ingest_code_graph_event(provider: Any, event: Dict[str, Any]) -> Dict[str, A
     producer = str(event.get("producer") or "")
     if producer not in {"mcp-code-shrinker", "code-shrinker"}:
         raise ValueError("unexpected code graph producer")
-    repository_id = str(event.get("repository_id") or "").strip()
-    event_id = str(event.get("event_id") or "").strip()
-    if not repository_id or not event_id:
+    raw_repository_id = str(event.get("repository_id") or "").strip()
+    raw_event_id = str(event.get("event_id") or "").strip()
+    if not raw_repository_id or not raw_event_id:
         raise ValueError("repository_id and event_id are required")
     snapshot_mode = str(event.get("snapshot_mode") or "full").lower()
     if snapshot_mode not in {"full", "delta"}:
         raise ValueError("snapshot_mode must be full or delta")
-    payload_hash = str(event.get("snapshot_hash") or _sha(_json(event)))
-    conn = provider._connect()
-    install_code_graph_schema(conn)
-    prior = conn.execute("SELECT payload_hash,stats_json FROM code_graph_events WHERE event_id=?", (event_id,)).fetchone()
-    if prior:
-        if str(prior[0]) != payload_hash:
-            raise ValueError("event_id reuse with different code graph payload")
-        previous = json.loads(prior[1] or "{}")
-        return {"status": "deduplicated", "deduplicated": True, **previous}
-
-    ts = _now()
-    changed_files = []
-    for item in event.get("files") or []:
-        if isinstance(item, dict) and item.get("file_path"):
-            changed_files.append(_canonical_path(item["file_path"]))
-    deleted_files = [_canonical_path(p) for p in (event.get("deleted_files") or []) if str(p or "").strip()]
-    touched = sorted(set(changed_files + deleted_files))
-
-    # Invalidate old semantic claims before replacing graph rows.
-    invalidated = 0
-    if hasattr(provider, "_invalidate_revision"):
-        for path in touched:
-            try:
-                result = provider._invalidate_revision({
-                    "repository_id": repository_id,
-                    "file_path": path,
-                    "new_commit_sha": str(event.get("commit_sha") or ""),
-                    "new_content_hash": next((
-                        str(f.get("file_hash") or "") for f in event.get("files") or []
-                        if isinstance(f, dict) and str(f.get("file_path") or "") == path
-                    ), ""),
-                })
-                invalidated += int(result.get("invalidated") or 0)
-            except Exception:
-                pass
-
-    with conn:
-        if snapshot_mode == "full":
-            _delete_fts_for_files(conn, repository_id, [])
-            for table in ("code_graph_edges", "code_graph_lines", "code_graph_chunks", "code_graph_symbols", "code_graph_files"):
-                conn.execute(f"DELETE FROM {table} WHERE repository_id=?", (repository_id,))
-        else:
-            _delete_files(conn, repository_id, touched)
-            if bool(event.get("edges_full", True)):
-                conn.execute("DELETE FROM code_graph_edges WHERE repository_id=?", (repository_id,))
-        counts = _insert_graph_rows(conn, event, repository_id, ts)
-        repo_stats = event.get("stats") if isinstance(event.get("stats"), dict) else counts
-        conn.execute(
-            """INSERT INTO code_graph_repositories(repository_id,root,commit_sha,graph_revision,snapshot_hash,generated_at,updated_at,stats_json)
-               VALUES(?,?,?,?,?,?,?,?)
-               ON CONFLICT(repository_id) DO UPDATE SET root=excluded.root,commit_sha=excluded.commit_sha,
-               graph_revision=excluded.graph_revision,snapshot_hash=excluded.snapshot_hash,
-               generated_at=excluded.generated_at,updated_at=excluded.updated_at,stats_json=excluded.stats_json""",
-            (repository_id, str(event.get("root") or "")[:2000], str(event.get("commit_sha") or "")[:64],
-             str(event.get("graph_revision") or payload_hash[:20])[:160], payload_hash[:128],
-             int(event.get("generated_at") or ts), ts, _json(repo_stats)[:100000]),
-        )
-
-    embed_stats = _embed_graph_chunks(
-        provider, repository_id, str(event.get("commit_sha") or ""), event_id,
-        changed_files if snapshot_mode == "delta" else [], pending_only=True,
+    # Revision invalidation is part of the same lifecycle boundary as replacing
+    # graph rows.  Validate it before touching either representation: otherwise
+    # a malformed producer event could be accepted, delete graph rows, and leave
+    # the associated semantic claims active.
+    commit_sha = str(event.get("commit_sha") or "").strip().lower()
+    if commit_sha and not re.fullmatch(r"[0-9a-f]{7,64}", commit_sha):
+        raise ValueError("commit_sha must be a 7-64 character hexadecimal Git object ID")
+    # Keep the pre-normalization digest as a legacy compatibility candidate.
+    # v1 producers persisted raw event bytes/dicts in a few releases, while v2
+    # binds the canonical normalized payload below.
+    legacy_raw_payload_hash = _sha(_json(event))
+    # Do this before opening a graph transaction or invalidating claims. The
+    # writer otherwise converts several producer values only after a full
+    # snapshot has already made implicit deletions effective.
+    normalized_raw_event = _normalize_code_graph_event(event)
+    # ``snapshot_hash`` is producer metadata, not a proof that two opaque
+    # event bodies are identical.  Bind the deduplication key to the complete
+    # normalized *raw* payload so an attacker cannot reuse an event id and a
+    # claimed snapshot hash while changing a secret-only graph revision.  The
+    # digest is opaque; the redacted copy below is the only payload persisted.
+    calculated_payload_hash = _sha(_json(normalized_raw_event))
+    supplied_snapshot_hash = str(normalized_raw_event.get("snapshot_hash") or "")
+    raw_producer_snapshot_hash = supplied_snapshot_hash or calculated_payload_hash
+    candidate_recovery_hash = str(recovery_payload_hash or "").strip()
+    try:
+        candidate_recovery_version = int(recovery_payload_hash_version or 0)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid recovery code graph payload binding version") from exc
+    if candidate_recovery_hash:
+        verify_recovery_binding = getattr(provider, "_verify_code_graph_recovery_payload_binding", None)
+        if not callable(verify_recovery_binding) or not bool(verify_recovery_binding(
+            event,
+            candidate_recovery_hash,
+            candidate_recovery_version,
+            recovery_artifact_reference,
+        )):
+            raise ValueError("recovery code graph payload binding requires a verified artifact")
+        if candidate_recovery_version not in {3, 4}:
+            raise ValueError("unsupported recovery code graph payload binding")
+        if candidate_recovery_version >= 3:
+            candidate_recovery_hash = candidate_recovery_hash.lower()
+            if not re.fullmatch(r"[0-9a-f]{64}", candidate_recovery_hash):
+                raise ValueError("invalid recovery code graph payload digest")
+        payload_hash = candidate_recovery_hash
+        payload_hash_version = candidate_recovery_version
+    else:
+        if candidate_recovery_version:
+            raise ValueError("recovery code graph payload binding is incomplete")
+        payload_hash = calculated_payload_hash
+        payload_hash_version = 3
+    event, _redaction_changed = _sanitize_graph_event_for_storage(
+        normalized_raw_event,
+        _provider_graph_redactor(provider),
+        preserve_opaque_ids=trusted_opaque_ids,
     )
-    result = {
-        "repository_id": repository_id,
-        "event_id": event_id,
-        "snapshot_mode": snapshot_mode,
-        "counts": counts,
-        "deleted_files": len(deleted_files),
-        "invalidated_claims": invalidated,
-        "embedding": embed_stats,
-        "snapshot_hash": payload_hash,
-    }
-    with conn:
-        conn.execute(
-            "INSERT INTO code_graph_events(event_id,repository_id,payload_hash,snapshot_mode,status,stats_json,created_at) VALUES(?,?,?,?,?,?,?)",
-            (event_id, repository_id, payload_hash, snapshot_mode, "completed", _json(result), ts),
+    # The raw identifiers above are used only while deriving the opaque event
+    # fingerprint.  Every SQLite key, result and downstream claim now uses the
+    # safe identity from the persisted event; otherwise a secret embedded in a
+    # repository path or producer event ID would bypass text redaction.
+    repository_id = str(event.get("repository_id") or "").strip()
+    event_id = str(event.get("event_id") or "").strip()
+    if not repository_id or not event_id:
+        raise ValueError("repository_id and event_id are required")
+    producer_snapshot_hash = str(event.get("snapshot_hash") or payload_hash)
+
+    # This section intentionally contains only local SQLite work.  Keeping
+    # embedding calls outside it avoids holding the writer transaction across
+    # model/network work, while the event record makes the graph mutation
+    # exactly-once before deferred embeddings begin.
+    with _GRAPH_INGEST_LOCK:
+        conn, owns_conn = _open_graph_writer_connection(provider)
+        try:
+            if conn.in_transaction:
+                raise RuntimeError("code graph ingestion requires an idle SQLite connection")
+            conn.execute("BEGIN IMMEDIATE")
+            # ``event`` was structurally redacted before the transaction.  A
+            # connection-aware pass now resolves its keys to v2 (or preserves
+            # one exact registered v2 replay key) and records only values we
+            # deterministically minted in this atomic write.
+            event, minted_opaque_ids = _canonicalize_sanitized_graph_event_identities(
+                event, conn, trusted_opaque_ids=trusted_opaque_ids,
+            )
+            repository_id = str(event.get("repository_id") or "").strip()
+            event_id = str(event.get("event_id") or "").strip()
+            if not repository_id or not event_id:
+                raise ValueError("repository_id and event_id are required")
+            _register_opaque_graph_id_provenance(
+                conn,
+                sorted(minted_opaque_ids),
+                version=(
+                    _GRAPH_IDENTITY_PROVENANCE_VERSION
+                    if _graph_identity_migration_complete(conn) else 1
+                ),
+            )
+            prior = conn.execute(
+                "SELECT payload_hash,payload_hash_version,status,stats_json "
+                "FROM code_graph_events WHERE event_id=?",
+                (event_id,),
+            ).fetchone()
+            if prior:
+                prior_hash = str(prior[0] or "")
+                prior_version = int(prior[1] or 1)
+                if str(prior[2] or "") != "completed":
+                    raise RuntimeError("stored code graph event is not completed")
+                # Some v1 writers stored a hash of the complete raw request,
+                # which can still be verified exactly.  They must not be
+                # confused with v1 rows that stored only a producer-controlled
+                # snapshot hash: accepting the latter would let a changed body
+                # silently reuse an event ID.
+                legacy_match = prior_version < 2 and prior_hash == legacy_raw_payload_hash
+                if prior_hash != payload_hash and not legacy_match:
+                    if prior_version == 4:
+                        raise ValueError(
+                            "legacy recovery artifact lacks the original raw payload digest; "
+                            "send a fresh snapshot with a new event_id"
+                        )
+                    if prior_version < 2 and prior_hash == raw_producer_snapshot_hash:
+                        raise ValueError(
+                            "legacy code graph event lacks an exact payload digest; "
+                            "send a fresh snapshot with a new event_id"
+                        )
+                    raise ValueError("event_id reuse with different code graph payload")
+                previous = json.loads(prior[3] or "{}")
+                if not isinstance(previous, dict):
+                    raise RuntimeError("stored code graph event metadata is invalid")
+                conn.rollback()
+                return {"status": "deduplicated", "deduplicated": True, **previous}
+
+            ts = _now()
+            # Reserve the event before lifecycle mutations.  The reservation,
+            # claim invalidation, graph rows and final metadata all commit or
+            # roll back together under this BEGIN IMMEDIATE boundary.
+            conn.execute(
+                """INSERT INTO code_graph_events(
+                       event_id,repository_id,payload_hash,payload_hash_version,snapshot_mode,status,stats_json,created_at
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                (event_id, repository_id, payload_hash, payload_hash_version, snapshot_mode, "processing", "{}", ts),
+            )
+
+            new_hash_by_path: Dict[str, str] = {}
+            for item in event.get("files") or []:
+                path = str(item["file_path"])
+                file_hash = str(item.get("file_hash") or "").strip().lower().removeprefix("sha256:")
+                new_hash_by_path[path] = file_hash if re.fullmatch(r"[0-9a-f]{64}", file_hash) else ""
+            changed_files = sorted(new_hash_by_path)
+            deleted_files = list(event.get("deleted_files") or [])
+            previous_file_hashes = {
+                str(row[0]): str(row[1] or "").lower().removeprefix("sha256:")
+                for row in conn.execute(
+                    "SELECT file_path,file_hash FROM code_graph_files WHERE repository_id=?",
+                    (repository_id,),
+                ).fetchall()
+            }
+            implicit_deleted = set()
+            if snapshot_mode == "full":
+                # Legacy graph snapshots could contain chunks/symbols/lines
+                # without a file row.  Claims may also predate graph indexing.
+                # A full snapshot is authoritative, so derive omissions from
+                # every file-bearing representation, not files alone.
+                prior_paths = set(previous_file_hashes)
+                for table in ("code_graph_symbols", "code_graph_chunks", "code_graph_lines"):
+                    prior_paths.update(
+                        str(row[0]) for row in conn.execute(
+                            f"SELECT DISTINCT file_path FROM {table} WHERE repository_id=? AND file_path<>''",
+                            (repository_id,),
+                        ).fetchall()
+                    )
+                try:
+                    prior_paths.update(
+                        str(row[0]) for row in conn.execute(
+                            "SELECT DISTINCT file_path FROM code_claim_metadata "
+                            "WHERE repository_id=? AND file_path<>''",
+                            (repository_id,),
+                        ).fetchall()
+                    )
+                except sqlite3.OperationalError:
+                    # Standalone graph-only databases intentionally omit the
+                    # provider's semantic-claim tables.
+                    pass
+                implicit_deleted = prior_paths - set(changed_files)
+            touched = sorted(set(changed_files + deleted_files) | implicit_deleted)
+
+            # Do not archive semantic chunk claims for an unchanged file: a
+            # chunk's content hash differs from the file hash by design.  New
+            # or changed file hashes, explicit deletes and full-snapshot
+            # omissions still invalidate their old code claims atomically.
+            invalidation_paths = set(deleted_files) | implicit_deleted
+            for path in changed_files:
+                if previous_file_hashes.get(path) != new_hash_by_path.get(path, ""):
+                    invalidation_paths.add(path)
+
+            # The actual provider accepts ``conn`` so claim status, mutation
+            # ledger, audit trail, outbox, graph rows and event reservation are
+            # one SQLite transaction.  Do not fall back to a separate commit:
+            # that was the divergence boundary this routine is closing.
+            invalidated = 0
+            invalidate_revision = getattr(provider, "_invalidate_revision", None)
+            if callable(invalidate_revision):
+                for path in sorted(invalidation_paths):
+                    invalidate_result = invalidate_revision({
+                        "repository_id": repository_id,
+                        "file_path": path,
+                        "new_commit_sha": commit_sha,
+                        "new_content_hash": new_hash_by_path.get(path, ""),
+                    }, conn=conn, trusted_opaque_graph_ids=True)
+                    invalidated += int(invalidate_result.get("invalidated") or 0)
+
+            if snapshot_mode == "full":
+                _delete_fts_for_files(conn, repository_id, [])
+                for table in ("code_graph_edges", "code_graph_lines", "code_graph_chunks", "code_graph_symbols", "code_graph_files"):
+                    conn.execute(f"DELETE FROM {table} WHERE repository_id=?", (repository_id,))
+            else:
+                _delete_files(conn, repository_id, touched)
+                if bool(event.get("edges_full", True)):
+                    conn.execute("DELETE FROM code_graph_edges WHERE repository_id=?", (repository_id,))
+            counts = _insert_graph_rows(
+                conn, event, repository_id, ts,
+                graph_event_id=event_id, graph_payload_hash=payload_hash,
+            )
+            repo_stats = event.get("stats") if isinstance(event.get("stats"), dict) else counts
+            durable_result = {
+                "repository_id": repository_id,
+                "event_id": event_id,
+                "snapshot_mode": snapshot_mode,
+                "counts": counts,
+                "deleted_files": len(deleted_files),
+                "invalidated_claims": invalidated,
+                "embedding": {"status": "pending"},
+                "snapshot_hash": producer_snapshot_hash,
+            }
+            conn.execute(
+                """INSERT INTO code_graph_repositories(repository_id,root,commit_sha,graph_revision,snapshot_hash,generated_at,updated_at,stats_json)
+                   VALUES(?,?,?,?,?,?,?,?)
+                   ON CONFLICT(repository_id) DO UPDATE SET root=excluded.root,commit_sha=excluded.commit_sha,
+                   graph_revision=excluded.graph_revision,snapshot_hash=excluded.snapshot_hash,
+                   generated_at=excluded.generated_at,updated_at=excluded.updated_at,stats_json=excluded.stats_json""",
+                (repository_id, str(event.get("root") or "")[:2000], commit_sha,
+                 str(event.get("graph_revision") or payload_hash[:20])[:160], producer_snapshot_hash[:128],
+                 int(event.get("generated_at") or ts), ts, _json(repo_stats)[:100000]),
+            )
+            finalized = conn.execute(
+                """UPDATE code_graph_events
+                   SET status='completed',stats_json=?
+                   WHERE event_id=? AND payload_hash=? AND payload_hash_version=?""",
+                (_json(durable_result), event_id, payload_hash, payload_hash_version),
+            )
+            if finalized.rowcount != 1:
+                raise RuntimeError("code graph event reservation was not finalized")
+            conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            _close_graph_writer_connection(conn, owns_conn)
+
+    try:
+        embed_stats = _embed_graph_chunks(
+            provider, repository_id, commit_sha, event_id,
+            changed_files if snapshot_mode == "delta" else [], pending_only=True,
+            expected_event_id=event_id, expected_payload_hash=payload_hash,
         )
+    except Exception as exc:
+        # Graph state is already durable and can be retried through
+        # embed_pending_chunks.  Preserve that success rather than making a
+        # network/model issue appear to roll back a committed snapshot.
+        embed_stats = {"enabled": True, "processed": 0, "created": 0, "reused": 0, "failed": 1,
+                       "errors": [f"deferred embedding: {type(exc).__name__}: {exc}"]}
+
+    result = {**durable_result, "embedding": embed_stats}
+    # Best effort only: failure to refresh optional embedding telemetry must
+    # not alter the atomic graph/event result above.
+    with _GRAPH_INGEST_LOCK:
+        conn, owns_conn = _open_graph_writer_connection(provider)
+        try:
+            if not conn.in_transaction:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    """UPDATE code_graph_events SET stats_json=?
+                       WHERE event_id=? AND payload_hash=? AND payload_hash_version=?""",
+                    (_json(result), event_id, payload_hash, payload_hash_version),
+                )
+                conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+        finally:
+            _close_graph_writer_connection(conn, owns_conn)
     return {"status": "completed", "deduplicated": False, **result}
 
 
-def embed_pending_chunks(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
+def embed_pending_chunks(
+    provider: Any, args: Dict[str, Any], *, trusted_opaque_ids: bool = False,
+) -> Dict[str, Any]:
     """Create/reuse semantic claims for graph chunks left pending by bounded ingestion."""
-    repository_id = str(args.get("repository_id") or "").strip()
-    if not repository_id:
-        raise ValueError("repository_id is required")
     limit = max(1, min(int(args.get("limit") or 1000), 10000))
-    conn = provider._connect(); install_code_graph_schema(conn)
-    repo = conn.execute(
-        "SELECT commit_sha,snapshot_hash FROM code_graph_repositories WHERE repository_id=?",
-        (repository_id,),
-    ).fetchone()
-    if not repo:
-        raise ValueError(f"unknown repository_id: {repository_id}")
-    before = conn.execute(
-        "SELECT COUNT(*) FROM code_graph_chunks WHERE repository_id=? AND embedding_claim_id=''",
-        (repository_id,),
-    ).fetchone()
+    conn, owns_conn = _open_graph_writer_connection(provider)
+    try:
+        repository_id = _graph_lookup_identity(
+            provider,
+            str(args.get("repository_id") or "").strip(),
+            trusted_opaque_id=trusted_opaque_ids,
+            conn=conn,
+        )
+        if not repository_id:
+            raise ValueError("repository_id is required")
+        repo = conn.execute(
+            "SELECT commit_sha,snapshot_hash FROM code_graph_repositories WHERE repository_id=?",
+            (repository_id,),
+        ).fetchone()
+        if not repo:
+            raise ValueError(f"unknown repository_id: {repository_id}")
+        before = conn.execute(
+            "SELECT COUNT(*) FROM code_graph_chunks WHERE repository_id=? AND embedding_claim_id=''",
+            (repository_id,),
+        ).fetchone()
+    finally:
+        _close_graph_writer_connection(conn, owns_conn)
     stats = _embed_graph_chunks(
         provider, repository_id, str(repo[0] or ""),
         f"manual-backfill:{repository_id}:{str(repo[1] or '')[:20]}", [],
         unit_limit=limit, pending_only=True,
     )
-    after = conn.execute(
-        "SELECT COUNT(*) FROM code_graph_chunks WHERE repository_id=? AND embedding_claim_id=''",
-        (repository_id,),
-    ).fetchone()
+    conn, owns_conn = _open_graph_writer_connection(provider)
+    try:
+        after = conn.execute(
+            "SELECT COUNT(*) FROM code_graph_chunks WHERE repository_id=? AND embedding_claim_id=''",
+            (repository_id,),
+        ).fetchone()
+    finally:
+        _close_graph_writer_connection(conn, owns_conn)
     return {
         "repository_id": repository_id,
         "pending_before": int(before[0] if before else 0),
@@ -780,15 +2105,25 @@ def _load_candidate(conn: sqlite3.Connection, key: str) -> Optional[Dict[str, An
 
 
 def query_code_graph(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Query through a private connection so read-time schema checks cannot commit a writer."""
+    conn, owns_conn = _open_graph_reader_connection(provider)
+    try:
+        return _query_code_graph_on_connection(provider, args, conn)
+    finally:
+        _close_graph_writer_connection(conn, owns_conn)
+
+
+def _query_code_graph_on_connection(
+    provider: Any, args: Dict[str, Any], conn: sqlite3.Connection
+) -> Dict[str, Any]:
     query = str(args.get("query") or "").strip()
     if not query:
         raise ValueError("query is required")
-    repository_id = str(args.get("repository_id") or "").strip()
+    repository_id = _graph_lookup_identity(
+        provider, str(args.get("repository_id") or "").strip(), conn=conn,
+    )
     limit = max(1, min(int(args.get("limit") or 12), 50))
     lexical_limit = max(20, min(int(args.get("candidate_limit") or limit * 8), 300))
-    conn = provider._connect()
-    install_code_graph_schema(conn)
-
     symbol_rows = _fts_rows(conn, "code_graph_symbols_fts", repository_id, query,
                             "repository_id,symbol_id,file_path,qualified_name,signature", lexical_limit)
     chunk_rows = _fts_rows(conn, "code_graph_chunks_fts", repository_id, query,
@@ -813,7 +2148,8 @@ def query_code_graph(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
         # memories cannot consume Memory Wiki's bounded semantic top-K.
         semantic_rows = provider._search(query, limit=min(50, lexical_limit), include_stale=False,
                                          topic="code-intelligence",
-                                         session_id=str(args.get("session_id") or ""))
+                                         session_id=str(args.get("session_id") or ""),
+                                         record_retrieval=False, conn=conn)
         claim_ids = [str(r.get("id") or "") for r in semantic_rows if str(r.get("id") or "")]
         if claim_ids:
             placeholders = ",".join("?" for _ in claim_ids)
@@ -838,7 +2174,6 @@ def query_code_graph(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
         semantic_error = ""
 
     # Exact file/symbol/path boosts are deterministic and intentionally small.
-    q_lower = query.lower()
     for key in list(scores):
         candidate = _load_candidate(conn, key)
         if not candidate:
@@ -908,7 +2243,12 @@ def query_code_graph(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
             rerank_id = f"codegraph:{idx}:{candidate.get('candidate_type','')}:{candidate.get('id','')}"
             pseudo_row = {
                 "id": rerank_id,
-                "claim": candidate.get("embedding_text") or candidate.get("excerpt") or candidate.get("search_text") or "",
+                # Never send the stored full chunk (including a legacy row) to
+                # an external reranker.  The bounded navigation excerpt passes
+                # through the same complete redactor as public graph output.
+                "claim": _redact_graph_text(
+                    candidate.get("excerpt") or "", 2400, _provider_graph_redactor(provider)
+                ),
                 "status": "active", "risk": "low", "trust_class": "code_claim",
                 "score": candidate["score"], "score_parts": {},
                 "updated_at": int(candidate.get("updated_at") or 0),
@@ -931,7 +2271,7 @@ def query_code_graph(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "repository_id": repository_id,
         "query": query,
-        "results": candidates[:limit],
+        "results": [_public_graph_candidate(provider, item) for item in candidates[:limit]],
         "retrieval": {
             "fts_symbols": len(symbol_rows), "fts_chunks": len(chunk_rows), "fts_lines": len(line_rows),
             "semantic_chunks": semantic_count, "semantic_error": semantic_error,
@@ -941,12 +2281,25 @@ def query_code_graph(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def code_line_context(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
-    repository_id = str(args.get("repository_id") or "").strip()
-    line_id = str(args.get("line_id") or "").strip()
+    conn, owns_conn = _open_graph_reader_connection(provider)
+    try:
+        return _code_line_context_on_connection(provider, args, conn)
+    finally:
+        _close_graph_writer_connection(conn, owns_conn)
+
+
+def _code_line_context_on_connection(
+    provider: Any, args: Dict[str, Any], conn: sqlite3.Connection
+) -> Dict[str, Any]:
+    repository_id = _graph_lookup_identity(
+        provider, str(args.get("repository_id") or "").strip(), conn=conn,
+    )
+    line_id = _graph_lookup_identity(
+        provider, str(args.get("line_id") or "").strip(), conn=conn,
+    )
     radius = max(0, min(int(args["radius"] if "radius" in args else 12), 100))
     if not repository_id:
         raise ValueError("repository_id is required")
-    conn = provider._connect(); install_code_graph_schema(conn)
     if line_id:
         target = conn.execute(
             "SELECT file_path,line_no FROM code_graph_lines WHERE repository_id=? AND line_id=? LIMIT 1",
@@ -956,7 +2309,9 @@ def code_line_context(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
             raise ValueError(f"unknown line_id for repository: {line_id}")
         file_path, line_no = str(target[0]), int(target[1])
     else:
-        file_path = _canonical_path(args.get("file_path") or "")
+        file_path = _graph_lookup_identity(
+            provider, _canonical_path(args.get("file_path") or ""), conn=conn,
+        )
         line_no = int(args.get("line_no") or 0)
         if line_no < 1:
             raise ValueError("provide line_id or file_path + line_no")
@@ -974,19 +2329,33 @@ def code_line_context(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
             [repository_id, *symbol_ids],
         ).fetchall()]
     return {"repository_id": repository_id, "file_path": file_path, "target_line": line_no,
-            "range": [max(1, line_no - radius), line_no + radius], "lines": rows, "symbols": symbols,
+            "range": [max(1, line_no - radius), line_no + radius],
+            "lines": _safe_graph_output(provider, rows), "symbols": _safe_graph_output(provider, symbols),
             "line_id": line_id or next((str(r.get("line_id") or "") for r in rows if int(r.get("line_no") or 0) == line_no), ""),
             "note": "Stored lines are redacted navigation copies; use Code Shrinker file.lines or symbol.source for exact source."}
 
 
 def code_graph_neighbors(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
-    repository_id = str(args.get("repository_id") or "").strip()
-    node_id = str(args.get("node_id") or args.get("symbol_id") or "").strip()
+    conn, owns_conn = _open_graph_reader_connection(provider)
+    try:
+        return _code_graph_neighbors_on_connection(provider, args, conn)
+    finally:
+        _close_graph_writer_connection(conn, owns_conn)
+
+
+def _code_graph_neighbors_on_connection(
+    provider: Any, args: Dict[str, Any], conn: sqlite3.Connection
+) -> Dict[str, Any]:
+    repository_id = _graph_lookup_identity(
+        provider, str(args.get("repository_id") or "").strip(), conn=conn,
+    )
+    node_id = _graph_lookup_identity(
+        provider, str(args.get("node_id") or args.get("symbol_id") or "").strip(), conn=conn,
+    )
     hops = max(1, min(int(args.get("hops") or 1), 3))
     limit = max(1, min(int(args.get("limit") or 50), 500))
     if not repository_id or not node_id:
         raise ValueError("repository_id and node_id are required")
-    conn = provider._connect(); install_code_graph_schema(conn)
     frontier = {node_id}; seen = {node_id}; edges: List[Dict[str, Any]] = []
     for depth in range(1, hops + 1):
         if not frontier or len(edges) >= limit:
@@ -1012,13 +2381,25 @@ def code_graph_neighbors(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
             f"SELECT symbol_id,file_path,qualified_name,kind,signature,start_line,end_line FROM code_graph_symbols WHERE repository_id=? AND symbol_id IN ({placeholders})",
             [repository_id, *symbol_nodes],
         ).fetchall()]
-    return {"repository_id": repository_id, "node_id": node_id, "hops": hops, "nodes": nodes, "edges": edges[:limit]}
+    return {"repository_id": repository_id, "node_id": node_id, "hops": hops,
+            "nodes": _safe_graph_output(provider, nodes), "edges": _safe_graph_output(provider, edges[:limit])}
 
 
 def code_graph_status(provider: Any, args: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    conn, owns_conn = _open_graph_reader_connection(provider)
+    try:
+        return _code_graph_status_on_connection(provider, args, conn)
+    finally:
+        _close_graph_writer_connection(conn, owns_conn)
+
+
+def _code_graph_status_on_connection(
+    provider: Any, args: Optional[Dict[str, Any]], conn: sqlite3.Connection
+) -> Dict[str, Any]:
     args = args or {}
-    repository_id = str(args.get("repository_id") or "").strip()
-    conn = provider._connect(); install_code_graph_schema(conn)
+    repository_id = _graph_lookup_identity(
+        provider, str(args.get("repository_id") or "").strip(), conn=conn,
+    )
     repos = [dict(r) for r in conn.execute(
         "SELECT * FROM code_graph_repositories " + ("WHERE repository_id=? " if repository_id else "") + "ORDER BY updated_at DESC",
         (repository_id,) if repository_id else (),
@@ -1045,18 +2426,273 @@ def code_graph_status(provider: Any, args: Optional[Dict[str, Any]] = None) -> D
     return {
         "enabled": _env_bool("MEMORY_WIKI_CODE_GRAPH", True),
         "schema_version": SCHEMA_VERSION,
-        "repositories": repos,
+        "repositories": _safe_graph_output(provider, repos),
         "totals": totals,
         "embedding_enabled": _env_bool("MEMORY_WIKI_CODE_GRAPH_EMBED", True),
         "rerank_enabled": _env_bool("MEMORY_WIKI_CODE_GRAPH_RERANK", True),
     }
 
 
+def _scrub_graph_identity_columns(
+    provider: Any, conn: sqlite3.Connection, *, apply: bool, limit: int,
+) -> Tuple[int, int, int, int, set[str]]:
+    """Migrate legacy graph keys that predate ingress identity redaction.
+
+    Key columns cannot be passed through a generic marker: references between
+    files, symbols, chunks, lines, edges, events and code-claim metadata must
+    retain their equality relationship.  The deterministic opaque transform
+    makes the per-table updates safe to run in one caller-owned transaction.
+    """
+    targets = (
+        ("code_graph_repositories", ("repository_id",), ""),
+        ("code_graph_files", ("repository_id", "file_path"), ""),
+        ("code_graph_symbols", ("repository_id", "symbol_id", "file_path"), ""),
+        ("code_graph_chunks", ("repository_id", "chunk_id", "file_path", "symbol_id", "graph_event_id"), ""),
+        ("code_graph_lines", ("repository_id", "file_path", "line_id", "symbol_id", "chunk_id"), ""),
+        ("code_graph_edges", ("repository_id", "edge_id", "source_id", "target_id", "source_file", "target_file"), ""),
+        ("code_graph_events", ("event_id", "repository_id"), ""),
+        # Graph embeddings link through this provider table; preserve that
+        # relationship when cleaning a database written by an older release.
+        ("code_claim_metadata", ("repository_id", "file_path", "symbol_id"), ""),
+        # Patch outcomes share the same graph namespace and are later used by
+        # invalidation/replay, so leaving their legacy v1 keys behind would
+        # fork a graph immediately after a successful scrub.
+        ("patch_outcomes", ("repository_id", "patch_id", "source_event_id"), ""),
+        # This table is written only by the code-claim/patch exactly-once
+        # paths in this provider. Its event_id is their collision guard, so a
+        # stale v1 spelling would let a post-migration raw retry fork it.
+        ("integration_events", ("event_id",), ""),
+    )
+    changed_rows = changed_fields = scanned_rows = batches = 0
+    migrated_opaque_ids: set[str] = set()
+    batch_size = max(1, min(int(limit or 5000), 100_000))
+    redactor = _provider_graph_redactor(provider)
+    for table, columns, predicate in targets:
+        # ``rowid`` is stable while an identity update changes a primary key.
+        # Advance a cursor through every batch instead of repeatedly applying
+        # ``LIMIT 5000`` to the first rows forever; legacy graph stores can be
+        # much larger than one maintenance batch.
+        last_rowid = 0
+        while True:
+            try:
+                select_columns = ["rowid", *columns]
+                if table == "integration_events":
+                    select_columns.extend(("producer", "payload_hash"))
+                where = "rowid>?"
+                if predicate:
+                    where += " AND " + predicate
+                rows = conn.execute(
+                    f"SELECT {','.join(select_columns)} FROM {table} "
+                    f"WHERE {where} ORDER BY rowid LIMIT ?",
+                    (last_rowid, batch_size),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                break
+            if not rows:
+                break
+            batches += 1
+            scanned_rows += len(rows)
+            last_rowid = int(rows[-1]["rowid"])
+            for row in rows:
+                changes: Dict[str, str] = {}
+                for column in columns:
+                    original = str(row[column] or "")
+                    safe = _migrate_stored_graph_identity(
+                        original, redactor=redactor, conn=conn,
+                    )
+                    if safe != original:
+                        if apply and table == "integration_events" and column == "event_id":
+                            collision = conn.execute(
+                                "SELECT 1 FROM integration_events "
+                                "WHERE producer=? AND event_id=? AND rowid<>? LIMIT 1",
+                                (str(row["producer"] or ""), safe, row["rowid"]),
+                            ).fetchone()
+                            if collision is not None:
+                                # A collision would silently weaken the source
+                                # event reuse guard. Stop the transaction rather
+                                # than discard either claim's provenance.
+                                raise RuntimeError("code graph integration-event identity migration collision")
+                        changes[column] = safe
+                        if _OPAQUE_GRAPH_ID_RE.fullmatch(safe):
+                            migrated_opaque_ids.add(safe)
+                if not changes:
+                    continue
+                changed_rows += 1
+                changed_fields += len(changes)
+                if apply:
+                    assignments = ",".join(f"{column}=?" for column in changes)
+                    conn.execute(
+                        f"UPDATE {table} SET {assignments} WHERE rowid=?",
+                        [*changes.values(), row["rowid"]],
+                    )
+    return changed_rows, changed_fields, scanned_rows, batches, migrated_opaque_ids
+
+
+def scrub_code_graph_storage(
+    provider: Any, conn: sqlite3.Connection, *, apply: bool = False, limit: int = 5000,
+) -> Dict[str, Any]:
+    """Redact legacy graph text and rebuild graph FTS from the safe rows.
+
+    New ingestion never writes raw source, but existing databases can predate
+    that invariant.  This maintenance helper deliberately works on the caller's
+    transaction and returns counts only; it never surfaces the original text.
+    """
+    batch_size = max(1, min(int(limit or 5000), 100_000))
+    targets = (
+        ("code_graph_repositories", ("root", "graph_revision", "snapshot_hash", "stats_json")),
+        ("code_graph_files", ("file_hash", "imports_json")),
+        ("code_graph_symbols", ("symbol_revision", "qualified_name", "short_name", "signature", "contract_json", "search_text")),
+        ("code_graph_chunks", ("qualified_name", "chunk_text", "embedding_text", "search_text")),
+        ("code_graph_lines", ("anchor_hash", "line_text", "flags")),
+        ("code_graph_edges", ("evidence",)),
+        ("code_graph_events", ("stats_json",)),
+        (
+            "patch_outcomes",
+            (
+                "outcome", "rollback_steps", "validation_report_json",
+                "changed_files_json", "changed_symbols_json",
+            ),
+        ),
+    )
+    changed_rows, changed_fields, scanned_rows, batches, migrated_opaque_ids = _scrub_graph_identity_columns(
+        provider, conn, apply=apply, limit=batch_size,
+    )
+    for table, fields in targets:
+        last_rowid = 0
+        while True:
+            try:
+                rows = conn.execute(
+                    f"SELECT rowid,{','.join(fields)} FROM {table} "
+                    "WHERE rowid>? ORDER BY rowid LIMIT ?",
+                    (last_rowid, batch_size),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                break
+            if not rows:
+                break
+            batches += 1
+            scanned_rows += len(rows)
+            last_rowid = int(rows[-1]["rowid"])
+            for row in rows:
+                changes: Dict[str, str] = {}
+                def identity_mapper(value: Any) -> str:
+                    return _migrate_stored_graph_identity(
+                        value,
+                        redactor=_provider_graph_redactor(provider),
+                        conn=conn,
+                    )
+                for field in fields:
+                    original = str(row[field] or "")
+                    if table == "patch_outcomes":
+                        safe = _scrub_patch_outcome_storage_value(
+                            provider,
+                            field,
+                            original,
+                            redactor=_provider_graph_redactor(provider),
+                            identity_mapper=identity_mapper,
+                        )
+                    else:
+                        safe = _redact_graph_storage_value(
+                            original,
+                            _provider_graph_redactor(provider),
+                            identity_mapper=identity_mapper,
+                            key=(field[:-5] if field.endswith("_json") else field),
+                        )
+                    if safe != original:
+                        changes[field] = safe
+                        try:
+                            parsed = json.loads(safe)
+                        except (TypeError, ValueError):
+                            parsed = None
+                        if parsed is not None:
+                            def collect(value: Any, key: str = "") -> None:
+                                if isinstance(value, dict):
+                                    for child_key, child_value in value.items():
+                                        collect(child_value, str(child_key))
+                                elif isinstance(value, list):
+                                    for child in value:
+                                        collect(child, key)
+                                elif (
+                                    str(key or "").lower() in _GRAPH_IDENTITY_FIELDS
+                                    and _OPAQUE_GRAPH_ID_RE.fullmatch(str(value or "").strip())
+                                ):
+                                    migrated_opaque_ids.add(str(value).strip())
+                            collect(
+                                parsed,
+                                field[:-5] if field.endswith("_json") else field,
+                            )
+                if not changes:
+                    continue
+                changed_rows += 1
+                changed_fields += len(changes)
+                if apply:
+                    assignments = ",".join(f"{field}=?" for field in changes)
+                    conn.execute(
+                        f"UPDATE {table} SET {assignments} WHERE rowid=?",
+                        [*changes.values(), row["rowid"]],
+                    )
+    if apply:
+        # All v1 and unverified opaque spellings have now been deterministically
+        # re-keyed in every graph-bearing column.  Record their exact v2 IDs
+        # and only then flip the durable lookup-mode marker, so an interrupted
+        # caller cannot leave raw-source writes pointing at a half-migration.
+        _register_opaque_graph_id_provenance(
+            conn,
+            sorted(migrated_opaque_ids),
+            version=_GRAPH_IDENTITY_PROVENANCE_VERSION,
+        )
+        try:
+            conn.execute(
+                f"DELETE FROM {_GRAPH_IDENTITY_PROVENANCE_TABLE} "
+                "WHERE provenance_version<?",
+                (_GRAPH_IDENTITY_PROVENANCE_VERSION,),
+            )
+            conn.execute(
+                f"INSERT OR REPLACE INTO {_GRAPH_IDENTITY_MIGRATIONS_TABLE}("
+                "migration_version,completed_at) VALUES(?,?)",
+                (_GRAPH_IDENTITY_MIGRATION_VERSION, _now()),
+            )
+        except sqlite3.Error:
+            # Missing registry schema must never enable v2 lookup aliases.
+            raise RuntimeError("code graph opaque-ID provenance migration is unavailable")
+        try:
+            conn.execute("DELETE FROM code_graph_symbols_fts")
+            conn.execute(
+                "INSERT INTO code_graph_symbols_fts(repository_id,symbol_id,file_path,qualified_name,signature,search_text) "
+                "SELECT repository_id,symbol_id,file_path,qualified_name,signature,search_text FROM code_graph_symbols"
+            )
+            conn.execute("DELETE FROM code_graph_chunks_fts")
+            conn.execute(
+                "INSERT INTO code_graph_chunks_fts(repository_id,chunk_id,file_path,symbol_id,qualified_name,search_text,chunk_text) "
+                "SELECT repository_id,chunk_id,file_path,symbol_id,qualified_name,search_text,chunk_text FROM code_graph_chunks"
+            )
+            conn.execute("DELETE FROM code_graph_lines_fts")
+            conn.execute(
+                "INSERT INTO code_graph_lines_fts(repository_id,file_path,line_no,line_text) "
+                "SELECT repository_id,file_path,line_no,line_text FROM code_graph_lines"
+            )
+        except sqlite3.OperationalError:
+            pass
+    return {
+        "rows": changed_rows,
+        "fields": changed_fields,
+        "scanned_rows": scanned_rows,
+        "batches": batches,
+        "complete": True,
+        "batch_size": batch_size,
+    }
+
+
 def maybe_prefetch_code_context(provider: Any, query: str, max_chars: int = 8000) -> str:
     if not _env_bool("MEMORY_WIKI_CODE_GRAPH_PREFETCH", True) or not _CODE_HINT.search(str(query or "")):
         return ""
-    conn = provider._connect(); install_code_graph_schema(conn)
-    repos = [str(r[0]) for r in conn.execute("SELECT repository_id FROM code_graph_repositories ORDER BY updated_at DESC LIMIT 20").fetchall()]
+    conn, owns_conn = _open_graph_reader_connection(provider)
+    try:
+        repos = [str(r[0]) for r in conn.execute(
+            "SELECT repository_id FROM code_graph_repositories ORDER BY updated_at DESC LIMIT 20"
+        ).fetchall()]
+    finally:
+        _close_graph_writer_connection(conn, owns_conn)
     if not repos:
         return ""
     inferred = ""
@@ -1091,5 +2727,5 @@ def maybe_prefetch_code_context(provider: Any, query: str, max_chars: int = 8000
 __all__ = [
     "install_code_graph_schema", "ingest_code_graph_event", "query_code_graph",
     "code_line_context", "code_graph_neighbors", "code_graph_status",
-    "embed_pending_chunks", "maybe_prefetch_code_context",
+    "embed_pending_chunks", "maybe_prefetch_code_context", "scrub_code_graph_storage",
 ]

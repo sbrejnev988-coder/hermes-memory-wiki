@@ -24,6 +24,7 @@ def test_metadata_registry_query_works_without_legacy_secret_core(tmp_path: Path
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("MEMORY_WIKI_SEMANTIC", "0")
     monkeypatch.setenv("HERMES_SECURITY_STRICT", "0")
+    monkeypatch.setenv("MEMORY_WIKI_ALLOW_SHARED_SECRET_METADATA", "1")
     registry = tmp_path / "secret-vault" / "secrets_registry.json"
     registry.parent.mkdir(parents=True)
     registry.write_text(
@@ -72,6 +73,7 @@ def test_metadata_registry_query_skips_legacy_index_by_default_when_core_exists(
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("MEMORY_WIKI_SEMANTIC", "0")
     monkeypatch.setenv("HERMES_SECURITY_STRICT", "0")
+    monkeypatch.setenv("MEMORY_WIKI_ALLOW_SHARED_SECRET_METADATA", "1")
     registry = tmp_path / "secret-vault" / "secrets_registry.json"
     registry.parent.mkdir(parents=True)
     registry.write_text(

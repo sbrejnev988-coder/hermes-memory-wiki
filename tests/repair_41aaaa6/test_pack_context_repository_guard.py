@@ -8,6 +8,7 @@ from test_repository_scoping_regression import code_args, load_provider
 
 def test_pack_context_excludes_foreign_repository_and_keeps_global_preference(tmp_path, monkeypatch):
     provider = load_provider(tmp_path, monkeypatch)
+    provider.project_scope = "repo-A"
     foreign = provider._code_claim_add(code_args(
         "repo-B", "Repository B uses the foreign implementation sentinel",
         symbol="sym_foreign", content="foreign-body",
@@ -28,11 +29,14 @@ def test_pack_context_excludes_foreign_repository_and_keeps_global_preference(tm
     assert "foreign implementation sentinel" not in rendered.lower()
     assert preference_id in result.get("claim_ids", []) or "concise verification summaries" in rendered.lower()
     suppressed = result.get("suppression_manifest", {}).get("suppressed", [])
-    assert any(item.get("claim_id") == foreign["id"] and item.get("reason") == "foreign_repository" for item in suppressed)
+    # Coverage metadata cannot grant access to a foreign project: the claim
+    # must be absent before classification, including its suppression report.
+    assert not any(item.get("claim_id") == foreign["id"] for item in suppressed)
 
 
 def test_pack_context_exact_source_suppresses_duplicate_even_with_contract_after_it(tmp_path, monkeypatch):
     provider = load_provider(tmp_path, monkeypatch)
+    provider.project_scope = "repo-A"
     digest = hashlib.sha256(b"same-body").hexdigest()
     claim = provider._code_claim_add(code_args(
         "repo-A", "Service uses port 1234", symbol="sym_shared", revision="rev1", content="same-body",

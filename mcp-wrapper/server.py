@@ -95,10 +95,17 @@ def ensure_plugin():
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     provider = module.MemoryWikiProvider()
+    # One stdio server represents one caller identity. External multi-agent
+    # clients must launch separate processes with stable explicit IDs.
+    session_id = os.environ.get("MW_MCP_SESSION_ID") or f"mw_mcp_{os.getpid()}"
+    bot_id = os.environ.get("MW_MCP_BOT_ID") or f"mcp_{os.getpid()}"
+    project_id = os.environ.get("MW_MCP_PROJECT_ID") or ""
     provider.initialize(
-        "mw_mcp",
+        session_id,
         hermes_home=str(HERMES_HOME),
         agent_context="mcp",
+        bot_id=bot_id,
+        project_id=project_id,
     )
     _PROVIDER = provider
     log("Plugin loaded")

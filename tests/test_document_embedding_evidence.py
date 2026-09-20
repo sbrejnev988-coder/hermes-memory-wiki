@@ -48,7 +48,7 @@ def test_embedding_evidence_uses_safe_refs_not_token_like_provenance() -> None:
                 parser, parser_version, revision_id, status, active, created_at, updated_at
             ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                source_id, "scope", "scope", "C:/Users/Kekl/AppData/Local/hermes/documents/session.md",
+                source_id, "scope", "scope", "C:/fixture-root/hermes/documents/session.md",
                 "session.md", ".md", "session", "hash", "stdlib-text", "test",
                 revision_id, "ok", 1, 1, 1,
             ),

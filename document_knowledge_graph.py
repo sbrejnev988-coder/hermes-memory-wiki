@@ -234,6 +234,34 @@ def _assert_source_access(provider: Any, row: Any) -> None:
     _document_access_scope(provider, source_scope, source_repository)
 
 
+def _assert_connector_owner(provider: Any, source_id: str) -> None:
+    """Keep direct document mutation tools from bypassing connector ownership."""
+    try:
+        rows = provider._connect().execute(
+            "SELECT owner_bot_id FROM external_sources WHERE document_source_id=? AND status='active'",
+            (source_id,),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return
+        raise
+    bot_id = str(getattr(provider, "bot_id", "") or "").strip()
+    if any(not bot_id or str(row[0] or "") != bot_id for row in rows):
+        raise PermissionError("connector_source_not_owned")
+
+
+def _connector_visibility_clause(conn: sqlite3.Connection, provider: Any,
+                                 source_expression: str) -> tuple[str, list[str]]:
+    """Exclude another bot's connector document from shared project queries."""
+    if not conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='external_sources'"
+    ).fetchone():
+        return "", []
+    return ("NOT EXISTS (SELECT 1 FROM external_sources x WHERE "
+            f"x.document_source_id={source_expression} AND x.status='active' "
+            "AND x.owner_bot_id<>?)", [str(getattr(provider, "bot_id", "") or "")])
+
+
 def _absolute_unresolved(value: Any) -> Path:
     """Normalize a user spelling without following links or reparse points."""
     text = str(value or "").strip()
@@ -1225,6 +1253,7 @@ def ingest_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
         str(args.get("repository_id") or ""),
     )
     source_id = _source_id(path)
+    _assert_connector_owner(provider, source_id)
     snapshot, snapshot_meta = _snapshot_allowed_file(
         path,
         max_bytes=int(_worker_options(args)["max_bytes"]),
@@ -1254,6 +1283,7 @@ def ingest_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     payload["mtime_ns"] = int(snapshot_meta["mtime_ns"])
     payload["file_size"] = int(snapshot_meta["size_bytes"])
     conn = provider._connect(); install_document_graph_schema(conn)
+    _assert_connector_owner(provider, source_id)
     file_hash = str(payload.get("file_hash") or "")
     parser = str(payload.get("parser") or "")
     parser_version = str(payload.get("parser_version") or "")
@@ -1772,6 +1802,8 @@ def embed_pending_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, An
     conn = provider._connect(); install_document_graph_schema(conn)
     clauses = ["c.active=1", "c.embedding_claim_id=''", "s.active=1"]
     params: List[Any] = []
+    connector_filter, connector_params = _connector_visibility_clause(conn, provider, "s.source_id")
+    if connector_filter: clauses.append(connector_filter); params.extend(connector_params)
     if source_id: clauses.append("c.source_id=?"); params.append(source_id)
     if scope_id: clauses.append("c.scope_id=?"); params.append(scope_id)
     if repository_id: clauses.append("c.repository_id=?"); params.append(repository_id)
@@ -1791,10 +1823,27 @@ def embed_pending_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, An
         evidence_key = "document_chunk_ref:" + _evidence_ref(
             f"{item['source_id']}\0{item['content_hash']}"
         )
-        prior = conn.execute(
-            "SELECT id FROM claims WHERE topic=? AND status='active' AND evidence LIKE ? ORDER BY updated_at DESC LIMIT 1",
-            (_TOPIC, f"%{evidence_key}%"),
-        ).fetchone()
+        try:
+            connector_owned = bool(conn.execute(
+                "SELECT 1 FROM external_sources WHERE document_source_id=? "
+                "AND status='active' AND owner_bot_id=? LIMIT 1",
+                (item["source_id"], str(getattr(provider, "bot_id", "") or "")),
+            ).fetchone())
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            connector_owned = False
+        if connector_owned:
+            prior = conn.execute(
+                "SELECT id FROM claims WHERE topic=? AND status='active' AND evidence LIKE ? "
+                "AND visibility_scope='bot' AND origin_bot_id=? ORDER BY updated_at DESC LIMIT 1",
+                (_TOPIC, f"%{evidence_key}%", str(provider.bot_id)),
+            ).fetchone()
+        else:
+            prior = conn.execute(
+                "SELECT id FROM claims WHERE topic=? AND status='active' AND evidence LIKE ? ORDER BY updated_at DESC LIMIT 1",
+                (_TOPIC, f"%{evidence_key}%"),
+            ).fetchone()
         try:
             if prior:
                 claim_id = str(prior[0]); reused += 1
@@ -1809,7 +1858,8 @@ def embed_pending_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, An
                 claim_id = provider._add_claim(
                     str(item.get("embedding_text") or item.get("chunk_text") or ""), topic=_TOPIC,
                     evidence=evidence, source="artifact:document-index", confidence=0.78, salience=0.42,
-                    visibility_scope="project" if project_id else "global", project_id=project_id,
+                    visibility_scope="bot" if connector_owned else ("project" if project_id else "global"),
+                    project_id=project_id,
                 )
                 if str(claim_id).startswith("rq_"):
                     raise RuntimeError(f"claim quarantined: {claim_id}")
@@ -1882,6 +1932,8 @@ def query_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     conn = provider._connect(); install_document_graph_schema(conn)
     fts = _fts_query(query)
     filters = []; filter_params: List[Any] = []
+    connector_filter, connector_params = _connector_visibility_clause(conn, provider, "s.source_id")
+    if connector_filter: filters.append(connector_filter); filter_params.extend(connector_params)
     if source_id: filters.append("s.source_id=?"); filter_params.append(source_id)
     if scope_id: filters.append("s.scope_id=?"); filter_params.append(scope_id)
     if repository_id: filters.append("s.repository_id=?"); filter_params.append(repository_id)
@@ -1945,6 +1997,7 @@ def query_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
             if repository_id: sql += " AND s.repository_id=?"; params.append(repository_id)
             if extension: sql += " AND s.extension=?"; params.append(extension)
             if global_only: sql += " AND s.scope_id='' AND s.repository_id=''"
+            if connector_filter: sql += " AND " + connector_filter; params.extend(connector_params)
             mapping = {str(r["embedding_claim_id"]): str(r["chunk_id"]) for r in conn.execute(sql, params).fetchall()}
             sem_keys = [f"chunk:{mapping[cid]}" for cid in claim_ids if cid in mapping]
             semantic_count = len(sem_keys); _rrf(scores, parts, sem_keys, "semantic", 1.30)
@@ -2030,6 +2083,7 @@ def document_source(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("source_id or path is required")
     if not row: raise ValueError("document source not found")
     _assert_source_access(provider, row)
+    _assert_connector_owner(provider, str(row["source_id"]))
     out = _row(row)
     for key in ("metadata_json", "warnings_json"):
         raw = out.pop(key, "")
@@ -2054,6 +2108,7 @@ def document_unit_context(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]
     source = conn.execute("SELECT scope_id,repository_id FROM document_sources WHERE source_id=? AND active=1", (source_id,)).fetchone()
     if not source: raise ValueError("document source not found")
     _assert_source_access(provider, source)
+    _assert_connector_owner(provider, source_id)
     if unit_id:
         target = conn.execute("SELECT ordinal FROM document_units WHERE source_id=? AND unit_id=? AND active=1", (source_id, unit_id)).fetchone()
     elif anchor:
@@ -2084,6 +2139,7 @@ def document_neighbors(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     source = conn.execute("SELECT scope_id,repository_id FROM document_sources WHERE source_id=? AND active=1", (source_id,)).fetchone()
     if not source: raise ValueError("document source not found")
     _assert_source_access(provider, source)
+    _assert_connector_owner(provider, source_id)
     queue = deque([(anchor, 0)]); seen = {anchor}; found = []
     while queue and len(found) < limit:
         node, depth = queue.popleft()
@@ -2107,6 +2163,8 @@ def document_status(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
         str(args.get("repository_id") or ""),
     )
     clauses = ["active=1"]; params: List[Any] = []
+    connector_filter, connector_params = _connector_visibility_clause(conn, provider, "document_sources.source_id")
+    if connector_filter: clauses.append(connector_filter); params.extend(connector_params)
     if scope_id: clauses.append("scope_id=?"); params.append(scope_id)
     if repository_id: clauses.append("repository_id=?"); params.append(repository_id)
     sources = [_row(r) for r in conn.execute(
@@ -2144,6 +2202,7 @@ def delete_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     source = conn.execute("SELECT scope_id,repository_id FROM document_sources WHERE source_id=? AND active=1", (source_id,)).fetchone()
     if not source: raise ValueError("document source not found")
     _assert_source_access(provider, source)
+    _assert_connector_owner(provider, source_id)
     claim_ids = [str(r[0]) for r in conn.execute("SELECT embedding_claim_id FROM document_chunks WHERE source_id=? AND active=1 AND embedding_claim_id<>''", (source_id,)).fetchall()]
     with conn:
         archived = _archive_claims(conn, claim_ids, retiring_source_ids={source_id})
