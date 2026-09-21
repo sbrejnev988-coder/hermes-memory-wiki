@@ -18,7 +18,7 @@ from typing import Any, Mapping
 
 
 SDK_API_VERSION = "1.0"
-__version__ = "1.23.2"
+__version__ = "1.23.3"
 
 
 class MemoryWikiClientError(RuntimeError):

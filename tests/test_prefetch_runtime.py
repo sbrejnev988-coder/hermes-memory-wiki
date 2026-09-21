@@ -137,6 +137,7 @@ def test_prefetch_row_fixture_matches_current_renderer_contract() -> None:
 
 def test_reranker_timeout_is_single_attempt_and_fail_open() -> None:
     provider = mod.MemoryWikiProvider()
+    provider.home = mod._IMPORT_HERMES_HOME
     calls = []
     def fail_urlopen(_request, timeout=0):
         calls.append(float(timeout))
@@ -158,6 +159,7 @@ def test_reranker_timeout_is_single_attempt_and_fail_open() -> None:
 
 def test_reranker_cache_uses_candidate_set_not_input_order() -> None:
     provider = mod.MemoryWikiProvider()
+    provider.home = mod._IMPORT_HERMES_HOME
     rows = sample_rows()
     calls = []
 

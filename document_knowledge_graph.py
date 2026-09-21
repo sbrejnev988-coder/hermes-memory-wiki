@@ -14,6 +14,7 @@ untrusted derivative and is wrapped accordingly before prompt injection.
 """
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import heapq
 import json
@@ -27,6 +28,7 @@ import tempfile
 import threading
 import time
 from collections import defaultdict, deque
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
@@ -67,6 +69,57 @@ _ALLOWED_EDGE_PREDICATES = {
     "contains", "next", "references", "formula_ref", "links_to", "derived_from", "supersedes",
 }
 
+_DOCUMENT_PROFILE_SCOPE: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
+    contextvars.ContextVar("memory_wiki_document_profile", default=None)
+)
+
+
+@contextmanager
+def _document_profile_scope(home: Path):
+    """Bind document filesystem and policy reads to one provider's home.
+
+    Hermes Desktop can host several providers in one process. Its ambient
+    environment describes the importer, so a different provider must get its
+    own document settings from its own .env or use the safe defaults.
+    """
+    profile_home = Path(os.path.abspath(os.fspath(Path(home).expanduser())))
+    active = _DOCUMENT_PROFILE_SCOPE.get()
+    if active is not None and active["home"] == profile_home:
+        yield
+        return
+    ambient_home = Path(os.path.abspath(os.fspath(Path(
+        os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+    ).expanduser())))
+    settings: Dict[str, str] = {}
+    if profile_home != ambient_home:
+        env_path = profile_home / ".env"
+        if env_path.is_file():
+            with env_path.open("r", encoding="utf-8-sig") as handle:
+                for line in handle:
+                    key, separator, value = line.partition("=")
+                    key = key.strip().removeprefix("export ").strip()
+                    if separator and (key.startswith("MEMORY_WIKI_DOCUMENT_")
+                                      or key in {"HERMES_DOCUMENT_CACHE_DIR", "MEMORY_WIKI_TIKA_URL"}):
+                        value = value.strip()
+                        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                            value = value[1:-1]
+                        settings[key] = value
+    token = _DOCUMENT_PROFILE_SCOPE.set({
+        "home": profile_home, "strict": profile_home != ambient_home,
+        "settings": settings,
+    })
+    try:
+        yield
+    finally:
+        _DOCUMENT_PROFILE_SCOPE.reset(token)
+
+
+def _document_env(name: str, default: Optional[str] = None) -> Optional[str]:
+    scope = _DOCUMENT_PROFILE_SCOPE.get()
+    if scope is not None and scope["strict"]:
+        return scope["settings"].get(name, default)
+    return os.environ.get(name, default)
+
 
 def _now() -> int:
     return int(time.time())
@@ -93,7 +146,7 @@ def _decode_json(value: Any, default: Any) -> Any:
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name)
+    raw = _document_env(name)
     if raw is None:
         return default
     return str(raw).strip().lower() not in {"", "0", "false", "no", "off"}
@@ -101,7 +154,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 def _env_int(name: str, default: int, low: int, high: int) -> int:
     try:
-        value = int(os.environ.get(name, str(default)))
+        value = int(_document_env(name, str(default)))
     except (TypeError, ValueError):
         value = default
     return max(low, min(value, high))
@@ -109,7 +162,7 @@ def _env_int(name: str, default: int, low: int, high: int) -> int:
 
 def _env_float(name: str, default: float, low: float, high: float) -> float:
     try:
-        value = float(os.environ.get(name, str(default)))
+        value = float(_document_env(name, str(default)))
     except (TypeError, ValueError):
         value = default
     return max(low, min(value, high))
@@ -152,13 +205,16 @@ def _fts_query(query: str) -> str:
 def _hermes_home() -> Path:
     # Preserve the configured lexical spelling. Windows Path.resolve() can expand
     # an 8.3 path alias and break descriptor-relative allowlist matching.
+    scope = _DOCUMENT_PROFILE_SCOPE.get()
+    if scope is not None:
+        return scope["home"]
     return Path(os.path.abspath(os.fspath(Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser())))
 
 
 def _document_cache_root() -> Path:
     configured = (
-        os.environ.get("MEMORY_WIKI_DOCUMENT_CACHE_DIR", "").strip()
-        or os.environ.get("HERMES_DOCUMENT_CACHE_DIR", "").strip()
+        str(_document_env("MEMORY_WIKI_DOCUMENT_CACHE_DIR", "") or "").strip()
+        or str(_document_env("HERMES_DOCUMENT_CACHE_DIR", "") or "").strip()
     )
     if configured:
         return _absolute_unresolved(configured)
@@ -166,7 +222,7 @@ def _document_cache_root() -> Path:
 
 
 def _roots() -> List[Path]:
-    configured = os.environ.get("MEMORY_WIKI_DOCUMENT_ROOTS", "").strip()
+    configured = str(_document_env("MEMORY_WIKI_DOCUMENT_ROOTS", "") or "").strip()
     if configured:
         raw = [p for p in configured.split(os.pathsep) if p.strip()]
     else:
@@ -201,11 +257,11 @@ def _document_access_scope(provider: Any, requested_scope: str = "", requested_r
     environment policy is the authority for ordinary document operations.
     """
     configured_scope = (
-        os.environ.get("MEMORY_WIKI_DOCUMENT_ACCESS_SCOPE_ID", "").strip()
+        str(_document_env("MEMORY_WIKI_DOCUMENT_ACCESS_SCOPE_ID", "") or "").strip()
         or str(getattr(provider, "project_scope", "") or "").strip()
     )
     configured_repository = (
-        os.environ.get("MEMORY_WIKI_DOCUMENT_ACCESS_REPOSITORY_ID", "").strip()
+        str(_document_env("MEMORY_WIKI_DOCUMENT_ACCESS_REPOSITORY_ID", "") or "").strip()
         or configured_scope
     )
     scope = str(requested_scope or "").strip() or configured_scope
@@ -702,10 +758,10 @@ def _worker_options(args: Dict[str, Any]) -> Dict[str, Any]:
         "zip_max_ratio": _env_int("MEMORY_WIKI_DOCUMENT_ZIP_MAX_RATIO", 200, 5, 10_000),
         "zip_max_member": _env_int("MEMORY_WIKI_DOCUMENT_ZIP_MAX_MEMBER_BYTES", 16 * 1024 * 1024, 1024 * 1024, 256 * 1024 * 1024),
         "ocr": bool(args.get("ocr", _env_bool("MEMORY_WIKI_DOCUMENT_OCR", False))),
-        "ocr_language": str(args.get("ocr_language") or os.environ.get("MEMORY_WIKI_DOCUMENT_OCR_LANGUAGE", "eng+rus")),
+        "ocr_language": str(args.get("ocr_language") or _document_env("MEMORY_WIKI_DOCUMENT_OCR_LANGUAGE", "eng+rus")),
         "ocr_min_native_chars": _env_int("MEMORY_WIKI_DOCUMENT_OCR_MIN_NATIVE_CHARS", 40, 0, 10_000),
         "external_timeout": _env_int("MEMORY_WIKI_DOCUMENT_EXTERNAL_TIMEOUT", 90, 5, 900),
-        "tika_url": str(os.environ.get("MEMORY_WIKI_TIKA_URL", "")),
+        "tika_url": str(_document_env("MEMORY_WIKI_TIKA_URL", "") or ""),
     }
 
 
@@ -1741,7 +1797,7 @@ def document_cache_scan_journal_ready(provider: Any) -> bool:
     last = float(getattr(provider, "_memory_wiki_document_cache_scan_at", 0.0) or 0.0)
     if last and time.monotonic() - last < cooldown:
         return False
-    scope_id = os.environ.get("MEMORY_WIKI_DOCUMENT_AUTO_SCOPE_ID", "").strip()
+    scope_id = str(_document_env("MEMORY_WIKI_DOCUMENT_AUTO_SCOPE_ID", "") or "").strip()
     return bool(scope_id or _env_bool("MEMORY_WIKI_DOCUMENT_ALLOW_GLOBAL_AUTO", False))
 
 
@@ -1762,8 +1818,8 @@ def maybe_ingest_document_cache(provider: Any, *, force: bool = False) -> Dict[s
     last = float(getattr(provider, "_memory_wiki_document_cache_scan_at", 0.0) or 0.0)
     if not force and last and now - last < cooldown:
         return {"status": "cooldown", "root": str(root), "retry_after": max(0.0, cooldown - (now - last))}
-    scope_id = os.environ.get("MEMORY_WIKI_DOCUMENT_AUTO_SCOPE_ID", "").strip()
-    repository_id = os.environ.get("MEMORY_WIKI_DOCUMENT_AUTO_REPOSITORY_ID", "").strip() or scope_id
+    scope_id = str(_document_env("MEMORY_WIKI_DOCUMENT_AUTO_SCOPE_ID", "") or "").strip()
+    repository_id = str(_document_env("MEMORY_WIKI_DOCUMENT_AUTO_REPOSITORY_ID", "") or "").strip() or scope_id
     if not scope_id and not _env_bool("MEMORY_WIKI_DOCUMENT_ALLOW_GLOBAL_AUTO", False):
         return {
             "status": "blocked_missing_scope",
@@ -2191,7 +2247,7 @@ def document_status(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
             "chunks": int(totals.get("chunks") or 0), "pending": int(totals.get("pending") or 0),
             "embedded": int(totals.get("embedded") or 0)},
             "features": {"ocr": _env_bool("MEMORY_WIKI_DOCUMENT_OCR", False),
-                         "tika": bool(os.environ.get("MEMORY_WIKI_TIKA_URL")), "rerank": _env_bool("MEMORY_WIKI_DOCUMENT_RERANK", True)}}
+                         "tika": bool(_document_env("MEMORY_WIKI_TIKA_URL")), "rerank": _env_bool("MEMORY_WIKI_DOCUMENT_RERANK", True)}}
 
 
 def delete_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -2318,8 +2374,7 @@ def replay_document_recovery_reference(provider: Any, reference: Dict[str, Any])
 
 
 def _inbox_dir() -> Path:
-    home = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))).expanduser()
-    return home / "context-coordination" / "inbox" / "documents"
+    return _hermes_home() / "context-coordination" / "inbox" / "documents"
 
 
 def ingest_document_inbox(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:

@@ -1,4 +1,4 @@
-"""memory-wiki v1.23.2+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.23.3+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -17,7 +17,10 @@ v1.5.0 — Cross-Source Collapse & Session Intelligence (2026-06-27):
 from __future__ import annotations
 
 import hashlib
+import contextvars
+import functools
 import hmac
+import inspect
 import ipaddress
 import json
 import math
@@ -236,7 +239,7 @@ try:
 except ImportError:
     import online_metrics as _online_metrics
 
-PLUGIN_VERSION = "1.23.2"
+PLUGIN_VERSION = "1.23.3"
 BUILTIN_PREFERENCE_RULES = (
     ("pref_current_instruction", "Fresh explicit user instruction in the current turn overrides durable memory and autonomy defaults.", 1000, "global", "system"),
     ("pref_user_correction", "Explicit user corrections supersede older inferred or assistant-written claims.", 940, "global", "system"),
@@ -548,6 +551,7 @@ except ImportError:
 # HERMES-DOCUMENT-KNOWLEDGE-GRAPH-v0.4.0: universal structured document ingestion.
 try:
     from .document_knowledge_graph import (
+        _document_profile_scope,
         install_document_graph_schema as _install_document_graph_schema,
         ingest_document as _document_ingest,
         scan_documents as _document_scan,
@@ -568,6 +572,7 @@ try:
 except ImportError:
     try:
         from document_knowledge_graph import (
+            _document_profile_scope,
             install_document_graph_schema as _install_document_graph_schema,
             ingest_document as _document_ingest,
             scan_documents as _document_scan,
@@ -587,6 +592,9 @@ except ImportError:
         )
     except ImportError as _document_graph_import_exc:
         _DOCUMENT_GRAPH_IMPORT_ERROR = _safe_exception_label(_document_graph_import_exc)
+        @contextmanager
+        def _document_profile_scope(_home):
+            yield
         def _document_graph_unavailable(*args, **kwargs):
             raise RuntimeError(f"document_knowledge_graph unavailable: {_DOCUMENT_GRAPH_IMPORT_ERROR}")
         def _install_document_graph_schema(conn): return None
@@ -994,6 +1002,7 @@ _QDRANT_ALIAS_CAPABILITY: Dict[str, Any] = {
     "checked_at": 0.0,
     "supported": None,
     "error": "",
+    "endpoint": "",
 }
 
 QDRANT_API_KEY = os.environ.get(
@@ -1002,6 +1011,175 @@ QDRANT_API_KEY = os.environ.get(
 )
 
 QDRANT_VECTOR_SIZE = _env_int("MEMORY_WIKI_VECTOR_SIZE", 4096, 8, 65536)
+
+# Hermes Desktop can host providers for multiple HERMES_HOME directories in
+# one process. Import-time environment variables describe only the importer,
+# not every provider that subsequently uses this module. Bind routing to the
+# provider's own home (and to a worker's database path) for each call.
+_QDRANT_PROFILE_SCOPE: contextvars.ContextVar[Optional[Dict[str, str]]] = (
+    contextvars.ContextVar("memory_wiki_qdrant_profile", default=None)
+)
+_QDRANT_PROFILE_DEFAULTS = {
+    "MEMORY_WIKI_QDRANT_URL": "http://127.0.0.1:6333",
+    "MEMORY_WIKI_QDRANT_COLLECTION": "memory_wiki_claims",
+    "MEMORY_WIKI_EPISODIC_QDRANT_COLLECTION": "memory_wiki_episodes",
+    "MEMORY_WIKI_QDRANT_ALIAS": "memory_wiki_claims_active",
+    "MEMORY_WIKI_QDRANT_ALIAS_MODE": "auto",
+    "MEMORY_WIKI_QDRANT_API_KEY": "",
+    "MEMORY_WIKI_QDRANT_HISTORICAL_COLLECTIONS": "",
+    "MEMORY_WIKI_QDRANT_HISTORICAL_ENDPOINTS": "",
+}
+_IMPORT_HERMES_HOME = Path(
+    os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+).expanduser().resolve()
+_PROFILE_SECRET_KEYS = {
+    "MEMORY_WIKI_EMBED_API_KEY", "MEMORY_WIKI_RERANK_API_KEY",
+    "MEMORY_WIKI_GRAPH_EXTRACT_API_KEY",
+    "MEMORY_WIKI_GRAPH_EXTRACT_ENABLED", "MEMORY_WIKI_GRAPH_EXTRACT_URL",
+    "MEMORY_WIKI_GRAPH_EXTRACT_MODEL", "MEMORY_WIKI_GRAPH_EXTRACT_TIMEOUT",
+    "MEMORY_WIKI_LLM_BASE_URL", "MEMORY_WIKI_LLM_MODEL", "OPENROUTER_API_KEY",
+}
+_PROFILE_EMBED_CONTRACT = {
+    "MEMORY_WIKI_EMBED_PROVIDER": str(EMBED_PROVIDER),
+    "MEMORY_WIKI_EMBED_MODEL": str(EMBED_MODEL),
+    "MEMORY_WIKI_EMBED_URL": str(EMBED_URL),
+    "MEMORY_WIKI_EMBED_DIMENSIONS": str(EMBED_DIMENSIONS),
+    "MEMORY_WIKI_VECTOR_SIZE": str(QDRANT_VECTOR_SIZE),
+}
+
+
+def _profile_qdrant_settings(home: Path) -> Dict[str, str]:
+    """Load only routing settings from this profile's own environment file."""
+    env_path = Path(home).expanduser() / ".env"
+    selected: Dict[str, str] = {}
+    if env_path.is_file():
+        # The profile file is the authority for persistent Qdrant routing.
+        # Never log its contents, especially the API key.
+        with env_path.open("r", encoding="utf-8-sig") as handle:
+            for line in handle:
+                key, separator, value = line.partition("=")
+                key = key.strip().removeprefix("export ").strip()
+                if separator and key in (
+                    _QDRANT_PROFILE_DEFAULTS.keys()
+                    | _PROFILE_EMBED_CONTRACT.keys() | _PROFILE_SECRET_KEYS
+                ):
+                    value = value.strip()
+                    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                        value = value[1:-1]
+                    selected[key] = value
+        compatible = all(
+            key not in selected or selected[key].rstrip("/") == value.rstrip("/")
+            for key, value in _PROFILE_EMBED_CONTRACT.items()
+        )
+        if Path(home).expanduser().resolve() != _IMPORT_HERMES_HOME:
+            required_route = {
+                "MEMORY_WIKI_QDRANT_URL", "MEMORY_WIKI_QDRANT_COLLECTION",
+                "MEMORY_WIKI_EPISODIC_QDRANT_COLLECTION",
+                "MEMORY_WIKI_QDRANT_ALIAS",
+            }
+            if any(not selected.get(key) for key in required_route):
+                compatible = False
+            if (EMBED_PROVIDER in {"openrouter", "nous"}
+                    and not selected.get("MEMORY_WIKI_EMBED_API_KEY")):
+                compatible = False
+        return {name: selected.get(name, default)
+                for name, default in _QDRANT_PROFILE_DEFAULTS.items()} | {
+                    "__strict": "1", "__semantic_compatible": "1" if compatible else "0",
+                } | {key: selected[key] for key in _PROFILE_SECRET_KEYS if key in selected}
+    if Path(home).expanduser().resolve() != _IMPORT_HERMES_HOME:
+        # A foreign provider with no own configuration cannot borrow the
+        # importer's collections or credentials. Local SQLite/FTS may continue.
+        return dict(_QDRANT_PROFILE_DEFAULTS) | {
+            "__strict": "1", "__semantic_compatible": "0",
+        }
+    # Legacy single-profile installations may have no profile .env.
+    return {
+        "MEMORY_WIKI_QDRANT_URL": QDRANT_URL,
+        "MEMORY_WIKI_QDRANT_COLLECTION": QDRANT_COLLECTION,
+        "MEMORY_WIKI_EPISODIC_QDRANT_COLLECTION": EPISODIC_QDRANT_COLLECTION,
+        "MEMORY_WIKI_QDRANT_ALIAS": QDRANT_ALIAS,
+        "MEMORY_WIKI_QDRANT_ALIAS_MODE": QDRANT_ALIAS_MODE,
+        "MEMORY_WIKI_QDRANT_API_KEY": QDRANT_API_KEY,
+        "MEMORY_WIKI_QDRANT_HISTORICAL_COLLECTIONS": "",
+        "MEMORY_WIKI_QDRANT_HISTORICAL_ENDPOINTS": "",
+        "__strict": "0",
+        "__semantic_compatible": "1",
+    }
+
+
+@contextmanager
+def _profile_qdrant_scope(home: Path):
+    resolved = str(Path(home).expanduser().resolve())
+    active = _QDRANT_PROFILE_SCOPE.get()
+    if active is not None and active.get("__home") == resolved:
+        yield
+        return
+    settings = _profile_qdrant_settings(Path(resolved))
+    settings["__home"] = resolved
+    token = _QDRANT_PROFILE_SCOPE.set(settings)
+    try:
+        yield
+    finally:
+        _QDRANT_PROFILE_SCOPE.reset(token)
+
+
+def _qdrant_setting(name: str, fallback: str) -> str:
+    scope = _QDRANT_PROFILE_SCOPE.get()
+    return str(scope.get(name, fallback) if scope is not None else fallback)
+
+
+def _semantic_profile_ready() -> bool:
+    scope = _QDRANT_PROFILE_SCOPE.get()
+    return scope is None or scope.get("__semantic_compatible") != "0"
+
+
+def _profile_secret_setting(name: str, import_value: str = "") -> str:
+    scope = _QDRANT_PROFILE_SCOPE.get()
+    if scope is None:
+        return import_value
+    if name in scope:
+        return str(scope[name])
+    return import_value if Path(scope["__home"]) == _IMPORT_HERMES_HOME else ""
+
+
+def _embed_api_key() -> str:
+    return _profile_secret_setting("MEMORY_WIKI_EMBED_API_KEY", EMBED_API_KEY)
+
+
+def _rerank_api_key() -> str:
+    return _profile_secret_setting("MEMORY_WIKI_RERANK_API_KEY", RERANK_API_KEY)
+
+
+def _bound_profile_home() -> Path:
+    scope = _QDRANT_PROFILE_SCOPE.get()
+    return Path(
+        scope["__home"] if scope is not None
+        else os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+    ).expanduser()
+
+
+def _qdrant_url() -> str:
+    return _qdrant_setting("MEMORY_WIKI_QDRANT_URL", QDRANT_URL).rstrip("/")
+
+
+def _qdrant_collection() -> str:
+    return _qdrant_setting("MEMORY_WIKI_QDRANT_COLLECTION", QDRANT_COLLECTION)
+
+
+def _episodic_qdrant_collection() -> str:
+    return _qdrant_setting("MEMORY_WIKI_EPISODIC_QDRANT_COLLECTION", EPISODIC_QDRANT_COLLECTION)
+
+
+def _qdrant_alias() -> str:
+    return _qdrant_setting("MEMORY_WIKI_QDRANT_ALIAS", QDRANT_ALIAS)
+
+
+def _qdrant_alias_mode() -> str:
+    return _qdrant_setting("MEMORY_WIKI_QDRANT_ALIAS_MODE", QDRANT_ALIAS_MODE)
+
+
+def _qdrant_api_key() -> str:
+    return _qdrant_setting("MEMORY_WIKI_QDRANT_API_KEY", QDRANT_API_KEY)
 
 # ═══ Embedding Manifest v2.0 + Transactional Outbox ═══
 def _embedding_manifest() -> dict:
@@ -1040,9 +1218,9 @@ def _physical_collection_name(manifest: Optional[dict] = None) -> str:
     verbatim. Otherwise append the manifest hash to the base prefix.
     """
     current = manifest or _embedding_manifest()
-    if re.match(r"^.+_[0-9a-f]{12}$", QDRANT_COLLECTION):
-        return QDRANT_COLLECTION
-    return f"{QDRANT_COLLECTION}_{_manifest_hash(current)}"
+    if re.match(r"^.+_[0-9a-f]{12}$", _qdrant_collection()):
+        return _qdrant_collection()
+    return f"{_qdrant_collection()}_{_manifest_hash(current)}"
 
 
 def _episodic_collection_name(manifest: Optional[dict] = None) -> str:
@@ -1054,12 +1232,12 @@ def _episodic_collection_name(manifest: Optional[dict] = None) -> str:
     A fully suffixed name remains an explicit immutable collection override.
     """
     current = manifest or _embedding_manifest()
-    if re.match(r"^.+_[0-9a-f]{12}$", EPISODIC_QDRANT_COLLECTION):
-        candidate = EPISODIC_QDRANT_COLLECTION
+    if re.match(r"^.+_[0-9a-f]{12}$", _episodic_qdrant_collection()):
+        candidate = _episodic_qdrant_collection()
     else:
-        candidate = f"{EPISODIC_QDRANT_COLLECTION}_{_manifest_hash(current)}"
+        candidate = f"{_episodic_qdrant_collection()}_{_manifest_hash(current)}"
     claim_collection = _physical_collection_name(current)
-    if candidate in {claim_collection, QDRANT_ALIAS}:
+    if candidate in {claim_collection, _qdrant_alias()}:
         # A misconfigured shared name must not mix untrusted dialogue vectors
         # with trusted claim points. Preserve service by choosing a stable,
         # obviously isolated fallback rather than silently sharing storage.
@@ -1075,12 +1253,17 @@ def _qdrant_alias_supported(*, refresh: bool = False) -> bool:
     In auto mode we probe once per TTL and fall back to the immutable physical
     collection. Real Qdrant keeps the atomic alias-switch path.
     """
-    if QDRANT_ALIAS_MODE == "physical":
+    if _qdrant_alias_mode() == "physical":
         return False
     ts = time.monotonic()
+    endpoint = _normalized_qdrant_endpoint()
     cached = _QDRANT_ALIAS_CAPABILITY.get("supported")
     checked = float(_QDRANT_ALIAS_CAPABILITY.get("checked_at") or 0.0)
-    if not refresh and cached is not None and ts - checked < QDRANT_ALIAS_PROBE_TTL_SECONDS:
+    if (
+        not refresh and cached is not None
+        and _QDRANT_ALIAS_CAPABILITY.get("endpoint") == endpoint
+        and ts - checked < QDRANT_ALIAS_PROBE_TTL_SECONDS
+    ):
         return bool(cached)
     result = _qdrant_req("GET", "/aliases", timeout=3.0)
     supported = bool(
@@ -1092,6 +1275,7 @@ def _qdrant_alias_supported(*, refresh: bool = False) -> bool:
         "checked_at": ts,
         "supported": supported,
         "error": "" if supported else "alias_api_unavailable",
+        "endpoint": endpoint,
     })
     return supported
 
@@ -1104,10 +1288,10 @@ def _active_collection_name() -> str:
     alias is actually mapped, reads/outbox writes stay on the deterministic
     physical collection. Require mode remains fail-closed on the alias.
     """
-    if QDRANT_ALIAS_MODE == "require":
-        return QDRANT_ALIAS
+    if _qdrant_alias_mode() == "require":
+        return _qdrant_alias()
     if _qdrant_alias_supported():
-        return QDRANT_ALIAS if _qdrant_alias_target(QDRANT_ALIAS) else _physical_collection_name()
+        return _qdrant_alias() if _qdrant_alias_target(_qdrant_alias()) else _physical_collection_name()
     return _physical_collection_name()
 
 
@@ -1164,7 +1348,9 @@ def _check_manifest_change() -> dict | None:
     Every incompatible manifest receives a new immutable collection. Online reads
     continue through QDRANT_ALIAS until reindex completes and atomically switches it.
     """
-    mpath = Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))) / "memory-wiki" / "embedding_manifest.json"
+    if not _semantic_profile_ready():
+        return None
+    mpath = _bound_profile_home() / "memory-wiki" / "embedding_manifest.json"
     manifest = _embedding_manifest()
     old_manifest = None
     if mpath.exists():
@@ -1222,8 +1408,7 @@ OUTBOX_EMBED_DELAY_SECONDS = max(0.0, min(float(os.environ.get("MEMORY_WIKI_OUTB
 
 
 def _mk_db_path() -> str:
-    hh = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
-    return str(Path(hh) / "memory-wiki" / "memory_wiki.sqlite3")
+    return str(_bound_profile_home() / "memory-wiki" / "memory_wiki.sqlite3")
 
 
 def _outbox_db_path(db_path: Optional[str] = None) -> str:
@@ -1590,7 +1775,7 @@ def _claim_outbox_endpoint(payload: Any) -> str:
     raw = (
         str(payload.get("endpoint") or "").strip()
         if isinstance(payload, dict) else ""
-    ) or str(QDRANT_URL or "").strip()
+    ) or str(_qdrant_url() or "").strip()
     validated, _is_loopback = _validated_http_endpoint(
         raw, allow_loopback_http=True,
     )
@@ -1607,7 +1792,7 @@ def _claim_outbox_collection(payload: Any, *, resolve_alias: bool = True) -> str
     supplied = str(payload.get("collection") or "").strip() if isinstance(payload, dict) else ""
     endpoint = _claim_outbox_endpoint(payload)
     current_endpoint = _normalized_qdrant_endpoint()
-    if endpoint == current_endpoint and resolve_alias and supplied in {"", QDRANT_ALIAS}:
+    if endpoint == current_endpoint and resolve_alias and supplied in {"", _qdrant_alias()}:
         return _qdrant_resolved_active_collection() or _physical_collection_name()
     return supplied or _physical_collection_name()
 
@@ -1616,7 +1801,7 @@ def _claim_target_payload(
     *, collection: str, endpoint: str = "", manifest_hash: str = "",
     vector_target_hash: str = "", reason: str = "",
 ) -> Dict[str, Any]:
-    raw_endpoint = str(endpoint or QDRANT_URL or "").strip()
+    raw_endpoint = str(endpoint or _qdrant_url() or "").strip()
     validated_endpoint, _is_loopback = _validated_http_endpoint(
         raw_endpoint, allow_loopback_http=True,
     )
@@ -1733,6 +1918,14 @@ def _delete_claim_vector_targets(
                 if str(row.get("collection") or "") == hinted_collection
                 and str(row.get("endpoint") or "") == hinted_endpoint
             ]
+        foreign_target_pending = any(
+            not _profile_target_allowed(str(row.get("collection") or ""))
+            for row in rows
+        ) or bool(hinted_collection and not _profile_target_allowed(hinted_collection))
+        rows = [
+            row for row in rows
+            if _profile_target_allowed(str(row.get("collection") or ""))
+        ]
         # A previous attempt may have deleted this physical point and left a
         # durable tombstone. Recreating it from a retained outbox hint would
         # delete a later canonical upsert on every retry.
@@ -1741,7 +1934,8 @@ def _delete_claim_vector_targets(
             "AND endpoint=? AND collection=? LIMIT 1",
             (str(claim_id), hinted_endpoint, hinted_collection),
         ).fetchone() if hinted_collection else None
-        if hinted_collection and (not known_target or not targeted_delete) and not any(
+        if (hinted_collection and _profile_target_allowed(hinted_collection)
+                and (not known_target or not targeted_delete)) and not any(
             str(row.get("collection") or "") == hinted_collection
             and str(row.get("endpoint") or "") == hinted_endpoint
             for row in rows
@@ -1771,7 +1965,7 @@ def _delete_claim_vector_targets(
             )
     lifecycle_db.close()
 
-    failed = False
+    failed = foreign_target_pending
     seen: set[Tuple[str, str]] = set()
     for row in rows:
         endpoint = _normalized_qdrant_endpoint(str(row.get("endpoint") or "") or None)
@@ -1881,6 +2075,16 @@ def _claim_outbox_vector(
 
 def _outbox_process(batch_size=50, *, db_path: Optional[str] = None, worker_id: str = "") -> dict:
     path = _outbox_db_path(db_path)
+    home = Path(path).parent.parent
+    with _profile_qdrant_scope(home), _document_profile_scope(home):
+        if not _semantic_profile_ready():
+            return {"processed": 0, "ok": 0, "fail": 0,
+                    "error": "profile embedding contract mismatch", "worker_id": worker_id}
+        return _outbox_process_scoped(batch_size, db_path=path, worker_id=worker_id)
+
+
+def _outbox_process_scoped(batch_size=50, *, db_path: Optional[str] = None, worker_id: str = "") -> dict:
+    path = _outbox_db_path(db_path)
     worker_id = worker_id or f"pid-{os.getpid()}-{uuid.uuid4().hex[:8]}"
     lease_seconds = OUTBOX_LEASE_SECONDS
     db = None
@@ -1944,7 +2148,16 @@ def _outbox_process(batch_size=50, *, db_path: Optional[str] = None, worker_id: 
                             or _physical_collection_name()
                         )
                     else:
-                        claim_target_collection = _claim_outbox_collection(payload)
+                        # A retained hint may have been created while another
+                        # profile's module globals were active. Use this DB's
+                        # bound profile target for every canonical upsert.
+                        if (_QDRANT_PROFILE_SCOPE.get() or {}).get("__strict") == "1":
+                            claim_target_collection = (
+                                _qdrant_resolved_active_collection()
+                                or _physical_collection_name()
+                            )
+                        else:
+                            claim_target_collection = _claim_outbox_collection(payload)
                     claim_target_manifest = _manifest_hash(_embedding_manifest())
                     claim_target_payload = _claim_target_payload(
                         collection=claim_target_collection,
@@ -1953,8 +2166,16 @@ def _outbox_process(batch_size=50, *, db_path: Optional[str] = None, worker_id: 
                     )
                     snapshot = _load_active_claim_index_snapshot(path, str(row["object_id"]))
                     if snapshot is None:
+                        # An inactive claim may only have a retained delivery
+                        # hint for its former target. Preserve that location
+                        # for privacy cleanup; the ledger adds any other known
+                        # targets. The profile fence rejects foreign hints.
+                        cleanup_hint = (
+                            payload if str(payload.get("collection") or "").strip()
+                            else claim_target_payload
+                        )
                         if not _delete_claim_vector_targets(
-                            path, str(row["object_id"]), claim_target_payload,
+                            path, str(row["object_id"]), cleanup_hint,
                         ):
                             raise RuntimeError("inactive claim cleanup failed")
                         performed_operation = "delete"
@@ -2983,7 +3204,10 @@ def _debug_log(msg: str) -> None:
     """Запись в debug-лог если MEMORY_WIKI_DEBUG=1."""
     if not DEBUG_MODE: return
     try:
-        log_path = Path(DEBUG_LOG)
+        log_path = (
+            _bound_profile_home() / "memory-wiki" / "debug.log"
+            if _QDRANT_PROFILE_SCOPE.get() is not None else Path(DEBUG_LOG)
+        )
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with log_path.open("a", encoding="utf-8") as f:
             f.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {msg}\n")
@@ -3030,7 +3254,17 @@ def _embed_text(text: str, timeout: float = 8.0) -> Optional[List[float]]:
 
 def _qdrant_req(method: str, path: str, body: Optional[dict] = None, timeout: float = 10.0) -> Optional[dict]:
     """HTTP-запрос к Qdrant, ограниченный текущим prefetch budget."""
-    validated_endpoint, _is_loopback = _validated_http_endpoint(QDRANT_URL)
+    if not _semantic_profile_ready():
+        return None
+    path_parts = urllib.parse.urlsplit(path).path.split("/")
+    if (
+        len(path_parts) > 2 and path_parts[1] == "collections"
+        and path_parts[2] != "aliases"
+        and not _profile_target_allowed(urllib.parse.unquote(path_parts[2]))
+    ):
+        _debug_log("qdrant request rejected foreign profile collection")
+        return None
+    validated_endpoint, _is_loopback = _validated_http_endpoint(_qdrant_url())
     if not validated_endpoint:
         _debug_log("qdrant request rejected unsafe endpoint")
         return None
@@ -3043,8 +3277,8 @@ def _qdrant_req(method: str, path: str, body: Optional[dict] = None, timeout: fl
         headers = {"Accept": "application/json"}
         if data is not None:
             headers["Content-Type"] = "application/json"
-        if QDRANT_API_KEY:
-            headers["api-key"] = QDRANT_API_KEY
+        if _qdrant_api_key():
+            headers["api-key"] = _qdrant_api_key()
         req = urllib.request.Request(
             f"{validated_endpoint}{path}", data=data, headers=headers, method=method
         )
@@ -3076,7 +3310,7 @@ def _qdrant_point_id(claim_id: str):
 # --- Embedding dispatch: provider-aware document vs query ---
 def _embed_document(text: str) -> Optional[List[float]]:
     """Embedding для индексации документа с bounded in-process reuse."""
-    if not EMBED_CONTRACT_VALID:
+    if not EMBED_CONTRACT_VALID or not _semantic_profile_ready():
         return None
     raw = str(text or "")
     try:
@@ -3100,6 +3334,8 @@ def _embed_document(text: str) -> Optional[List[float]]:
 
 def _embed_query(text: str) -> Optional[List[float]]:
     """Embedding для нормализованного запроса с TTL/LRU и single-flight reuse."""
+    if not _semantic_profile_ready():
+        return None
     if not EMBED_CONTRACT_VALID:
         return None
     raw = str(text or "")
@@ -3125,13 +3361,13 @@ def _embed_query(text: str) -> Optional[List[float]]:
 
 def _openrouter_available() -> bool:
     """Check model availability using OpenRouter's documented model list, then probe if needed."""
-    if not EMBED_API_KEY or not EMBED_CONTRACT_VALID:
+    if not _embed_api_key() or not EMBED_CONTRACT_VALID:
         return False
     if EMBED_PROVIDER == "nous":
         # inference-api банит urllib по TLS-отпечатку (Cloudflare 1010) — curl.
         result = _http_json_via_curl(
             "GET", "/models?output_modalities=embeddings", timeout=10.0,
-            headers={"Authorization": f"Bearer {EMBED_API_KEY}", "Accept": "application/json"},
+            headers={"Authorization": f"Bearer {_embed_api_key()}", "Accept": "application/json"},
         )
         available_ids = {
             str(item.get("id") or "")
@@ -3148,7 +3384,7 @@ def _openrouter_available() -> bool:
         ) is not None
     request = urllib.request.Request(
         f"{EMBED_URL}/models?output_modalities=embeddings",
-        headers={"Authorization": f"Bearer {EMBED_API_KEY}", "Accept": "application/json"},
+        headers={"Authorization": f"Bearer {_embed_api_key()}", "Accept": "application/json"},
         method="GET",
     )
     try:
@@ -3172,6 +3408,8 @@ def _openrouter_available() -> bool:
 
 def _embed_req(method: str, path: str, body: Optional[dict] = None, timeout: float = 6.0) -> Optional[dict]:
     """HTTP-request to embed endpoint, bounded by the active prefetch deadline."""
+    if not _semantic_profile_ready():
+        return None
     if not EMBED_CONTRACT_VALID:
         return None
     timeout = _prefetch_network_timeout(timeout)
@@ -3289,9 +3527,11 @@ def _http_json_via_curl(method: str, path: str, body: Optional[dict] = None,
 # --- OpenRouter/Nous Embeddings client ---
 def _openrouter_embed(text: str, *, input_type: str, timeout: float = 30.0) -> Optional[List[float]]:
     """OpenRouter embeddings — Bearer auth, model, dimensions, retry."""
+    if not _semantic_profile_ready():
+        return None
     if not EMBED_CONTRACT_VALID or not text or not text.strip():
         return None
-    if not EMBED_API_KEY:
+    if not _embed_api_key():
         _debug_log("OpenRouter embedding API key is missing")
         return None
 
@@ -3304,7 +3544,7 @@ def _openrouter_embed(text: str, *, input_type: str, timeout: float = 30.0) -> O
     }
 
     headers = {
-        "Authorization": f"Bearer {EMBED_API_KEY}",
+        "Authorization": f"Bearer {_embed_api_key()}",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
@@ -3435,7 +3675,7 @@ def _payload_field(metadata: Any, key: str, default: Any = "") -> Any:
 
 def _normalized_qdrant_endpoint(value: Optional[str] = None) -> str:
     """Return a stable, credential-free identity for the configured endpoint."""
-    raw = str(QDRANT_URL if value is None else value).strip()
+    raw = str(_qdrant_url() if value is None else value).strip()
     try:
         parsed = urllib.parse.urlsplit(raw)
         scheme = parsed.scheme.lower()
@@ -3667,7 +3907,7 @@ def _qdrant_upsert(claim_id: str, vector: List[float], payload: dict, collection
         _debug_log(f"qdrant vector size mismatch: expected={QDRANT_VECTOR_SIZE}, actual={len(vector)}")
         return False
     coll = collection or _active_collection_name()
-    if coll != QDRANT_ALIAS and not _ensure_collection(coll):
+    if coll != _qdrant_alias() and not _ensure_collection(coll):
         _debug_log(f"qdrant physical collection unavailable: {coll}")
         return False
     stored_payload = dict(payload or {})
@@ -3704,6 +3944,8 @@ def _qdrant_delete(claim_id: str, collection: str = None) -> bool:
 
 def _qdrant_collection_confirmed_absent(collection: str, endpoint: str) -> bool:
     """Acknowledge a missing target only on an exact same-server GET 404."""
+    if not _profile_target_allowed(collection):
+        return False
     validated_endpoint, _is_loopback = _validated_http_endpoint(
         endpoint, allow_loopback_http=True,
     )
@@ -3719,8 +3961,8 @@ def _qdrant_collection_confirmed_absent(collection: str, endpoint: str) -> bool:
     if timeout <= 0.0:
         return False
     headers = {"Accept": "application/json"}
-    if QDRANT_API_KEY:
-        headers["api-key"] = QDRANT_API_KEY
+    if _qdrant_api_key():
+        headers["api-key"] = _qdrant_api_key()
     request = urllib.request.Request(
         f"{target_endpoint}/collections/"
         f"{urllib.parse.quote(str(collection), safe='')}",
@@ -3745,7 +3987,10 @@ def _qdrant_delete_target(
     intentionally follows the active endpoint, while lifecycle cleanup must
     address the historical location that actually received the point.
     """
-    raw_endpoint = str(endpoint or QDRANT_URL or "").strip()
+    if not _profile_target_allowed(collection):
+        _debug_log("qdrant delete rejected foreign profile collection")
+        return False
+    raw_endpoint = str(endpoint or _qdrant_url() or "").strip()
     validated_endpoint, _is_loopback = _validated_http_endpoint(
         raw_endpoint, allow_loopback_http=True,
     )
@@ -3753,6 +3998,9 @@ def _qdrant_delete_target(
         _debug_log("qdrant historical delete rejected unsafe endpoint")
         return False
     target_endpoint = _normalized_qdrant_endpoint(validated_endpoint)
+    if not _profile_endpoint_allowed(target_endpoint):
+        _debug_log("qdrant historical delete rejected foreign profile endpoint")
+        return False
     if target_endpoint == _normalized_qdrant_endpoint():
         if _qdrant_delete(object_id, collection=collection):
             return True
@@ -3955,8 +4203,20 @@ def _qdrant_ensure_collection(collection: Optional[str] = None) -> bool:
 _OPENROUTER_HEALTH_CACHE = {
     "checked_at": 0.0, "available": None, "refreshing": False, "last_error": "",
 }
+_OPENROUTER_HEALTH_BY_PROFILE: Dict[str, Dict[str, Any]] = {}
 _OPENROUTER_HEALTH_LOCK = threading.Lock()
 _OPENROUTER_HEALTH_TTL_SECONDS = 300.0
+
+
+def _openrouter_health_cache() -> Dict[str, Any]:
+    """Return health state for the bound provider, preserving legacy importer state."""
+    scope = _QDRANT_PROFILE_SCOPE.get()
+    if scope is None or Path(scope.get("__home", "")).resolve() == _IMPORT_HERMES_HOME:
+        return _OPENROUTER_HEALTH_CACHE
+    return _OPENROUTER_HEALTH_BY_PROFILE.setdefault(
+        scope["__home"],
+        {"checked_at": 0.0, "available": None, "refreshing": False, "last_error": ""},
+    )
 
 
 def _refresh_openrouter_health() -> None:
@@ -3967,25 +4227,31 @@ def _refresh_openrouter_health() -> None:
         available = False
         error = _safe_exception_label(exc)
     with _OPENROUTER_HEALTH_LOCK:
-        _OPENROUTER_HEALTH_CACHE["available"] = available
-        _OPENROUTER_HEALTH_CACHE["checked_at"] = time.time()
-        _OPENROUTER_HEALTH_CACHE["refreshing"] = False
-        _OPENROUTER_HEALTH_CACHE["last_error"] = error
+        cache = _openrouter_health_cache()
+        cache["available"] = available
+        cache["checked_at"] = time.time()
+        cache["refreshing"] = False
+        cache["last_error"] = error
 
 
 def _openrouter_health_swr(force_refresh: bool = False) -> bool:
     """Return the last health state immediately and refresh stale state in background."""
+    if not _semantic_profile_ready():
+        return False
     start_refresh = False
     with _OPENROUTER_HEALTH_LOCK:
-        checked_at = float(_OPENROUTER_HEALTH_CACHE.get("checked_at") or 0.0)
-        current = _OPENROUTER_HEALTH_CACHE.get("available")
+        cache = _openrouter_health_cache()
+        checked_at = float(cache.get("checked_at") or 0.0)
+        current = cache.get("available")
         stale = force_refresh or checked_at <= 0.0 or (time.time() - checked_at) >= _OPENROUTER_HEALTH_TTL_SECONDS
-        if stale and not bool(_OPENROUTER_HEALTH_CACHE.get("refreshing")):
-            _OPENROUTER_HEALTH_CACHE["refreshing"] = True
+        if stale and not bool(cache.get("refreshing")):
+            cache["refreshing"] = True
             start_refresh = True
     if start_refresh:
+        profile_context = contextvars.copy_context()
         threading.Thread(
-            target=_refresh_openrouter_health, daemon=True, name="memory-wiki-openrouter-health"
+            target=profile_context.run, args=(_refresh_openrouter_health,), daemon=True,
+            name="memory-wiki-openrouter-health",
         ).start()
     # Cold start is optimistic: the bounded embed call itself remains authoritative.
     return True if current is None else bool(current)
@@ -3999,7 +4265,8 @@ def _qdrant_count(collection: Optional[str] = None) -> Optional[int]:
     return int(result.get("result", {}).get("points_count", result.get("points_count", 0)))
 
 
-def _qdrant_alias_target(alias: str = QDRANT_ALIAS) -> str:
+def _qdrant_alias_target(alias: Optional[str] = None) -> str:
+    alias = alias or _qdrant_alias()
     if not _qdrant_alias_supported():
         return ""
     result = _qdrant_req("GET", "/aliases")
@@ -4014,12 +4281,12 @@ def _qdrant_resolved_active_collection() -> str:
     """Resolve the actual collection, including pre-alias bootstrap fallback."""
     alias_supported = _qdrant_alias_supported()
     if alias_supported:
-        target = _qdrant_alias_target(QDRANT_ALIAS)
+        target = _qdrant_alias_target(_qdrant_alias())
         if target:
             return target
-        if QDRANT_ALIAS_MODE == "require":
+        if _qdrant_alias_mode() == "require":
             return ""
-    elif QDRANT_ALIAS_MODE == "require":
+    elif _qdrant_alias_mode() == "require":
         return ""
     physical = _physical_collection_name()
     return physical if _collection_config(physical) is not None else ""
@@ -4028,8 +4295,8 @@ def _qdrant_resolved_active_collection() -> str:
 def _is_managed_claim_collection(collection: str) -> bool:
     """Recognize only collections this configured plugin can have created."""
     value = str(collection or "").strip()
-    base = str(QDRANT_COLLECTION or "").strip()
-    if not value or not base or value == QDRANT_ALIAS:
+    base = str(_qdrant_collection() or "").strip()
+    if not value or not base or value == _qdrant_alias():
         return False
     if value == base or value == _physical_collection_name():
         return True
@@ -4037,6 +4304,55 @@ def _is_managed_claim_collection(collection: str) -> bool:
         return False
     suffix = value[len(base) + 1:]
     return bool(re.fullmatch(r"[0-9a-f]{12}(?:_force_[0-9]+)?", suffix))
+
+
+def _profile_target_allowed(collection: str) -> bool:
+    """Fence Qdrant traffic against another profile's physical namespace."""
+    scope = _QDRANT_PROFILE_SCOPE.get()
+    if scope is None:
+        return True
+    target = str(collection or "").strip()
+    if target == _qdrant_alias() or _is_managed_claim_collection(target):
+        return True
+    episode_base = _episodic_qdrant_collection().strip()
+    if target == episode_base or target == _episodic_collection_name():
+        return True
+    if target.startswith(episode_base + "_") and re.fullmatch(
+        r"[0-9a-f]{12}", target[len(episode_base) + 1:]
+    ):
+        return True
+    historical = {
+        item.strip()
+        for item in scope.get("MEMORY_WIKI_QDRANT_HISTORICAL_COLLECTIONS", "").split(",")
+        if item.strip()
+    }
+    if target in historical:
+        return True
+    # Retained DB rows cannot authorize their own namespace: an older mixed
+    # process may already have polluted target and reindex history tables.
+    return False
+
+
+def _profile_endpoint_allowed(endpoint: str) -> bool:
+    """Fence historical Qdrant deletes to this profile's explicit endpoints."""
+    validated, _is_loopback = _validated_http_endpoint(
+        endpoint, allow_loopback_http=True,
+    )
+    if not validated:
+        return False
+    scope = _QDRANT_PROFILE_SCOPE.get()
+    if scope is None:
+        return True
+    target = _normalized_qdrant_endpoint(validated)
+    if target == _normalized_qdrant_endpoint():
+        return True
+    for item in scope.get("MEMORY_WIKI_QDRANT_HISTORICAL_ENDPOINTS", "").split(","):
+        candidate, _candidate_loopback = _validated_http_endpoint(
+            item.strip(), allow_loopback_http=True,
+        )
+        if candidate and target == _normalized_qdrant_endpoint(candidate):
+            return True
+    return False
 
 
 def _discover_managed_claim_collections() -> List[str]:
@@ -4059,7 +4375,7 @@ def _migrate_and_resume_claim_vector_targets(db_path: str) -> Dict[str, int]:
     safer than silently retaining a point in an old collection.
     """
     validated_endpoint, _is_loopback = _validated_http_endpoint(
-        QDRANT_URL, allow_loopback_http=True,
+        _qdrant_url(), allow_loopback_http=True,
     )
     if not validated_endpoint:
         raise RuntimeError("unsafe Qdrant endpoint for claim target recovery")
@@ -4086,7 +4402,7 @@ def _migrate_and_resume_claim_vector_targets(db_path: str) -> Dict[str, int]:
                     candidate = str(value or "").strip()
                     # Reindex history is itself an authoritative plugin-owned
                     # registry, including custom names from older settings.
-                    if candidate and candidate != QDRANT_ALIAS:
+                    if candidate and _profile_target_allowed(candidate):
                         discovered.add(candidate)
 
         claims = db.execute("SELECT id,status FROM claims").fetchall()
@@ -4121,6 +4437,10 @@ def _migrate_and_resume_claim_vector_targets(db_path: str) -> Dict[str, int]:
                 WHERE t.status IN ('delete_pending','write_pending','active')"""
         ).fetchall()
         for row in candidates:
+            if not _profile_target_allowed(str(row["collection"] or "")):
+                # A previous shared-process startup may have registered a
+                # foreign profile's collection. Never refresh its delete job.
+                continue
             claim_status = str(row["claim_status"] or "")
             target_is_current = (
                 claim_status == "active"
@@ -4175,21 +4495,23 @@ def _switch_alias(new_collection: str) -> bool:
     Alias-capable Qdrant gets an atomic switch. Alias-less stubs operate on the
     deterministic physical collection, so activation is a verified no-op.
     """
+    if not _profile_target_allowed(new_collection):
+        return False
     if not _qdrant_alias_supported(refresh=True):
-        if QDRANT_ALIAS_MODE == "require":
+        if _qdrant_alias_mode() == "require":
             _debug_log("Qdrant alias API is required but unavailable")
             return False
         return _collection_config(new_collection) is not None
-    current = _qdrant_alias_target(QDRANT_ALIAS)
+    current = _qdrant_alias_target(_qdrant_alias())
     if current == new_collection:
         return True
     actions = []
     if current:
-        actions.append({"delete_alias": {"alias_name": QDRANT_ALIAS}})
+        actions.append({"delete_alias": {"alias_name": _qdrant_alias()}})
     actions.append({
         "create_alias": {
             "collection_name": new_collection,
-            "alias_name": QDRANT_ALIAS,
+            "alias_name": _qdrant_alias(),
         }
     })
     result = _qdrant_req("POST", "/collections/aliases", {"actions": actions})
@@ -4198,7 +4520,7 @@ def _switch_alias(new_collection: str) -> bool:
 
 def _semantic_available() -> bool:
     """Check the embedding contract, effective provider and Qdrant before semantic operations."""
-    if not SEMANTIC_ENABLED:
+    if not SEMANTIC_ENABLED or not _semantic_profile_ready():
         return False
     if not EMBED_CONTRACT_VALID:
         for error in _EMBED_BOOT_ERRORS:
@@ -5457,7 +5779,7 @@ class MemoryWikiProvider(MemoryProvider):
         # Code Shrinker inbox ingestion is an explicit, journaled tool action.
         # Initialization must not mutate code/document graph state.
         self._render_all()
-        if SEMANTIC_ENABLED:
+        if SEMANTIC_ENABLED and _semantic_profile_ready():
             try:
                 target_recovery = _migrate_and_resume_claim_vector_targets(
                     str(self.db_path),
@@ -5484,7 +5806,8 @@ class MemoryWikiProvider(MemoryProvider):
                 f"{manifest_change['new_hash']}. Run memory_wiki_reindex before "
                 "treating semantic results as fully compatible."
             )
-        if _episodic_semantic_enabled() and _episodic_memory.enabled():
+        if (_semantic_profile_ready() and _episodic_semantic_enabled()
+                and _episodic_memory.enabled()):
             try:
                 queued_episodes = _episodic_memory.enqueue_semantic_backfill(
                     self, sys.modules[__name__],
@@ -5499,7 +5822,7 @@ class MemoryWikiProvider(MemoryProvider):
                 _debug_log(f"Episode semantic backfill deferred: {_safe_exception_label(exc)}")
         # Qdrant bootstrap. Real Qdrant uses aliases; the lightweight stub
         # transparently operates on the deterministic physical collection.
-        if SEMANTIC_ENABLED:
+        if SEMANTIC_ENABLED and _semantic_profile_ready():
             try:
                 coll = _physical_collection_name()
                 if not _ensure_collection(coll):
@@ -5521,7 +5844,7 @@ class MemoryWikiProvider(MemoryProvider):
                             str(row.get("collection_name") or "")
                             for row in alias_rows
                             if isinstance(row, dict)
-                            and str(row.get("alias_name") or "") == QDRANT_ALIAS
+                            and str(row.get("alias_name") or "") == _qdrant_alias()
                         ),
                         "",
                     ):
@@ -5531,13 +5854,13 @@ class MemoryWikiProvider(MemoryProvider):
                         # fenced that target. Switching here would publish an
                         # empty collection immediately after a restart.
                         _debug_log(
-                            f"Bootstrap OK: preserving alias {QDRANT_ALIAS} → "
+                            f"Bootstrap OK: preserving alias {_qdrant_alias()} → "
                             f"{current_alias_target}; staged target={coll}"
                         )
                     elif _switch_alias(coll):
-                        _debug_log(f"Bootstrap OK: new alias {QDRANT_ALIAS} → {coll}")
+                        _debug_log(f"Bootstrap OK: new alias {_qdrant_alias()} → {coll}")
                     else:
-                        _debug_log(f"Bootstrap FAILED: could not create alias {QDRANT_ALIAS} → {coll}")
+                        _debug_log(f"Bootstrap FAILED: could not create alias {_qdrant_alias()} → {coll}")
                 else:
                     _debug_log(f"Bootstrap OK: alias API unavailable; physical mode → {coll}")
             except Exception as e:
@@ -15684,7 +16007,7 @@ class MemoryWikiProvider(MemoryProvider):
         if (
             not RERANK_ENABLED
             or not RERANK_ENDPOINT_VALID
-            or not RERANK_API_KEY
+            or not _rerank_api_key()
             or len(q) < 12
             or len(q) > RERANK_USER_QUERY_MAX_CHARS
             or len(original) < RERANK_MIN_CANDIDATES
@@ -15797,7 +16120,7 @@ class MemoryWikiProvider(MemoryProvider):
                     _RERANK_CACHE.pop(key, None)
 
         headers = {
-            "Authorization": f"Bearer {RERANK_API_KEY}",
+            "Authorization": f"Bearer {_rerank_api_key()}",
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
@@ -18349,7 +18672,11 @@ class MemoryWikiProvider(MemoryProvider):
         through the ordinary journaled add_relation tool, so recovery never
         calls an external model to reconstruct graph facts.
         """
-        if os.environ.get('MEMORY_WIKI_GRAPH_EXTRACT_ENABLED', '0').lower() not in {'1','true','yes','on'}:
+        graph_enabled = _profile_secret_setting(
+            'MEMORY_WIKI_GRAPH_EXTRACT_ENABLED',
+            os.environ.get('MEMORY_WIKI_GRAPH_EXTRACT_ENABLED', '0'),
+        )
+        if graph_enabled.lower() not in {'1','true','yes','on'}:
             raise PermissionError('graph extraction requires MEMORY_WIKI_GRAPH_EXTRACT_ENABLED=1')
         claim_id=str(a.get('claim_id') or '').strip()
         claim=self._require_visible_claim(claim_id)
@@ -18361,13 +18688,28 @@ class MemoryWikiProvider(MemoryProvider):
                 or int(claim['quarantined_at'] or 0) > 0
                 or secret_scan(source_text).get('raw_secret')):
             raise ValueError('source claim is not eligible for remote extraction')
-        endpoint=(os.environ.get('MEMORY_WIKI_GRAPH_EXTRACT_URL') or os.environ.get('MEMORY_WIKI_LLM_BASE_URL') or 'https://openrouter.ai/api/v1').rstrip('/')
+        endpoint=(
+            _profile_secret_setting('MEMORY_WIKI_GRAPH_EXTRACT_URL', os.environ.get('MEMORY_WIKI_GRAPH_EXTRACT_URL', ''))
+            or _profile_secret_setting('MEMORY_WIKI_LLM_BASE_URL', os.environ.get('MEMORY_WIKI_LLM_BASE_URL', ''))
+            or 'https://openrouter.ai/api/v1'
+        ).rstrip('/')
         if not endpoint.endswith('/chat/completions'):
             endpoint += '/chat/completions'
-        model=os.environ.get('MEMORY_WIKI_GRAPH_EXTRACT_MODEL') or os.environ.get('MEMORY_WIKI_LLM_MODEL') or ''
-        key=os.environ.get('MEMORY_WIKI_GRAPH_EXTRACT_API_KEY') or os.environ.get('OPENROUTER_API_KEY') or ''
+        model=(
+            _profile_secret_setting('MEMORY_WIKI_GRAPH_EXTRACT_MODEL', os.environ.get('MEMORY_WIKI_GRAPH_EXTRACT_MODEL', ''))
+            or _profile_secret_setting('MEMORY_WIKI_LLM_MODEL', os.environ.get('MEMORY_WIKI_LLM_MODEL', ''))
+        )
+        key=(
+            _profile_secret_setting('MEMORY_WIKI_GRAPH_EXTRACT_API_KEY', os.environ.get('MEMORY_WIKI_GRAPH_EXTRACT_API_KEY', ''))
+            or _profile_secret_setting('OPENROUTER_API_KEY', os.environ.get('OPENROUTER_API_KEY', ''))
+        )
+        if not key:
+            raise PermissionError('graph extraction credential unavailable for profile')
         try:
-            configured_timeout=max(1.0,min(float(os.environ.get('MEMORY_WIKI_GRAPH_EXTRACT_TIMEOUT','30')),60.0))
+            configured_timeout=max(1.0,min(float(_profile_secret_setting(
+                'MEMORY_WIKI_GRAPH_EXTRACT_TIMEOUT',
+                os.environ.get('MEMORY_WIKI_GRAPH_EXTRACT_TIMEOUT', '30'),
+            ) or '30'),60.0))
         except (TypeError,ValueError):
             configured_timeout=30.0
         try:
@@ -19138,9 +19480,32 @@ class MemoryWikiProvider(MemoryProvider):
 
     def _llm_pack_context(self, query: str, candidate_context: str, max_chars: int) -> str:
         """Use the configured local GPT-5.5-compatible endpoint as a secondary context analyst."""
-        if not candidate_context.strip() or os.environ.get('MEMORY_WIKI_LLM_PACK','0').lower() in ('0','false','no','off'):
+        llm_keys = {
+            'MEMORY_WIKI_LLM_PACK', 'MEMORY_WIKI_LLM_BASE_URL',
+            'MEMORY_WIKI_LLM_API_KEY', 'MEMORY_WIKI_LLM_MODEL',
+            'MEMORY_WIKI_LLM_TIMEOUT',
+        }
+        llm_env: Dict[str, str] = {}
+        profile_home = Path(getattr(self, 'home', _bound_profile_home()))
+        env_path = profile_home / '.env'
+        if env_path.is_file():
+            try:
+                with env_path.open('r', encoding='utf-8-sig') as env_file:
+                    for line in env_file:
+                        key, separator, value = line.partition('=')
+                        key = key.strip().removeprefix('export ').strip()
+                        if separator and key in llm_keys:
+                            value = value.strip()
+                            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                                value = value[1:-1]
+                            llm_env[key] = value
+            except OSError:
+                return ''
+        else:
+            llm_env = {key: os.environ.get(key, '') for key in llm_keys}
+        if not candidate_context.strip() or llm_env.get('MEMORY_WIKI_LLM_PACK','0').lower() in ('0','false','no','off'):
             return ''
-        cfg_path=Path(os.environ.get('HERMES_CONFIG') or str(Path.home()/'.hermes'/'config.yaml'))
+        cfg_path=profile_home / 'config.yaml'
         raw=''
         try:
             raw=cfg_path.read_text(encoding='utf-8', errors='ignore')
@@ -19149,9 +19514,9 @@ class MemoryWikiProvider(MemoryProvider):
         def grab(key: str, default: str='') -> str:
             m=re.search(rf'(?m)^\s*{re.escape(key)}:\s*([^\n#]+)', raw)
             return (m.group(1).strip().strip('"\'') if m else default)
-        base_url=os.environ.get('MEMORY_WIKI_LLM_BASE_URL') or grab('base_url','http://127.0.0.1:18646/v1')
-        api_key=os.environ.get('MEMORY_WIKI_LLM_API_KEY') or grab('api_key','noop')
-        model=os.environ.get('MEMORY_WIKI_LLM_MODEL') or grab('model','gpt-5.5')
+        base_url=llm_env.get('MEMORY_WIKI_LLM_BASE_URL') or grab('base_url','http://127.0.0.1:18646/v1')
+        api_key=llm_env.get('MEMORY_WIKI_LLM_API_KEY') or grab('api_key','noop')
+        model=llm_env.get('MEMORY_WIKI_LLM_MODEL') or grab('model','gpt-5.5')
         if not base_url:
             return ''
         validated_base, is_loopback = _validated_http_endpoint(base_url)
@@ -19174,7 +19539,7 @@ class MemoryWikiProvider(MemoryProvider):
         payload={'model':model,'messages':[{'role':'system','content':system},{'role':'user','content':user}], 'max_tokens':max(512, min(8192, budget//2)), 'temperature':0}
         try:
             req=urllib.request.Request(endpoint, data=json.dumps(payload, ensure_ascii=False).encode('utf-8'), headers={'Content-Type':'application/json','Authorization':f'Bearer {api_key}'}, method='POST')
-            timeout=max(1.0, min(float(os.environ.get('MEMORY_WIKI_LLM_TIMEOUT','45')), 60.0))
+            timeout=max(1.0, min(float(llm_env.get('MEMORY_WIKI_LLM_TIMEOUT') or '45'), 60.0))
             with _urlopen_no_redirect(req, timeout=timeout) as resp:
                 raw_response=resp.read(1_000_001)
             if len(raw_response) > 1_000_000:
@@ -19663,7 +20028,7 @@ class MemoryWikiProvider(MemoryProvider):
             if str(row["operation"]) not in {"upsert", "embed_and_upsert", "delete"}:
                 item["reason"] = "unsupported_operation"
                 skipped.append(item)
-            elif target not in {online, QDRANT_ALIAS, _physical_collection_name()}:
+            elif target not in {online, _qdrant_alias(), _physical_collection_name()}:
                 item["reason"] = "stale_collection_target"
                 skipped.append(item)
             else:
@@ -19780,10 +20145,10 @@ class MemoryWikiProvider(MemoryProvider):
         embed_ok = bool(_semantic_available())
         pts = 0
         alias_supported = _qdrant_alias_supported()
-        alias_target = _qdrant_alias_target(QDRANT_ALIAS) if alias_supported else ""
+        alias_target = _qdrant_alias_target(_qdrant_alias()) if alias_supported else ""
         active_target = _qdrant_resolved_active_collection()
         try:
-            online_collection = QDRANT_ALIAS if alias_supported and alias_target else active_target
+            online_collection = _qdrant_alias() if alias_supported and alias_target else active_target
             r = _qdrant_req("GET", f"/collections/{online_collection}") if online_collection else None
             pts = r.get("result", {}).get("points_count", 0) if r else 0
         except Exception:
@@ -19797,7 +20162,7 @@ class MemoryWikiProvider(MemoryProvider):
             "embedding_contract_errors": list(_EMBED_BOOT_ERRORS),
             "embedding_provider": EMBED_PROVIDER,
             "embedding_url": EMBED_URL,
-            "embedding_api_key_present": bool(EMBED_API_KEY),
+            "embedding_api_key_present": bool(_embed_api_key()),
             "embedding_model": EMBED_MODEL,
             "embedding_dimensions": EMBED_DIMENSIONS,
             "qdrant_vector_size": QDRANT_VECTOR_SIZE,
@@ -19813,10 +20178,10 @@ class MemoryWikiProvider(MemoryProvider):
             "outbox_embed_delay_seconds": OUTBOX_EMBED_DELAY_SECONDS,
             "manifest_hash": _manifest_hash(manifest),
             "qdrant_points": pts,
-            "alias": QDRANT_ALIAS,
+            "alias": _qdrant_alias(),
             "alias_mode": (
                 "alias" if alias_supported else
-                ("required_unavailable" if QDRANT_ALIAS_MODE == "require" else "physical_fallback")
+                ("required_unavailable" if _qdrant_alias_mode() == "require" else "physical_fallback")
             ),
             "alias_api_supported": alias_supported,
             "atomic_alias_switch": alias_supported,
@@ -20300,6 +20665,26 @@ class MemoryWikiProvider(MemoryProvider):
     def _query_mode_tool(self, query: str) -> Dict[str,Any]:
         q = query or ""
         return {"query": q, "mode": _detect_query_mode(q), "tech_matches": len(TECH_PATTERNS.findall(q)), "sem_matches": len(SEMANTIC_PATTERNS.findall(q))}
+
+
+def _bind_memory_wiki_profile_methods() -> None:
+    """Keep each provider's calls on its own Qdrant namespace in shared hosts."""
+    for method_name, method in tuple(vars(MemoryWikiProvider).items()):
+        if method_name.startswith("__") or not inspect.isfunction(method):
+            continue
+
+        def scoped(self, *args, __method=method, __name=method_name, **kwargs):
+            base_home = getattr(self, "home", None) or _IMPORT_HERMES_HOME
+            home = base_home
+            if __name == "initialize":
+                home = kwargs.get("hermes_home") or base_home
+            with _profile_qdrant_scope(Path(home)), _document_profile_scope(Path(home)):
+                return __method(self, *args, **kwargs)
+
+        setattr(MemoryWikiProvider, method_name, functools.wraps(method)(scoped))
+
+
+_bind_memory_wiki_profile_methods()
 
 
 def _vault_raw_access_guard(tool_name: str = "", args: Optional[dict] = None, **kwargs):

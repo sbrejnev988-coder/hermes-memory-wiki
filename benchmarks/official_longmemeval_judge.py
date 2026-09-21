@@ -16,18 +16,32 @@ from typing import Any
 
 def summarize(report_path: Path, judge_path: Path) -> dict[str, Any]:
     report = json.loads(report_path.read_text(encoding="utf-8"))
-    if not isinstance(report, dict) or not isinstance(report.get("questions"), list):
+    if not isinstance(report, dict) or ("questions" in report) == ("cases" in report):
+        raise ValueError("invalid Memory Wiki answer report")
+    episode_report = "cases" in report
+    rows = report["cases" if episode_report else "questions"]
+    if not isinstance(rows, list):
         raise ValueError("invalid Memory Wiki answer report")
     if not isinstance(report.get("dataset_sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", report["dataset_sha256"]):
         raise ValueError("invalid dataset SHA-256 in Memory Wiki report")
+    if episode_report:
+        answer_evaluation = report.get("answer_evaluation")
+        if not isinstance(answer_evaluation, dict) or not isinstance(answer_evaluation.get("model"), str):
+            raise ValueError("invalid Memory Wiki episode answer model")
+        reader_model = answer_evaluation["model"]
+    else:
+        reader_model = report.get("answer_model")
     expected: dict[str, dict[str, Any]] = {}
     all_ids: set[str] = set()
-    for row in report["questions"]:
+    question_type_key = "category" if episode_report else "question_type"
+    for row in rows:
         if not isinstance(row, dict):
             raise ValueError("invalid Memory Wiki question")
         question_id, hypothesis = row.get("question_id"), row.get("hypothesis")
         if not isinstance(question_id, str) or question_id in all_ids:
             raise ValueError("duplicate or invalid Memory Wiki question ID")
+        if not isinstance(row.get(question_type_key), str) or not row[question_type_key]:
+            raise ValueError("invalid Memory Wiki question type")
         all_ids.add(question_id)
         if isinstance(hypothesis, str):
             expected[question_id] = row
@@ -57,7 +71,7 @@ def summarize(report_path: Path, judge_path: Path) -> dict[str, Any]:
             elif model != verdict["model"]:
                 raise ValueError("official judge models differ across rows")
             label = verdict["label"]
-            by_type.setdefault(str(expected[question_id]["question_type"]), []).append(label)
+            by_type.setdefault(expected[question_id][question_type_key], []).append(label)
             if question_id.endswith("_abs"):
                 abstention.append(label)
             seen.add(question_id)
@@ -70,7 +84,7 @@ def summarize(report_path: Path, judge_path: Path) -> dict[str, Any]:
     return {
         "benchmark": "LongMemEval official QA judge result for Memory Wiki hypotheses",
         "dataset_sha256": report.get("dataset_sha256"),
-        "reader_model": report.get("answer_model"),
+        "reader_model": reader_model,
         "official_judge_model": model,
         "evaluated_questions": evaluated,
         "generated_hypotheses": len(expected),

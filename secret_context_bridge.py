@@ -135,8 +135,23 @@ def _candidate_files(home: Path) -> Iterable[Path]:
     explicit = os.environ.get("MEMORY_WIKI_SECRET_CONTEXT_PLUGIN", "").strip()
     if explicit:
         p = Path(explicit).expanduser()
-        yield p / "__init__.py" if p.is_dir() else p
-        return
+        target = p / "__init__.py" if p.is_dir() else p
+        ambient = Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes")).expanduser()
+        if home.resolve(strict=False) != ambient.resolve(strict=False):
+            # A process-wide override from another profile is not authority
+            # to load that profile's plugin for this provider. The default
+            # home can contain profiles/*, so use only its own plugins root.
+            try:
+                if not target.is_absolute():
+                    raise ValueError("relative secret-context plugin override")
+                target.resolve(strict=False).relative_to(
+                    (home / "plugins").resolve(strict=False)
+                )
+            except (OSError, ValueError):
+                target = None
+        if target is not None:
+            yield target
+            return
     # Hermes profiles are intentionally isolated.  Cross-profile discovery can
     # import inactive-profile plugin code into the current provider; callers who
     # intentionally need a non-default location must set the explicit path above.

@@ -152,6 +152,32 @@ def test_github_public_incremental_etag_and_record_collision(tmp_path, monkeypat
             provider._conn.close()
 
 
+def test_github_connector_does_not_borrow_another_profiles_token(tmp_path, monkeypatch):
+    home = tmp_path / "default"
+    _isolate(monkeypatch, home)
+    module = _module()
+    adapter = sys.modules[module._sync_github_source.__module__]
+    provider = _provider(module, home)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "learning"))
+    monkeypatch.setenv("GITHUB_TOKEN", "synthetic-foreign-token")
+    requests = []
+
+    def fake_open(request, timeout):
+        requests.append(dict((key.lower(), value) for key, value in request.header_items()))
+        return _Response(200, _body("note.txt", "Synthetic public source."))
+
+    monkeypatch.setattr(adapter, "_open", fake_open)
+    try:
+        result = _call(provider, "memory_wiki_source_github_sync", owner="example",
+                       repo="wiki", path="note.txt")
+        assert result.get("success") is True, result
+        assert result["source_type"] == "github_public"
+        assert requests and "authorization" not in requests[0]
+    finally:
+        if provider._conn is not None:
+            provider._conn.close()
+
+
 def test_github_rejects_untrusted_paths_hash_and_rate_limit(tmp_path, monkeypatch):
     _isolate(monkeypatch, tmp_path)
     module = _module()

@@ -16,6 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import Any
 
 try:
@@ -31,6 +32,22 @@ _BLOB_MIME = frozenset({
 })
 _DOC_MIME = "application/vnd.google-apps.document"
 _MAX_META_BYTES = 32_768
+
+
+def _profile_credential(provider: Any, name: str) -> str:
+    """Use process credentials only for the profile that owns the process."""
+    provider_home = getattr(provider, "home", None)
+    if provider_home is None:
+        return ""
+    ambient_home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+    try:
+        if Path(provider_home).expanduser().resolve(strict=False) != Path(
+            ambient_home
+        ).expanduser().resolve(strict=False):
+            return ""
+    except (OSError, ValueError):
+        return ""
+    return os.environ.get(name, "").strip()
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -119,7 +136,7 @@ def sync_file(provider: Any, args: dict[str, Any]) -> dict[str, Any]:
     file_id = str(args.get("file_id") or "").strip()
     if not _FILE_ID.fullmatch(file_id):
         raise ValueError("invalid_drive_file_id")
-    token = os.environ.get("MEMORY_WIKI_GOOGLE_DRIVE_ACCESS_TOKEN", "").strip()
+    token = _profile_credential(provider, "MEMORY_WIKI_GOOGLE_DRIVE_ACCESS_TOKEN")
     if not token:
         raise ValueError("drive_access_token_required")
     if len(token) > 4096 or any(ord(ch) < 33 or ord(ch) > 126 for ch in token):

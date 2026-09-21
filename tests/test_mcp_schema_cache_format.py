@@ -40,7 +40,9 @@ def test_wrapper_cache_preserves_native_schema_names() -> None:
             ]
 
     with tempfile.TemporaryDirectory(prefix="mw-mcp-cache-format-") as tmp:
-        cache = Path(tmp) / "tool_schemas.json"
+        module.HERMES_HOME = Path(tmp)
+        module.PLUGIN_PATH = SERVER.parent.parent / "__init__.py"
+        cache = Path(tmp) / "cache" / "memory-wiki" / "tool_schemas.json"
         module._SCHEMAS = None
         module._SCHEMA_MAP = {}
         module.SCHEMAS_FILE = cache

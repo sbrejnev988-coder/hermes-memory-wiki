@@ -38,6 +38,22 @@ _TEXT_EXTENSIONS = frozenset({
 })
 
 
+def _profile_credential(provider: Any, name: str) -> str:
+    """Use process credentials only for the profile that owns the process."""
+    provider_home = getattr(provider, "home", None)
+    if provider_home is None:
+        return ""
+    ambient_home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+    try:
+        if Path(provider_home).expanduser().resolve(strict=False) != Path(
+            ambient_home
+        ).expanduser().resolve(strict=False):
+            return ""
+    except (OSError, ValueError):
+        return ""
+    return os.environ.get(name, "").strip()
+
+
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, request, fp, code, msg, headers, newurl):
         raise ValueError("github_redirect_denied")
@@ -145,7 +161,7 @@ def sync_file(provider: Any, args: dict[str, Any]) -> dict[str, Any]:
     scope_id, repository_id = connectors._scope(
         provider, str(args.get("scope_id") or ""), str(args.get("repository_id") or ""),
     )
-    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    token = _profile_credential(provider, "GITHUB_TOKEN")
     if len(token) > 500 or any(ord(ch) < 33 or ord(ch) > 126 for ch in token):
         raise ValueError("invalid_github_token_configuration")
     source_type = "github_authenticated" if token else "github_public"

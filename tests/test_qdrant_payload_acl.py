@@ -41,6 +41,19 @@ def add_chat_claim(provider) -> str:
     return value
 
 
+def allow_historical_targets(module, tmp_path: Path, collections: str, endpoints: str = "") -> None:
+    """Declare synthetic legacy targets as owned by this isolated test profile."""
+    (tmp_path / ".env").write_text(
+        f"MEMORY_WIKI_QDRANT_URL={module.QDRANT_URL}\n"
+        f"MEMORY_WIKI_QDRANT_COLLECTION={module.QDRANT_COLLECTION}\n"
+        f"MEMORY_WIKI_EPISODIC_QDRANT_COLLECTION={module.EPISODIC_QDRANT_COLLECTION}\n"
+        f"MEMORY_WIKI_QDRANT_ALIAS={module.QDRANT_ALIAS}\n"
+        f"MEMORY_WIKI_QDRANT_HISTORICAL_COLLECTIONS={collections}\n"
+        f"MEMORY_WIKI_QDRANT_HISTORICAL_ENDPOINTS={endpoints}\n",
+        encoding="utf-8",
+    )
+
+
 def test_initialize_preserves_populated_alias_when_manifest_target_changes(
     tmp_path, monkeypatch,
 ):
@@ -438,6 +451,8 @@ def test_delete_scrubs_inflight_upsert_text_and_error(tmp_path, monkeypatch):
 
 def test_inactive_or_deleted_claim_job_cleans_point_without_upsert(tmp_path, monkeypatch):
     module = load_module("memory_wiki_qdrant_outbox_inactive", tmp_path, monkeypatch)
+    allow_historical_targets(module, tmp_path, "claims-active")
+    monkeypatch.setattr(module, "_qdrant_resolved_active_collection", lambda: module._physical_collection_name())
     provider = make_provider(module, tmp_path)
     inactive_id = add_chat_claim(provider)
     with provider._connect() as conn:
@@ -475,6 +490,8 @@ def test_inactive_or_deleted_claim_job_cleans_point_without_upsert(tmp_path, mon
 
 def test_claim_archived_during_remote_upsert_is_immediately_deleted(tmp_path, monkeypatch):
     module = load_module("memory_wiki_qdrant_outbox_post_upsert", tmp_path, monkeypatch)
+    allow_historical_targets(module, tmp_path, "claims-active")
+    monkeypatch.setattr(module, "_qdrant_resolved_active_collection", lambda: module._physical_collection_name())
     provider = make_provider(module, tmp_path)
     claim_id = add_chat_claim(provider)
     with provider._connect() as conn:
@@ -509,7 +526,7 @@ def test_claim_archived_during_remote_upsert_is_immediately_deleted(tmp_path, mo
     )
     assert outcome["ok"] == 1 and outcome["fail"] == 0
     assert len(upserts) == 1
-    assert deleted == [(claim_id, "claims-active")]
+    assert deleted == [(claim_id, upserts[0][2])]
 
 
 def test_versioned_reindex_then_claim_delete_removes_every_physical_copy(tmp_path, monkeypatch):
@@ -744,6 +761,17 @@ def test_historical_endpoint_outage_keeps_retry_through_checkpoint_recovery(tmp_
     assert checkpoint_payload["counts"]["claim_vector_targets"] == 2
 
     restored_home = tmp_path / "restored"
+    restored_home.mkdir()
+    (restored_home / ".env").write_text(
+        f"MEMORY_WIKI_QDRANT_URL={module.QDRANT_URL}\n"
+        f"MEMORY_WIKI_QDRANT_COLLECTION={module.QDRANT_COLLECTION}\n"
+        f"MEMORY_WIKI_QDRANT_ALIAS={module.QDRANT_ALIAS}\n"
+        f"MEMORY_WIKI_EPISODIC_QDRANT_COLLECTION={module.EPISODIC_QDRANT_COLLECTION}\n"
+        "MEMORY_WIKI_QDRANT_HISTORICAL_COLLECTIONS=claims-v1,claims-v2\n"
+        "MEMORY_WIKI_QDRANT_HISTORICAL_ENDPOINTS=https://old-qdrant.example\n"
+        "MEMORY_WIKI_EMBED_API_KEY=synthetic-restore-key\n",
+        encoding="utf-8",
+    )
     module.SEMANTIC_ENABLED = False
     restored = make_provider(module, restored_home)
     restored._apply_checkpoint_payload(checkpoint_payload)
@@ -790,6 +818,7 @@ def test_historical_endpoint_outage_keeps_retry_through_checkpoint_recovery(tmp_
 
 def test_active_claim_scrub_deletes_old_targets_before_republishing_redacted_text(tmp_path, monkeypatch):
     module = load_module("memory_wiki_qdrant_scrub_fanout", tmp_path, monkeypatch)
+    allow_historical_targets(module, tmp_path, "claims-v1,claims-v2")
     provider = make_provider(module, tmp_path)
     claim_id = add_chat_claim(provider)
     module.SEMANTIC_ENABLED = True
@@ -1027,6 +1056,9 @@ def test_stale_claim_upsert_retargets_current_endpoint_and_keeps_old_cleanup(
     tmp_path, monkeypatch,
 ):
     module = load_module("memory_wiki_stale_endpoint_upsert", tmp_path, monkeypatch)
+    allow_historical_targets(
+        module, tmp_path, "claims-old,claims-current", "https://old-qdrant.example",
+    )
     provider = make_provider(module, tmp_path)
     claim_id = add_chat_claim(provider)
     module.SEMANTIC_ENABLED = True

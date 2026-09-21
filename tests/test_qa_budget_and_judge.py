@@ -38,16 +38,23 @@ def test_hard_request_budget_and_cost_coverage() -> None:
     assert missing.summary()["reported_cost_usd"] is None
 
 
-def test_official_judge_parser_binds_exact_hypotheses(tmp_path: Path) -> None:
+@pytest.mark.parametrize("schema", ["questions", "cases"])
+def test_official_judge_parser_binds_exact_hypotheses(tmp_path: Path, schema: str) -> None:
     judge = _load("official_longmemeval_judge", "official_longmemeval_judge.py")
     report = tmp_path / "report.json"
-    report.write_text(json.dumps({
-        "dataset_sha256": "a" * 64, "answer_model": "reader/test", "evaluated_questions": 2,
-        "questions": [
-            {"question_id": "q1", "question_type": "single-session-user", "hypothesis": "Blue."},
-            {"question_id": "q2_abs", "question_type": "multi-session", "hypothesis": "I don't know."},
+    question_type_key = "category" if schema == "cases" else "question_type"
+    payload = {
+        "dataset_sha256": "a" * 64, "evaluated_questions": 2,
+        schema: [
+            {"question_id": "q1", question_type_key: "single-session-user", "hypothesis": "Blue."},
+            {"question_id": "q2_abs", question_type_key: "multi-session", "hypothesis": "I don't know."},
         ],
-    }), encoding="utf-8")
+    }
+    if schema == "cases":
+        payload["answer_evaluation"] = {"model": "reader/test"}
+    else:
+        payload["answer_model"] = "reader/test"
+    report.write_text(json.dumps(payload), encoding="utf-8")
     output = tmp_path / "judge.jsonl"
     rows = [
         {"question_id": "q1", "hypothesis": "Blue.", "autoeval_label": {"model": "gpt-4o-2024-08-06", "label": True}},
@@ -55,10 +62,19 @@ def test_official_judge_parser_binds_exact_hypotheses(tmp_path: Path) -> None:
     ]
     output.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
     summary = judge.summarize(report, output)
+    assert summary["reader_model"] == "reader/test"
     assert summary["qa_accuracy_on_judged"] == .5
     assert summary["qa_accuracy_full_run"] == .5
     assert summary["abstention_accuracy_on_judged"] == 0
+    assert summary["by_question_type"] == {
+        "multi-session": {"n": 1, "accuracy": 0},
+        "single-session-user": {"n": 1, "accuracy": 1},
+    }
     rows[0]["hypothesis"] = "Changed"
     output.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
     with pytest.raises(ValueError, match="edited hypothesis"):
+        judge.summarize(report, output)
+    payload["questions" if schema == "cases" else "cases"] = []
+    report.write_text(json.dumps(payload), encoding="utf-8")
+    with pytest.raises(ValueError, match="invalid Memory Wiki answer report"):
         judge.summarize(report, output)

@@ -96,6 +96,26 @@ def test_drive_blob_fetch_checksum_and_incremental_metadata(tmp_path, monkeypatc
             provider._conn.close()
 
 
+def test_drive_connector_refuses_foreign_profile_token(tmp_path, monkeypatch):
+    home = tmp_path / "default"
+    _isolate(monkeypatch, home)
+    module = _module()
+    adapter = sys.modules[module._sync_google_drive_source.__module__]
+    provider = module.MemoryWikiProvider()
+    provider.initialize("drive-test", hermes_home=str(home), bot_id="drive-test",
+                        project_id="project-a", agent_context="test")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "learning"))
+    monkeypatch.setenv("MEMORY_WIKI_GOOGLE_DRIVE_ACCESS_TOKEN", "synthetic-foreign-token")
+    calls = []
+    monkeypatch.setattr(adapter, "_open", lambda *_args: calls.append("network"))
+    try:
+        assert _call(provider, file_id=FILE_ID).get("error") == "drive_access_token_required"
+        assert calls == []
+    finally:
+        if provider._conn is not None:
+            provider._conn.close()
+
+
 def test_drive_refuses_bad_checksum_before_provenance(tmp_path, monkeypatch):
     _isolate(monkeypatch, tmp_path)
     monkeypatch.setenv("MEMORY_WIKI_GOOGLE_DRIVE_ACCESS_TOKEN", "mock-oauth-token")

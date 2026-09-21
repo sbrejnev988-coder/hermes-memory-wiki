@@ -35,8 +35,33 @@ PLUGIN_PATH = Path(
 ).expanduser()
 
 
+def assert_profile_paths_consistent() -> None:
+    """Refuse mixed-profile plugin code or a cache outside this caller's home."""
+    home = HERMES_HOME.resolve(strict=False)
+    target_install = (home / "plugins" / "memory-wiki" / "__init__.py")
+    colocated = (BASE_DIR.parent / "__init__.py").resolve(strict=False)
+    plugin = PLUGIN_PATH.resolve(strict=False)
+    installed = BASE_DIR.parent
+    if installed.name == "memory-wiki" and installed.parent.name == "plugins":
+        if installed.parent.parent.resolve(strict=False) != home and target_install.is_file():
+            raise RuntimeError("MCP wrapper profile home mismatch")
+    if PLUGIN_PATH.name != "__init__.py":
+        raise RuntimeError("MCP plugin path must name __init__.py")
+    if PLUGIN_PATH.parent.name == "memory-wiki" and PLUGIN_PATH.parent.parent.name == "plugins":
+        if PLUGIN_PATH.parent.parent.parent.resolve(strict=False) != home and target_install.is_file():
+            raise RuntimeError("MCP plugin profile home mismatch")
+    if plugin != colocated and plugin != target_install.resolve(strict=False):
+        raise RuntimeError("MCP plugin path is not co-located with this wrapper")
+    cache_root = (home / "cache" / "memory-wiki").resolve(strict=False)
+    try:
+        SCHEMAS_FILE.resolve(strict=False).relative_to(cache_root)
+    except ValueError as exc:
+        raise RuntimeError("MCP schema cache is outside this profile") from exc
+
+
 def manifest_version() -> str:
     """Read the co-located plugin version without importing the provider."""
+    assert_profile_paths_consistent()
     manifest = PLUGIN_PATH.parent / "plugin.yaml"
     try:
         for line in manifest.read_text(encoding="utf-8").splitlines():
@@ -80,6 +105,7 @@ def redact_error_message(message: Any) -> str:
 
 def ensure_plugin():
     global _PROVIDER
+    assert_profile_paths_consistent()
     if _PROVIDER is not None:
         return _PROVIDER
     if not PLUGIN_PATH.is_file():
@@ -143,6 +169,7 @@ def normalize_schema(schema: dict[str, Any]) -> dict[str, Any]:
 
 def load_schemas() -> list[dict[str, Any]]:
     global _SCHEMAS, _SCHEMA_MAP
+    assert_profile_paths_consistent()
     if _SCHEMAS is not None:
         return _SCHEMAS
 
