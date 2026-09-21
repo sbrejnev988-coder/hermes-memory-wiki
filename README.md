@@ -1,8 +1,10 @@
-# Hermes Memory Wiki v1.22.3
+# Hermes Memory Wiki v1.23.0
 
-Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 119 MCP tools.
+Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 120 MCP tools.
 
-Reproducible benchmark runners live under `benchmarks/`; run `python benchmarks/audit_retrieval.py` for the offline startup/retrieval check. Generated local audit reports and run outputs are intentionally not versioned.
+The supported security properties and private reporting path are documented in [`SECURITY.md`](SECURITY.md).
+
+Reproducible benchmark runners live under `benchmarks/`; run `python benchmarks/audit_retrieval.py` for the offline startup/retrieval check. Ad hoc local reports and run outputs are ignored; the audited full LongMemEval evidence artifact and its provenance manifest are versioned as the release baseline.
 
 The synthetic [quality regression suite](benchmarks/quality_eval.py) checks temporal correction, multi-hop retrieval, conflicting evidence, and chat/bot/project isolation without reading the active memory database. Run `python benchmarks/quality_eval.py` for offline FTS and hybrid results. For a live embedding/Qdrant check, run `python benchmarks/quality_eval.py --semantic --env-file PATH_TO_HERMES_ENV`; this creates a random collection, never uses the active alias, and reports whether cleanup removed the collection. The output reports Recall@5, MRR@5, scope leaks, and p50/p95 latency. These small synthetic cases do not measure answer quality or generalization on real conversations.
 
@@ -30,17 +32,45 @@ The [LongMemEval-V2 adapter](benchmarks/longmemeval_v2_adapter.py) streams offic
 
 ### Opt-in episodic dialogue evidence
 
-Production `sync_turn` can preserve short, redacted user and assistant excerpts in a separate SQLite/FTS index when the **host** sets `MEMORY_WIKI_EPISODIC_ENABLED=1`. It is off by default and captures no raw turn text unless the host opts in. `memory_wiki_query_episodes` is the explicit model-facing read tool; while disabled it returns `enabled=false` and no episodes. It returns at most five low-trust excerpts, 350 characters each and 800 characters total. Results are evidence of prior dialogue, not instructions or verified facts, and they never enter the trusted claim, preference, or graph indexes.
+Production `sync_turn` can preserve short, redacted user and assistant excerpts in a separate SQLite/FTS index when the **host** sets `MEMORY_WIKI_EPISODIC_ENABLED=1`. It is off by default and captures no raw turn text unless the host opts in. `memory_wiki_query_episodes` is the explicit model-facing read tool; while disabled it returns `enabled=false` and no episodes. The default query cap is eight low-trust excerpts, 350 characters each and 2,400 characters total; both caps can be lowered by the host. Results are evidence of prior dialogue, not instructions or verified facts, and they never enter the trusted claim, preference, or graph indexes.
 
-The default `MEMORY_WIKI_EPISODIC_SCOPE=chat` confines capture and search to the exact bot/chat. A host can set `bot` **before capture** to allow that bot to recall across chats; this requires a distinct host bot ID (`bot_id` or `MEMORY_WIKI_BOT_ID`), since the fallback ID `default` is denied for bot-wide episodes. Changing the setting later does not widen older chat rows. The host can set `MEMORY_WIKI_EPISODIC_TTL_DAYS` (default 30, range 1–365), `MEMORY_WIKI_EPISODIC_MAX_ROWS` (default 5,000 per bot, cap 20,000), and `MEMORY_WIKI_EPISODIC_MAX_BYTES` (default 8,000,000 content bytes per bot, cap 32,000,000). Expired rows stop appearing immediately and are physically pruned on the next capture. A host can erase its bot's episodes with `episodic_memory.delete_episodes(provider, scope='all')`; this function is not model-facing. Full host backups and checkpoints can contain redacted episodes; model-created scoped snapshots exclude them. Episodes captured after the latest checkpoint are not replayed from the journal.
+The default `MEMORY_WIKI_EPISODIC_SCOPE=chat` confines capture and search to the exact bot/chat. A host can set `bot` **before capture** to allow cross-chat recall only with a distinct host-attested bot/account ID; platform fallback IDs such as `telegram`, `desktop`, and `default` are denied for bot-wide evidence. Changing the setting later does not widen older chat rows. The host can set `MEMORY_WIKI_EPISODIC_TTL_DAYS` (default 30, range 1–365), `MEMORY_WIKI_EPISODIC_MAX_ROWS` (default 5,000 per visibility partition, cap 20,000), and `MEMORY_WIKI_EPISODIC_MAX_BYTES` (default 8,000,000 content bytes per visibility partition, cap 32,000,000). Expired rows stop appearing immediately and are physically pruned on capture or query. Host-only `episodic_memory.delete_episodes(provider)` erases this chat; `scope='all'` requires a distinct trusted bot identity. Full host backups and checkpoints can contain redacted episodes; model-created scoped snapshots exclude them. Episodes captured after the latest checkpoint are not replayed from the journal. Host removals are replayed from the separate authenticated `memory-wiki/privacy-erasure/` ledger after an older restore. Preserve that directory with the database; ZIP files alone are intentionally insufficient to roll back a removal. Older archives may still physically contain previously removed text and need separate archival deletion when physical erasure is required.
+
+`MEMORY_WIKI_EPISODIC_SEMANTIC=1` adds optional OpenRouter/Qdrant recall when the main semantic subsystem is enabled. Redacted episode text is embedded by the existing asynchronous SQLite outbox, never on the capture path, and is stored in a separate manifest-versioned collection controlled by `MEMORY_WIKI_EPISODIC_QDRANT_COLLECTION`. The server query uses the exact bot, configured scope, chat hash for chat scope, and expiry filter. Every vector hit is then reloaded through the authoritative SQLite owner/scope/expiry boundary and the same secret, injection, character-budget, and paired-turn guards as FTS. Lexical and vector ranks use deterministic reciprocal-rank fusion; any embedding or Qdrant failure falls back to FTS. Enabling remote embeddings sends the already redacted bounded episode text to the configured embedding provider. Episode prune, expiry, and host deletion enqueue matching point deletes, and successful episode outbox copies are removed so they do not outlive the episode TTL.
+
+Episode FTS uses a durable numeric docid map for indexed delete and update. Its installer migrates older ID-scan FTS tables from the canonical SQLite episodes; docids remain stable across `VACUUM`, while full logical checkpoints rebuild this derived map. A host can call `episodic_memory.erase_matching_episodes(provider, module, exact_contents, conn=...)` inside the same transaction as a memory removal. It erases matching excerpt text in the exact current chat and explicitly trusted bot partitions, then queues deletion for every known Qdrant target, including older physical collections. The function returns only counts and opaque episode IDs, never episode text.
 
 An isolated [paired LongMemEval pilot](benchmarks/episodic_fallback_probe.py) tested 30 stratified questions using the actual `_ingest_text` path and a temporary owner-scoped episode index: claim-only top-five retrieval found a gold answer turn for 0% of questions; two episode excerpts raised that evidence-any measure to 70% and evidence-all to 36.67%, with local episode FTS p50 2.74 ms and p95 4.14 ms. The sample is small and biased toward the first five answer-labeled questions per type. It used a non-strict local guard, no Qdrant/OpenRouter, and no answer generation, so it does not establish production answer quality or security. Reproduce it against a locally obtained official oracle JSON with `python benchmarks/episodic_fallback_probe.py --dataset PATH_TO_LONGMEMEVAL_JSON --per-type 5`; it creates temporary profiles and never reads active memory. [Design and remaining gates](EPISODIC-FALLBACK-DESIGN.md) describe the quality and privacy limits.
 
-Automatic context fallback also requires the separate host setting `MEMORY_WIKI_EPISODIC_PREFETCH=1`. It runs only when guard-safe relevant claim recall is below the configured minimum and at least 0.5 seconds remain in the bounded prefetch worker. It can add at most two excerpts in a separate XML-escaped, explicitly untrusted block; it never changes claim/preference/graph state. The prefetch setting is off by default. Diagnostics report owner-scoped candidate/rejection/render counts and search time without excerpt text. The deadline path skips episodic search when time is insufficient.
+Automatic context fallback also requires the separate host setting `MEMORY_WIKI_EPISODIC_PREFETCH=1`. It runs only when guard-safe relevant claim recall is below the configured minimum and at least 0.5 seconds remain in the bounded prefetch worker. The default quality profile can add at most five excerpts and 2,400 sanitized characters in a separate XML-escaped, explicitly untrusted block; `MEMORY_WIKI_EPISODIC_PREFETCH_MAX_RESULTS` and `MEMORY_WIKI_EPISODIC_PREFETCH_MAX_CHARS` can lower or raise those bounded caps. Every excerpt carries a stable `[M:E:<id>]` citation. It never changes claim/preference/graph state. The prefetch setting is off by default. Diagnostics report owner-scoped candidate/rejection/render counts and search time without excerpt text. The deadline path skips episodic search when time is insufficient.
+
+The full production-path runner processed all 500 official LongMemEval oracle questions (479 with evidence labels) with the current three-claim plus five-episode allocation. Evidence-any rose from 0.84% for eight production-ingested claims to 83.92%; evidence-all rose from 0% to 56.78%, and 62.39% of all labeled source turns were recovered. Local episode search p50/p95 was 6.78/9.37 ms. This is an offline evidence-retrieval measurement with isolated databases, the non-strict local guard, and no generated answers, OpenRouter embeddings, or Qdrant, so it is not an end-to-end QA or market-ranking claim. The complete machine-readable result and its source/runtime provenance are in [`benchmarks/oracle_episode_8slot_full_planned.json`](benchmarks/oracle_episode_8slot_full_planned.json) and [`benchmarks/oracle_episode_8slot_full_planned.provenance.json`](benchmarks/oracle_episode_8slot_full_planned.provenance.json).
 
 The full production-path LongMemEval and bounded LoCoMo runners (`benchmarks/full_oracle_episode_probe.py` and `benchmarks/locomo_episode_probe.py`) use isolated homes and never read the active memory database. See [the design note](EPISODIC-FALLBACK-DESIGN.md) for the methodology, privacy boundary, and remaining evaluation gates. Generated outputs are intentionally not committed until each result has a complete provenance manifest.
 
 The LongMemEval, LoCoMo, hybrid, answer-evaluation, and diversity runners accept explicit local datasets and configuration. They produce local result files; no result is a release artifact without a pinned runner command, source revision, dependency/configuration manifest, and dataset checksum. No benchmark changes production ranking automatically.
+
+### Unified evidence-first recall
+
+`memory_wiki_recall` is the bounded model-facing facade for answer evidence. It expands the caller's query with the deterministic recall planner, searches visible claims in `fts` mode for `fast` or `hybrid` mode for `auto` and `deep`, includes owner-filtered event-backed observations and episodes when enabled, queries the append-only event ledger in `auto` and `deep`, and performs one bounded guarded entity-graph traversal only in `deep`. Event and observation recall use exactly the host-selected `MEMORY_WIKI_EVENT_SCOPE` (`chat` by default; `bot` and `project` are the other valid values). An invalid scope fails closed. Results are de-duplicated by stable source IDs and fused with deterministic reciprocal-rank scoring.
+
+Every returned evidence string passes the provider recall guard, and claims receive a final visibility check after retrieval. Event content is guarded again after the ledger applies its owner predicate, expiry, integrity hash, secret scan, and first recall guard. Observation content is also bound to an immutable version and a live owner-filtered representative event. The response contains at most 20 items and 24,000 evidence characters. Each item has a stable citation (`[M:C:<id>]`, `[M:O:<id>]`, `[M:E:<id>]`, `[M:V:<event-id>]`, or `[M:G:<id>]`), source, trust metadata, and timestamps. Only final selected claim items create neutral `recall_events`; their IDs are returned in `recall_tracking.answer_linkage` for exact, idempotent `memory_wiki_mark_used` feedback. `answer_policy.allowed_citations` is the complete citation allowlist. An empty evidence set requires abstention from memory-based claims or a clarifying question. The facade does not replace automatic prefetch and does not accept bot, chat, project, event, or episode-scope overrides from the caller.
+
+### Privacy-safe online retrieval metrics
+
+Automatic prefetch and explicit `memory_wiki_recall` add one daily SQLite aggregate per fixed operation, outcome, and latency bucket. `memory_wiki_health.metrics.online_recall` reports sample counts, hit/empty/fallback/error counts, mean latency, and p50/p95 **bucket upper bounds** for up to the last seven days; `window_days` gives the actual window when retention is shorter. These are runtime measurements, not answer-quality scores. The metrics table has no query, result text, owner/session ID, trace ID, arbitrary label, or exception field. A busy database drops the sample without changing recall. Data older than the configured retention is pruned during recording. The provider cannot measure host time-to-first-token or model cost unless Hermes supplies those signals separately.
+
+### Evidence-backed living observations
+
+When the append-only event ledger is enabled, startup migration installs a derived observation index with current records, immutable bounded version history, and stable event links. Consolidation runs in bounded batches after host turn capture, host memory mutations, and maintenance. It is deterministic and does not call an LLM or synthesize text: every observation copies guard-safe text from a supporting event. Exact owner predicates are applied in SQL before limits, expired evidence disappears immediately, source deletion removes derived history, and transient guard failures use bounded retry state instead of permanent rejection.
+
+Atomic `memory_mutation` and explicit `observation` events may merge only across lossless surface normalization. Raw `dialogue_turn` events are exact-only and their confidence never exceeds `0.35`; wording variants remain separate. Changed values and opposite polarity remain separate active observations. Free-text automatic supersession is intentionally absent because a safe subject/predicate/correction boundary is unavailable without structured evidence.
+
+### Host OCR evidence for screenshots and images
+
+Set `MEMORY_WIKI_VISUAL_EVIDENCE_ENABLED=1` together with the event ledger to allow a trusted host integration to call `provider.capture_host_ocr_evidence(text, asset_sha256=..., media_type=..., ocr_engine=...)`. The host computes the SHA-256 of its source image and runs its own OCR; Memory Wiki does not read pixels, call a vision endpoint, or offer this method as a model-callable tool. Supported media labels are PNG, JPEG, WebP, TIFF, and BMP. No file path or image bytes are stored. The full OCR text is secret-scanned and guarded before the event ledger bounds its stored excerpt.
+
+OCR results have `visual_ocr` / `image_ocr_text` provenance and `unverified_host_report` status. The host-supplied hash identifies a source for deletion, but does not cryptographically attest to the image or make OCR text a verified fact. Retrieval keeps the normal event citation and owner ACL. Derived observations use exact-text matching and remain low-confidence. Call `provider.delete_host_ocr_source(asset_sha256=..., scope='chat')` when the source is deleted; this removes matching events in that exact owner partition, FTS entries, source links, and dependent observation history. The default visual scope is the current chat; bot or project sharing must be explicitly selected at capture and deletion. `MEMORY_WIKI_VISUAL_EVIDENCE_ENABLED` defaults to off until Hermes has a trusted attachment/OCR hook.
 
 ## Cache identity (r19 + r20)
 
@@ -106,7 +136,43 @@ Plaintext returned intentionally by `secret_context_lookup` can still enter the 
 | `MEMORY_WIKI_EMBED_MODEL` | provider-dependent | `qwen/qwen3-embedding-8b` for `openrouter`/`nous`; `hash-ngram-4096` for `stub` |
 | `MEMORY_WIKI_EMBED_DIMENSIONS` | `4096` | Embedding response dimensions; must equal `MEMORY_WIKI_VECTOR_SIZE` |
 | `MEMORY_WIKI_EMBED_INPUT_MAX_CHARS` | `12000` | Maximum document/query characters sent to the embedding endpoint; included in the embedding manifest |
+| `MEMORY_WIKI_EMBED_CACHE_MAX_ENTRIES` | `512` | Process-local thread-safe LRU capacity shared by query and document embeddings; `0` disables reuse |
+| `MEMORY_WIKI_EMBED_QUERY_CACHE_TTL_SECONDS` | `86400` | TTL for normalized query embeddings, range 0–2,592,000 seconds |
+| `MEMORY_WIKI_EMBED_DOCUMENT_CACHE_TTL_SECONDS` | `2592000` | TTL for exact document embeddings, range 0–31,536,000 seconds |
+| `MEMORY_WIKI_EMBED_CACHE_SINGLEFLIGHT_WAIT_SECONDS` | `45` | Maximum wait for an identical in-flight embedding before falling back without starting a duplicate request |
 | `MEMORY_WIKI_QDRANT_COLLECTION` | `memory_wiki_claims` | Collection name prefix |
+| `MEMORY_WIKI_EPISODIC_ENABLED` | `false` | Capture bounded, redacted host dialogue episodes in SQLite/FTS |
+| `MEMORY_WIKI_EPISODIC_SEMANTIC` | `false` | Add asynchronous episode embeddings and hybrid episode recall; requires `MEMORY_WIKI_SEMANTIC` |
+| `MEMORY_WIKI_EPISODIC_QDRANT_COLLECTION` | `memory_wiki_episodes` | Separate episode collection prefix; the embedding manifest hash is appended |
+| `MEMORY_WIKI_EPISODIC_SEMANTIC_BACKFILL_ROWS` | `5000` | Maximum owner-scoped active episodes queued per startup when enabling semantic recall or changing the embedding manifest |
+| `MEMORY_WIKI_EPISODIC_SCOPE` | `chat` | Episode visibility partition: exact `chat` or host bot-wide `bot` |
+| `MEMORY_WIKI_EPISODIC_QUERY_MODE` | `auto` | Bounded multilingual query planning: `fast`, `auto`, or `deep` |
+| `MEMORY_WIKI_EPISODIC_QUERY_MAX_RESULTS` | `8` | Host cap for explicit episode-query results, range 1–20 |
+| `MEMORY_WIKI_EPISODIC_QUERY_MAX_CHARS` | `2400` | Total sanitized episode characters returned by one query, range 350–12,000 |
+| `MEMORY_WIKI_EPISODIC_PREFETCH` | `false` | Permit episode fallback when safe durable claims do not fill automatic recall |
+| `MEMORY_WIKI_EPISODIC_PREFETCH_MAX_RESULTS` | `5` | Episode slots available to automatic fallback, range 1–8 |
+| `MEMORY_WIKI_EPISODIC_PREFETCH_MAX_CHARS` | `2400` | Sanitized episode-character budget for automatic fallback, range 350–8,000 |
+| `MEMORY_WIKI_EVENT_LEDGER_ENABLED` | `false` | Preserve a bounded append-only, sanitized event evidence ledger |
+| `MEMORY_WIKI_EVENT_SCOPE` | `chat` | Exact event partition used for capture and unified recall: `chat`, `bot`, or `project` |
+| `MEMORY_WIKI_EVENT_TTL_DAYS` | `90` | Event evidence retention, range 1–3,650 days |
+| `MEMORY_WIKI_EVENT_MAX_ROWS` | `20000` | Maximum retained event rows per bot, cap 10,000,000; storage and cleanup costs rise with this setting |
+| `MEMORY_WIKI_EVENT_MAX_BYTES` | `32000000` | Maximum retained event content/provenance bytes per bot, cap 16,000,000,000 |
+| `MEMORY_WIKI_VISUAL_EVIDENCE_ENABLED` | `false` | Permit host-only OCR text evidence; requires the event ledger and an external trusted OCR hook |
+| `MEMORY_WIKI_OBSERVATIONS_ENABLED` | `true` | Build deterministic, event-backed living observations during lifecycle hooks |
+| `MEMORY_WIKI_OBSERVATION_TURN_BATCH` | `32` | Maximum event rows consolidated after one host turn, cap 256 |
+| `MEMORY_WIKI_OBSERVATION_MUTATION_BATCH` | `16` | Maximum event rows consolidated after one host memory mutation, cap 256 |
+| `MEMORY_WIKI_OBSERVATION_MAINTENANCE_BATCH` | `1000` full / `64` light | Maximum event rows consolidated per maintenance pass, cap 10,000 |
+| `MEMORY_WIKI_OBSERVATION_TTL_DAYS` | `365` | Observation retention ceiling; the earliest supporting event expiry wins |
+| `MEMORY_WIKI_OBSERVATION_MAX_ROWS` | `10000` | Maximum derived observation rows retained per bot |
+| `MEMORY_WIKI_OBSERVATION_MAX_BYTES` | `16000000` | Maximum current observation content bytes retained per bot |
+| `MEMORY_WIKI_OBSERVATION_VERSIONS_PER_RECORD` | `64` | Bounded immutable versions retained per observation, cap 512 |
+| `MEMORY_WIKI_OBSERVATION_VERSION_EVIDENCE_MAX` | `128` | Deterministic oldest/recent event-link sample per version; full set remains committed by digest |
+| `MEMORY_WIKI_BACKGROUND_JOBS_ENABLED` | `false` | Optional durable, content-free extraction/observation/graph queue; chat events without a project are eligible for event jobs |
+| `MEMORY_WIKI_BACKGROUND_DAILY_JOBS` | `500` | Per-profile job execution budget; clamp 1–100,000 |
+| `MEMORY_WIKI_BACKGROUND_DAILY_REQUESTS` | `100` | Per-profile remote-request budget; clamp 1–100,000 |
+| `MEMORY_WIKI_BACKGROUND_LEASE_SECONDS` | `120` | Lease/recovery timeout; clamp 30–1,800 seconds |
+| `MEMORY_WIKI_BACKGROUND_MAX_ATTEMPTS` | `5` | Retry cap before dead-letter; clamp 1–20 |
+| `MEMORY_WIKI_BACKGROUND_POLL_SECONDS` | `10` | Worker poll interval; clamp 1–300 seconds |
 | `MEMORY_WIKI_VECTOR_SIZE` | `4096` | Qdrant vector size; the local stub and provider response are validated against it |
 | `MEMORY_WIKI_RERANK_ENABLED` | `false` | Enable second-stage reranking |
 | `MEMORY_WIKI_RERANK_TIMEOUT` | `3.0` | Per-request rerank timeout; accepts 0.25–4.0 seconds and is additionally trimmed by a shorter active prefetch budget |
@@ -126,6 +192,8 @@ Plaintext returned intentionally by `secret_context_lookup` can still enter the 
 | `MEMORY_WIKI_PREFETCH_FALLBACK_RESERVE_SECONDS` | `0.45` | Tail budget reserved for local FTS/SQLite fallback |
 | `MEMORY_WIKI_MAX_PREFETCH_CHARS` | `24000` | Character budget for automatic prompt-time recall |
 | `MEMORY_WIKI_PREFETCH_MIN_RELEVANT_CLAIMS` | `4` | Soft minimum of relevant, guard-safe claims; never pads with unrelated/quarantined rows |
+| `MEMORY_WIKI_ONLINE_METRICS_ENABLED` | `true` | Keep fixed-dimension, content-free daily prefetch and explicit-recall aggregates; set `0` to disable |
+| `MEMORY_WIKI_ONLINE_METRICS_DAYS` | `30` | Retain aggregates for 1–90 days; health shows at most the latest seven days |
 | `MEMORY_WIKI_PREFETCH_MIN_RELEVANT_CHARS` | `2000` | Soft relevant-content target used for shortfall diagnostics |
 | `MEMORY_WIKI_PREFETCH_EXPANSION_FACTOR` | `3` | Candidate-pool multiplier, capped at 50 rows |
 | `MEMORY_WIKI_PREFETCH_DIAGNOSTICS` | `anomalies` | `off`, `anomalies`, or `always`; records searched/rendered/quarantined/size |
@@ -141,16 +209,27 @@ Plaintext returned intentionally by `secret_context_lookup` can still enter the 
 | `HERMES_HOME` | `~/.hermes` | Hermes data directory (DB at `{HERMES_HOME}/memory-wiki/memory_wiki.sqlite3`) |
 | `MEMORY_WIKI_ALLOW_SHARED_SECRET_METADATA` | `0` | Permit old ownerless secret metadata and the external read-through registry only in one shared authorization domain; owner-tagged local metadata uses its own ACL |
 | `MEMORY_WIKI_ALLOW_LEGACY_UNSCOPED_GRAPH` | `0` | Permit reads of pre-migration graph rows with unknown owner only in a deliberately shared authorization domain; new graph writes are scoped |
-| `MEMORY_WIKI_GRAPH_EXTRACT_ENABLED` | `0` | Enable explicit remote relation extraction from one named visible claim; no background session ingestion |
+| `MEMORY_WIKI_GRAPH_EXTRACT_ENABLED` | `0` | Enable remote relation extraction from one named, visible, bounded claim |
 | `MEMORY_WIKI_GRAPH_EXTRACT_MODEL` | unset | OpenRouter chat model for graph extraction; required unless `MEMORY_WIKI_LLM_MODEL` is set |
 | `MEMORY_WIKI_GRAPH_EXTRACT_URL` | OpenRouter chat completions | HTTPS or loopback endpoint; `MEMORY_WIKI_LLM_BASE_URL` is the fallback |
 | `MEMORY_WIKI_GRAPH_EXTRACT_API_KEY` | `OPENROUTER_API_KEY` | Optional separate graph extraction key |
+| `MEMORY_WIKI_GRAPH_AUTO_EXTRACT` | `0` | After session extraction, automatically enrich only newly persisted, grounded, relation-like chat claims; also requires `MEMORY_WIKI_GRAPH_EXTRACT_ENABLED=1` |
+| `MEMORY_WIKI_GRAPH_AUTO_EXTRACT_MAX_CLAIMS` | `2` | Maximum remote graph-extraction calls per session end, clamped to 1–4 |
+| `MEMORY_WIKI_GRAPH_AUTO_EXTRACT_TOTAL_DEADLINE_SECONDS` | `12` | Total automatic-enrichment budget, clamped to 1–30 seconds |
+| `MW_EXTRACTION_ENABLED` | `0` | Opt in to grounded session-end LLM extraction; local explicit-memory heuristics continue while disabled |
+| `MW_EXTRACTION_MODEL` | `openai/gpt-4.1-mini` | OpenRouter-compatible structured-output model used for session extraction |
+| `MW_EXTRACTION_BASE_URL` | OpenRouter chat completions | HTTPS or explicit loopback endpoint; query strings, URL credentials, and remote plaintext HTTP are rejected |
+| `MW_EXTRACTION_API_KEY` | `OPENROUTER_API_KEY` | Optional separate session-extraction key; loopback endpoints may omit it |
+| `MW_EXTRACTION_TIMEOUT` | `30` | Session extraction timeout in seconds, clamped to 1–60; failures never abort session finalization |
+| `MW_EXTRACTION_MAX_TOKENS` | `1800` | Structured response budget, clamped to 256–3000 tokens |
 | `MEMORY_WIKI_ALLOW_LEGACY_UNSCOPED_PREFERENCES` | `0` | Permit reads of old preference rules with unknown owner only in one shared authorization domain; new rules are scoped |
 | `MEMORY_WIKI_ALLOW_LEGACY_UNSCOPED_REVIEW_QUEUE` | `0` | Permit reads and review actions on old queue rows with unknown owner only in one shared authorization domain; new rows are scoped |
 | `MEMORY_WIKI_ALLOW_SHARED_SESSION_HISTORY` | `0` | Additional authorization-domain opt-in for reading all `HERMES_HOME/sessions/session_*.json`; `MEMORY_WIKI_INCLUDE_SESSIONS_IN_PACK=1` is also required to include them in a context pack |
 | `MEMORY_WIKI_ALLOW_PATH_BUNDLE_IMPORT` | `0` | Permit `memory_wiki_import_bundle(path=...)` to read a host file, including bundles from another profile; inline payload import remains available |
 | `MEMORY_WIKI_ALLOW_SHARED_AUDIT_LOG` | `0` | Permit model-facing reads of the legacy audit log, which has no per-consumer owner |
 | `MEMORY_WIKI_ALLOW_SHARED_RECOVERY` | `0` | Permit model-facing full-store backup, backup listing, restore, journal checkpoint, and journal rebuild only when the entire Hermes home is one trusted authorization domain |
+
+Enabling `MW_EXTRACTION_ENABLED` sends a bounded recent transcript (at most 32 messages, 6,000 characters per message, and 48,000 characters total) to the configured endpoint at session end. Returned memories must use the strict response schema, cite an exact quote and source message, pass local support and injection checks, and are stored as unverified chat-scoped claims with session, speaker, message index, and event-time evidence. A failed or incompatible endpoint is audited and does not interrupt session shutdown.
 
 ## Bounded prompt-time recall
 
@@ -410,6 +489,8 @@ New entity and relation rows carry `visibility_scope`, owner identity, optional 
 
 `memory_wiki_graph_extract_claim` requires `MEMORY_WIKI_GRAPH_EXTRACT_ENABLED=1`, a configured chat model and API key, and a specific visible claim ID. It sends at most 4,000 characters of that claim to the configured endpoint. Strict JSON parsing accepts up to eight directed relations whose subject, object, and evidence appear in the claim text; unsupported predicates or ungrounded output fail before any write. `apply=false` previews proposals. Applied relations go through `memory_wiki_add_relation` and the normal journal, so replay never calls the remote model. Model extraction can still misinterpret a stated relationship; review important edges and use corrections to supersede their source claim.
 
+`MEMORY_WIKI_GRAPH_AUTO_EXTRACT=1` adds a bounded synchronous step after grounded session claims are persisted. It never sends raw transcript text: only a new active/current public chat claim with `memory-wiki-extraction-evidence-v1` provenance can qualify. A conservative local relation-verb filter skips preferences and other claims unlikely to produce an allowed edge. Claims that already own any relation are not sent again. The per-session call cap and total deadline apply before each request; request or write failures are counted in a content-free audit record and never fail session shutdown. Relations keep the source claim's ACL and lifecycle through the ordinary journaled relation writer.
+
 Session history and path-based bundle import have the same boundary. With `MEMORY_WIKI_INCLUDE_SESSIONS_IN_PACK=1`, the default session-history path can read only `sessions/session_<current-session-id>.json` when its `session_id` matches the host-issued current session, and any present bot/project IDs match too. The ambiguous `default` session ID, links, and oversized files are skipped. Set `MEMORY_WIKI_ALLOW_SHARED_SESSION_HISTORY=1` only when all session files belong to one authorization domain and cross-session recall is intended. Path-based bundle import is disabled unless `MEMORY_WIKI_ALLOW_PATH_BUNDLE_IMPORT=1`; use an inline bundle payload when a trusted caller already has the content. Legacy session files without an exact current-session match remain unavailable by default.
 
 Inline export/import and sync bundles bind newly imported claims to the receiving context's chat/private owner. Model-facing import cannot turn a supplied visibility field into a global or project-wide claim. Intentionally restoring global or project visibility requires a trusted host-level migration route with reviewed ownership and provenance.
@@ -420,7 +501,7 @@ Full-store recovery artifacts have the same ownership gap, including old backups
 
 For model-facing recovery without that host flag, use `memory_wiki_scoped_backup`, `memory_wiki_list_scoped_backups`, and `memory_wiki_restore_scoped_backup` with the returned opaque `backup_id`. Scoped snapshots contain claims created by the same bot/session with a matching or empty project ID, plus their evidence, contradictions whose two claims are owned, and code claim metadata. Legacy rows without creator metadata, secret or quarantined claims, non-public claims, and claims with detected raw secrets in linked evidence or metadata are excluded. Remaining strings are redacted before writing. A host-local 256-bit key authenticates each JSON artifact; preserve `memory-wiki/.scoped-backup-key` together with `memory-wiki/backups/scoped/` for recovery after SQLite loss. Restore validates the signed owner and every claim/reference, rejects ID collisions with another creator, then merges the saved rows. It restores updates and physically deleted owned claims while preserving unrelated and later-created rows. It does not roll back claims added after the snapshot, restore audit/secret/graph data, or replace a whole database. The scoped backup files contain public claim content in plaintext and should receive the same filesystem protection as the SQLite database. The signing key is not a separate security boundary against code running as the same OS account. Use trusted-host full backups for excluded data.
 
-Full list: 119 tools in `plugin.yaml` (generated from `get_tool_schemas()`).
+Full list: 120 tools in `plugin.yaml` (generated from `get_tool_schemas()`).
 
 ## Usage examples
 
@@ -498,9 +579,19 @@ memory_wiki_reindex({"limit": 100})
 memory_wiki_query({"query": "proxy port"})
 # → retrieval counts updated (recall_count++, no usefulness penalty)
 
-# After answer evaluation (manual or via answer evaluator):
-# recall_feedback table has full lifecycle:
-# retrieved → injected → used → helpful/irrelevant/harmful
+# Unified recall returns exact pending event linkage for final claims:
+result = memory_wiki_recall({"query": "proxy port"})
+link = result["recall_tracking"]["answer_linkage"]
+
+# After answer evaluation, bind one terminal outcome to those exact events.
+# Repeating the same answer_id + claim + outcome is idempotent.
+memory_wiki_mark_used({
+    "claim_ids": link["claim_ids"],
+    "recall_event_ids": link["recall_event_ids"],
+    "answer_id": "answer-2026-09-21-001",
+    "outcome": "helpful",
+    "usefulness": 0.9,
+})
 ```
 
 
@@ -697,7 +788,7 @@ Latency and reindex duration depend on the embedding provider, Qdrant placement,
 
 ## Changelog
 
-- **Unreleased local hardening (2026-09-12)**: `memory_wiki_maintenance` now matches its zero-argument implementation and packaged schema, rejects unrecognised arguments before they reach the journal, and reports an optional checkpoint failure without making recovery unreplayable. Full code-graph snapshots archive claims for omitted files before graph replacement; malformed graph rows/collection shapes, revision IDs, or failed invalidations stop the event before recallable claims or graph rows can diverge. Code-graph event IDs bind a canonical normalized payload and serialize reservation, claim lifecycle, graph replacement, and final event metadata in one transaction; embeddings run only after it commits. Graph source is redacted before SQLite/FTS, embeddings, reranking, prefetch, recovery and terminal records; the secret scrubber rebuilds legacy graph FTS and sanitizes legacy terminal Code Shrinker files. Inbox claims now survive until artifact, terminal record, and journal completion are durable, preserve their retry identity, and fail closed when the inbox is unavailable. Review-queued patch events cannot invalidate claims. Journal operation pairs and checkpoints are serialized across threads/processes; only a strict internal empty-poll marker may recover as non-mutating, and public callers cannot forge journal controls.
+- **v1.23.0 (2026-09-21)**: Adds evidence-first unified recall across claims, paired dialogue episodes, append-only events, versioned observations and graph relations, with stable citations and multilingual `fast`/`auto`/`deep` planning. Episode retrieval now has an owner-scoped SQLite/FTS source of truth, an optional Qdrant hybrid index, durable vector-target cleanup and bounded context rendering. Grounded OpenRouter extraction, bounded graph enrichment, explicit recall outcomes and a TTL/LRU/single-flight embedding cache improve memory formation and feedback. Qdrant payload ACLs are rechecked against SQLite; claim and episode retargeting fan out privacy deletion to historical physical collections. Secret scanning covers complete pre-truncation inputs and outbound model/embedding boundaries, authenticated HTTP calls reject redirects, and memory removal retires exact visible matches plus derived event/observation evidence within the same ACL partition. This release also includes the earlier local hardening for journal serialization and replay, code/document graph atomicity, redaction, inbox durability, schema validation and checkpoint safety.
 - **v1.22.3 (2026-08-29)**: Fixes the final Windows validation gaps: missing-source pruning now compares both lexical and canonical Windows path identities, and FTS rebuild obtains an exclusive SQLite transaction so concurrent provider initialization cannot race table replacement. Supersedes the immutable but Windows-CI-failed `v1.22.2` tag.
 - **v1.22.2 (2026-08-29)**: Corrects five late recovery-audit blockers. Document scans now capture every source action beyond display caps and include `prune_missing` deletions; journal recovery rejects truncated prefixes and orphan `after` events; keyed Code Shrinker metadata secrets are redacted before artifact retention; and checkpoint restores use dependency-safe table order. Supersedes the immutable but unsafe `v1.22.1` tag.
 - **v1.22.1 (2026-08-29)**: Fixes a post-release privacy regression: complex tool results (including document inbox paths) are no longer copied into journal summaries. Sensitive recovery-reference capture errors are redacted, and recovery now verifies a published local checkpoint manifest's path, ID, sequence and SHA-256 before any swap. Supersedes the immutable but CI-failed `v1.22.0` tag.
@@ -724,7 +815,7 @@ MIT
 
 ## Audit fix r1 (2026-07-29)
 
-This source package includes the runtime modules required by the advertised code and document graph tools. `plugin.yaml`, the MCP schema cache and the Python provider are synchronized from the same 119-schema source. `memory_wiki_compare_search` now performs real FTS-only, vector-only and hybrid runs without mutating process-wide environment variables. Backup restore validates archive entry count, uncompressed size, member size and compression ratio before creating a safety backup or writing staged files.
+This source package includes the runtime modules required by the advertised code and document graph tools. `plugin.yaml`, the MCP schema cache and the Python provider are synchronized from the same 120-schema source. `memory_wiki_compare_search` now performs real FTS-only, vector-only and hybrid runs without mutating process-wide environment variables. Backup restore validates archive entry count, uncompressed size, member size and compression ratio before creating a safety backup or writing staged files.
 
 
 ## Automatic prefetch hardening in v1.20.4

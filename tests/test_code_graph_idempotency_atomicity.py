@@ -85,6 +85,33 @@ def chunk_snapshot(event_id: str, name: str):
     return event
 
 
+def test_mapped_code_identity_does_not_exempt_adjacent_secret_metadata(tmp_path, monkeypatch) -> None:
+    """Only exact mapper-created IDs and validated digests bypass entropy scanning."""
+    _module, provider = load_provider("memory_wiki_mapped_identity_secret_guard", tmp_path, monkeypatch)
+    token = "ghp_" + "a" * 36
+    payload = {
+        "claim": "A verified code procedure retains a safe graph identifier.",
+        "topic": "code-intelligence",
+        "repository_id": f"repo-{token}",
+        "file_path": "src/safe.py",
+        "symbol_id": "safe_symbol",
+        "content_hash": hashlib.sha256(b"safe source revision").hexdigest(),
+    }
+    try:
+        prepared = provider._prepare_code_claim(payload)
+        assert isinstance(prepared, dict)
+        assert str(prepared["repository_id"]).startswith("redacted-graph-id-")
+        with pytest.raises(ValueError, match="secret in claim metadata"):
+            provider._prepare_code_claim({
+                **payload,
+                "symbol_revision": "OPENAI_API_KEY=sk-proj-" + "b" * 40,
+            })
+    finally:
+        if provider._conn is not None:
+            provider._conn.close()
+            provider._conn = None
+
+
 def test_concurrent_same_event_id_binds_graph_to_winning_payload_across_providers(tmp_path, monkeypatch) -> None:
     """A same-id collision cannot leave graph B behind event metadata for A."""
     module_a, provider_a = load_provider("memory_wiki_atomicity_a", tmp_path, monkeypatch)

@@ -1,8 +1,9 @@
-"""Isolated retrieval-only evaluation on the official LoCoMo dialogue dataset.
+"""Isolated retrieval and optional bounded reader on the official LoCoMo dataset.
 
 Raw dialogue turns are indexed directly as FTS claims. This measures Memory
-Wiki retrieval and evidence ranking, not automatic memory extraction or answer
-generation. The official JSON is fetched only with --download-official.
+Wiki retrieval and evidence ranking, not automatic memory extraction. Optional
+reader hypotheses are not scored as official LoCoMo QA. The official JSON is
+fetched only with --download-official.
 """
 
 from __future__ import annotations
@@ -23,6 +24,11 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
+
+BENCHMARKS = Path(__file__).resolve().parent
+if str(BENCHMARKS) not in sys.path:
+    sys.path.insert(0, str(BENCHMARKS))
+from qa_reader import AnswerBudget, answer_openrouter, looks_like_abstention, safe_outbound_evidence
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -199,13 +205,17 @@ def _index_turns(provider: Any, module: Any, sample: dict[str, Any]) -> dict[str
 
 
 def _score_question(provider: Any, question: dict[str, Any], claim_to_dialogue: dict[str, str],
-                    indexed_dialogues: set[str], top_k: int) -> dict[str, Any]:
+                    indexed_dialogues: set[str], top_k: int,
+                    context_out: list[tuple[str, str]] | None = None) -> dict[str, Any]:
     gold, malformed = _evidence_ids(question["evidence"])
     unresolved = sorted(gold - indexed_dialogues)
     started = time.perf_counter()
     found = provider._search(question["question"], limit=top_k, retrieval_mode="fts",
                              record_retrieval=False, apply_rerank=False)
     latency_ms = (time.perf_counter() - started) * 1000
+    if context_out is not None:
+        context_out.extend((claim_to_dialogue.get(str(row["id"]), ""), str(row.get("claim") or ""))
+                           for row in found if claim_to_dialogue.get(str(row["id"])))
     retrieved = [claim_to_dialogue.get(str(row["id"]), "") for row in found]
     retrieved = [dia_id for dia_id in retrieved if dia_id]
     hits = gold.intersection(retrieved)
@@ -240,15 +250,38 @@ def _aggregate(rows: list[dict[str, Any]], top_k: int) -> dict[str, Any]:
 
 
 def run(raw: bytes, *, max_conversations: int | None = 1,
-        questions_per_conversation: int | None = 50, top_k: int = 5) -> dict[str, Any]:
+        questions_per_conversation: int | None = 50, top_k: int = 5,
+        answer_model: str = "", env_file: Path | None = None,
+        answer_max_tokens: int = 160, answer_context_chars: int = 6000,
+        answer_request_budget: int | None = None,
+        answer_cost_soft_cap_usd: float | None = None) -> dict[str, Any]:
     if max_conversations is not None and max_conversations < 1:
         raise ValueError("max_conversations must be positive")
     if questions_per_conversation is not None and questions_per_conversation < 1:
         raise ValueError("questions_per_conversation must be positive")
     if not 1 <= top_k <= 50:
         raise ValueError("top_k must be 1..50")
+    if answer_model and not (1 <= answer_max_tokens <= 256 and 256 <= answer_context_chars <= 10000):
+        raise ValueError("answer limits must be 1-256 tokens and 256-10000 context characters")
+    if not answer_model and (answer_request_budget is not None or answer_cost_soft_cap_usd is not None):
+        raise ValueError("answer budgets require --answer-model")
+    if answer_model:
+        if env_file is None:
+            raise ValueError("--answer-model requires --env-file")
+        try:
+            from dotenv import dotenv_values
+        except ImportError as exc:
+            raise RuntimeError("--env-file requires python-dotenv") from exc
+        api_key = str(dotenv_values(env_file).get("OPENROUTER_API_KEY") or "")
+        if not api_key:
+            raise ValueError("--answer-model requires --env-file with OPENROUTER_API_KEY")
+    else:
+        api_key = ""
     data = _load_dataset(raw)
     selected = data[:max_conversations]
+    question_count = sum(len(sample["qa"][:questions_per_conversation]) for sample in selected)
+    budget = AnswerBudget(question_count if answer_request_budget is None else answer_request_budget,
+                          answer_cost_soft_cap_usd) if answer_model else None
     results: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="memory-wiki-locomo-") as tmp:
         with _isolated_home(tmp):
@@ -260,9 +293,42 @@ def run(raw: bytes, *, max_conversations: int | None = 1,
                         provider.initialize(f"locomo-{index}", hermes_home=str(Path(tmp) / f"sample-{index}"),
                                             bot_id="locomo-benchmark", project_id=f"locomo-{index}")
                         indexed = _index_turns(provider, module, sample)
-                        rows = [_score_question(provider, question, indexed["claim_to_dialogue"],
-                                                set(indexed["claim_to_dialogue"].values()), top_k)
-                                for question in sample["qa"][:questions_per_conversation]]
+                        rows = []
+                        for question in sample["qa"][:questions_per_conversation]:
+                            context: list[tuple[str, str]] = []
+                            row = _score_question(provider, question, indexed["claim_to_dialogue"],
+                                                  set(indexed["claim_to_dialogue"].values()), top_k,
+                                                  context_out=context if answer_model else None)
+                            if answer_model:
+                                assert budget is not None
+                                reason = (
+                                    None if safe_outbound_evidence(
+                                        module.secret_scan, str(question["question"]), context,
+                                    ) else "secret_guard"
+                                ) or budget.skip_reason()
+                                if reason:
+                                    row["answer_skipped_reason"] = reason
+                                else:
+                                    budget.begin()
+                                    try:
+                                        answer, usage, elapsed = answer_openrouter(
+                                            api_key=api_key, model=answer_model,
+                                            question=question["question"], context=context,
+                                            max_tokens=answer_max_tokens,
+                                            context_chars=answer_context_chars,
+                                            unsupported_answer="No information available",
+                                        )
+                                    except Exception as exc:
+                                        row["answer_error"] = type(exc).__name__
+                                        budget.unknown_cost = True
+                                    else:
+                                        row["hypothesis"] = answer
+                                        row["answer_usage"] = usage
+                                        row["answer_ms"] = elapsed
+                                        row["answer_abstention_heuristic"] = looks_like_abstention(answer)
+                                        row["expected_abstention"] = question["category"] == 5
+                                        budget.record(usage)
+                            rows.append(row)
                         results.append({
                             "sample_id": sample["sample_id"], "indexed_turns": indexed["indexed_turns"],
                             "blank_turns": indexed["blank_turns"],
@@ -278,6 +344,11 @@ def run(raw: bytes, *, max_conversations: int | None = 1,
             finally:
                 sys.modules.pop(module.__name__, None)
     all_rows = [row for sample in results for row in sample["questions"]]
+    answered = [row for row in all_rows if "answer_usage" in row]
+    def complete_usage(field: str) -> int | None:
+        return (sum(int(row["answer_usage"][field]) for row in answered)
+                if answered and all(row["answer_usage"].get(field) is not None for row in answered)
+                else None)
     categories = sorted({str(row["category"]) for row in all_rows})
     return {
         "benchmark": "LoCoMo official dialogue evidence retrieval",
@@ -290,6 +361,27 @@ def run(raw: bytes, *, max_conversations: int | None = 1,
         "retrieval_mode": "fts", "top_k": top_k,
         "indexing": "raw dialogue turns inserted as isolated FTS claims; automatic memory extraction bypassed",
         "answer_generation_scored": False,
+        "answer_model": answer_model or None,
+        "answer_config": {
+            "reader_prompt_version": 1,
+            "max_completion_tokens_per_request": answer_max_tokens,
+            "max_retrieved_context_chars_per_request": answer_context_chars,
+            "temperature": 0,
+        } if answer_model else None,
+        "answer_budget": budget.summary() if budget else None,
+        "answer_generated": len(answered),
+        "answer_errors": sum("answer_error" in row for row in all_rows),
+        "answer_skipped": sum("answer_skipped_reason" in row for row in all_rows),
+        "answer_prompt_tokens": complete_usage("prompt_tokens") if answer_model else None,
+        "answer_completion_tokens": complete_usage("completion_tokens") if answer_model else None,
+        "answer_reported_cost": budget.summary()["reported_cost_usd"] if budget else None,
+        "answer_p50_ms": round(statistics.median(row["answer_ms"] for row in answered), 2) if answered else None,
+        "answer_p95_ms": round(sorted(row["answer_ms"] for row in answered)[max(0, int(len(answered) * .95 + .999999) - 1)], 2) if answered else None,
+        "answer_abstention_heuristic": {
+            "expected": sum(row["expected_abstention"] for row in answered),
+            "recognized": sum(row["expected_abstention"] and row["answer_abstention_heuristic"] for row in answered),
+            "false_abstentions": sum(not row["expected_abstention"] and row["answer_abstention_heuristic"] for row in answered),
+        } if answer_model else None,
         "metrics": _aggregate(all_rows, top_k),
         "by_category": {category: _aggregate([row for row in all_rows if str(row["category"]) == category], top_k)
                         for category in categories},
@@ -305,9 +397,27 @@ if __name__ == "__main__":
     parser.add_argument("--max-conversations", type=int, default=1, help="Default 1; use 10 for the full official set")
     parser.add_argument("--questions-per-conversation", type=int, default=50, help="Default 50; use 0 for all")
     parser.add_argument("--top-k", type=int, default=5)
+    parser.add_argument("--answer-model", default="", help="Optional OpenRouter chat model for retrieved dialogue answers")
+    parser.add_argument("--env-file", type=Path, help="Dotenv file with OPENROUTER_API_KEY; required for --answer-model")
+    parser.add_argument("--answer-max-tokens", type=int, default=160)
+    parser.add_argument("--answer-context-chars", type=int, default=6000)
+    parser.add_argument("--answer-request-budget", type=int, help="Hard cap on answer requests")
+    parser.add_argument("--answer-cost-soft-cap-usd", type=float, help="Stop future calls after reported cost cap; may overshoot by one request")
+    parser.add_argument("--output", type=Path, help="Optional result JSON file")
     args = parser.parse_args()
+    if args.output and args.env_file and args.output.resolve() == args.env_file.resolve():
+        parser.error("--output must differ from --env-file")
+    if args.output and args.dataset and args.output.resolve() == args.dataset.resolve():
+        parser.error("--output must differ from --dataset")
     payload = download_official() if args.download_official else args.dataset.read_bytes()
     report = run(payload, max_conversations=args.max_conversations,
                  questions_per_conversation=args.questions_per_conversation or None,
-                 top_k=args.top_k)
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+                 top_k=args.top_k, answer_model=args.answer_model, env_file=args.env_file,
+                 answer_max_tokens=args.answer_max_tokens,
+                 answer_context_chars=args.answer_context_chars,
+                 answer_request_budget=args.answer_request_budget,
+                 answer_cost_soft_cap_usd=args.answer_cost_soft_cap_usd)
+    rendered = json.dumps(report, ensure_ascii=False, indent=2)
+    if args.output:
+        args.output.write_text(rendered + "\n", encoding="utf-8")
+    print(rendered)

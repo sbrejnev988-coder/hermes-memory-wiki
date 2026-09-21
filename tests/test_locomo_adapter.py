@@ -104,3 +104,24 @@ def test_short_turn_is_reported_as_unindexed_evidence(tmp_path: Path, monkeypatc
     assert result["short_turns"] == 1
     assert result["skipped_dialogue_ids"] == ["D1:2"]
     assert result["questions"][0]["unresolved_gold_dialogue_ids"] == ["D1:2"]
+
+
+def test_optional_reader_obeys_request_cap_without_live_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    env = tmp_path / "private.env"
+    env.write_text("OPENROUTER_API_KEY=synthetic-key\n", encoding="utf-8")
+    called = []
+
+    def fake_answer(**kwargs):
+        called.append(kwargs["question"])
+        assert kwargs["context"]
+        return "Arbor", {"prompt_tokens": 20, "completion_tokens": 2,
+                         "total_tokens": 22, "cost": .00002, "context_chars": 100}, 4.0
+
+    monkeypatch.setattr(adapter, "answer_openrouter", fake_answer)
+    report = adapter.run(json.dumps([_sample()]).encode(), questions_per_conversation=None,
+                         answer_model="test/model", env_file=env, answer_request_budget=1)
+    assert len(called) == 1
+    assert report["answer_generated"] == 1
+    assert report["answer_skipped"] == 1
+    assert report["answer_reported_cost"] == .00002
+    assert report["samples"][0]["questions"][1]["answer_skipped_reason"] == "request_budget"

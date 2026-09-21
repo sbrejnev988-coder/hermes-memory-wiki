@@ -12,7 +12,6 @@ import argparse
 import hashlib
 import json
 import random
-import statistics
 import sys
 import tempfile
 import uuid

@@ -190,3 +190,64 @@ def test_recall_query_is_never_exposed_and_legacy_events_are_scrubbed(tmp_path, 
     other, _ = _provider(tmp_path, monkeypatch, bot="bot-b", session="session-b")
     assert marker not in json.dumps(other._why_believe("c_global"))
     assert other._connect().execute("SELECT query FROM recall_events WHERE id='re_legacy'").fetchone()[0] == ""
+
+
+def test_hybrid_fallback_rows_do_not_receive_synthetic_rrf_relevance(tmp_path, monkeypatch):
+    provider, module = _provider(tmp_path, monkeypatch)
+    _seed(
+        provider,
+        module,
+        "c_relevant",
+        "Cobalt telescope calibration uses a quartz fiducial at Meridian Observatory",
+        "global",
+    )
+    _seed(
+        provider,
+        module,
+        "c_unrelated",
+        "Annual payroll reconciliation requires signed approvals from finance supervisors",
+        "global",
+    )
+    provider._upsert_fts("c_relevant")
+    provider._upsert_fts("c_unrelated")
+
+    rows = provider._search(
+        "cobalt telescope quartz",
+        limit=10,
+        retrieval_mode="hybrid",
+        record_retrieval=False,
+        apply_rerank=False,
+    )
+    by_id = {row["id"]: row for row in rows}
+
+    assert by_id["c_relevant"]["score_parts"].get("rrf", 0) > 0
+    assert "rrf" not in by_id["c_unrelated"]["score_parts"]
+    assert provider._prefetch_row_relevant(by_id["c_relevant"]) is True
+    assert provider._prefetch_row_relevant(by_id["c_unrelated"]) is False
+
+
+def test_conversation_summaries_default_to_chat_visibility(tmp_path, monkeypatch):
+    provider, module = _provider(tmp_path, monkeypatch)
+    monkeypatch.setattr(module, "memory_gate_decision", lambda *_a, **_k: {"action": "accept"})
+    assert provider._source_kind("session_end:session-a") == "conversation_summary"
+    assert provider._source_kind("pre_compress") == "conversation_summary"
+    assert provider._default_visibility_for("session_end:session-a") == "chat"
+    assert provider._default_visibility_for("pre_compress") == "chat"
+
+    claim_ids = [
+        provider._add_claim(
+            "The private cobalt telescope calibration belongs to this conversation.",
+            source="session_end:session-a",
+        ),
+        provider._add_claim(
+            "The private amber compass calibration belongs to this conversation.",
+            source="pre_compress",
+        ),
+    ]
+    rows = provider._connect().execute(
+        "SELECT visibility_scope,origin_bot_id,origin_session_id FROM claims "
+        "WHERE id IN (?,?) ORDER BY id",
+        tuple(claim_ids),
+    ).fetchall()
+    assert len(rows) == 2
+    assert all(tuple(row) == ("chat", "bot-a", "session-a") for row in rows)

@@ -125,6 +125,45 @@
     }
   },
   {
+    "name": "memory_wiki_recall",
+    "description": "Unified evidence-first recall over visible claims, guarded event-backed observations, episodes, events, and optional deep graph traversal. Returns bounded evidence with stable citations, recall event linkage, and an abstention policy.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "fast",
+            "deep"
+          ],
+          "default": "auto"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 10,
+          "minimum": 1,
+          "maximum": 20
+        },
+        "max_chars": {
+          "type": "integer",
+          "default": 6000,
+          "minimum": 128,
+          "maximum": 24000
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "memory_wiki_post_task",
     "description": "Record a post-task durable summary with changed files, backups, verification and service restarts.",
     "parameters": {
@@ -1369,7 +1408,7 @@
   },
   {
     "name": "memory_wiki_mark_used",
-    "description": "Feedback loop: mark recalled claims as useful or not useful.",
+    "description": "Record idempotent outcome feedback for recalled claims. Pass returned recall_event_ids to bind the answer to exact retrievals; retrieval alone stays neutral.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -1379,12 +1418,42 @@
             "type": "string"
           }
         },
+        "recall_event_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 50,
+          "description": "Exact pending recall event IDs returned by recall. At most one per claim."
+        },
         "usefulness": {
           "type": "number",
           "default": 1.0
         },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "used",
+            "helpful",
+            "irrelevant",
+            "contradicted",
+            "harmful"
+          ],
+          "default": "helpful"
+        },
+        "answer_id": {
+          "type": "string",
+          "default": "",
+          "maxLength": 128
+        },
+        "notes": {
+          "type": "string",
+          "default": "",
+          "maxLength": 500
+        },
         "query": {
-          "type": "string"
+          "type": "string",
+          "description": "Deprecated and never persisted."
         }
       },
       "required": [

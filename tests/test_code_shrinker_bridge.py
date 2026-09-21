@@ -824,9 +824,9 @@ def test_qdrant_reindex_builds_physical_collection_before_alias_switch(tmp_path)
     assert result.get("id")
 
     # R21: model the current Qdrant contract, not only point count. _reindex now
-    # asks _qdrant_claim_state() for claim_id -> vector_text_hash before deciding
-    # whether a collection is complete/reusable.
-    points: dict[str, dict[str, str]] = {}
+    # asks _qdrant_claim_state() for the complete vector/ACL payload contract
+    # before deciding whether a collection is complete/reusable.
+    points: dict[str, dict[str, dict]] = {}
     switched = []
     created = []
     module.SEMANTIC_ENABLED = True
@@ -835,12 +835,15 @@ def test_qdrant_reindex_builds_physical_collection_before_alias_switch(tmp_path)
     module._embed_document = lambda text: [0.0] * module.QDRANT_VECTOR_SIZE
 
     def fake_upsert(claim_id, vector, payload, collection=None):
-        points.setdefault(collection, {})[claim_id] = str(payload.get("vector_text_hash") or "")
+        points.setdefault(collection, {})[claim_id] = dict(payload)
         return True
 
     module._qdrant_upsert = fake_upsert
     module._qdrant_count = lambda collection=None: len(points.get(collection, {}))
-    module._qdrant_claim_state = lambda collection, max_points=200000: dict(points.get(collection, {}))
+    module._qdrant_claim_state = lambda collection, max_points=200000: {
+        claim_id: module._qdrant_claim_reconciliation_state(payload)
+        for claim_id, payload in points.get(collection, {}).items()
+    }
     module._qdrant_alias_supported = lambda: True
     module._qdrant_alias_target = lambda alias=module.QDRANT_ALIAS: switched[-1] if switched else "old_collection"
     module._switch_alias = lambda collection: switched.append(collection) or True

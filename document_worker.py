@@ -44,7 +44,7 @@ def _apply_resource_limits() -> None:
         resource.setrlimit(resource.RLIMIT_FSIZE, (output_mb * 1024 * 1024, output_mb * 1024 * 1024))
         resource.setrlimit(resource.RLIMIT_NOFILE, (64, 64))
     except OSError as exc:
-        raise RuntimeError(f"unable to install document worker resource limits: {exc}") from exc
+        raise RuntimeError(f"unable to install document worker resource limits: {type(exc).__name__}") from exc
 
 
 def main() -> int:
@@ -65,7 +65,7 @@ def main() -> int:
     except BaseException as exc:
         response = {
             "ok": False,
-            "error": f"{type(exc).__name__}: {exc}",
+            "error": type(exc).__name__,
         }
         if os.environ.get("MEMORY_WIKI_DOCUMENT_WORKER_DEBUG", "0").lower() not in {"", "0", "false", "no", "off"}:
             response["traceback"] = traceback.format_exc(limit=8)[-6000:]

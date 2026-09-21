@@ -119,3 +119,45 @@ def test_prefetch_skips_episode_when_claims_suffice_or_deadline_is_low(tmp_path,
         assert provider._last_prefetch_diagnostics["episode_deadline_skipped"] is True
     finally:
         provider.shutdown()
+
+
+def test_prefetch_uses_quality_budget_and_stable_episode_citations(tmp_path, monkeypatch):
+    _environment(tmp_path, monkeypatch)
+    monkeypatch.setenv("MEMORY_WIKI_EPISODIC_PREFETCH_MAX_RESULTS", "5")
+    monkeypatch.setenv("MEMORY_WIKI_EPISODIC_PREFETCH_MAX_CHARS", "900")
+    module = _module()
+    monkeypatch.setattr(module, "_maybe_prefetch_code_context", lambda *_a, **_k: "")
+    monkeypatch.setattr(module, "_maybe_prefetch_document_context", lambda *_a, **_k: "")
+    provider = _provider(module, tmp_path, "alice", "chat-a")
+    requested = []
+
+    def episodes(_provider, _module, _query, limit, **_kwargs):
+        requested.append(limit)
+        return {
+            "enabled": True,
+            "scope": "chat",
+            "episodes": [
+                {
+                    "id": f"ep-{index}",
+                    "role": "user" if index % 2 else "assistant",
+                    "content": (f"episode {index} " + "x" * 280),
+                    "created_at": index,
+                }
+                for index in range(1, 6)
+            ],
+            "diagnostics": {"candidates": 5, "search_ms": 1.0},
+        }
+
+    monkeypatch.setattr(module._episodic_memory, "query_episodes", episodes)
+    try:
+        output = provider._prefetch_impl("remember the episode", session_id="chat-a")
+        assert requested == [5]
+        assert output.count("[M:E:ep-") == 3
+        assert "[M:E:ep-1]" in output
+        diagnostics = provider._last_prefetch_diagnostics
+        assert diagnostics["episode_requested_limit"] == 5
+        assert diagnostics["episode_char_budget"] == 900
+        assert diagnostics["episode_rendered"] == 3
+        assert diagnostics["episode_budget_rejected"] == 2
+    finally:
+        provider.shutdown()

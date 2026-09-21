@@ -13,7 +13,6 @@ import hashlib
 import importlib.util
 import json
 import os
-import re
 import sqlite3
 import statistics
 import sys

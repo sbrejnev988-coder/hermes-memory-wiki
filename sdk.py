@@ -17,6 +17,10 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
+SDK_API_VERSION = "1.0"
+__version__ = "1.23.0"
+
+
 class MemoryWikiClientError(RuntimeError):
     """The MCP transport or provider rejected a request."""
 
@@ -81,7 +85,7 @@ class MemoryWikiClient:
             self._request("initialize", {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {},
-                "clientInfo": {"name": "memory-wiki-python-sdk", "version": "1"},
+                "clientInfo": {"name": "memory-wiki-python-sdk", "version": __version__},
             })
             self._notify("notifications/initialized", {})
         except Exception:

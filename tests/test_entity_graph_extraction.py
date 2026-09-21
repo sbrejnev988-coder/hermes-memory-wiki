@@ -26,6 +26,12 @@ def _call(provider, tool_name, **kwargs):
     return json.loads(provider.handle_tool_call(tool_name, kwargs))
 
 
+def test_relation_grounding_rejects_reversed_endpoints():
+    from entity_relation_extractor import _grounded_relation_clause as grounded
+    assert grounded("Orion", "runs_on", "Atlas", "Orion runs on Atlas.")
+    assert not grounded("Atlas", "runs_on", "Orion", "Orion runs on Atlas.")
+
+
 class _Response:
     def __init__(self, relations):
         self.payload = json.dumps({"choices": [{"message": {"content": json.dumps({"relations": relations})}}]}).encode()
@@ -130,6 +136,36 @@ def test_graph_extractor_rejects_unbacked_relation(monkeypatch):
     with pytest.raises(ValueError, match="not grounded"):
         module.extract_relations("Orion runs on Atlas", endpoint="https://openrouter.ai/api/v1/chat/completions",
                                  api_key="test", model="test", predicates=frozenset({"runs_on"}))
+
+
+def test_graph_extractor_rejects_cross_clause_and_low_confidence_links(monkeypatch):
+    spec = importlib.util.spec_from_file_location("entity_relation_extractor", PLUGIN.parent / "entity_relation_extractor.py")
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    import pytest
+
+    source = "Alice owns Atlas. Bob uses Qdrant."
+    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *args, **kwargs: _Response([{
+        "subject": "Alice", "predicate": "uses_provider", "object": "Qdrant",
+        "evidence": source, "confidence": .95,
+    }]))
+    with pytest.raises(ValueError, match="one evidence clause"):
+        module.extract_relations(
+            source, endpoint="https://openrouter.ai/api/v1/chat/completions",
+            api_key="test", model="test", predicates=frozenset({"uses_provider"}),
+        )
+
+    monkeypatch.setattr(module.urllib.request, "urlopen", lambda *args, **kwargs: _Response([{
+        "subject": "Bob", "predicate": "uses_provider", "object": "Qdrant",
+        "evidence": "Bob uses Qdrant", "confidence": 0.2,
+    }]))
+    with pytest.raises(ValueError, match="confidence"):
+        module.extract_relations(
+            source, endpoint="https://openrouter.ai/api/v1/chat/completions",
+            api_key="test", model="test", predicates=frozenset({"uses_provider"}),
+        )
 
 
 def test_graph_extractor_rejects_loopback_userinfo_spoof(monkeypatch):

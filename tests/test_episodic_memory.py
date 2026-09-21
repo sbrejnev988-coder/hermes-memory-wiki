@@ -7,6 +7,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 
 PLUGIN = Path(__file__).resolve().parents[1] / "__init__.py"
 
@@ -124,6 +126,51 @@ def test_bot_scope_requires_distinct_host_bot_identity(tmp_path, monkeypatch):
         provider.shutdown()
 
 
+def test_default_episode_delete_cannot_erase_peer_chat_with_fallback_bot(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MEMORY_WIKI_SEMANTIC", "0")
+    monkeypatch.setenv("HERMES_SECURITY_STRICT", "0")
+    monkeypatch.setenv("MEMORY_WIKI_EPISODIC_ENABLED", "1")
+    monkeypatch.setenv("MEMORY_WIKI_EPISODIC_SCOPE", "chat")
+    module = _module()
+    own = _provider(module, tmp_path, "default", "chat-a")
+    peer = _provider(module, tmp_path, "default", "chat-b")
+    try:
+        own.sync_turn("The copper telescope belongs in archive A.", "")
+        peer.sync_turn("The silver telescope belongs in archive B.", "")
+        assert module._episodic_memory.delete_episodes(own) == 1
+        assert _call(own, "copper telescope")["episodes"] == []
+        assert len(_call(peer, "silver telescope")["episodes"]) == 1
+        with pytest.raises(PermissionError, match="trusted bot identity"):
+            module._episodic_memory.delete_episodes(own, scope="all")
+    finally:
+        own.shutdown()
+        peer.shutdown()
+
+
+def test_episode_quota_is_scoped_per_chat_with_fallback_bot(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MEMORY_WIKI_SEMANTIC", "0")
+    monkeypatch.setenv("HERMES_SECURITY_STRICT", "0")
+    monkeypatch.setenv("MEMORY_WIKI_EPISODIC_ENABLED", "1")
+    monkeypatch.setenv("MEMORY_WIKI_EPISODIC_SCOPE", "chat")
+    monkeypatch.setenv("MEMORY_WIKI_EPISODIC_MAX_ROWS", "1")
+    module = _module()
+    own = _provider(module, tmp_path, "default", "chat-a")
+    peer = _provider(module, tmp_path, "default", "chat-b")
+    try:
+        peer.sync_turn("Deneb telescope is silver.", "")
+        own.sync_turn("Vega telescope is copper.", "")
+        own.sync_turn("Rigel telescope is brass.", "")
+        assert len(_call(peer, "Deneb telescope")["episodes"]) == 1
+        assert own._connect().execute(
+            "SELECT COUNT(*) FROM episodic_turns"
+        ).fetchone()[0] == 2
+    finally:
+        own.shutdown()
+        peer.shutdown()
+
+
 def test_benign_dan_names_survive_real_episode_capture(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("MEMORY_WIKI_SEMANTIC", "0")
@@ -136,6 +183,51 @@ def test_benign_dan_names_survive_real_episode_capture(tmp_path, monkeypatch):
         result = _call(provider, "Jordan telescope")
         assert len(result["episodes"]) == 1
         assert "Indonesian guidance" in result["episodes"][0]["content"]
+    finally:
+        provider.shutdown()
+
+
+def test_long_turn_keeps_searchable_tail_with_explicit_truncation_metadata(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MEMORY_WIKI_SEMANTIC", "0")
+    monkeypatch.setenv("HERMES_SECURITY_STRICT", "0")
+    monkeypatch.setenv("MEMORY_WIKI_EPISODIC_ENABLED", "1")
+    monkeypatch.setenv("MEMORY_WIKI_EPISODIC_RECALL_MAX_CHARS", "220")
+    module = _module()
+    provider = _provider(module, tmp_path, "alice", "chat-a")
+    try:
+        tail_fact = "The final quasar registry code is Omega Zephyr 731."
+        text = "Opening telescope context. " + ("ordinary filler " * 180) + tail_fact
+        provider.sync_turn(text, "")
+        row = provider._connect().execute(
+            "SELECT content,truncated,source_chars FROM episodic_turns",
+        ).fetchone()
+        assert row
+        assert len(row["content"]) <= 1200
+        assert row["content"].startswith("Opening telescope context")
+        assert tail_fact in row["content"]
+        assert row["truncated"] == 1
+        assert row["source_chars"] == len(text.strip())
+
+        result = _call(provider, "quasar registry Omega Zephyr", limit=1)
+        assert len(result["episodes"]) == 1
+        recalled = result["episodes"][0]
+        assert tail_fact in recalled["content"]
+        assert len(recalled["content"]) <= 220
+        assert recalled["truncated"] is True
+        assert recalled["source_chars"] == len(text.strip())
+
+        # Secret detection covers the complete source before the omitted middle
+        # is created, so a secret outside the retained head/tail rejects it all.
+        hidden_secret = (
+            "Safe beginning. " + ("left filler " * 100)
+            + " api_key=sk-test-123456789012345678901234 "
+            + ("right filler " * 100) + "Safe ending."
+        )
+        provider.sync_turn(hidden_secret, "")
+        assert provider._connect().execute(
+            "SELECT COUNT(*) FROM episodic_turns",
+        ).fetchone()[0] == 1
     finally:
         provider.shutdown()
 

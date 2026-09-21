@@ -24,3 +24,11 @@ dist/
 .venv/
 .release-venv/
 .pytest_cache/
+
+# Local benchmark scratch outputs.  The one audited full-run evidence artifact
+# and its provenance manifest are intentionally kept in the release source.
+benchmarks/*_results.json
+benchmarks/*_partial_results.json
+benchmarks/oracle_episode_*_planned.json
+!benchmarks/oracle_episode_8slot_full_planned.json
+!benchmarks/oracle_episode_8slot_full_planned.provenance.json

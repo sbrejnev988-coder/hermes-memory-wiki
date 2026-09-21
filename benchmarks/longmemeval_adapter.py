@@ -3,12 +3,14 @@
 Reads a user-supplied official LongMemEval JSON file. It never downloads data
 or loads the active Hermes profile. The default FTS baseline is offline;
 ``--semantic --env-file`` explicitly enables OpenRouter and isolated physical
-Qdrant collections. Neither mode is the official answer-generation evaluation.
+Qdrant collections. ``--answer-model`` adds a bounded reader and emits official
+hypothesis JSONL, but judging is a separate, optional step.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -17,8 +19,6 @@ import statistics
 import sys
 import tempfile
 import time
-import urllib.error
-import urllib.request
 import uuid
 from collections import Counter
 from contextlib import contextmanager
@@ -28,6 +28,14 @@ from typing import Any, Iterator
 
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+BENCHMARKS = Path(__file__).resolve().parent
+if str(BENCHMARKS) not in sys.path:
+    sys.path.insert(0, str(BENCHMARKS))
+import qa_reader
+from qa_reader import AnswerBudget, looks_like_abstention
+
 _ISOLATED_ENV = {
     "HERMES_SECURITY_STRICT": "0",
     "MEMORY_WIKI_SEMANTIC": "0",
@@ -303,60 +311,11 @@ def _evaluate_case(provider: Any, case: dict[str, Any], top_k: int, hypothesis: 
 def _answer_openrouter(case: dict[str, Any], context: list[tuple[str, str]], *,
                        api_key: str, model: str, max_tokens: int, context_chars: int) -> tuple[str, dict[str, Any], float]:
     """Generate one bounded answer from retrieved isolated claims only."""
-    remaining = context_chars
-    evidence = []
-    for claim_id, claim in context:
-        if remaining <= 0:
-            break
-        line = f"[{claim_id}] " + " ".join(claim.split())
-        excerpt = line[:min(remaining, 1600)]
-        if excerpt:
-            evidence.append(excerpt)
-            remaining -= len(excerpt)
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": "Answer the question using only the supplied memory evidence. If it does not support an answer, say I don't know. Keep the answer concise."},
-            {"role": "user", "content": "Question date: " + str(case.get("question_date") or "")[:80]
-             + "\nQuestion: " + case["question"][:2000]
-             + "\nMemory evidence:\n" + ("\n".join(evidence) if evidence else "(none)")},
-        ],
-        "temperature": 0,
-        "max_tokens": max_tokens,
-    }
-    request = urllib.request.Request(
-        "https://openrouter.ai/api/v1/chat/completions",
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "Accept": "application/json"},
-        method="POST",
+    return qa_reader.answer_openrouter(
+        api_key=api_key, model=model, question=case["question"], context=context,
+        max_tokens=max_tokens, context_chars=context_chars,
+        question_date=str(case.get("question_date") or ""),
     )
-    started = time.perf_counter()
-    try:
-        with urllib.request.urlopen(request, timeout=45) as response:
-            reply = json.loads(response.read().decode("utf-8", "replace"))
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"OpenRouter answer request returned HTTP {exc.code}") from None
-    except (urllib.error.URLError, TimeoutError) as exc:
-        raise RuntimeError(f"OpenRouter answer request failed: {type(exc).__name__}") from None
-    elapsed_ms = (time.perf_counter() - started) * 1000
-    choices = reply.get("choices") if isinstance(reply, dict) else None
-    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-        raise RuntimeError("OpenRouter answer response has no choice")
-    message = choices[0].get("message") or {}
-    answer = message.get("content") if isinstance(message, dict) else None
-    if not isinstance(answer, str) or not answer.strip():
-        raise RuntimeError("OpenRouter answer response has no text")
-    usage = reply.get("usage") or {}
-    if not isinstance(usage, dict):
-        usage = {}
-    reported = {
-        "prompt_tokens": int(usage["prompt_tokens"]) if isinstance(usage.get("prompt_tokens"), (int, float)) else None,
-        "completion_tokens": int(usage["completion_tokens"]) if isinstance(usage.get("completion_tokens"), (int, float)) else None,
-        "total_tokens": int(usage["total_tokens"]) if isinstance(usage.get("total_tokens"), (int, float)) else None,
-        "cost": float(usage["cost"]) if isinstance(usage.get("cost"), (int, float)) else None,
-        "context_chars": context_chars - remaining,
-    }
-    return answer.strip(), reported, round(elapsed_ms, 2)
 
 
 def _attach_generated_answer(row: dict[str, Any], case: dict[str, Any], context: list[tuple[str, str]], *,
@@ -367,7 +326,7 @@ def _attach_generated_answer(row: dict[str, Any], case: dict[str, Any], context:
             max_tokens=max_tokens, context_chars=context_chars,
         )
     except Exception as exc:
-        row["answer_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+        row["answer_error"] = type(exc).__name__
         return
     expected = case.get("answer")
     answers = expected if isinstance(expected, list) else [expected]
@@ -375,6 +334,30 @@ def _attach_generated_answer(row: dict[str, Any], case: dict[str, Any], context:
     row["answer_proxy_exact_match"] = any(_normalized_answer(answer) == _normalized_answer(value) for value in answers)
     row["answer_usage"] = usage
     row["answer_ms"] = latency
+    row["answer_abstention_heuristic"] = looks_like_abstention(answer)
+    row["expected_abstention"] = case["question_id"].endswith("_abs")
+
+
+def _maybe_attach_answer(row: dict[str, Any], case: dict[str, Any], context: list[tuple[str, str]], *,
+                         budget: AnswerBudget, api_key: str, model: str,
+                         max_tokens: int, context_chars: int, scanner: Any) -> None:
+    if not qa_reader.safe_outbound_evidence(
+        scanner, str(case["question"]), context,
+        str(case.get("question_date") or ""),
+    ):
+        row["answer_skipped_reason"] = "secret_guard"
+        return
+    reason = budget.skip_reason()
+    if reason:
+        row["answer_skipped_reason"] = reason
+        return
+    budget.begin()  # Counts failed network requests against the hard request cap.
+    _attach_generated_answer(row, case, context, api_key=api_key, model=model,
+                             max_tokens=max_tokens, context_chars=context_chars)
+    if "answer_usage" in row:
+        budget.record(row["answer_usage"])
+    else:
+        budget.unknown_cost = True
 
 
 def _load_plugin() -> Any:
@@ -445,7 +428,8 @@ def _remove_isolated_collection(module: Any, physical: str, generated_prefix: st
 def _run_semantic_case(case: dict[str, Any], index: int, top_k: int, hypothesis: str | None,
                        *, tmp: str, env_values: dict[str, str], run_token: str,
                        answer_model: str = "", answer_max_tokens: int = 160,
-                       answer_context_chars: int = 6000) -> dict[str, Any]:
+                       answer_context_chars: int = 6000,
+                       answer_budget: AnswerBudget | None = None) -> dict[str, Any]:
     generated_prefix = f"memory_wiki_lme_{run_token}_{index:04d}"
     overrides = {
         **env_values, "MEMORY_WIKI_SEMANTIC": "1",
@@ -491,9 +475,12 @@ def _run_semantic_case(case: dict[str, Any], index: int, top_k: int, hypothesis:
             result = _evaluate_case(provider, case, top_k, hypothesis, retrieval_mode="hybrid", reindex=True,
                                     context_out=context if answer_model else None)
             if answer_model:
-                _attach_generated_answer(
-                    result, case, context, api_key=env_values.get("OPENROUTER_API_KEY") or env_values.get("MEMORY_WIKI_EMBED_API_KEY") or "",
+                assert answer_budget is not None
+                _maybe_attach_answer(
+                    result, case, context, budget=answer_budget,
+                    api_key=env_values.get("OPENROUTER_API_KEY") or env_values.get("MEMORY_WIKI_EMBED_API_KEY") or "",
                     model=answer_model, max_tokens=answer_max_tokens, context_chars=answer_context_chars,
+                    scanner=module.secret_scan,
                 )
             result["embedding_operations"] = len(embedding_calls)
             result["embedding_input_chars"] = sum(chars for _, chars in embedding_calls)
@@ -525,16 +512,31 @@ def _mean(rows: list[dict[str, Any]], field: str) -> float | None:
     return round(statistics.mean(values), 4) if values else None
 
 
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def run(dataset: Path, *, limit: int = 5, top_k: int = 5, hypotheses: Path | None = None,
         semantic: bool = False, env_file: Path | None = None, answer_model: str = "",
-        answer_max_tokens: int = 160, answer_context_chars: int = 6000) -> dict[str, Any]:
+        answer_max_tokens: int = 160, answer_context_chars: int = 6000,
+        answer_request_budget: int | None = None,
+        answer_cost_soft_cap_usd: float | None = None) -> dict[str, Any]:
     if not 1 <= top_k <= 50:
         raise ValueError("--top-k must be between 1 and 50")
     if answer_model and not (1 <= answer_max_tokens <= 256 and 256 <= answer_context_chars <= 10000):
         raise ValueError("answer limits must be 1-256 tokens and 256-10000 context characters")
     if answer_model and hypotheses is not None:
         raise ValueError("--hypotheses and --answer-model cannot be combined")
+    if not answer_model and (answer_request_budget is not None or answer_cost_soft_cap_usd is not None):
+        raise ValueError("answer budgets require --answer-model")
+    dataset_sha256 = _file_sha256(dataset)
     cases, total_questions = load_cases(dataset, limit)
+    budget = AnswerBudget(limit if answer_request_budget is None else answer_request_budget,
+                          answer_cost_soft_cap_usd) if answer_model else None
     supplied_hypotheses = load_hypotheses(hypotheses)
     results = []
     env_values = _env_file_values(env_file) if semantic or answer_model else {}
@@ -558,6 +560,7 @@ def run(dataset: Path, *, limit: int = 5, top_k: int = 5, hypotheses: Path | Non
                     tmp=tmp, env_values=env_values, run_token=run_token,
                     answer_model=answer_model, answer_max_tokens=answer_max_tokens,
                     answer_context_chars=answer_context_chars,
+                    answer_budget=budget,
                 ))
         else:
             with _isolated_environment(tmp, env_values if answer_model else None):
@@ -577,11 +580,12 @@ def run(dataset: Path, *, limit: int = 5, top_k: int = 5, hypotheses: Path | Non
                                 context_out=context if answer_model else None,
                             )
                             if answer_model:
-                                _attach_generated_answer(
-                                    row, case, context,
+                                assert budget is not None
+                                _maybe_attach_answer(
+                                    row, case, context, budget=budget,
                                     api_key=env_values.get("OPENROUTER_API_KEY") or env_values.get("MEMORY_WIKI_EMBED_API_KEY") or "",
                                     model=answer_model, max_tokens=answer_max_tokens,
-                                    context_chars=answer_context_chars,
+                                    context_chars=answer_context_chars, scanner=module.secret_scan,
                                 )
                             results.append(row)
                         finally:
@@ -593,12 +597,20 @@ def run(dataset: Path, *, limit: int = 5, top_k: int = 5, hypotheses: Path | Non
                     sys.modules.pop(module.__name__, None)
     evidence_rows = [row for row in results if row["evidence_scored"]]
     answer_rows = [row for row in results if "answer_proxy_exact_match" in row]
+    generated_rows = [row for row in results if "answer_usage" in row]
+    def complete_usage(field: str) -> int | None:
+        return (sum(int(row["answer_usage"][field]) for row in generated_rows)
+                if generated_rows and all(row["answer_usage"].get(field) is not None for row in generated_rows)
+                else None)
     by_type = {}
     for question_type in sorted({row["question_type"] for row in evidence_rows}):
         group = [row for row in evidence_rows if row["question_type"] == question_type]
         by_type[question_type] = {"n": len(group), "session_recall_all": _mean(group, "session_recall_all"), "session_recall_any": _mean(group, "session_recall_any")}
+    if _file_sha256(dataset) != dataset_sha256:
+        raise RuntimeError("benchmark dataset changed during evaluation")
     return {
-        "dataset": str(dataset.resolve()), "dataset_questions": total_questions,
+        "dataset_sha256": dataset_sha256,
+        "dataset_questions": total_questions,
         "evaluated_questions": len(results), "top_k": top_k,
         "retrieval_mode": "hybrid" if semantic else "fts",
         "isolation": (
@@ -613,14 +625,26 @@ def run(dataset: Path, *, limit: int = 5, top_k: int = 5, hypotheses: Path | Non
         "answer_proxy_exact_match": _mean(answer_rows, "answer_proxy_exact_match"),
         "answer_proxy_coverage": len(answer_rows),
         "answer_model": answer_model or None,
+        "answer_config": {
+            "reader_prompt_version": 1,
+            "max_completion_tokens_per_request": answer_max_tokens,
+            "max_retrieved_context_chars_per_request": answer_context_chars,
+            "temperature": 0,
+        } if answer_model else None,
+        "answer_budget": budget.summary() if budget else None,
         "answer_errors": sum("answer_error" in row for row in results),
+        "answer_skipped": sum("answer_skipped_reason" in row for row in results),
+        "answer_generated": len(generated_rows),
+        "abstention_heuristic": {
+            "expected": sum(row["expected_abstention"] for row in generated_rows),
+            "recognized": sum(row["expected_abstention"] and row["answer_abstention_heuristic"] for row in generated_rows),
+            "false_abstentions": sum(not row["expected_abstention"] and row["answer_abstention_heuristic"] for row in generated_rows),
+        } if answer_model else None,
         "answer_p50_ms": round(statistics.median([row["answer_ms"] for row in results if "answer_ms" in row]), 2) if answer_rows and answer_model else None,
-        "answer_prompt_tokens": sum((row.get("answer_usage") or {}).get("prompt_tokens") or 0 for row in results) if answer_model else None,
-        "answer_completion_tokens": sum((row.get("answer_usage") or {}).get("completion_tokens") or 0 for row in results) if answer_model else None,
-        "answer_reported_cost": (
-            round(sum((row.get("answer_usage") or {}).get("cost") or 0.0 for row in results), 8)
-            if answer_model and all((row.get("answer_usage") or {}).get("cost") is not None for row in answer_rows) and answer_rows else None
-        ),
+        "answer_p95_ms": round(sorted(row["answer_ms"] for row in generated_rows)[max(0, int(len(generated_rows) * .95 + .999999) - 1)], 2) if generated_rows else None,
+        "answer_prompt_tokens": complete_usage("prompt_tokens") if answer_model else None,
+        "answer_completion_tokens": complete_usage("completion_tokens") if answer_model else None,
+        "answer_reported_cost": budget.summary()["reported_cost_usd"] if budget else None,
         "search_p50_ms": round(statistics.median([row["search_ms"] for row in results]), 2) if results else None,
         "embedding_operations": sum(row.get("embedding_operations", 0) for row in results) if semantic else 0,
         "embedding_input_chars": sum(row.get("embedding_input_chars", 0) for row in results) if semantic else 0,
@@ -634,6 +658,8 @@ def run(dataset: Path, *, limit: int = 5, top_k: int = 5, hypotheses: Path | Non
             "Raw turns are sent through claim quality policy; queued turns are not searchable.",
             "Duplicate turns can merge into a claim, making one retrieved claim map to multiple evidence IDs.",
             "The optional normalized exact-match answer score is a local proxy, not the official model-judged LongMemEval QA metric.",
+            "The request count is a hard cap; the optional reported-dollar cap stops future calls only after usage is returned and can overshoot by one request.",
+            "Unknown provider usage or failed requests make exact total cost unavailable; embedding tokens/cost are not measured.",
         ],
     }
 
@@ -649,6 +675,8 @@ def main() -> None:
     parser.add_argument("--answer-model", default="", help="Optional OpenRouter chat model for answers from retrieved claims")
     parser.add_argument("--answer-max-tokens", type=int, default=160, help="Maximum completion tokens per answer (1-256)")
     parser.add_argument("--answer-context-chars", type=int, default=6000, help="Maximum retrieved context characters (256-10000)")
+    parser.add_argument("--answer-request-budget", type=int, help="Hard cap on OpenRouter answer requests (default: --limit)")
+    parser.add_argument("--answer-cost-soft-cap-usd", type=float, help="Stop future answers after this reported USD cost; may overshoot by one request")
     parser.add_argument("--hypotheses-out", type=Path, help="Official-format hypothesis JSONL output; required with --answer-model")
     parser.add_argument("--output", type=Path, help="Optional result JSON path")
     args = parser.parse_args()
@@ -656,6 +684,8 @@ def main() -> None:
         parser.error("--output must differ from --dataset")
     if args.output and args.hypotheses and args.output.resolve() == args.hypotheses.resolve():
         parser.error("--output must differ from --hypotheses")
+    if args.output and args.env_file and args.output.resolve() == args.env_file.resolve():
+        parser.error("--output must differ from --env-file")
     if args.answer_model and not args.hypotheses_out:
         parser.error("--answer-model requires --hypotheses-out")
     if args.hypotheses_out:
@@ -664,7 +694,9 @@ def main() -> None:
             parser.error("--hypotheses-out must differ from all input and result paths")
     result = run(args.dataset, limit=args.limit, top_k=args.top_k, hypotheses=args.hypotheses,
                  semantic=args.semantic, env_file=args.env_file, answer_model=args.answer_model,
-                 answer_max_tokens=args.answer_max_tokens, answer_context_chars=args.answer_context_chars)
+                 answer_max_tokens=args.answer_max_tokens, answer_context_chars=args.answer_context_chars,
+                 answer_request_budget=args.answer_request_budget,
+                 answer_cost_soft_cap_usd=args.answer_cost_soft_cap_usd)
     rendered = json.dumps(result, ensure_ascii=False, indent=2)
     if args.output:
         args.output.write_text(rendered + "\n", encoding="utf-8")

@@ -6,7 +6,7 @@ from guard module, adding prompt-injection detection to all memory recall paths.
 """
 from __future__ import annotations
 import re
-from typing import List, Optional
+from typing import List
 
 _INJECTION_PATTERNS: List[re.Pattern] = [
     re.compile(r"ignore\s+(?:all\s+)?(?:previous|prior|above|the\s+above)\s+(?:instructions?|directives?|commands?|context|conversation)", re.I),
@@ -35,7 +35,7 @@ def sanitize_context_text(text: str, max_len: int = 600) -> str:
         return ""
     for pattern in _INJECTION_PATTERNS:
         if pattern.search(text):
-            return f"[filtered: injection pattern detected]"
+            return "[filtered: injection pattern detected]"
     return str(text)[:max_len]
 
 def sanitize_context_batch(items: list, text_key: str = "text", max_len: int = 400, label: str = "") -> list:

@@ -197,7 +197,7 @@ if __name__ == "__main__":
     assert v1_wrapped.startswith("enc:v1:"), f"v1 prefix: {v1_wrapped[:20]}"
     v1_unwrapped = unwrap(v1_wrapped)
     assert v1_unwrapped == v1_test, f"v1 roundtrip: got {v1_unwrapped[:20]}..."
-    print(f"  [PASS] v1 XOR: wrap/unwrap roundtrip (no MW_VAULT_KEY)")
+    print("  [PASS] v1 XOR: wrap/unwrap roundtrip (no MW_VAULT_KEY)")
 
     # Test 2: wrap/unwrap roundtrip (v2 — with MW_VAULT_KEY)
     os.environ["MW_VAULT_KEY"] = "test-secret-key-12345"
@@ -206,7 +206,7 @@ if __name__ == "__main__":
     assert v2_wrapped.startswith("enc:v2:"), f"v2 prefix: {v2_wrapped[:20]}"
     v2_unwrapped = unwrap(v2_wrapped)
     assert v2_unwrapped == v2_test, f"v2 roundtrip: got {v2_unwrapped[:20]}..."
-    print(f"  [PASS] v2 AEAD: wrap/unwrap roundtrip (MW_VAULT_KEY set)")
+    print("  [PASS] v2 AEAD: wrap/unwrap roundtrip (MW_VAULT_KEY set)")
 
     # Test 3: HMAC tamper detection
     parts = v2_wrapped.split(":")
@@ -215,13 +215,13 @@ if __name__ == "__main__":
     tampered = f"{parts[0]}:{parts[1]}:{parts[2]}:{parts[3]}:{tampered_ct.hex()}:{parts[5]}"
     result = unwrap(tampered)
     assert result.startswith("<v2 secret: HMAC mismatch"), f"tamper detection: {result[:50]}"
-    print(f"  [PASS] v2 AEAD: HMAC tamper detection works")
+    print("  [PASS] v2 AEAD: HMAC tamper detection works")
 
     # Test 4: v2 without key → error message
     del os.environ["MW_VAULT_KEY"]
     result = unwrap(v2_wrapped)
     assert "MW_VAULT_KEY" in result, f"missing key: {result}"
-    print(f"  [PASS] v2 decrypt without MW_VAULT_KEY → error")
+    print("  [PASS] v2 decrypt without MW_VAULT_KEY → error")
 
     # Test 5: empty values
     assert wrap("") == ""
@@ -252,6 +252,6 @@ if __name__ == "__main__":
     assert long_unwrapped == long_test
     print("  [PASS] 10KB value roundtrip")
 
-    print(f"\nAll 9 tests PASSED")
+    print("\nAll 9 tests PASSED")
     sys.exit(0)
 

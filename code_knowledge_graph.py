@@ -835,7 +835,7 @@ def _normalize_code_graph_event(event: Dict[str, Any]) -> Dict[str, Any]:
             try:
                 deleted_files.append(_canonical_path(value))
             except ValueError as exc:
-                raise ValueError(f"invalid deleted_files[{index}]: {exc}") from exc
+                raise ValueError(f"invalid deleted_files[{index}]: {type(exc).__name__}") from exc
     normalized["deleted_files"] = deleted_files
 
     # A snapshot may carry semantic rows without a separate file inventory
@@ -1630,7 +1630,7 @@ def _embed_graph_chunks(
                 conn.rollback()
             stats["failed"] += 1
             if len(stats["errors"]) < 12:
-                stats["errors"].append(f"{candidate.get('chunk_id')}: {type(exc).__name__}: {exc}")
+                stats["errors"].append(f"chunk failure: {type(exc).__name__}")
         finally:
             if conn is not None:
                 _close_graph_writer_connection(conn, owns_conn)
@@ -1640,7 +1640,7 @@ def _embed_graph_chunks(
             provider._after_claim_commit(claim_id, topic, claim)
         except Exception as exc:
             if len(stats["errors"]) < 12:
-                stats["errors"].append(f"{claim_id}: post_commit {type(exc).__name__}: {exc}")
+                stats["errors"].append(f"post_commit failure: {type(exc).__name__}")
     return stats
 
 
@@ -1944,7 +1944,7 @@ def ingest_code_graph_event(
         # embed_pending_chunks.  Preserve that success rather than making a
         # network/model issue appear to roll back a committed snapshot.
         embed_stats = {"enabled": True, "processed": 0, "created": 0, "reused": 0, "failed": 1,
-                       "errors": [f"deferred embedding: {type(exc).__name__}: {exc}"]}
+                       "errors": [f"deferred embedding: {type(exc).__name__}"]}
 
     result = {**durable_result, "embedding": embed_stats}
     # Best effort only: failure to refresh optional embedding telemetry must
@@ -2169,7 +2169,7 @@ def _query_code_graph_on_connection(
             semantic_count = len(semantic_keys)
             _rrf_add(scores, score_parts, semantic_keys, "semantic", 1.25)
     except Exception as exc:
-        semantic_error = f"{type(exc).__name__}: {exc}"
+        semantic_error = type(exc).__name__
     else:
         semantic_error = ""
 
@@ -2266,7 +2266,7 @@ def _query_code_graph_on_connection(
                 candidates = ordered_candidates
                 reranked = any("rerank_rank" in row for row in reranked_rows)
             except Exception as exc:
-                rerank_error = f"{type(exc).__name__}: {exc}"
+                rerank_error = type(exc).__name__
 
     return {
         "repository_id": repository_id,

@@ -11,10 +11,16 @@ import argparse
 import json
 import re
 import statistics
+import sys
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from http_safety import urlopen_no_redirect
 
 from quality_eval import DEFAULT_FIXTURE, _percentile, run as run_retrieval
 
@@ -60,7 +66,7 @@ def _answer(model: str, api_key: str, context: list[str], question: str) -> tupl
     )
     started = time.perf_counter()
     try:
-        with urllib.request.urlopen(request, timeout=45) as response:
+        with urlopen_no_redirect(request, timeout=45) as response:
             result = json.loads(response.read().decode("utf-8", "replace"))
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f"OpenRouter answer request returned HTTP {exc.code}") from None

@@ -144,7 +144,7 @@ def test_bounded_openrouter_answer_uses_only_retrieved_context(monkeypatch: pyte
         def __exit__(self, *args):
             return None
 
-        def read(self):
+        def read(self, amount=-1):
             return json.dumps({
                 "choices": [{"message": {"content": "Arbor Observatory"}}],
                 "usage": {"prompt_tokens": 42, "completion_tokens": 3, "total_tokens": 45, "cost": 0.00001},
@@ -156,7 +156,7 @@ def test_bounded_openrouter_answer_uses_only_retrieved_context(monkeypatch: pyte
         assert timeout == 45
         return Response()
 
-    monkeypatch.setattr(adapter.urllib.request, "urlopen", fake_urlopen)
+    monkeypatch.setattr(adapter.qa_reader.urllib.request, "urlopen", fake_urlopen)
     answer, usage, latency = adapter._answer_openrouter(
         _case(), [("c_1", "Arbor Observatory has the blue telescope."), ("c_2", "x" * 5000)],
         api_key="synthetic-key", model="test/model", max_tokens=96, context_chars=256,
@@ -175,6 +175,52 @@ def test_answer_model_requires_explicit_credentials(tmp_path: Path) -> None:
     dataset.write_text(json.dumps([_case()]), encoding="utf-8")
     with pytest.raises(ValueError, match="requires --env-file"):
         adapter.run(dataset, limit=1, answer_model="test/model")
+
+
+def test_answer_request_budget_and_missing_cost_are_explicit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    first = _case()
+    second = _case()
+    second["question_id"] = "q2_abs"
+    dataset = tmp_path / "dataset.json"
+    dataset.write_text(json.dumps([first, second]), encoding="utf-8")
+    env = tmp_path / "private.env"
+    env.write_text("OPENROUTER_API_KEY=synthetic-key\n", encoding="utf-8")
+    called = []
+
+    def fake_answer(case, context, **kwargs):
+        called.append(case["question_id"])
+        return "Arbor Observatory", {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12,
+                                      "cost": None, "context_chars": 100}, 3.5
+
+    monkeypatch.setattr(adapter, "_answer_openrouter", fake_answer)
+    report = adapter.run(dataset, limit=2, answer_model="test/model", env_file=env,
+                         answer_request_budget=1)
+    assert called == ["q1"]
+    assert report["answer_budget"]["attempted_requests"] == 1
+    assert report["answer_reported_cost"] is None
+    assert report["answer_prompt_tokens"] == 10
+    assert report["answer_skipped"] == 1
+    assert report["questions"][1]["answer_skipped_reason"] == "request_budget"
+    assert report["dataset_sha256"] and "dataset" not in report
+
+
+def test_answer_guard_checks_full_untrusted_context_before_budget_or_network(monkeypatch):
+    monkeypatch.setattr(
+        adapter, "_answer_openrouter",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("secret-bearing context reached OpenRouter")
+        ),
+    )
+    row = {}
+    budget = adapter.AnswerBudget(1)
+    scanner = lambda value: {"raw_secret": "api_key=synthetic-secret" in value}
+    adapter._maybe_attach_answer(
+        row, _case(), [("c_safe", "a" * 1700 + " api_key=synthetic-secret")],
+        budget=budget, api_key="test-key", model="test/model",
+        max_tokens=64, context_chars=256, scanner=scanner,
+    )
+    assert row["answer_skipped_reason"] == "secret_guard"
+    assert budget.attempted == 0
 
 
 def test_real_run_uses_temporary_profile_and_restores_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

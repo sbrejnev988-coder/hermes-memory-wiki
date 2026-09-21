@@ -240,7 +240,7 @@ def main() -> int:
                     "result": {"tools": load_schemas()},
                 })
             elif method == "tools/call":
-                schemas = load_schemas()
+                load_schemas()
                 tool_name = str(params.get("name") or "")
                 if tool_name not in _SCHEMA_MAP:
                     respond_error(-32601, f"Unknown tool: {tool_name}")
