@@ -1,4 +1,4 @@
-# Hermes Memory Wiki v1.23.0
+# Hermes Memory Wiki v1.23.1
 
 Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 120 MCP tools.
 
@@ -788,6 +788,7 @@ Latency and reindex duration depend on the embedding provider, Qdrant placement,
 
 ## Changelog
 
+- **v1.23.1 (2026-09-22)**: Redacts JSON and escaped quoted secret assignments, including prefixed and camel-case credential keys and structured values. Project-profile stacks are recursively sanitized before SQLite, mutation, and export persistence. Existing installations should run the built-in secret scrub and reindex affected Qdrant collections after upgrading.
 - **v1.23.0 (2026-09-21)**: Adds evidence-first unified recall across claims, paired dialogue episodes, append-only events, versioned observations and graph relations, with stable citations and multilingual `fast`/`auto`/`deep` planning. Episode retrieval now has an owner-scoped SQLite/FTS source of truth, an optional Qdrant hybrid index, durable vector-target cleanup and bounded context rendering. Grounded OpenRouter extraction, bounded graph enrichment, explicit recall outcomes and a TTL/LRU/single-flight embedding cache improve memory formation and feedback. Qdrant payload ACLs are rechecked against SQLite; claim and episode retargeting fan out privacy deletion to historical physical collections. Secret scanning covers complete pre-truncation inputs and outbound model/embedding boundaries, authenticated HTTP calls reject redirects, and memory removal retires exact visible matches plus derived event/observation evidence within the same ACL partition. This release also includes the earlier local hardening for journal serialization and replay, code/document graph atomicity, redaction, inbox durability, schema validation and checkpoint safety.
 - **v1.22.3 (2026-08-29)**: Fixes the final Windows validation gaps: missing-source pruning now compares both lexical and canonical Windows path identities, and FTS rebuild obtains an exclusive SQLite transaction so concurrent provider initialization cannot race table replacement. Supersedes the immutable but Windows-CI-failed `v1.22.2` tag.
 - **v1.22.2 (2026-08-29)**: Corrects five late recovery-audit blockers. Document scans now capture every source action beyond display caps and include `prune_missing` deletions; journal recovery rejects truncated prefixes and orphan `after` events; keyed Code Shrinker metadata secrets are redacted before artifact retention; and checkpoint restores use dependency-safe table order. Supersedes the immutable but unsafe `v1.22.1` tag.

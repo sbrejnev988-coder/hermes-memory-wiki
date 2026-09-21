@@ -132,6 +132,136 @@ def test_auxiliary_arrays_and_sources_reject_secrets_before_insert(tmp_path, mon
         provider._conn.close()
 
 
+def test_quoted_json_secret_fields_are_scanned_and_redacted(tmp_path, monkeypatch):
+    provider = _provider(tmp_path, monkeypatch)
+    try:
+        # The standalone test environment has no installed Hermes secret core.
+        monkeypatch.setattr(provider, "_quarantine_secret", lambda *_args: "synthetic-quarantine")
+        monkeypatch.setattr(provider, "_make_secret_index_from_raw", lambda *_args: "")
+        module = sys.modules[provider.__class__.__module__]
+        synthetic = "synthetic-value-271828"
+        for field in (
+            "password", "api_key", "token", "db_password", "auth_token",
+            "openai_api_key", "dbPassword", "authToken", "jwtSecret", r"pass\u0077ord",
+        ):
+            raw = json.dumps({field: synthetic, "framework": "FastAPI"})
+            scan = module.secret_scan(raw)
+            assert scan["raw_secret"]
+            assert synthetic not in scan["redacted"]
+            assert json.loads(scan["redacted"])["framework"] == "FastAPI"
+        for raw in (
+            "{'password': 'synthetic-value-271828'}",
+            r'{\"token\":\"synthetic-value-271828\"}',
+            '{"api_key": 271828}',
+            '{"password": "escaped\\\"synthetic-value-271828"}',
+            'Project configuration contains {"token":["synthetic-value-271828"]}',
+        ):
+            assert module.secret_scan(raw)["raw_secret"]
+            assert synthetic not in module.redact_secrets(raw)
+        escaped_container = r'{\"password\":[\"synthetic-value-271828\"],\"framework\":\"FastAPI\"}'
+        assert "FastAPI" in module.redact_secrets(escaped_container)
+        assert module.redact_secrets(escaped_container).endswith("}")
+        nested_json = json.dumps({"note": json.dumps({
+            "token": ["synthetic-value-271828"], "framework": "FastAPI",
+        })})
+        nested_redacted = json.loads(module.redact_secrets(nested_json))
+        assert json.loads(nested_redacted["note"])["framework"] == "FastAPI"
+        assert synthetic not in nested_redacted["note"]
+        assert not module.secret_scan('{"framework":"FastAPI","tokenizer":"qwen"}')["raw_secret"]
+
+        result = _call(
+            provider, "memory_wiki_add_claim",
+            claim='Project configuration contains {"password":"synthetic-value-271828"}',
+            topic="projects", evidence="Configuration was reviewed",
+        )
+        assert result.get("success"), result
+        rows = provider._connect().execute("SELECT claim,evidence FROM claims").fetchall()
+        assert rows
+        assert all(synthetic not in str(value) for row in rows for value in row)
+    finally:
+        provider._conn.close()
+
+
+def test_project_profile_stack_is_sanitized_before_persistence(tmp_path, monkeypatch):
+    provider = _provider(tmp_path, monkeypatch)
+    try:
+        monkeypatch.setattr(provider, "_quarantine_secret", lambda *_args: "synthetic-quarantine")
+        monkeypatch.setattr(provider, "_make_secret_index_from_raw", lambda *_args: "")
+        project_id = provider.project_scope
+        stack = {
+            "framework": "FastAPI",
+            "config": {"api_key": "synthetic-value-314159", "region": "eu"},
+            "items": [{"token": "synthetic-value-271828"}, {"note": "password=synthetic-value-161803"}],
+            "credential": {"unquoted_secret": 12345678},
+            "dbPassword": "synthetic-value-141421",
+        }
+        for supplied in ({"stack": stack}, {"stack_json": json.dumps(stack)}):
+            result = _call(
+                provider, "memory_wiki_add_project_profile",
+                project_id=project_id, purpose="Synthetic profile test", **supplied,
+            )
+            assert result.get("success") and result["secret_quarantined"], result
+            row = provider._connect().execute(
+                "SELECT stack_json FROM project_profiles WHERE project_id=?", (project_id,)
+            ).fetchone()
+            stored = json.loads(row["stack_json"])
+            assert stored["framework"] == "FastAPI"
+            assert stored["config"]["region"] == "eu"
+            assert stored["config"]["api_key"] == "<SECRET_ASSIGNMENT_REDACTED>"
+            assert stored["credential"] == "<SECRET_ASSIGNMENT_REDACTED>"
+            assert all(synthetic not in row["stack_json"] for synthetic in (
+                "synthetic-value-314159", "synthetic-value-271828", "synthetic-value-161803",
+                "synthetic-value-141421",
+            ))
+        stored_rows = provider._connect().execute(
+            "SELECT after_json FROM memory_mutations WHERE target_table='project_profiles'"
+        ).fetchall()
+        assert all("synthetic-value-314159" not in str(row[0]) for row in stored_rows)
+        safe_stack = {"framework": "FastAPI", "tokenizer": "qwen", "nested": ["safe"]}
+        safe = _call(
+            provider, "memory_wiki_add_project_profile", project_id=project_id,
+            purpose="Synthetic profile test", stack_json=json.dumps(safe_stack),
+        )
+        assert safe.get("success") and not safe["secret_quarantined"], safe
+        row = provider._connect().execute(
+            "SELECT stack_json FROM project_profiles WHERE project_id=?", (project_id,)
+        ).fetchone()
+        assert json.loads(row["stack_json"]) == safe_stack
+    finally:
+        provider._conn.close()
+
+
+def test_secret_scrub_repairs_legacy_quoted_project_stack(tmp_path, monkeypatch):
+    provider = _provider(tmp_path, monkeypatch)
+    try:
+        monkeypatch.setattr(provider, "_quarantine_secret", lambda *_args: "synthetic-quarantine")
+        monkeypatch.setattr(provider, "_make_secret_index_from_raw", lambda *_args: "")
+        project_id = provider.project_scope
+        result = _call(
+            provider, "memory_wiki_add_project_profile", project_id=project_id,
+            purpose="Synthetic migration test", stack={"framework": "FastAPI"},
+        )
+        assert result.get("success"), result
+        legacy = json.dumps({
+            "framework": "FastAPI", "db_password": "synthetic-value-271828",
+            "authToken": ["synthetic-value-314159"],
+        })
+        with provider._connect() as conn:
+            conn.execute(
+                "UPDATE project_profiles SET stack_json=? WHERE project_id=?", (legacy, project_id),
+            )
+        assert provider._scrub_secrets(apply=True, limit=200)["updated_rows"] >= 1
+        row = provider._connect().execute(
+            "SELECT stack_json FROM project_profiles WHERE project_id=?", (project_id,)
+        ).fetchone()
+        stored = json.loads(row["stack_json"])
+        assert stored["framework"] == "FastAPI"
+        assert "synthetic-value-271828" not in row["stack_json"]
+        assert "synthetic-value-314159" not in row["stack_json"]
+    finally:
+        provider._conn.close()
+
+
 def test_auxiliary_row_rolls_back_when_claim_write_fails(tmp_path, monkeypatch):
     provider = _provider(tmp_path, monkeypatch)
     try:

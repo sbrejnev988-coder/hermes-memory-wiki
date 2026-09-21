@@ -1,4 +1,4 @@
-"""memory-wiki v1.23.0+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.23.1+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -236,7 +236,7 @@ try:
 except ImportError:
     import online_metrics as _online_metrics
 
-PLUGIN_VERSION = "1.23.0"
+PLUGIN_VERSION = "1.23.1"
 BUILTIN_PREFERENCE_RULES = (
     ("pref_current_instruction", "Fresh explicit user instruction in the current turn overrides durable memory and autonomy defaults.", 1000, "global", "system"),
     ("pref_user_correction", "Explicit user corrections supersede older inferred or assistant-written claims.", 940, "global", "system"),
@@ -4340,6 +4340,26 @@ SECRET_PATTERNS = [
 ]
 SECRET_FIELD_RE = re.compile(r"(?i)\b(password|passwd|пароль|token|токен|api[_ -]?key|secret|client[_ -]?secret|access[_ -]?key|private[_ -]?key|credential|credentials)\b")
 SECRET_ASSIGN_RE = re.compile(r"(?i)\b(password|passwd|пароль|token|токен|api[_ -]?key|secret|client[_ -]?secret|access[_ -]?key|private[_ -]?key)\s*[:=]\s*([^\s,;]+)")
+QUOTED_SECRET_ASSIGN_RE = re.compile(
+    r"""(?ix)
+    (?P<key_quote>\\?["'])
+    (?P<field>(?:(?!(?P=key_quote))\\.|(?!(?P=key_quote))[^\\])+)
+    (?P=key_quote)\s*[:=]\s*
+    (?P<value>
+        (?P<value_quote>\\?["'])
+        (?:(?!(?P=value_quote))\\.|(?!(?P=value_quote))[^\\])*
+        (?P=value_quote)
+        |[^\s,{}\[\]]+
+    )
+    """
+)
+QUOTED_SECRET_CONTAINER_RE = re.compile(
+    r"""(?ix)
+    (?P<key_quote>\\?["'])
+    (?P<field>(?:(?!(?P=key_quote))\\.|(?!(?P=key_quote))[^\\])+)
+    (?P=key_quote)\s*[:=]\s*(?P<value>[\[{])
+    """
+)
 _PATCH_OUTCOME_SENSITIVE_KEY_RE = re.compile(
     r"(?i)(?:^|[_-])(?:api[_-]?key|token|password|passwd|secret|authorization|"
     r"credential|private[_-]?key)(?:$|[_-])"
@@ -4641,11 +4661,128 @@ def validate_restore_archive(zf: zipfile.ZipFile) -> List[zipfile.ZipInfo]:
             raise ValueError(f"backup expands beyond configured limit: {total} > {max_total}")
     return infos
 
+def _sensitive_secret_field(field: str) -> bool:
+    try:
+        decoded = json.loads('"' + field + '"')
+    except (TypeError, ValueError):
+        decoded = field
+    separated = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(decoded))
+    words = [word for word in re.split(r"[^\w]+|_+", separated.lower()) if word]
+    sensitive = {"password", "passwd", "passphrase", "pwd", "dbpass", "pass",
+                 "пароль", "token", "токен", "secret", "credential", "credentials",
+                 "authorization", "apikey", "accesskey", "privatekey", "clientsecret"}
+    if any(word in sensitive for word in words):
+        return True
+    return any((left, right) in {("api", "key"), ("access", "key"),
+                                 ("private", "key"), ("client", "secret")}
+               for left, right in zip(words, words[1:]))
+
+
+def _quoted_secret_assignment_is_raw(match: re.Match) -> bool:
+    if not _sensitive_secret_field(match.group("field")):
+        return False
+    value = match.group("value")
+    quote = match.group("value_quote")
+    content = value[len(quote):-len(quote)] if quote else value
+    if not content or REDaction_MARKER_RE.fullmatch(content):
+        return False
+    if re.fullmatch(r"sec_[0-9a-f]{12}", content, re.I):
+        return False
+    return bool(quote or content.lower() not in {"null", "true", "false"})
+
+
+def _redact_quoted_secret_assignment(match: re.Match) -> str:
+    if not _quoted_secret_assignment_is_raw(match):
+        return match.group(0)
+    prefix = match.group(0)[:match.start("value") - match.start()]
+    quote = match.group("value_quote") or '"'
+    return prefix + quote + "<SECRET_ASSIGNMENT_REDACTED>" + quote
+
+
+def _balanced_secret_container_end(text: str, start: int) -> Optional[int]:
+    stack: List[str] = []
+    quote = ""
+    escaped_quote = False
+    index = start
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if escaped_quote and char == "\\" and text[index:index + 2] == "\\" + quote:
+                quote = ""
+                index += 2
+                continue
+            if not escaped_quote and char == "\\":
+                index += 2
+                continue
+            if not escaped_quote and char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in "\"'":
+            quote = char
+            escaped_quote = index > start and text[index - 1] == "\\"
+        elif char in "[{":
+            stack.append("]" if char == "[" else "}")
+        elif char in "]}":
+            if not stack or stack.pop() != char:
+                return None
+            if not stack:
+                return index + 1
+        index += 1
+    return None
+
+
+def _redact_quoted_secret_containers(text: str) -> str:
+    parts: List[str] = []
+    cursor = 0
+    decoder = json.JSONDecoder()
+    for match in QUOTED_SECRET_CONTAINER_RE.finditer(text):
+        if not _sensitive_secret_field(match.group("field")):
+            continue
+        start = match.start("value")
+        if start < cursor:
+            continue
+        try:
+            _, length = decoder.raw_decode(text[start:])
+        except ValueError:
+            end = _balanced_secret_container_end(text, start)
+            if end is None:
+                # An unbounded malformed value has no safe suffix to preserve.
+                return "<SECRET_ASSIGNMENT_REDACTED>"
+            length = end - start
+        quote = '\\"' if match.group("key_quote").startswith("\\") else '"'
+        parts.extend((text[cursor:start], quote + "<SECRET_ASSIGNMENT_REDACTED>" + quote))
+        cursor = start + length
+    if not parts:
+        return text
+    return "".join(parts) + text[cursor:]
+
+
 def redact_secrets(text: str) -> str:
     s = str(text or "")
+    s = _redact_quoted_secret_containers(s)
+    s = QUOTED_SECRET_ASSIGN_RE.sub(_redact_quoted_secret_assignment, s)
     for pat, repl in SECRET_PATTERNS:
         s = pat.sub(repl, s)
     return s
+
+
+def redact_structured_secrets(value: Any) -> Any:
+    """Sanitize nested model-provided data before serializing it to memory."""
+    if isinstance(value, dict):
+        return {
+            redact_secrets(str(key)): (
+                "<SECRET_ASSIGNMENT_REDACTED>"
+                if _sensitive_secret_field(str(key))
+                else redact_structured_secrets(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [redact_structured_secrets(item) for item in value]
+    if isinstance(value, str):
+        return redact_secrets(value)
+    return value
 
 
 def redact_secrets_preserving_opaque_graph_ids(
@@ -4752,6 +4889,15 @@ def secret_scan(text: str) -> Dict[str, Any]:
     raw = str(text or "")
     redacted = redact_secrets(raw)
     findings: List[Dict[str, Any]] = []
+    for m in QUOTED_SECRET_CONTAINER_RE.finditer(raw):
+        if not _sensitive_secret_field(m.group("field")):
+            continue
+        findings.append({"kind": "secret_assignment", "field": "sensitive_field",
+                         "span": [m.start(), m.end()], "sample": "sensitive_field=<REDACTED>"})
+    for m in QUOTED_SECRET_ASSIGN_RE.finditer(raw):
+        if _quoted_secret_assignment_is_raw(m):
+            findings.append({"kind": "secret_assignment", "field": "sensitive_field",
+                             "span": [m.start(), m.end()], "sample": "sensitive_field=<REDACTED>"})
     for pat, repl in SECRET_PATTERNS:
         for m in pat.finditer(raw):
             findings.append({"kind": repl.strip("<>").lower(), "span": [m.start(), m.end()], "sample": short(redact_secrets(m.group(0)), 80)})
@@ -17864,6 +18010,7 @@ class MemoryWikiProvider(MemoryProvider):
         if isinstance(stack, str):
             try: stack=json.loads(stack)
             except Exception: stack={"raw": short(redact_secrets(stack), 800)}
+        stack=redact_structured_secrets(stack)
         status=normalize_claim(redact_secrets(a.get('current_status') or ''))
         last_verified=0  # Model arguments do not attest the current project state.
         before=self._table_row('project_profiles', pid, 'project_id')
