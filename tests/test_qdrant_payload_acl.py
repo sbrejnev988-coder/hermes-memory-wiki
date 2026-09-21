@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import urllib.error
 from pathlib import Path
 
 
@@ -186,6 +187,64 @@ def test_reindex_repairs_matching_vector_with_outdated_payload_contract(tmp_path
     assert repaired["payload_version"] == module.QDRANT_CLAIM_PAYLOAD_VERSION
     assert repaired["visibility_scope"] == "chat"
     assert repaired["origin_chat_hash"] == row["origin_chat_hash"]
+
+
+def test_reindex_fast_path_completes_matching_running_job(tmp_path, monkeypatch):
+    module = load_module("memory_wiki_qdrant_fast_path_job", tmp_path, monkeypatch)
+    provider = make_provider(module, tmp_path)
+    claim_id = add_chat_claim(provider)
+    module.SEMANTIC_ENABLED = True
+    manifest = module._embedding_manifest()
+    manifest_json = json.dumps(manifest, ensure_ascii=False, sort_keys=True)
+    stored_manifest = dict(manifest)
+    stored_manifest["query_instruction_hash"] = "different-but-ignored-by-hash"
+    stored_manifest_json = json.dumps(stored_manifest, ensure_ascii=False, sort_keys=True)
+    assert stored_manifest_json != manifest_json
+    assert module._manifest_hash(stored_manifest) == module._manifest_hash(manifest)
+    manifest_hash = module._manifest_hash(manifest)
+    target = module._physical_collection_name(manifest)
+    job_id = f"reindex_{manifest_hash}_{module.hashlib.sha256(target.encode()).hexdigest()[:8]}"
+    row = provider._connect().execute("SELECT * FROM claims WHERE id=?", (claim_id,)).fetchone()
+    expected = module._expected_qdrant_claim_state(
+        claim_id, row["normalized_claim"], row, manifest_hash,
+    )
+    with provider._connect() as conn:
+        conn.execute(
+            """INSERT INTO reindex_jobs(id,source_collection,target_collection,
+                   manifest_json,total_count,processed_count,failed_count,status,
+                   started_at,updated_at,failed_ids_json,last_error)
+               VALUES(?,?,?, ?,1,0,1,'running',1,1,'["synthetic"]','retry')""",
+            (job_id, "old-target", target, stored_manifest_json),
+        )
+    monkeypatch.setattr(module, "_semantic_available", lambda: True)
+    monkeypatch.setattr(module, "_ensure_collection", lambda collection=None: True)
+    monkeypatch.setattr(module, "_qdrant_alias_supported", lambda: True)
+    monkeypatch.setattr(module, "_qdrant_resolved_active_collection", lambda: target)
+    monkeypatch.setattr(module, "_qdrant_count", lambda collection=None: 1)
+    actual = {"state": expected}
+    monkeypatch.setattr(
+        module, "_qdrant_claim_state",
+        lambda collection: {claim_id: actual["state"]},
+    )
+    stale_payload = module._qdrant_claim_payload(
+        claim_id, row["normalized_claim"], row, manifest_hash=manifest_hash,
+    )
+    stale_payload["topic"] = "synthetic-stale-topic"
+    actual["state"] = module._qdrant_claim_reconciliation_state(stale_payload)
+    monkeypatch.setattr(module, "_embed_document", lambda _text: None)
+    incomplete = provider._reindex(limit=1)
+    assert incomplete["status"] != "already_complete"
+    assert provider._connect().execute(
+        "SELECT status FROM reindex_jobs WHERE id=?", (job_id,),
+    ).fetchone()[0] == "running"
+    actual["state"] = expected
+    result = provider._reindex()
+    assert result["status"] == "already_complete"
+    job = provider._connect().execute(
+        "SELECT status,processed_count,total_count,failed_count,failed_ids_json,last_error "
+        "FROM reindex_jobs WHERE id=?", (job_id,),
+    ).fetchone()
+    assert tuple(job) == ("completed", 1, 1, 0, "[]", "")
 
 
 def test_qdrant_query_sends_exact_visibility_filter(tmp_path, monkeypatch):
@@ -764,6 +823,13 @@ def test_active_claim_scrub_deletes_old_targets_before_republishing_redacted_tex
 
     monkeypatch.setattr(module, "_qdrant_delete_target", delete_target)
     monkeypatch.setattr(module, "_qdrant_upsert", upsert)
+    monkeypatch.setattr(
+        module, "_qdrant_claim_point_state",
+        lambda cid, collection: (
+            points[collection][cid]
+            if cid in points.get(collection, {}) else {}
+        ),
+    )
     for run in range(3):
         result = module._outbox_process(
             batch_size=20, db_path=str(provider.db_path), worker_id=f"scrub-worker-{run}",
@@ -791,6 +857,149 @@ def test_historical_delete_rejects_credentialed_or_remote_plaintext_endpoint(tmp
         "c_secret", collection="claims-v1",
         endpoint="https://user:password@qdrant.example",
     ) is False
+
+
+def test_missing_collection_delete_needs_authenticated_same_endpoint_404(tmp_path, monkeypatch):
+    module = load_module("memory_wiki_qdrant_missing_collection", tmp_path, monkeypatch)
+    module.QDRANT_API_KEY = "synthetic-current-key"
+    endpoint = module._normalized_qdrant_endpoint()
+    monkeypatch.setattr(module, "_qdrant_delete", lambda *_args, **_kwargs: False)
+    seen = []
+    response_code = {"value": 404}
+
+    def probe(request, **_kwargs):
+        seen.append(request)
+        raise urllib.error.HTTPError(
+            request.full_url, response_code["value"], "synthetic", {}, None,
+        )
+
+    monkeypatch.setattr(module, "_urlopen_no_redirect", probe)
+    assert module._qdrant_delete_target(
+        "c_synthetic", collection="claims-old", endpoint=endpoint,
+    )
+    assert seen[-1].get_method() == "GET"
+    assert seen[-1].get_header("Api-key") == "synthetic-current-key"
+    assert seen[-1].full_url.startswith(endpoint + "/collections/")
+    for code in (401, 403, 500):
+        response_code["value"] = code
+        assert not module._qdrant_delete_target(
+            "c_synthetic", collection="claims-old", endpoint=endpoint,
+        )
+    monkeypatch.setattr(
+        module, "_urlopen_no_redirect",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("synthetic")),
+    )
+    assert not module._qdrant_delete_target(
+        "c_synthetic", collection="claims-old", endpoint=endpoint,
+    )
+    historical = "https://old-qdrant.example"
+    assert not module._qdrant_collection_confirmed_absent("claims-old", historical)
+    module.QDRANT_API_KEY = ""
+    assert not module._qdrant_collection_confirmed_absent("claims-old", historical)
+
+
+def test_retried_target_delete_preserves_new_canonical_point(tmp_path, monkeypatch):
+    module = load_module("memory_wiki_qdrant_target_retry", tmp_path, monkeypatch)
+    provider = make_provider(module, tmp_path)
+    claim_id = add_chat_claim(provider)
+    module.SEMANTIC_ENABLED = True
+    endpoint = module._normalized_qdrant_endpoint()
+    current = "claims-current"
+    old = "claims-old"
+    with provider._connect() as conn:
+        for index, collection in enumerate((old, current), start=1):
+            module._record_claim_vector_target(
+                conn, claim_id, endpoint=endpoint, collection=collection,
+                manifest_hash=f"v{index}", status="delete_pending", indexed_at=index,
+            )
+        conn.execute(
+            "UPDATE claims SET claim=?,normalized_claim=? WHERE id=?",
+            ("Canonical redacted claim.", "Canonical redacted claim.", claim_id),
+        )
+    row = provider._connect().execute("SELECT * FROM claims WHERE id=?", (claim_id,)).fetchone()
+    fresh = module._qdrant_claim_payload(
+        claim_id, row["normalized_claim"], row,
+        manifest_hash=module._manifest_hash(module._embedding_manifest()),
+    )
+    stale = dict(fresh)
+    stale["topic"] = "synthetic-private-topic"
+    points = {current: {claim_id: stale}}
+    deletes = []
+    outage = {"old": True}
+    monkeypatch.setattr(module, "_qdrant_resolved_active_collection", lambda: current)
+    monkeypatch.setattr(
+        module, "_qdrant_claim_point_state",
+        lambda cid, collection: (
+            points[collection][cid]
+            if cid in points.get(collection, {}) else {}
+        ),
+    )
+
+    def delete(cid, *, collection, endpoint=""):
+        deletes.append(collection)
+        if collection == old and outage["old"]:
+            return False
+        points.setdefault(collection, {}).pop(cid, None)
+        return True
+
+    monkeypatch.setattr(module, "_qdrant_delete_target", delete)
+    targets = {
+        row["collection"]: dict(row)
+        for row in provider._connect().execute(
+            "SELECT * FROM claim_vector_targets WHERE claim_id=?", (claim_id,),
+        ).fetchall()
+    }
+    def hint(collection):
+        return {
+            "endpoint": endpoint, "collection": collection,
+            "vector_target_hash": targets[collection]["vector_target_hash"],
+            "reason": "claim_content_rewritten",
+        }
+
+    assert not module._delete_claim_vector_targets(str(provider.db_path), claim_id, hint(old))
+    assert deletes == [old]
+    assert claim_id in points[current]
+    outage["old"] = False
+    assert module._delete_claim_vector_targets(str(provider.db_path), claim_id, hint(old))
+    assert deletes == [old, old]
+    assert module._delete_claim_vector_targets(str(provider.db_path), claim_id, hint(old))
+    assert deletes == [old, old]
+    assert module._delete_claim_vector_targets(str(provider.db_path), claim_id, hint(current))
+    assert deletes == [old, old, current]
+    points[current][claim_id] = fresh
+    with provider._connect() as conn:
+        module._record_claim_vector_target(
+            conn, claim_id, endpoint=endpoint, collection=current,
+            manifest_hash=module._manifest_hash(module._embedding_manifest()),
+            status="active", indexed_at=10,
+        )
+    assert module._delete_claim_vector_targets(str(provider.db_path), claim_id, hint(current))
+    assert deletes == [old, old, current]
+    assert claim_id in points[current]
+
+
+def test_non_targeted_cleanup_rechecks_tombstone_after_late_write(tmp_path, monkeypatch):
+    module = load_module("memory_wiki_qdrant_late_upsert_cleanup", tmp_path, monkeypatch)
+    provider = make_provider(module, tmp_path)
+    claim_id = add_chat_claim(provider)
+    endpoint = module._normalized_qdrant_endpoint()
+    collection = "claims-current"
+    with provider._connect() as conn:
+        module._record_claim_vector_target(
+            conn, claim_id, endpoint=endpoint, collection=collection,
+            status="deleted", indexed_at=1,
+        )
+        conn.execute("UPDATE claims SET status='retired' WHERE id=?", (claim_id,))
+    calls = []
+    monkeypatch.setattr(
+        module, "_qdrant_delete_target",
+        lambda cid, *, collection, endpoint="": calls.append(collection) or True,
+    )
+    assert module._delete_claim_vector_targets(
+        str(provider.db_path), claim_id,
+        {"collection": collection, "endpoint": endpoint},
+    )
+    assert calls == [collection]
 
 
 def test_historical_delete_does_not_send_current_server_key(tmp_path, monkeypatch):

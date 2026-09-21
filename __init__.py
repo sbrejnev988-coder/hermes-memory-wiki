@@ -1,4 +1,4 @@
-"""memory-wiki v1.23.1+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.23.2+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -236,7 +236,7 @@ try:
 except ImportError:
     import online_metrics as _online_metrics
 
-PLUGIN_VERSION = "1.23.1"
+PLUGIN_VERSION = "1.23.2"
 BUILTIN_PREFERENCE_RULES = (
     ("pref_current_instruction", "Fresh explicit user instruction in the current turn overrides durable memory and autonomy defaults.", 1000, "global", "system"),
     ("pref_user_correction", "Explicit user corrections supersede older inferred or assistant-written claims.", 940, "global", "system"),
@@ -1719,7 +1719,29 @@ def _delete_claim_vector_targets(
         rows = _claim_target_delete_rows(lifecycle_db, claim_id)
         hinted_collection = _claim_outbox_collection(hint)
         hinted_endpoint = _claim_outbox_endpoint(hint)
-        if hinted_collection and not any(
+        targeted_delete = (
+            str(hint.get("reason") or "") in {
+                "claim_content_rewritten", "claim_retargeted_or_rewritten",
+                "claim_target_recovery",
+            }
+            and bool(hint.get("vector_target_hash"))
+            and bool(hinted_collection)
+        )
+        if targeted_delete:
+            rows = [
+                row for row in rows
+                if str(row.get("collection") or "") == hinted_collection
+                and str(row.get("endpoint") or "") == hinted_endpoint
+            ]
+        # A previous attempt may have deleted this physical point and left a
+        # durable tombstone. Recreating it from a retained outbox hint would
+        # delete a later canonical upsert on every retry.
+        known_target = lifecycle_db.execute(
+            "SELECT 1 FROM claim_vector_targets WHERE claim_id=? "
+            "AND endpoint=? AND collection=? LIMIT 1",
+            (str(claim_id), hinted_endpoint, hinted_collection),
+        ).fetchone() if hinted_collection else None
+        if hinted_collection and (not known_target or not targeted_delete) and not any(
             str(row.get("collection") or "") == hinted_collection
             and str(row.get("endpoint") or "") == hinted_endpoint
             for row in rows
@@ -1731,13 +1753,22 @@ def _delete_claim_vector_targets(
                 status="delete_pending",
             )
             rows.append(registered)
-        lifecycle_db.execute(
-            """UPDATE claim_vector_targets
-                  SET status='delete_pending',updated_at=?
-                WHERE claim_id=?
-                  AND status IN ('write_pending','active','delete_pending')""",
-            (ts, str(claim_id)),
-        )
+        if targeted_delete:
+            lifecycle_db.execute(
+                """UPDATE claim_vector_targets
+                      SET status='delete_pending',updated_at=?
+                    WHERE claim_id=? AND endpoint=? AND collection=?
+                      AND status IN ('write_pending','active','delete_pending')""",
+                (ts, str(claim_id), hinted_endpoint, hinted_collection),
+            )
+        else:
+            lifecycle_db.execute(
+                """UPDATE claim_vector_targets
+                      SET status='delete_pending',updated_at=?
+                    WHERE claim_id=?
+                      AND status IN ('write_pending','active','delete_pending')""",
+                (ts, str(claim_id)),
+            )
     lifecycle_db.close()
 
     failed = False
@@ -1768,6 +1799,25 @@ def _delete_claim_vector_targets(
                 )
             lifecycle_db.close()
             continue
+
+        if active_before is not None and collection == active_collection:
+            current_state = _qdrant_claim_point_state(claim_id, collection)
+            if current_state is None:
+                failed = True
+                continue
+            expected_state = _qdrant_claim_payload(
+                claim_id, str(active_before.get("index_text") or ""),
+                active_before, manifest_hash=_manifest_hash(_embedding_manifest()),
+            )
+            if current_state == expected_state:
+                with sqlite3.connect(db_path, timeout=30.0) as lifecycle_db:
+                    lifecycle_db.execute(
+                        """UPDATE claim_vector_targets
+                              SET status='active',updated_at=?
+                            WHERE claim_id=? AND endpoint=? AND collection=?""",
+                        (int(time.time()), str(claim_id), endpoint, collection),
+                    )
+                continue
 
         if not _qdrant_delete_target(
             claim_id, collection=collection, endpoint=endpoint,
@@ -3445,6 +3495,9 @@ def _qdrant_claim_reconciliation_state(payload: Any) -> Dict[str, Any]:
     return {
         "vector_text_hash": str(source.get("vector_text_hash") or ""),
         "payload_version": payload_version,
+        "payload_digest": hashlib.sha256(
+            json.dumps(source, ensure_ascii=True, sort_keys=True).encode("utf-8")
+        ).hexdigest(),
         "acl_manifest_digest": hashlib.sha256(
             json.dumps(acl_manifest, ensure_ascii=True, sort_keys=True).encode("utf-8")
         ).hexdigest(),
@@ -3649,6 +3702,40 @@ def _qdrant_delete(claim_id: str, collection: str = None) -> bool:
     return result is not None and status in (None, "completed", "acknowledged")
 
 
+def _qdrant_collection_confirmed_absent(collection: str, endpoint: str) -> bool:
+    """Acknowledge a missing target only on an exact same-server GET 404."""
+    validated_endpoint, _is_loopback = _validated_http_endpoint(
+        endpoint, allow_loopback_http=True,
+    )
+    if not validated_endpoint:
+        return False
+    target_endpoint = _normalized_qdrant_endpoint(validated_endpoint)
+    current_endpoint = _normalized_qdrant_endpoint()
+    # Historical endpoint credentials are not retained. Its unauthenticated
+    # 404 cannot prove absence even when the current endpoint is keyless.
+    if target_endpoint != current_endpoint:
+        return False
+    timeout = _prefetch_network_timeout(10.0)
+    if timeout <= 0.0:
+        return False
+    headers = {"Accept": "application/json"}
+    if QDRANT_API_KEY:
+        headers["api-key"] = QDRANT_API_KEY
+    request = urllib.request.Request(
+        f"{target_endpoint}/collections/"
+        f"{urllib.parse.quote(str(collection), safe='')}",
+        headers=headers, method="GET",
+    )
+    try:
+        with _urlopen_no_redirect(request, timeout=timeout):
+            return False
+    except urllib.error.HTTPError as exc:
+        return exc.code == 404
+    except Exception as exc:
+        _debug_log(f"qdrant collection absence check failed: {_safe_exception_label(exc)}")
+        return False
+
+
 def _qdrant_delete_target(
     object_id: str, *, collection: str, endpoint: str = "",
 ) -> bool:
@@ -3667,7 +3754,9 @@ def _qdrant_delete_target(
         return False
     target_endpoint = _normalized_qdrant_endpoint(validated_endpoint)
     if target_endpoint == _normalized_qdrant_endpoint():
-        return _qdrant_delete(object_id, collection=collection)
+        if _qdrant_delete(object_id, collection=collection):
+            return True
+        return _qdrant_collection_confirmed_absent(collection, target_endpoint)
     try:
         parsed = urllib.parse.urlsplit(target_endpoint)
         if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -3692,9 +3781,37 @@ def _qdrant_delete_target(
         result = json.loads(raw) if raw else {}
         status = (result or {}).get("result", {}).get("status")
         return status in (None, "completed", "acknowledged")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return _qdrant_collection_confirmed_absent(collection, target_endpoint)
+        return False
     except Exception as exc:
         _debug_log(f"qdrant historical delete failed: {_safe_exception_label(exc)}")
         return False
+
+
+def _qdrant_claim_point_state(
+    claim_id: str, collection: str,
+) -> Optional[Dict[str, Any]]:
+    """Read the full authenticated payload before deleting an active claim."""
+    result = _qdrant_req(
+        "POST", f"/collections/{urllib.parse.quote(collection, safe='')}/points",
+        {"ids": [_qdrant_point_id(claim_id)], "with_payload": True,
+         "with_vector": False},
+    )
+    if not isinstance(result, dict) or not isinstance(result.get("result"), list):
+        return None
+    points = result["result"]
+    if not points:
+        return {}
+    if len(points) != 1 or not isinstance(points[0], dict):
+        return None
+    payload = points[0].get("payload")
+    if not isinstance(payload, dict):
+        return None
+    if str(payload.get("claim_id") or payload.get("id") or "") != str(claim_id):
+        return None
+    return payload
 
 
 def _qdrant_delete_many(claim_ids: Iterable[str], collection: Optional[str] = None) -> bool:
@@ -3724,10 +3841,7 @@ def _qdrant_claim_state(
     while len(found) < max_points:
         body: Dict[str, Any] = {
             "limit": min(512, max_points - len(found)),
-            "with_payload": [
-                "claim_id", "id", "vector_text_hash", "payload_version",
-                *_QDRANT_CLAIM_RECONCILIATION_FIELDS,
-            ],
+            "with_payload": True,
             "with_vector": False,
         }
         if offset is not None:
@@ -19753,6 +19867,8 @@ class MemoryWikiProvider(MemoryProvider):
                 if running_force else f"{base_target}_force_{int(time.time())}"
             )
 
+        job_id = f"reindex_{manifest_hash}_{hashlib.sha256(target_coll.encode()).hexdigest()[:8]}"
+
         if not _ensure_collection(target_coll):
             return {
                 "ok": False,
@@ -19785,25 +19901,43 @@ class MemoryWikiProvider(MemoryProvider):
             target_state = _qdrant_claim_state(target_coll)
             revision_after = self._meta_int("memory_revision")
             if target_state == expected_state and revision_before == revision_after:
-                observed_at = int(time.time())
-                for row in expected_rows:
-                    _record_claim_vector_target(
-                        c, str(row["id"]), collection=target_coll,
-                        endpoint=_normalized_qdrant_endpoint(),
-                        manifest_hash=manifest_hash, status="active",
-                        indexed_at=observed_at,
-                    )
-                c.commit()
-                return {
-                    "ok": True,
-                    "collection": target_coll,
-                    "count": existing_count,
-                    "total": total_active,
-                    "status": "already_complete",
-                    "alias_switched": True,
-                }
+                c.execute("BEGIN IMMEDIATE")
+                try:
+                    if (
+                        self._meta_int("memory_revision") == revision_after
+                        and _qdrant_resolved_active_collection() == target_coll
+                    ):
+                        observed_at = int(time.time())
+                        for row in expected_rows:
+                            _record_claim_vector_target(
+                                c, str(row["id"]), collection=target_coll,
+                                endpoint=_normalized_qdrant_endpoint(),
+                                manifest_hash=manifest_hash, status="active",
+                                indexed_at=observed_at,
+                            )
+                        c.execute(
+                            """UPDATE reindex_jobs SET status='completed',
+                                  processed_count=?,total_count=?,failed_count=0,
+                                  failed_ids_json='[]',last_error='',
+                                  completed_at=?,updated_at=?
+                                WHERE id=? AND status='running'
+                                  AND target_collection=?""",
+                            (total_active, total_active, observed_at, observed_at,
+                             job_id, target_coll),
+                        )
+                        c.commit()
+                        return {
+                            "ok": True,
+                            "collection": target_coll,
+                            "count": existing_count,
+                            "total": total_active,
+                            "status": "already_complete",
+                            "alias_switched": True,
+                        }
+                finally:
+                    if c.in_transaction:
+                        c.rollback()
 
-        job_id = f"reindex_{manifest_hash}_{hashlib.sha256(target_coll.encode()).hexdigest()[:8]}"
         job_row = c.execute(
             "SELECT * FROM reindex_jobs WHERE id=? AND status='running'",
             (job_id,),
