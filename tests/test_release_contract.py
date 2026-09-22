@@ -18,6 +18,11 @@ def test_release_contract_is_complete_and_version_consistent() -> None:
     assert (ROOT / "LICENSE").is_file(), "missing LICENSE"
     assert (ROOT / "uv.lock").is_file(), "missing dependency lockfile"
     assert (ROOT / "packaging" / "generate_sbom.py").is_file(), "missing SBOM generator"
+    assert (ROOT / "packaging" / "generate_tool_schemas.py").is_file(), "missing MCP schema generator"
+    assert (ROOT / "packaging" / "check_mcp_compatibility.py").is_file(), "missing MCP compatibility gate"
+    assert (ROOT / "compatibility" / "mcp-api-v1.json").is_file(), "missing MCP v1 baseline"
+    assert (ROOT / "COMPATIBILITY.md").is_file(), "missing compatibility policy"
+    assert (ROOT / "migrations.py").is_file(), "missing database compatibility ledger"
     assert (ROOT / "packaging" / "build_native_bundle.py").is_file(), "missing native bundle builder"
     assert (ROOT / "packaging" / "check_reproducible.py").is_file(), "missing reproducibility gate"
     release_workflow = ROOT / ".github" / "workflows" / "release.yml"
@@ -30,9 +35,11 @@ def test_release_contract_is_complete_and_version_consistent() -> None:
     manifest = (ROOT / "plugin.yaml").read_text(encoding="utf-8")
     runtime = (ROOT / "__init__.py").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    sdk = (ROOT / "sdk.py").read_text(encoding="utf-8")
     assert re.search(rf"^version:\s*{re.escape(version)}\s*$", manifest, re.M)
     assert re.search(rf'PLUGIN_VERSION\s*=\s*"{re.escape(version)}"', runtime)
     assert re.search(rf"^# Hermes Memory Wiki v{re.escape(version)}\s*$", readme, re.M)
+    assert re.search(rf'^__version__\s*=\s*"{re.escape(version)}"', sdk, re.M)
 
 
 if __name__ == "__main__":

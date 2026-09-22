@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "claims": [
+    {"id": "launch-old", "claim": "The Aster launch date was March 12, 2026.", "status": "archived"},
+    {"id": "launch-current", "claim": "The Aster launch date is April 27, 2026."},
+    {"id": "atlas-protocol", "claim": "The Atlas pipeline uses the Cedar protocol."},
+    {"id": "cedar-key", "claim": "The Cedar protocol authenticates with the Amber key."},
+    {"id": "zeta-retention-short", "claim": "An unverified note says Zeta retains logs for seven days."},
+    {"id": "zeta-retention-long", "claim": "The current Zeta policy retains logs for thirty days."},
+    {"id": "orion-east", "claim": "The Orion deployment region is east.", "visibility": "project", "project": "east"},
+    {"id": "orion-west", "claim": "The Orion deployment region is west.", "visibility": "project", "project": "west"},
+    {"id": "chat-a", "claim": "In this chat the travel codename is Lark.", "visibility": "chat", "session": "chat-a"},
+    {"id": "bot-a", "claim": "The assistant named Alder uses the Birch workflow.", "visibility": "bot", "bot": "bot-a"},
+    {"id": "distractor-1", "claim": "The Vega backup task runs on Tuesdays."},
+    {"id": "distractor-2", "claim": "The Luna dashboard uses the Coral palette."},
+    {"id": "distractor-3", "claim": "The Quill report format is PDF."},
+    {"id": "distractor-4", "claim": "The Rowan service has three replicas."}
+  ],
+  "cases": [
+    {"name": "temporal-current", "category": "temporal", "query": "What is the current Aster launch date?", "context": {"session": "chat-a", "bot": "bot-a", "project": "east"}, "required": ["launch-current"], "forbidden": ["launch-old"], "answer_must_match": ["(?i)(april\\s+27|27\\s+april)"], "answer_must_not_match": ["(?i)march\\s+12"]},
+    {"name": "multi-hop", "category": "multi_hop", "query": "Which authentication key does the Atlas pipeline protocol require?", "context": {"session": "chat-a", "bot": "bot-a", "project": "east"}, "required": ["atlas-protocol", "cedar-key"], "forbidden": [], "answer_must_match": ["(?i)amber"]},
+    {"name": "contradiction-evidence", "category": "contradiction", "query": "What is the Zeta log retention policy?", "context": {"session": "chat-a", "bot": "bot-a", "project": "east"}, "required": ["zeta-retention-short", "zeta-retention-long"], "forbidden": [], "answer_must_match": ["(?i)(thirty|30)", "(?i)current", "(?i)(seven|7)", "(?i)unverified"], "answer_must_not_match": ["(?i)(?<!un)\\bverified\\b"]},
+    {"name": "project-east", "category": "scope", "query": "Where is Orion deployed?", "context": {"session": "chat-a", "bot": "bot-a", "project": "east"}, "required": ["orion-east"], "forbidden": ["orion-west"], "answer_must_match": ["(?i)east"], "answer_must_not_match": ["(?i)west"]},
+    {"name": "project-west", "category": "scope", "query": "Where is Orion deployed?", "context": {"session": "chat-b", "bot": "bot-b", "project": "west"}, "required": ["orion-west"], "forbidden": ["orion-east"], "answer_must_match": ["(?i)west"], "answer_must_not_match": ["(?i)east"]},
+    {"name": "chat-visible", "category": "scope", "query": "What is the travel codename in this chat?", "context": {"session": "chat-a", "bot": "bot-a", "project": "east"}, "required": ["chat-a"], "forbidden": [], "answer_must_match": ["(?i)lark"]},
+    {"name": "chat-hidden", "category": "scope", "query": "What is the travel codename in this chat?", "context": {"session": "chat-b", "bot": "bot-b", "project": "west"}, "required": [], "forbidden": ["chat-a"], "answer_must_not_match": ["(?i)lark"]},
+    {"name": "bot-visible", "category": "scope", "query": "Which workflow does assistant Alder use?", "context": {"session": "chat-a", "bot": "bot-a", "project": "east"}, "required": ["bot-a"], "forbidden": [], "answer_must_match": ["(?i)birch"]},
+    {"name": "bot-hidden", "category": "scope", "query": "Which workflow does assistant Alder use?", "context": {"session": "chat-b", "bot": "bot-b", "project": "west"}, "required": [], "forbidden": ["bot-a"], "answer_must_not_match": ["(?i)birch"]}
+  ]
+}

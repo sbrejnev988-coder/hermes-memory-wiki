@@ -6,7 +6,7 @@ from guard module, adding prompt-injection detection to all memory recall paths.
 """
 from __future__ import annotations
 import re
-from typing import List, Optional
+from typing import List
 
 _INJECTION_PATTERNS: List[re.Pattern] = [
     re.compile(r"ignore\s+(?:all\s+)?(?:previous|prior|above|the\s+above)\s+(?:instructions?|directives?|commands?|context|conversation)", re.I),
@@ -15,7 +15,7 @@ _INJECTION_PATTERNS: List[re.Pattern] = [
     re.compile(r"(?:system\s*(?:prompt|message|instruction|directive)|developer\s*(?:prompt|message|note))\s*(?:is|was|has\s+been|:)\s*", re.I),
     re.compile(r"(?:new|updated|revised|changed|overridden)\s+(?:system\s*(?:prompt|message|instruction)|instructions?|directives?|rules?)", re.I),
     re.compile(r"(?:pretend|imagine|simulate|role-?play|act\s+as\s+if)\s+(?:you\s+(?:are|were)|that\s+you\s+(?:are|were))", re.I),
-    re.compile(r"(?:DAN|jailbreak|prompt\s*(?:injection|hack|leak)|system\s*prompt\s*(?:leak|reveal|show|display|print))", re.I),
+    re.compile(r"(?:\bDAN\s+(?:mode|persona|prompt|jailbreak)\b|\b(?:enable|activate|use)\s+DAN\b|\bdo\s+anything\s+now\b|jailbreak|prompt\s*(?:injection|hack|leak)|system\s*prompt\s*(?:leak|reveal|show|display|print))", re.I),
     re.compile(r"(?:from\s+now\s+on|starting\s+now|beginning\s+now|effective\s+immediately)\s+(?:you\s+(?:are|will|must|should))", re.I),
     re.compile(r"<\|?\s*(?:system|instruction|directive|command|prompt)\s*\|?>", re.I),
     re.compile(r"\[\s*(?:system|instruction|override|directive)\s*\]", re.I),
@@ -35,7 +35,7 @@ def sanitize_context_text(text: str, max_len: int = 600) -> str:
         return ""
     for pattern in _INJECTION_PATTERNS:
         if pattern.search(text):
-            return f"[filtered: injection pattern detected]"
+            return "[filtered: injection pattern detected]"
     return str(text)[:max_len]
 
 def sanitize_context_batch(items: list, text_key: str = "text", max_len: int = 400, label: str = "") -> list:

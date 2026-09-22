@@ -4,7 +4,7 @@
 PRAGMA foreign_keys=ON;
 
 -- table: audit_log
-CREATE TABLE audit_log(id TEXT PRIMARY KEY, op TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL);
+CREATE TABLE audit_log(id TEXT PRIMARY KEY, op TEXT NOT NULL, status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, visibility_scope TEXT NOT NULL DEFAULT 'legacy', origin_bot_id TEXT NOT NULL DEFAULT '', origin_session_id TEXT NOT NULL DEFAULT '', origin_chat_hash TEXT NOT NULL DEFAULT '', project_id TEXT NOT NULL DEFAULT '');
 
 -- table: backups
 CREATE TABLE backups(id TEXT PRIMARY KEY, path TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '', size INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
@@ -47,7 +47,7 @@ CREATE TABLE contradictions(id TEXT PRIMARY KEY, claim_a TEXT NOT NULL, claim_b 
 CREATE TABLE decisions(id TEXT PRIMARY KEY, decision TEXT NOT NULL, rationale TEXT NOT NULL DEFAULT '', topic TEXT NOT NULL DEFAULT 'decisions', alternatives TEXT NOT NULL DEFAULT '[]', source TEXT NOT NULL DEFAULT 'tool', created_at INTEGER NOT NULL, hash TEXT NOT NULL UNIQUE);
 
 -- table: entities
-CREATE TABLE entities(id TEXT PRIMARY KEY, name TEXT NOT NULL, entity_type TEXT NOT NULL DEFAULT 'thing', aliases TEXT NOT NULL DEFAULT '[]', notes TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL, hash TEXT NOT NULL UNIQUE);
+CREATE TABLE entities(id TEXT PRIMARY KEY, name TEXT NOT NULL, entity_type TEXT NOT NULL DEFAULT 'thing', aliases TEXT NOT NULL DEFAULT '[]', notes TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL, hash TEXT NOT NULL UNIQUE, visibility_scope TEXT NOT NULL DEFAULT 'legacy', origin_bot_id TEXT NOT NULL DEFAULT '', origin_session_id TEXT NOT NULL DEFAULT '', origin_chat_hash TEXT NOT NULL DEFAULT '', project_id TEXT NOT NULL DEFAULT '', source_claim_id TEXT NOT NULL DEFAULT '', valid_from INTEGER NOT NULL DEFAULT 0, valid_to INTEGER NOT NULL DEFAULT 0);
 
 -- table: evidence
 CREATE TABLE evidence(id TEXT PRIMARY KEY, claim_id TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'support', text TEXT NOT NULL, source TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, FOREIGN KEY(claim_id) REFERENCES claims(id) ON DELETE CASCADE);
@@ -124,7 +124,14 @@ CREATE TABLE post_task_log(
 CREATE TABLE preference_rules(
                 id TEXT PRIMARY KEY, rule TEXT NOT NULL, priority INTEGER NOT NULL DEFAULT 100,
                 scope TEXT NOT NULL DEFAULT 'global', source TEXT NOT NULL DEFAULT 'system', status TEXT NOT NULL DEFAULT 'active',
-                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, hash TEXT NOT NULL UNIQUE);
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, hash TEXT NOT NULL UNIQUE,
+                visibility_scope TEXT NOT NULL DEFAULT 'legacy', origin_bot_id TEXT NOT NULL DEFAULT '', origin_session_id TEXT NOT NULL DEFAULT '', origin_chat_hash TEXT NOT NULL DEFAULT '', project_id TEXT NOT NULL DEFAULT '');
+
+-- table: preference_attestations
+CREATE TABLE preference_attestations(
+                rule_id TEXT PRIMARY KEY REFERENCES preference_rules(id) ON DELETE CASCADE,
+                rule_digest TEXT NOT NULL, attested_at INTEGER NOT NULL,
+                attested_by TEXT NOT NULL);
 
 -- table: project_profiles
 CREATE TABLE project_profiles(project_id TEXT PRIMARY KEY, root TEXT NOT NULL DEFAULT '', purpose TEXT NOT NULL DEFAULT '', commands TEXT NOT NULL DEFAULT '[]', services TEXT NOT NULL DEFAULT '[]', notes TEXT NOT NULL DEFAULT '', updated_at INTEGER NOT NULL, stack_json TEXT NOT NULL DEFAULT '{}', current_status TEXT NOT NULL DEFAULT '', last_verified_at INTEGER NOT NULL DEFAULT 0, scope TEXT NOT NULL DEFAULT 'project', source TEXT NOT NULL DEFAULT 'project_profile');
@@ -169,7 +176,7 @@ CREATE TABLE reindex_jobs(
             );
 
 -- table: relations
-CREATE TABLE relations(id TEXT PRIMARY KEY, subject TEXT NOT NULL, predicate TEXT NOT NULL, object TEXT NOT NULL, confidence REAL NOT NULL DEFAULT .8, evidence TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, hash TEXT NOT NULL UNIQUE);
+CREATE TABLE relations(id TEXT PRIMARY KEY, subject TEXT NOT NULL, predicate TEXT NOT NULL, object TEXT NOT NULL, confidence REAL NOT NULL DEFAULT .8, evidence TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, hash TEXT NOT NULL UNIQUE, visibility_scope TEXT NOT NULL DEFAULT 'legacy', origin_bot_id TEXT NOT NULL DEFAULT '', origin_session_id TEXT NOT NULL DEFAULT '', origin_chat_hash TEXT NOT NULL DEFAULT '', project_id TEXT NOT NULL DEFAULT '', source_claim_id TEXT NOT NULL DEFAULT '', valid_from INTEGER NOT NULL DEFAULT 0, valid_to INTEGER NOT NULL DEFAULT 0, subject_id TEXT NOT NULL DEFAULT '', object_id TEXT NOT NULL DEFAULT '', source_ref TEXT NOT NULL DEFAULT '');
 
 -- table: retrieval_eval_cases
 CREATE TABLE retrieval_eval_cases(
@@ -180,14 +187,16 @@ CREATE TABLE retrieval_eval_cases(
 CREATE TABLE review_queue(
                 id TEXT PRIMARY KEY, candidate TEXT NOT NULL, topic TEXT NOT NULL DEFAULT 'general', source TEXT NOT NULL DEFAULT '', evidence TEXT NOT NULL DEFAULT '',
                 reason TEXT NOT NULL DEFAULT '', suggested_claim TEXT NOT NULL DEFAULT '', suggested_topic TEXT NOT NULL DEFAULT '', confidence REAL NOT NULL DEFAULT .5,
-                salience REAL NOT NULL DEFAULT .5, status TEXT NOT NULL DEFAULT 'pending', claim_id TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+                salience REAL NOT NULL DEFAULT .5, status TEXT NOT NULL DEFAULT 'pending', claim_id TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL,
+                visibility_scope TEXT NOT NULL DEFAULT 'legacy', origin_bot_id TEXT NOT NULL DEFAULT '', origin_session_id TEXT NOT NULL DEFAULT '', origin_chat_hash TEXT NOT NULL DEFAULT '', project_id TEXT NOT NULL DEFAULT '');
 
 -- table: secret_index
 CREATE TABLE secret_index(
                 id TEXT PRIMARY KEY, subject TEXT NOT NULL, scope TEXT NOT NULL, secret_type TEXT NOT NULL DEFAULT 'credential',
                 locator TEXT NOT NULL DEFAULT '', value TEXT NOT NULL DEFAULT '', purpose TEXT NOT NULL DEFAULT '', source TEXT NOT NULL DEFAULT '',
                 confidence REAL NOT NULL DEFAULT .85, salience REAL NOT NULL DEFAULT .85, status TEXT NOT NULL DEFAULT 'active',
-                last_verified_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, hash TEXT NOT NULL UNIQUE, vault_ref TEXT NOT NULL DEFAULT '', aliases_json TEXT NOT NULL DEFAULT '[]', metadata_json TEXT NOT NULL DEFAULT '{}');
+                last_verified_at INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, hash TEXT NOT NULL UNIQUE, vault_ref TEXT NOT NULL DEFAULT '', aliases_json TEXT NOT NULL DEFAULT '[]', metadata_json TEXT NOT NULL DEFAULT '{}',
+                visibility_scope TEXT NOT NULL DEFAULT 'legacy', origin_bot_id TEXT NOT NULL DEFAULT '', origin_session_id TEXT NOT NULL DEFAULT '', origin_chat_hash TEXT NOT NULL DEFAULT '', project_id TEXT NOT NULL DEFAULT '');
 
 -- table: secret_quarantine
 CREATE TABLE secret_quarantine(
@@ -222,6 +231,7 @@ CREATE TABLE topic_aliases(alias TEXT PRIMARY KEY, topic TEXT NOT NULL);
 
 -- index: idx_audit_log_created
 CREATE INDEX idx_audit_log_created ON audit_log(created_at);
+CREATE INDEX idx_audit_log_owner ON audit_log(visibility_scope,origin_bot_id,origin_session_id,origin_chat_hash,created_at);
 
 -- index: idx_ccm_hash
 CREATE INDEX idx_ccm_hash ON code_claim_metadata(repository_id, content_hash);
@@ -277,6 +287,9 @@ CREATE INDEX idx_claims_visibility_revision ON claims(visibility_scope,memory_re
 -- index: idx_entities_name
 CREATE INDEX idx_entities_name ON entities(name, entity_type);
 
+-- index: idx_entities_visibility_name
+CREATE INDEX idx_entities_visibility_name ON entities(visibility_scope,project_id,name);
+
 -- index: idx_integration_events_claim
 CREATE INDEX idx_integration_events_claim ON integration_events(result_claim_id);
 
@@ -311,6 +324,9 @@ CREATE INDEX idx_post_commit_failures_claim ON post_commit_failures(claim_id,cre
 -- index: idx_preference_rules_priority
 CREATE INDEX idx_preference_rules_priority ON preference_rules(status, priority, updated_at);
 
+-- index: idx_preference_rules_visibility
+CREATE INDEX idx_preference_rules_visibility ON preference_rules(visibility_scope,project_id,status,priority);
+
 -- index: idx_recall_events_claim
 CREATE INDEX idx_recall_events_claim ON recall_events(claim_id, created_at);
 
@@ -329,17 +345,32 @@ CREATE INDEX idx_relations_object ON relations(object,predicate);
 -- index: idx_relations_subject
 CREATE INDEX idx_relations_subject ON relations(subject,predicate);
 
+-- index: idx_relations_visibility_subject
+CREATE INDEX idx_relations_visibility_subject ON relations(visibility_scope,project_id,subject_id);
+
+-- index: idx_relations_visibility_object
+CREATE INDEX idx_relations_visibility_object ON relations(visibility_scope,project_id,object_id);
+
+-- index: idx_relations_claim
+CREATE INDEX idx_relations_claim ON relations(source_claim_id);
+
 -- index: idx_retrieval_eval_cases_updated
 CREATE INDEX idx_retrieval_eval_cases_updated ON retrieval_eval_cases(updated_at);
 
 -- index: idx_review_queue_status
 CREATE INDEX idx_review_queue_status ON review_queue(status, updated_at);
 
+-- index: idx_review_queue_visibility
+CREATE INDEX idx_review_queue_visibility ON review_queue(visibility_scope,project_id,status,updated_at);
+
 -- index: idx_secret_index_subject
 CREATE INDEX idx_secret_index_subject ON secret_index(subject, scope, status);
 
 -- index: idx_secret_index_vault_ref
 CREATE INDEX idx_secret_index_vault_ref ON secret_index(vault_ref,status);
+
+-- index: idx_secret_index_visibility
+CREATE INDEX idx_secret_index_visibility ON secret_index(visibility_scope,project_id,status);
 
 -- index: idx_secret_quarantine_status
 CREATE INDEX idx_secret_quarantine_status ON secret_quarantine(status, created_at);
@@ -743,3 +774,68 @@ CREATE VIRTUAL TABLE document_units_fts USING fts5(
             source_id UNINDEXED, unit_id UNINDEXED, unit_type, title, anchor, unit_text,
             tokenize='unicode61 remove_diacritics 2'
         );
+
+-- Explicit claim-backed context sharing. The runtime migration is authoritative.
+CREATE TABLE shared_blocks(
+    id TEXT PRIMARY KEY, owner_bot_id TEXT NOT NULL, owner_chat_hash TEXT NOT NULL,
+    title TEXT NOT NULL, claim_refs_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active', created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+CREATE TABLE shared_block_grants(
+    block_id TEXT NOT NULL REFERENCES shared_blocks(id) ON DELETE CASCADE,
+    principal_type TEXT NOT NULL CHECK(principal_type IN ('bot','project')),
+    principal_id TEXT NOT NULL, granted_at INTEGER NOT NULL,
+    revoked_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(block_id, principal_type, principal_id)
+);
+CREATE TABLE shared_block_attachments(
+    block_id TEXT NOT NULL, principal_type TEXT NOT NULL, principal_id TEXT NOT NULL,
+    attached_at INTEGER NOT NULL, detached_at INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY(block_id, principal_type, principal_id),
+    FOREIGN KEY(block_id, principal_type, principal_id)
+        REFERENCES shared_block_grants(block_id, principal_type, principal_id)
+        ON DELETE CASCADE
+);
+CREATE TABLE shared_block_events(
+    id TEXT PRIMARY KEY, block_id TEXT NOT NULL REFERENCES shared_blocks(id),
+    action TEXT NOT NULL, actor_bot_id TEXT NOT NULL, actor_chat_hash TEXT NOT NULL,
+    principal_type TEXT NOT NULL DEFAULT '', principal_id TEXT NOT NULL DEFAULT '',
+    created_at INTEGER NOT NULL
+);
+CREATE INDEX idx_shared_block_grant_principal
+    ON shared_block_grants(principal_type,principal_id,revoked_at);
+
+CREATE TABLE external_sources(
+    source_key TEXT PRIMARY KEY, owner_bot_id TEXT NOT NULL DEFAULT '',
+    source_type TEXT NOT NULL,
+    display_uri TEXT NOT NULL, scope_id TEXT NOT NULL,
+    repository_id TEXT NOT NULL, document_source_id TEXT NOT NULL,
+    revision_key TEXT NOT NULL, content_hash TEXT NOT NULL,
+    etag TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active', created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    FOREIGN KEY(document_source_id) REFERENCES document_sources(source_id)
+);
+CREATE INDEX idx_external_sources_scope
+    ON external_sources(scope_id,repository_id,status);
+
+-- Host-attested, opt-in raw episodes. Model tools cannot insert these rows.
+CREATE TABLE episodic_turns(
+    id TEXT PRIMARY KEY, content TEXT NOT NULL, role TEXT NOT NULL
+        CHECK(role IN ('user','assistant')),
+    owner_bot_id TEXT NOT NULL, owner_chat_hash TEXT NOT NULL,
+    visibility_scope TEXT NOT NULL CHECK(visibility_scope IN ('chat','bot')),
+    created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL
+);
+CREATE INDEX idx_episodic_owner_expiry ON episodic_turns(
+    owner_bot_id,visibility_scope,owner_chat_hash,expires_at,created_at);
+CREATE VIRTUAL TABLE episodic_turns_fts USING fts5(
+    id UNINDEXED,content,tokenize='unicode61');
+CREATE TRIGGER episodic_turns_ai AFTER INSERT ON episodic_turns BEGIN
+    INSERT INTO episodic_turns_fts(id,content) VALUES(new.id,new.content); END;
+CREATE TRIGGER episodic_turns_ad AFTER DELETE ON episodic_turns BEGIN
+    DELETE FROM episodic_turns_fts WHERE id=old.id; END;
+CREATE TRIGGER episodic_turns_au AFTER UPDATE OF content ON episodic_turns BEGIN
+    DELETE FROM episodic_turns_fts WHERE id=old.id;
+    INSERT INTO episodic_turns_fts(id,content) VALUES(new.id,new.content); END;

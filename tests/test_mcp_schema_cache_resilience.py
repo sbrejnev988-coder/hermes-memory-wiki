@@ -39,9 +39,15 @@ def test_schema_discovery_survives_unwritable_cache_location() -> None:
             ]
 
     with tempfile.TemporaryDirectory(prefix="mw-mcp-cache-") as tmp:
+        module.HERMES_HOME = Path(tmp)
+        module.PLUGIN_PATH = SERVER.parent.parent / "__init__.py"
         module._SCHEMAS = None
         module._SCHEMA_MAP = {}
-        module.SCHEMAS_FILE = Path(tmp) / "nonexistent-parent" / "tool_schemas.json"
+        cache_root = Path(tmp) / "cache" / "memory-wiki"
+        cache_root.mkdir(parents=True)
+        blocker = cache_root / "not-a-directory"
+        blocker.write_text("synthetic blocker", encoding="utf-8")
+        module.SCHEMAS_FILE = blocker / "tool_schemas.json"
         module.ensure_plugin = lambda: Provider()
         schemas = module.load_schemas()
 

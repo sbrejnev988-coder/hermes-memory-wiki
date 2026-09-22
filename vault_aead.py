@@ -24,9 +24,7 @@ import hashlib
 import hmac
 import os
 import struct
-import time
 from pathlib import Path
-from typing import Optional
 
 # ── Key management ──────────────────────────────────────────────────
 _KEYS: dict[str, bytes] = {}
@@ -310,7 +308,6 @@ def _parse_legacy_v1(stored: str) -> str:
     Legacy XOR-obfuscation (vault.py without MW_VAULT_KEY).
     Key derived from hostname + home path.
     """
-    import base64
     parts = stored.split(":")
     if len(parts) != 4:  # ["enc", "v1", "salt", "xor"]
         raise ValueError(f"invalid_v1_format: expected enc:v1:<salt>:<xor>, got {len(parts)} parts")
@@ -424,8 +421,8 @@ def vault_force_migrate(stored: str, *, known_plaintext: str | None = None) -> s
     # Verify against known plaintext if provided
     if known_plaintext is not None and plaintext != known_plaintext:
         raise ValueError(
-            f"migration_plaintext_mismatch: decrypted value does not match "
-            f"known_plaintext. Wrong key or corrupted data."
+            "migration_plaintext_mismatch: decrypted value does not match "
+            "known_plaintext. Wrong key or corrupted data."
         )
     
     # Encrypt to v3

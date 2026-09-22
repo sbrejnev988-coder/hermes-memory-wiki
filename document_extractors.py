@@ -24,7 +24,6 @@ import mimetypes
 import os
 import re
 import subprocess
-import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -33,7 +32,7 @@ from dataclasses import dataclass, field, asdict
 from email import policy
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 from xml.etree import ElementTree as ET
 
 EXTRACTOR_VERSION = "3.0.0"
@@ -835,7 +834,7 @@ def extract_epub(path: Path, max_units: int, zip_limits: Dict[str, int]) -> Extr
                     if len(units) >= max_units:
                         break
             except Exception as exc:
-                warnings.append(f"{name}: {type(exc).__name__}: {str(exc)[:240]}")
+                warnings.append(f"{name}: {type(exc).__name__}")
             if len(units) >= max_units:
                 break
     return ExtractedDocument("stdlib-epub", "application/epub+zip", path.stem, units, warnings=warnings)
@@ -874,7 +873,7 @@ def _extract_pdf_pymupdf(path: Path, max_units: int, max_pages: int, ocr: bool, 
                 text = page.get_text("text", textpage=tp, sort=True) or text
                 used_ocr = True
             except Exception as exc:
-                warnings.append(f"page {page_idx+1} OCR failed: {type(exc).__name__}: {exc}")
+                warnings.append(f"page {page_idx+1} OCR failed: {type(exc).__name__}")
         text = clean_text(text).strip()
         if text:
             units.append(_unit("page", f"page:{page_idx+1}", text, ordinal=page_idx+1,
@@ -953,13 +952,17 @@ def extract_tika(path: Path, *, tika_url: str, timeout: int, max_chars: int) -> 
     data = path.read_bytes()
     req = urllib.request.Request(tika_url, data=data, method="PUT", headers={"Accept": "text/plain", "Content-Type": _mime_for(path)})
     try:
-        opener = urllib.request.build_opener(_NoRedirectHandler())
+        # The parser is deliberately loopback-only.  urllib otherwise honors
+        # HTTP_PROXY and could send the complete document to a remote proxy.
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _NoRedirectHandler(),
+        )
         with opener.open(req, timeout=timeout) as response:
             if not _is_loopback_http_url(response.geturl()):
                 raise ValueError("Tika response came from a non-loopback URL")
             raw = response.read(max_chars + 1)
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"Tika HTTP {exc.code}: {exc.reason}") from exc
+        raise RuntimeError(f"Tika HTTP {exc.code}") from None
     truncated = len(raw) > max_chars
     text, encoding = decode_text(raw[:max_chars])
     text = clean_text(text, max_chars).strip()

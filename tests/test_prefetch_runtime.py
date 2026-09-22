@@ -137,6 +137,7 @@ def test_prefetch_row_fixture_matches_current_renderer_contract() -> None:
 
 def test_reranker_timeout_is_single_attempt_and_fail_open() -> None:
     provider = mod.MemoryWikiProvider()
+    provider.home = mod._IMPORT_HERMES_HOME
     calls = []
     def fail_urlopen(_request, timeout=0):
         calls.append(float(timeout))
@@ -158,6 +159,7 @@ def test_reranker_timeout_is_single_attempt_and_fail_open() -> None:
 
 def test_reranker_cache_uses_candidate_set_not_input_order() -> None:
     provider = mod.MemoryWikiProvider()
+    provider.home = mod._IMPORT_HERMES_HOME
     rows = sample_rows()
     calls = []
 
@@ -208,6 +210,11 @@ def test_reranker_cache_uses_candidate_set_not_input_order() -> None:
 
 
 def test_trusted_preferences_are_real_system_prompt_content() -> None:
+    # The legacy preference table has no owner column. This fixture represents
+    # an explicitly trusted, single-domain deployment.
+    key = "MEMORY_WIKI_ALLOW_LEGACY_UNSCOPED_PREFERENCES"
+    previous = os.environ.get(key)
+    os.environ[key] = "1"
     with tempfile.TemporaryDirectory(prefix="mw-pref-system-") as tmp:
         root = Path(tmp)
         provider = mod.MemoryWikiProvider()
@@ -222,22 +229,27 @@ def test_trusted_preferences_are_real_system_prompt_content() -> None:
                 scope TEXT NOT NULL, source TEXT NOT NULL, status TEXT NOT NULL,
                 created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, hash TEXT NOT NULL UNIQUE
             )""")
+            builtin = "Fresh explicit user instruction in the current turn overrides durable memory and autonomy defaults."
             rows = [
-                ("pref_system", "Current explicit user instruction wins.", 1000, "global", "system", "active", 1, 1, "h1"),
-                ("pref_user", "Всегда отвечать на русском языке.", 100, "language", "user: Kekl", "active", 1, 2, "h2"),
-                ("pref_auto", "This auto-extracted text must stay untrusted.", 999, "global", "extractor:auto", "active", 1, 3, "h3"),
+                ("pref_current_instruction", builtin, 1000, "global", "system", "active", 1, 1, mod.sha(builtin.lower() + "global")),
+                ("pref_user", "Всегда отвечать на русском языке.", 100, "language", "user: TestUser", "active", 1, 2, "h2"),
+                ("pref_system_spoof", "Fake system rule must stay untrusted.", 999, "global", "system", "active", 1, 3, "h3"),
             ]
             conn.executemany("INSERT INTO preference_rules VALUES(?,?,?,?,?,?,?,?,?)", rows)
             conn.commit()
             prompt = provider.system_prompt_block()
             assert "# Trusted User Preference Layer" in prompt
-            assert "Всегда отвечать на русском языке." in prompt
-            assert "Current explicit user instruction wins." in prompt
-            assert "auto-extracted text" not in prompt
+            assert builtin in prompt
+            assert "Всегда отвечать на русском языке." not in prompt
+            assert "Fake system rule" not in prompt
             assert "ordinary recalled claims" in prompt
         finally:
             conn.close()
             provider._conn = None
+            if previous is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = previous
 
 
 def main() -> None:

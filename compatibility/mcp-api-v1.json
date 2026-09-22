@@ -1,0 +1,2558 @@
+{
+  "api_major": 1,
+  "tools": {
+    "memory_wiki_query": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 10
+        },
+        "include_stale": {
+          "type": "boolean",
+          "default": true
+        },
+        "topic": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ]
+    },
+    "memory_wiki_query_episodes": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 2
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "additionalProperties": false
+    },
+    "memory_wiki_add_claim": {
+      "type": "object",
+      "properties": {
+        "claim": {
+          "type": "string"
+        },
+        "topic": {
+          "type": "string",
+          "default": "general"
+        },
+        "evidence": {
+          "type": "string",
+          "default": ""
+        },
+        "confidence": {
+          "type": "number",
+          "default": 0.75
+        },
+        "salience": {
+          "type": "number",
+          "default": 0.7
+        },
+        "event_at": {
+          "type": "integer",
+          "default": 0
+        },
+        "event_timezone": {
+          "type": "string",
+          "default": "UTC"
+        }
+      },
+      "required": [
+        "claim"
+      ]
+    },
+    "memory_wiki_query_secrets": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "minLength": 2
+        },
+        "limit": {
+          "type": "integer",
+          "default": 10
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "additionalProperties": false
+    },
+    "memory_wiki_recall_plan": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 8
+        }
+      },
+      "required": [
+        "query"
+      ]
+    },
+    "memory_wiki_post_task": {
+      "type": "object",
+      "properties": {
+        "summary": {
+          "type": "string"
+        },
+        "topic": {
+          "type": "string",
+          "default": "operations"
+        },
+        "changed_files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64
+        },
+        "backups": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64
+        },
+        "verification": {
+          "type": "string",
+          "default": ""
+        },
+        "services": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64
+        }
+      },
+      "required": [
+        "summary"
+      ]
+    },
+    "memory_wiki_active_dashboard": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 80
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_doctor": {
+      "type": "object",
+      "properties": {
+        "repair": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_backup": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string",
+          "default": "manual"
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_list_backups": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 20
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_restore": {
+      "type": "object",
+      "properties": {
+        "backup": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "backup"
+      ]
+    },
+    "memory_wiki_scoped_backup": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string",
+          "default": "manual"
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "memory_wiki_list_scoped_backups": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 20
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "memory_wiki_restore_scoped_backup": {
+      "type": "object",
+      "properties": {
+        "backup_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "backup_id"
+      ],
+      "additionalProperties": false
+    },
+    "memory_wiki_add_decision": {
+      "type": "object",
+      "properties": {
+        "decision": {
+          "type": "string"
+        },
+        "rationale": {
+          "type": "string",
+          "default": ""
+        },
+        "topic": {
+          "type": "string",
+          "default": "decisions"
+        },
+        "alternatives": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 64
+        }
+      },
+      "required": [
+        "decision"
+      ]
+    },
+    "memory_wiki_add_mistake": {
+      "type": "object",
+      "properties": {
+        "trigger": {
+          "type": "string"
+        },
+        "mistake": {
+          "type": "string"
+        },
+        "fix": {
+          "type": "string",
+          "default": ""
+        },
+        "prevention": {
+          "type": "string",
+          "default": ""
+        },
+        "topic": {
+          "type": "string",
+          "default": "lessons"
+        }
+      },
+      "required": [
+        "trigger",
+        "mistake"
+      ]
+    },
+    "memory_wiki_add_project_profile": {
+      "type": "object",
+      "properties": {
+        "project_id": {
+          "type": "string"
+        },
+        "root": {
+          "type": "string",
+          "default": ""
+        },
+        "purpose": {
+          "type": "string",
+          "default": ""
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "services": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "notes": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "required": [
+        "project_id"
+      ]
+    },
+    "memory_wiki_add_task_capsule": {
+      "type": "object",
+      "properties": {
+        "intent": {
+          "type": "string"
+        },
+        "topic": {
+          "type": "string",
+          "default": "tasks"
+        },
+        "plan": {
+          "type": "string",
+          "default": ""
+        },
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "commands": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "fixes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "verification": {
+          "type": "string",
+          "default": ""
+        },
+        "followups": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "intent"
+      ]
+    },
+    "memory_wiki_add_entity": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "entity_type": {
+          "type": "string",
+          "default": "thing"
+        },
+        "aliases": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "notes": {
+          "type": "string",
+          "default": ""
+        },
+        "visibility_scope": {
+          "type": "string",
+          "enum": [
+            "global",
+            "bot",
+            "chat",
+            "project",
+            "private"
+          ]
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "source_claim_id": {
+          "type": "string"
+        },
+        "valid_from": {
+          "type": "integer"
+        },
+        "valid_to": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "name"
+      ]
+    },
+    "memory_wiki_add_relation": {
+      "type": "object",
+      "properties": {
+        "subject": {
+          "type": "string"
+        },
+        "predicate": {
+          "type": "string"
+        },
+        "object": {
+          "type": "string"
+        },
+        "confidence": {
+          "type": "number",
+          "default": 0.8
+        },
+        "evidence": {
+          "type": "string",
+          "default": ""
+        },
+        "visibility_scope": {
+          "type": "string",
+          "enum": [
+            "global",
+            "bot",
+            "chat",
+            "project",
+            "private"
+          ]
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "source_claim_id": {
+          "type": "string"
+        },
+        "valid_from": {
+          "type": "integer"
+        },
+        "valid_to": {
+          "type": "integer"
+        }
+      },
+      "required": [
+        "subject",
+        "predicate",
+        "object"
+      ]
+    },
+    "memory_wiki_graph_extract_claim": {
+      "type": "object",
+      "properties": {
+        "claim_id": {
+          "type": "string"
+        },
+        "apply": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": [
+        "claim_id"
+      ]
+    },
+    "memory_wiki_graph_query": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 20
+        }
+      },
+      "required": [
+        "query"
+      ]
+    },
+    "memory_wiki_apply_user_correction": {
+      "type": "object",
+      "properties": {
+        "correction": {
+          "type": "string"
+        },
+        "target_claim_id": {
+          "type": "string",
+          "default": ""
+        },
+        "topic": {
+          "type": "string",
+          "default": "corrections"
+        }
+      },
+      "required": [
+        "correction"
+      ]
+    },
+    "memory_wiki_pack_context": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "max_tokens": {
+          "type": "integer",
+          "default": 4000
+        },
+        "max_chars": {
+          "type": "integer",
+          "default": 12000,
+          "description": "Deprecated \u2014 use max_tokens"
+        },
+        "output_mode": {
+          "type": "string",
+          "enum": [
+            "canonical",
+            "debug"
+          ],
+          "default": "canonical"
+        },
+        "repository_id": {
+          "type": "string",
+          "default": "",
+          "description": "Expected repository for coverage_manifest validation"
+        },
+        "coverage_manifest": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "query"
+      ]
+    },
+    "memory_wiki_shared_block_create": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "claim_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "maxItems": 12
+        }
+      },
+      "required": [
+        "title",
+        "claim_ids"
+      ]
+    },
+    "memory_wiki_shared_block_grant": {
+      "type": "object",
+      "properties": {
+        "block_id": {
+          "type": "string"
+        },
+        "principal_type": {
+          "type": "string",
+          "enum": [
+            "bot",
+            "project"
+          ]
+        },
+        "principal_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "block_id",
+        "principal_type",
+        "principal_id"
+      ]
+    },
+    "memory_wiki_shared_block_revoke": {
+      "type": "object",
+      "properties": {
+        "block_id": {
+          "type": "string"
+        },
+        "principal_type": {
+          "type": "string",
+          "enum": [
+            "bot",
+            "project"
+          ]
+        },
+        "principal_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "block_id",
+        "principal_type",
+        "principal_id"
+      ]
+    },
+    "memory_wiki_shared_block_attach": {
+      "type": "object",
+      "properties": {
+        "block_id": {
+          "type": "string"
+        },
+        "principal_type": {
+          "type": "string",
+          "enum": [
+            "bot",
+            "project"
+          ]
+        }
+      },
+      "required": [
+        "block_id",
+        "principal_type"
+      ]
+    },
+    "memory_wiki_shared_block_detach": {
+      "type": "object",
+      "properties": {
+        "block_id": {
+          "type": "string"
+        },
+        "principal_type": {
+          "type": "string",
+          "enum": [
+            "bot",
+            "project"
+          ]
+        }
+      },
+      "required": [
+        "block_id",
+        "principal_type"
+      ]
+    },
+    "memory_wiki_shared_block_retire": {
+      "type": "object",
+      "properties": {
+        "block_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "block_id"
+      ]
+    },
+    "memory_wiki_shared_block_list": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    },
+    "memory_wiki_memory_diff": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "verified_facts": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "current_context": {
+          "type": "string",
+          "default": ""
+        },
+        "limit": {
+          "type": "integer",
+          "default": 12
+        }
+      },
+      "required": [
+        "query"
+      ]
+    },
+    "memory_wiki_preference_layer": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "default": ""
+        },
+        "limit": {
+          "type": "integer",
+          "default": 20
+        },
+        "include_policy": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_add_preference_rule": {
+      "type": "object",
+      "properties": {
+        "rule": {
+          "type": "string"
+        },
+        "priority": {
+          "type": "integer",
+          "default": 100
+        },
+        "scope": {
+          "type": "string",
+          "default": "general"
+        }
+      },
+      "required": [
+        "rule"
+      ]
+    },
+    "memory_wiki_snapshot": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_add_evidence": {
+      "type": "object",
+      "properties": {
+        "claim_id": {
+          "type": "string"
+        },
+        "text": {
+          "type": "string"
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "support",
+            "refute",
+            "source",
+            "note"
+          ],
+          "default": "support"
+        },
+        "source": {
+          "type": "string",
+          "default": "tool"
+        }
+      },
+      "required": [
+        "claim_id",
+        "text"
+      ]
+    },
+    "memory_wiki_update_claim": {
+      "type": "object",
+      "properties": {
+        "claim_id": {
+          "type": "string"
+        },
+        "claim": {
+          "type": "string"
+        },
+        "topic": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "active",
+            "retired",
+            "superseded",
+            "uncertain"
+          ]
+        },
+        "confidence": {
+          "type": "number"
+        },
+        "salience": {
+          "type": "number"
+        },
+        "refresh": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "claim_id"
+      ]
+    },
+    "memory_wiki_contradict": {
+      "type": "object",
+      "properties": {
+        "claim_a": {
+          "type": "string"
+        },
+        "claim_b": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "claim_a",
+        "claim_b",
+        "reason"
+      ]
+    },
+    "memory_wiki_resolve_contradiction": {
+      "type": "object",
+      "properties": {
+        "contradiction_id": {
+          "type": "string"
+        },
+        "resolution": {
+          "type": "string"
+        },
+        "winner_claim_id": {
+          "type": "string"
+        },
+        "loser_status": {
+          "type": "string",
+          "enum": [
+            "retired",
+            "superseded",
+            "uncertain"
+          ],
+          "default": "superseded"
+        }
+      },
+      "required": [
+        "contradiction_id",
+        "resolution"
+      ]
+    },
+    "memory_wiki_dashboard": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 20
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_get_page": {
+      "type": "object",
+      "properties": {
+        "topic": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "topic"
+      ]
+    },
+    "memory_wiki_maintenance": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "memory_wiki_merge_claims": {
+      "type": "object",
+      "properties": {
+        "keep_id": {
+          "type": "string"
+        },
+        "merge_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "resolution": {
+          "type": "string",
+          "default": "merged as duplicate"
+        },
+        "loser_status": {
+          "type": "string",
+          "enum": [
+            "retired",
+            "superseded",
+            "uncertain"
+          ],
+          "default": "superseded"
+        }
+      },
+      "required": [
+        "keep_id",
+        "merge_ids"
+      ]
+    },
+    "memory_wiki_import": {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "type": "object"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "upsert"
+          ],
+          "default": "upsert"
+        }
+      },
+      "required": [
+        "payload"
+      ]
+    },
+    "memory_wiki_curate": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "suggest",
+            "apply"
+          ],
+          "default": "suggest"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 80
+        },
+        "aggressiveness": {
+          "type": "number",
+          "default": 0.45
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_pin_claim": {
+      "type": "object",
+      "properties": {
+        "claim_id": {
+          "type": "string"
+        },
+        "pinned": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": [
+        "claim_id"
+      ]
+    },
+    "memory_wiki_health": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 100
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_evaluate_retrieval": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 10
+        },
+        "max_chars": {
+          "type": "integer",
+          "default": 3800
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_rewrite_claim": {
+      "type": "object",
+      "properties": {
+        "claim_id": {
+          "type": "string"
+        },
+        "claim": {
+          "type": "string"
+        },
+        "topic": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string",
+          "default": "manual rewrite"
+        }
+      },
+      "required": [
+        "claim_id",
+        "claim"
+      ]
+    },
+    "memory_wiki_explain_recall": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 10
+        },
+        "topic": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ]
+    },
+    "memory_wiki_vacuum": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "suggest",
+            "apply"
+          ],
+          "default": "suggest"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 120
+        },
+        "similarity": {
+          "type": "number",
+          "default": 0.82
+        },
+        "max_pairs": {
+          "type": "integer",
+          "default": 2500
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_review_queue": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "list",
+            "approve",
+            "reject",
+            "rewrite"
+          ],
+          "default": "list"
+        },
+        "item_id": {
+          "type": "string"
+        },
+        "claim": {
+          "type": "string"
+        },
+        "topic": {
+          "type": "string"
+        },
+        "reason": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 20
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_lint_claim": {
+      "type": "object",
+      "properties": {
+        "claim": {
+          "type": "string"
+        },
+        "topic": {
+          "type": "string",
+          "default": "general"
+        }
+      },
+      "required": [
+        "claim"
+      ]
+    },
+    "memory_wiki_why_believe": {
+      "type": "object",
+      "properties": {
+        "claim_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "claim_id"
+      ]
+    },
+    "memory_wiki_secret_quarantine": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 20
+        },
+        "status": {
+          "type": "string",
+          "default": "active"
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_recent_changes": {
+      "type": "object",
+      "properties": {
+        "since_seconds": {
+          "type": "integer",
+          "default": 3600
+        },
+        "limit": {
+          "type": "integer",
+          "default": 50
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_mark_used": {
+      "type": "object",
+      "properties": {
+        "claim_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "usefulness": {
+          "type": "number",
+          "default": 1.0
+        },
+        "query": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "claim_ids"
+      ]
+    },
+    "memory_wiki_normalize_topics": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "suggest",
+            "apply"
+          ],
+          "default": "suggest"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 100
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_immune_scan": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "suggest",
+            "apply"
+          ],
+          "default": "suggest"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 100
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_compress_topic": {
+      "type": "object",
+      "properties": {
+        "topic": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "suggest",
+            "apply"
+          ],
+          "default": "suggest"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 30
+        }
+      },
+      "required": [
+        "topic"
+      ]
+    },
+    "memory_wiki_resolve_by_policy": {
+      "type": "object",
+      "properties": {
+        "contradiction_id": {
+          "type": "string"
+        },
+        "policy": {
+          "type": "string",
+          "default": "prefer_explicit_user"
+        }
+      },
+      "required": [
+        "contradiction_id"
+      ]
+    },
+    "memory_wiki_repair": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "enum": [
+            "fts",
+            "dashboards",
+            "integrity",
+            "outbox",
+            "all"
+          ],
+          "default": "all"
+        },
+        "dry_run": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_audit_log": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 50
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_write_firewall": {
+      "type": "object",
+      "properties": {
+        "claim": {
+          "type": "string"
+        },
+        "topic": {
+          "type": "string",
+          "default": "general"
+        },
+        "evidence": {
+          "type": "string",
+          "default": ""
+        },
+        "source": {
+          "type": "string",
+          "default": "tool",
+          "description": "Used only for check mode; mutation provenance is assigned by the host."
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "check",
+            "queue",
+            "apply"
+          ],
+          "default": "check"
+        },
+        "confidence": {
+          "type": "number",
+          "default": 0.75
+        },
+        "salience": {
+          "type": "number",
+          "default": 0.7
+        }
+      },
+      "required": [
+        "claim"
+      ]
+    },
+    "memory_wiki_mutation_log": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 50
+        },
+        "target_table": {
+          "type": "string",
+          "default": ""
+        },
+        "target_id": {
+          "type": "string",
+          "default": ""
+        },
+        "since_seconds": {
+          "type": "integer",
+          "default": 0
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_undo_last": {
+      "type": "object",
+      "properties": {
+        "mutation_id": {
+          "type": "string",
+          "default": ""
+        },
+        "dry_run": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_transaction": {
+      "type": "object",
+      "properties": {
+        "operations": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "suggest",
+            "apply",
+            "apply_with_backup"
+          ],
+          "default": "suggest"
+        },
+        "reason": {
+          "type": "string",
+          "default": ""
+        },
+        "stop_on_error": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": [
+        "operations"
+      ]
+    },
+    "memory_wiki_compile_topic": {
+      "type": "object",
+      "properties": {
+        "topic": {
+          "type": "string"
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "suggest",
+            "apply"
+          ],
+          "default": "suggest"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 50
+        },
+        "summary_type": {
+          "type": "string",
+          "enum": [
+            "summary",
+            "runbook",
+            "profile",
+            "timeline",
+            "decision"
+          ],
+          "default": "summary"
+        }
+      },
+      "required": [
+        "topic"
+      ]
+    },
+    "memory_wiki_get_project_context": {
+      "type": "object",
+      "properties": {
+        "project_id": {
+          "type": "string"
+        },
+        "query": {
+          "type": "string",
+          "default": ""
+        },
+        "limit": {
+          "type": "integer",
+          "default": 20
+        }
+      },
+      "required": [
+        "project_id"
+      ]
+    },
+    "memory_wiki_source_policy": {
+      "type": "object",
+      "properties": {
+        "source": {
+          "type": "string",
+          "default": "tool"
+        },
+        "claim": {
+          "type": "string",
+          "default": ""
+        },
+        "topic": {
+          "type": "string",
+          "default": "general"
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_export_bundle": {
+      "type": "object",
+      "properties": {
+        "topic": {
+          "type": "string",
+          "default": ""
+        },
+        "project_id": {
+          "type": "string",
+          "default": ""
+        },
+        "scope": {
+          "type": "string",
+          "default": ""
+        },
+        "limit": {
+          "type": "integer",
+          "default": 500
+        },
+        "write_file": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_import_bundle": {
+      "type": "object",
+      "properties": {
+        "payload": {
+          "type": "object"
+        },
+        "path": {
+          "type": "string",
+          "default": ""
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "suggest",
+            "upsert"
+          ],
+          "default": "suggest"
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_journal_status": {
+      "type": "object",
+      "properties": {
+        "verify": {
+          "type": "boolean",
+          "default": true
+        },
+        "limit": {
+          "type": "integer",
+          "default": 5
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_journal_checkpoint": {
+      "type": "object",
+      "properties": {
+        "name": {
+          "type": "string",
+          "default": "manual"
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_semantic_status": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    },
+    "memory_wiki_reindex": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 0
+        },
+        "force": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_debug_search": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 10
+        },
+        "topic": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "required": [
+        "query"
+      ]
+    },
+    "memory_wiki_compare_search": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 10
+        },
+        "topic": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "required": [
+        "query"
+      ]
+    },
+    "memory_wiki_query_mode": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "query"
+      ]
+    },
+    "memory_wiki_rebuild_from_journal": {
+      "type": "object",
+      "properties": {
+        "apply": {
+          "type": "boolean",
+          "default": false
+        },
+        "checkpoint": {
+          "type": "string",
+          "default": ""
+        },
+        "max_events": {
+          "type": "integer",
+          "default": 0
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_export": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 200
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_decay_scan": {
+      "type": "object",
+      "properties": {
+        "threshold": {
+          "type": "number",
+          "default": 0.15
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_decay_stats": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    },
+    "memory_wiki_decay_archive": {
+      "type": "object",
+      "properties": {
+        "threshold": {
+          "type": "number",
+          "default": 0.05
+        },
+        "apply": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_gc": {
+      "type": "object",
+      "properties": {
+        "dry_run": {
+          "type": "boolean",
+          "default": true,
+          "description": "If true, only list candidates without archiving"
+        },
+        "max_age_days": {
+          "type": "integer",
+          "default": 90,
+          "description": "Max age in days before a claim is considered stale"
+        },
+        "min_salience": {
+          "type": "number",
+          "default": 0.05,
+          "description": "Minimum salience to keep"
+        }
+      },
+      "required": [
+        "dry_run"
+      ]
+    },
+    "memory_wiki_federate_merge": {
+      "type": "object",
+      "properties": {
+        "payload_json": {
+          "type": "string",
+          "default": "",
+          "description": "JSON string with {claims: [...]} from remote export"
+        },
+        "source_instance": {
+          "type": "string",
+          "default": "remote",
+          "description": "Identifier for the remote instance"
+        }
+      },
+      "required": [
+        "payload_json"
+      ]
+    },
+    "memory_wiki_summarize_topic": {
+      "type": "object",
+      "properties": {
+        "topic": {
+          "type": "string",
+          "default": "general",
+          "description": "Topic to summarize (uses alias resolution)"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 30,
+          "description": "Max claims to include"
+        }
+      },
+      "required": [
+        "topic"
+      ]
+    },
+    "memory_wiki_claim_history": {
+      "type": "object",
+      "properties": {
+        "claim_id": {
+          "type": "string",
+          "description": "Claim ID to show history for"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 20,
+          "description": "Max history entries"
+        }
+      },
+      "required": [
+        "claim_id"
+      ]
+    },
+    "memory_wiki_secrecy_report": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    },
+    "memory_wiki_context_sanitize": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string"
+        },
+        "max_len": {
+          "type": "integer",
+          "default": 400
+        }
+      },
+      "required": [
+        "text"
+      ]
+    },
+    "memory_wiki_is_social_close": {
+      "type": "object",
+      "properties": {
+        "text": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "text"
+      ]
+    },
+    "memory_wiki_document_ingest": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "scope_id": {
+          "type": "string",
+          "default": ""
+        },
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        },
+        "ocr": {
+          "type": "boolean",
+          "default": false
+        },
+        "ocr_language": {
+          "type": "string",
+          "default": "eng+rus"
+        },
+        "embed": {
+          "type": "boolean",
+          "default": false
+        },
+        "embed_limit": {
+          "type": "integer",
+          "default": 200,
+          "minimum": 1,
+          "maximum": 10000
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
+    "memory_wiki_document_scan": {
+      "type": "object",
+      "properties": {
+        "root": {
+          "type": "string",
+          "default": ""
+        },
+        "scope_id": {
+          "type": "string",
+          "default": ""
+        },
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        },
+        "recursive": {
+          "type": "boolean",
+          "default": true
+        },
+        "max_files": {
+          "type": "integer",
+          "default": 5000,
+          "minimum": 1,
+          "maximum": 100000
+        },
+        "extensions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "exclude_dirs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "ocr": {
+          "type": "boolean",
+          "default": false
+        },
+        "embed": {
+          "type": "boolean",
+          "default": false
+        },
+        "prune_missing": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_document_embed_pending": {
+      "type": "object",
+      "properties": {
+        "source_id": {
+          "type": "string",
+          "default": ""
+        },
+        "scope_id": {
+          "type": "string",
+          "default": ""
+        },
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        },
+        "limit": {
+          "type": "integer",
+          "default": 500,
+          "minimum": 1,
+          "maximum": 10000
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_document_query": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "minLength": 1
+        },
+        "source_id": {
+          "type": "string",
+          "default": ""
+        },
+        "scope_id": {
+          "type": "string",
+          "default": ""
+        },
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        },
+        "global_only": {
+          "type": "boolean",
+          "default": false
+        },
+        "extension": {
+          "type": "string",
+          "default": ""
+        },
+        "limit": {
+          "type": "integer",
+          "default": 12,
+          "minimum": 1,
+          "maximum": 50
+        },
+        "candidate_limit": {
+          "type": "integer",
+          "default": 120,
+          "minimum": 20,
+          "maximum": 500
+        },
+        "max_chars_per_hit": {
+          "type": "integer",
+          "default": 3000,
+          "minimum": 300,
+          "maximum": 20000
+        }
+      },
+      "required": [
+        "query"
+      ]
+    },
+    "memory_wiki_document_source": {
+      "type": "object",
+      "properties": {
+        "source_id": {
+          "type": "string",
+          "default": ""
+        },
+        "path": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_document_unit_context": {
+      "type": "object",
+      "properties": {
+        "source_id": {
+          "type": "string"
+        },
+        "unit_id": {
+          "type": "string",
+          "default": ""
+        },
+        "anchor": {
+          "type": "string",
+          "default": ""
+        },
+        "radius": {
+          "type": "integer",
+          "default": 5,
+          "minimum": 0,
+          "maximum": 100
+        }
+      },
+      "required": [
+        "source_id"
+      ]
+    },
+    "memory_wiki_document_neighbors": {
+      "type": "object",
+      "properties": {
+        "source_id": {
+          "type": "string"
+        },
+        "anchor": {
+          "type": "string"
+        },
+        "hops": {
+          "type": "integer",
+          "default": 1,
+          "minimum": 1,
+          "maximum": 3
+        },
+        "limit": {
+          "type": "integer",
+          "default": 100,
+          "minimum": 1,
+          "maximum": 1000
+        }
+      },
+      "required": [
+        "source_id",
+        "anchor"
+      ]
+    },
+    "memory_wiki_document_status": {
+      "type": "object",
+      "properties": {
+        "scope_id": {
+          "type": "string",
+          "default": ""
+        },
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_document_delete": {
+      "type": "object",
+      "properties": {
+        "source_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_id"
+      ]
+    },
+    "memory_wiki_document_ingest_inbox": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 25,
+          "minimum": 1,
+          "maximum": 1000
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_source_file_sync": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "scope_id": {
+          "type": "string",
+          "default": ""
+        },
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        },
+        "embed": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "path"
+      ]
+    },
+    "memory_wiki_source_github_sync": {
+      "type": "object",
+      "properties": {
+        "owner": {
+          "type": "string"
+        },
+        "repo": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "ref": {
+          "type": "string",
+          "default": ""
+        },
+        "scope_id": {
+          "type": "string",
+          "default": ""
+        },
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        },
+        "embed": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "owner",
+        "repo",
+        "path"
+      ]
+    },
+    "memory_wiki_source_drive_sync": {
+      "type": "object",
+      "properties": {
+        "file_id": {
+          "type": "string"
+        },
+        "scope_id": {
+          "type": "string",
+          "default": ""
+        },
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        },
+        "embed": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "file_id"
+      ]
+    },
+    "memory_wiki_source_record_upsert": {
+      "type": "object",
+      "properties": {
+        "source_uri": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        },
+        "content": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string",
+          "default": ""
+        },
+        "scope_id": {
+          "type": "string",
+          "default": ""
+        },
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        },
+        "embed": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "source_uri",
+        "revision",
+        "content"
+      ]
+    },
+    "memory_wiki_source_list": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 50
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_source_delete": {
+      "type": "object",
+      "properties": {
+        "source_key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_key"
+      ]
+    },
+    "memory_wiki_code_graph_status": {
+      "type": "object",
+      "properties": {
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_code_graph_embed_pending": {
+      "type": "object",
+      "properties": {
+        "repository_id": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 1000,
+          "minimum": 1,
+          "maximum": 10000
+        }
+      },
+      "required": [
+        "repository_id"
+      ]
+    },
+    "memory_wiki_code_graph_query": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "minLength": 1
+        },
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        },
+        "limit": {
+          "type": "integer",
+          "default": 12,
+          "minimum": 1,
+          "maximum": 50
+        },
+        "candidate_limit": {
+          "type": "integer",
+          "default": 96,
+          "minimum": 20,
+          "maximum": 300
+        },
+        "max_chars_per_hit": {
+          "type": "integer",
+          "default": 2400,
+          "minimum": 300,
+          "maximum": 12000
+        }
+      },
+      "required": [
+        "query"
+      ]
+    },
+    "memory_wiki_code_line_context": {
+      "type": "object",
+      "properties": {
+        "repository_id": {
+          "type": "string"
+        },
+        "line_id": {
+          "type": "string",
+          "default": ""
+        },
+        "file_path": {
+          "type": "string",
+          "default": ""
+        },
+        "line_no": {
+          "type": "integer",
+          "default": 0,
+          "minimum": 0
+        },
+        "radius": {
+          "type": "integer",
+          "default": 12,
+          "minimum": 0,
+          "maximum": 100
+        }
+      },
+      "required": [
+        "repository_id"
+      ]
+    },
+    "memory_wiki_code_graph_neighbors": {
+      "type": "object",
+      "properties": {
+        "repository_id": {
+          "type": "string"
+        },
+        "node_id": {
+          "type": "string"
+        },
+        "hops": {
+          "type": "integer",
+          "default": 1,
+          "minimum": 1,
+          "maximum": 3
+        },
+        "limit": {
+          "type": "integer",
+          "default": 50,
+          "minimum": 1,
+          "maximum": 500
+        }
+      },
+      "required": [
+        "repository_id",
+        "node_id"
+      ]
+    },
+    "memory_wiki_code_graph_ingest_inbox": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 25,
+          "minimum": 1,
+          "maximum": 250
+        }
+      },
+      "required": []
+    },
+    "memory_wiki_code_claim_add": {
+      "type": "object",
+      "properties": {
+        "claim": {
+          "type": "string",
+          "maxLength": 12000
+        },
+        "topic": {
+          "type": "string",
+          "default": "code-shrinker",
+          "maxLength": 200
+        },
+        "repository_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "commit_sha": {
+          "type": "string",
+          "default": "",
+          "maxLength": 64,
+          "pattern": "^(?:[0-9a-fA-F]{7,64})?$"
+        },
+        "file_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "symbol_id": {
+          "type": "string",
+          "default": "",
+          "maxLength": 512
+        },
+        "symbol_revision": {
+          "type": "string",
+          "default": "",
+          "maxLength": 128
+        },
+        "content_hash": {
+          "type": "string",
+          "description": "SHA-256 of symbol or file content",
+          "pattern": "^(?:sha256:)?[0-9a-fA-F]{64}$"
+        },
+        "claim_type": {
+          "type": "string",
+          "default": "code_claim",
+          "maxLength": 100
+        },
+        "confidence": {
+          "type": "number",
+          "default": 0.75,
+          "minimum": 0,
+          "maximum": 1
+        },
+        "salience": {
+          "type": "number",
+          "default": 0.7,
+          "minimum": 0,
+          "maximum": 1
+        },
+        "evidence": {
+          "type": "string",
+          "default": "",
+          "maxLength": 20000
+        },
+        "source_event_id": {
+          "type": "string",
+          "default": "",
+          "maxLength": 512,
+          "description": "Durable producer event identifier for exactly-once ingestion"
+        },
+        "producer": {
+          "type": "string",
+          "default": "code-shrinker",
+          "maxLength": 100
+        },
+        "phase_sep_version": {
+          "type": "string",
+          "default": "2",
+          "maxLength": 32
+        }
+      },
+      "required": [
+        "claim",
+        "repository_id",
+        "file_path",
+        "content_hash"
+      ],
+      "additionalProperties": false
+    },
+    "memory_wiki_code_claim_query": {
+      "type": "object",
+      "properties": {
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        },
+        "file_path": {
+          "type": "string",
+          "default": ""
+        },
+        "symbol_id": {
+          "type": "string",
+          "default": ""
+        },
+        "query": {
+          "type": "string",
+          "default": ""
+        },
+        "limit": {
+          "type": "integer",
+          "default": 10
+        }
+      },
+      "required": [
+        "repository_id"
+      ]
+    },
+    "memory_wiki_symbol_history": {
+      "type": "object",
+      "properties": {
+        "repository_id": {
+          "type": "string"
+        },
+        "symbol_id": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 20
+        }
+      },
+      "required": [
+        "repository_id",
+        "symbol_id"
+      ]
+    },
+    "memory_wiki_repository_context": {
+      "type": "object",
+      "properties": {
+        "repository_id": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 30
+        }
+      },
+      "required": [
+        "repository_id"
+      ]
+    },
+    "memory_wiki_invalidate_revision": {
+      "type": "object",
+      "properties": {
+        "repository_id": {
+          "type": "string",
+          "default": "",
+          "description": "Repository identifier"
+        },
+        "symbol_id": {
+          "type": "string",
+          "default": ""
+        },
+        "file_path": {
+          "type": "string",
+          "default": ""
+        },
+        "new_commit_sha": {
+          "type": "string",
+          "default": "",
+          "maxLength": 64,
+          "pattern": "^(?:[0-9a-fA-F]{7,64})?$",
+          "description": "Git commit SHA after the change"
+        },
+        "new_content_hash": {
+          "type": "string",
+          "default": "",
+          "pattern": "^(?:sha256:)?[0-9a-fA-F]{64}$",
+          "description": "SHA-256 of the new file or symbol content"
+        }
+      },
+      "required": [
+        "repository_id"
+      ]
+    },
+    "memory_wiki_patch_outcome_add": {
+      "type": "object",
+      "properties": {
+        "patch_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "outcome": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "repository_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300
+        },
+        "commit_sha": {
+          "type": "string",
+          "default": "",
+          "maxLength": 64,
+          "pattern": "^(?:[0-9a-fA-F]{7,64})?$"
+        },
+        "old_content_hash": {
+          "type": "string",
+          "default": "",
+          "pattern": "^(?:sha256:)?[0-9a-fA-F]{64}$"
+        },
+        "new_content_hash": {
+          "type": "string",
+          "default": "",
+          "pattern": "^(?:sha256:)?[0-9a-fA-F]{64}$"
+        },
+        "validation_report": {
+          "type": "object"
+        },
+        "changed_files": {
+          "type": "array",
+          "maxItems": 200,
+          "items": {
+            "type": "string",
+            "maxLength": 1024
+          }
+        },
+        "changed_symbols": {
+          "type": "array",
+          "maxItems": 500,
+          "items": {
+            "type": "string",
+            "maxLength": 512
+          }
+        },
+        "rollback_steps": {
+          "type": "string",
+          "default": "",
+          "maxLength": 20000
+        },
+        "source_event_id": {
+          "type": "string",
+          "default": "",
+          "maxLength": 512
+        },
+        "producer": {
+          "type": "string",
+          "default": "mcp-code-shrinker",
+          "maxLength": 100
+        },
+        "phase_sep_version": {
+          "type": "string",
+          "default": "2",
+          "maxLength": 32
+        }
+      },
+      "required": [
+        "patch_id",
+        "outcome",
+        "repository_id"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

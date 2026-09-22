@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import re
-from typing import Any, Dict, Iterable, List, Set, Tuple
+from typing import Any, Dict, List, Set, Tuple
 
 _WORD_RE = re.compile(r"[\w-]+", re.UNICODE)
 

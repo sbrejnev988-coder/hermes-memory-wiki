@@ -26,8 +26,61 @@
     }
   },
   {
+    "name": "memory_wiki_global_search",
+    "description": "Explicit opt-in read-only hybrid search across configured local Hermes profiles. Fans out FTS5 + Qdrant semantic retrieval, revalidates every match against each profile SQLite source of truth, and returns active redacted non-secret claims without copying or mutating profile data.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "limit": {
+          "type": "integer",
+          "default": 30,
+          "minimum": 1,
+          "maximum": 200
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "hybrid",
+            "fts",
+            "vector"
+          ],
+          "default": "hybrid"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "memory_wiki_query_episodes",
+    "description": "Search bounded, untrusted host-attested dialogue excerpts for this bot/chat. Disabled unless MEMORY_WIKI_EPISODIC_ENABLED=1; scope is fixed by host configuration.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 2
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "memory_wiki_add_claim",
-    "description": "Add/update a structured durable claim with visibility and event time.",
+    "description": "Add an unverified claim in the current chat with optional event time.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -42,10 +95,6 @@
           "type": "string",
           "default": ""
         },
-        "source": {
-          "type": "string",
-          "default": "tool"
-        },
         "confidence": {
           "type": "number",
           "default": 0.75
@@ -53,20 +102,6 @@
         "salience": {
           "type": "number",
           "default": 0.7
-        },
-        "visibility_scope": {
-          "type": "string",
-          "enum": [
-            "global",
-            "bot",
-            "chat",
-            "project",
-            "private"
-          ]
-        },
-        "project_id": {
-          "type": "string",
-          "default": ""
         },
         "event_at": {
           "type": "integer",
@@ -84,7 +119,7 @@
   },
   {
     "name": "memory_wiki_query_secrets",
-    "description": "Query safe secret metadata. Plaintext and capability tokens are never returned to the model.",
+    "description": "Query safe secret metadata from Memory Wiki plus read-through secret-context metadata. Plaintext and capability tokens are never returned by this tool.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -123,6 +158,45 @@
     }
   },
   {
+    "name": "memory_wiki_recall",
+    "description": "Unified evidence-first recall over visible claims, guarded event-backed observations, episodes, events, and optional deep graph traversal. Returns bounded evidence with stable citations, recall event linkage, and an abstention policy.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "fast",
+            "deep"
+          ],
+          "default": "auto"
+        },
+        "limit": {
+          "type": "integer",
+          "default": 10,
+          "minimum": 1,
+          "maximum": 20
+        },
+        "max_chars": {
+          "type": "integer",
+          "default": 6000,
+          "minimum": 128,
+          "maximum": 24000
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "memory_wiki_post_task",
     "description": "Record a post-task durable summary with changed files, backups, verification and service restarts.",
     "parameters": {
@@ -139,13 +213,15 @@
           "type": "array",
           "items": {
             "type": "string"
-          }
+          },
+          "maxItems": 64
         },
         "backups": {
           "type": "array",
           "items": {
             "type": "string"
-          }
+          },
+          "maxItems": 64
         },
         "verification": {
           "type": "string",
@@ -155,11 +231,8 @@
           "type": "array",
           "items": {
             "type": "string"
-          }
-        },
-        "source": {
-          "type": "string",
-          "default": "post_task"
+          },
+          "maxItems": 64
         }
       },
       "required": [
@@ -239,6 +312,52 @@
     }
   },
   {
+    "name": "memory_wiki_scoped_backup",
+    "description": "Save a signed logical snapshot of claims created by this exact bot/session/project context and their evidence.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "reason": {
+          "type": "string",
+          "default": "manual"
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "memory_wiki_list_scoped_backups",
+    "description": "List signed logical snapshots owned by this exact context.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 20
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    }
+  },
+  {
+    "name": "memory_wiki_restore_scoped_backup",
+    "description": "Restore owned claims and evidence from a signed scoped snapshot by ID. Existing unrelated claims are preserved.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "backup_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "backup_id"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "memory_wiki_add_decision",
     "description": "Record an architectural/product decision with rationale and alternatives.",
     "parameters": {
@@ -259,11 +378,8 @@
           "type": "array",
           "items": {
             "type": "string"
-          }
-        },
-        "source": {
-          "type": "string",
-          "default": "tool"
+          },
+          "maxItems": 64
         }
       },
       "required": [
@@ -400,7 +516,7 @@
   },
   {
     "name": "memory_wiki_add_entity",
-    "description": "Add/update entity and aliases for lightweight knowledge graph.",
+    "description": "Add/update a scoped entity. Optionally link it to a visible source claim and validity interval.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -420,6 +536,28 @@
         "notes": {
           "type": "string",
           "default": ""
+        },
+        "visibility_scope": {
+          "type": "string",
+          "enum": [
+            "global",
+            "bot",
+            "chat",
+            "project",
+            "private"
+          ]
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "source_claim_id": {
+          "type": "string"
+        },
+        "valid_from": {
+          "type": "integer"
+        },
+        "valid_to": {
+          "type": "integer"
         }
       },
       "required": [
@@ -429,7 +567,7 @@
   },
   {
     "name": "memory_wiki_add_relation",
-    "description": "Add a typed relation edge between entities. Valid predicates: owns, owned_by, runs_on, hosts, depends_on, required_by, uses_provider, authenticated_by, replaces, replaced_by, valid_until, supports, contradicts, related_to. Prefer specific over generic.",
+    "description": "Add a scoped typed edge. source_claim_id ties provenance and lifecycle to a visible claim. Valid predicates: owns, owned_by, runs_on, hosts, depends_on, required_by, uses_provider, authenticated_by, replaces, replaced_by, valid_until, supports, contradicts, related_to.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -449,12 +587,53 @@
         "evidence": {
           "type": "string",
           "default": ""
+        },
+        "visibility_scope": {
+          "type": "string",
+          "enum": [
+            "global",
+            "bot",
+            "chat",
+            "project",
+            "private"
+          ]
+        },
+        "project_id": {
+          "type": "string"
+        },
+        "source_claim_id": {
+          "type": "string"
+        },
+        "valid_from": {
+          "type": "integer"
+        },
+        "valid_to": {
+          "type": "integer"
         }
       },
       "required": [
         "subject",
         "predicate",
         "object"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_graph_extract_claim",
+    "description": "Explicit opt-in extraction of source-grounded graph relations from one visible claim using configured OpenRouter chat model; disabled unless MEMORY_WIKI_GRAPH_EXTRACT_ENABLED=1. Each applied edge inherits claim visibility and is journaled separately.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "claim_id": {
+          "type": "string"
+        },
+        "apply": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "required": [
+        "claim_id"
       ]
     }
   },
@@ -541,6 +720,154 @@
     }
   },
   {
+    "name": "memory_wiki_shared_block_create",
+    "description": "Create a bounded shared context block from currently visible active claim IDs. No content is copied into the grant journal.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string"
+        },
+        "claim_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "maxItems": 12
+        }
+      },
+      "required": [
+        "title",
+        "claim_ids"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_shared_block_grant",
+    "description": "Explicitly grant a named bot or project access to a block owned by this chat.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "block_id": {
+          "type": "string"
+        },
+        "principal_type": {
+          "type": "string",
+          "enum": [
+            "bot",
+            "project"
+          ]
+        },
+        "principal_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "block_id",
+        "principal_type",
+        "principal_id"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_shared_block_revoke",
+    "description": "Revoke a grant and detach that recipient's block.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "block_id": {
+          "type": "string"
+        },
+        "principal_type": {
+          "type": "string",
+          "enum": [
+            "bot",
+            "project"
+          ]
+        },
+        "principal_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "block_id",
+        "principal_type",
+        "principal_id"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_shared_block_attach",
+    "description": "Attach a block already granted to this bot or project for bounded context packing.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "block_id": {
+          "type": "string"
+        },
+        "principal_type": {
+          "type": "string",
+          "enum": [
+            "bot",
+            "project"
+          ]
+        }
+      },
+      "required": [
+        "block_id",
+        "principal_type"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_shared_block_detach",
+    "description": "Detach this bot or project's shared block without revoking its grant.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "block_id": {
+          "type": "string"
+        },
+        "principal_type": {
+          "type": "string",
+          "enum": [
+            "bot",
+            "project"
+          ]
+        }
+      },
+      "required": [
+        "block_id",
+        "principal_type"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_shared_block_retire",
+    "description": "Retire a block owned by this chat, hiding it from all recipients.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "block_id": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "block_id"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_shared_block_list",
+    "description": "List this chat's owned blocks and grants available to this bot or project.",
+    "parameters": {
+      "type": "object",
+      "properties": {},
+      "required": []
+    }
+  },
+  {
     "name": "memory_wiki_memory_diff",
     "description": "Compare recalled memory against supplied verified/current facts before answering; returns confirmed, changed/conflicting and stale/unverified memory.",
     "parameters": {
@@ -593,7 +920,7 @@
   },
   {
     "name": "memory_wiki_add_preference_rule",
-    "description": "Add/update a first-class preference priority rule used by the preference layer.",
+    "description": "Suggest a chat-scoped preference candidate for owner review; it is not active until a trusted host attests it.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -606,19 +933,7 @@
         },
         "scope": {
           "type": "string",
-          "default": "global"
-        },
-        "source": {
-          "type": "string",
-          "default": "explicit"
-        },
-        "status": {
-          "type": "string",
-          "enum": [
-            "active",
-            "retired"
-          ],
-          "default": "active"
+          "default": "general"
         }
       },
       "required": [
@@ -798,16 +1113,12 @@
   },
   {
     "name": "memory_wiki_maintenance",
-    "description": "Run vault maintenance: rebuild FTS, detect contradictions, render pages, optionally prune low-salience retired claims.",
+    "description": "Run vault maintenance: rebuild FTS, detect contradictions, render pages, and process a bounded semantic outbox batch.",
     "parameters": {
       "type": "object",
-      "properties": {
-        "prune_retired_days": {
-          "type": "integer",
-          "default": 0
-        }
-      },
-      "required": []
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
     }
   },
   {
@@ -1130,7 +1441,7 @@
   },
   {
     "name": "memory_wiki_mark_used",
-    "description": "Feedback loop: mark recalled claims as useful or not useful.",
+    "description": "Record idempotent outcome feedback for recalled claims. Pass returned recall_event_ids to bind the answer to exact retrievals; retrieval alone stays neutral.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -1140,12 +1451,42 @@
             "type": "string"
           }
         },
+        "recall_event_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 50,
+          "description": "Exact pending recall event IDs returned by recall. At most one per claim."
+        },
         "usefulness": {
           "type": "number",
           "default": 1.0
         },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "used",
+            "helpful",
+            "irrelevant",
+            "contradicted",
+            "harmful"
+          ],
+          "default": "helpful"
+        },
+        "answer_id": {
+          "type": "string",
+          "default": "",
+          "maxLength": 128
+        },
+        "notes": {
+          "type": "string",
+          "default": "",
+          "maxLength": 500
+        },
         "query": {
-          "type": "string"
+          "type": "string",
+          "description": "Deprecated and never persisted."
         }
       },
       "required": [
@@ -1245,7 +1586,7 @@
   },
   {
     "name": "memory_wiki_repair",
-    "description": "Run targeted self-healing repairs: fts, dashboards, integrity, or all.",
+    "description": "Run targeted self-healing repairs: fts, dashboards, integrity, outbox, or all.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -1255,6 +1596,7 @@
             "fts",
             "dashboards",
             "integrity",
+            "outbox",
             "all"
           ],
           "default": "all"
@@ -1283,7 +1625,7 @@
   },
   {
     "name": "memory_wiki_write_firewall",
-    "description": "Dry-run or queue a candidate memory through source policy, quality lint, artifact detection and secret firewall before durable write.",
+    "description": "Check a candidate through source policy and quality lint, or queue/apply it as unverified current-chat memory.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -1300,7 +1642,8 @@
         },
         "source": {
           "type": "string",
-          "default": "tool"
+          "default": "tool",
+          "description": "Used only for check mode; mutation provenance is assigned by the host."
         },
         "mode": {
           "type": "string",
@@ -1371,7 +1714,7 @@
   },
   {
     "name": "memory_wiki_transaction",
-    "description": "Dry-run/apply a bounded non-atomic batch. Each operation may commit independently; use apply_with_backup and stop_on_error for safer rollback.",
+    "description": "Suggest or apply a bounded batch. Multi-operation apply is atomic for update_claim, rewrite_claim, and merge_claims; other multi-operation batches are rejected before writing.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -1918,13 +2261,13 @@
   },
   {
     "name": "memory_wiki_document_scan",
-    "description": "Recursively discover and incrementally index supported documents below an allowlisted directory.",
+    "description": "Recursively discover and incrementally index supported documents below an allowlisted directory. If root is omitted, scans the Hermes attachment cache (~/.hermes/cache/documents). Reports missing indexed sources and prunes them only when prune_missing=true.",
     "parameters": {
       "type": "object",
       "properties": {
         "root": {
           "type": "string",
-          "minLength": 1
+          "default": ""
         },
         "scope_id": {
           "type": "string",
@@ -1959,11 +2302,17 @@
         "ocr": {
           "type": "boolean",
           "default": false
+        },
+        "embed": {
+          "type": "boolean",
+          "default": false
+        },
+        "prune_missing": {
+          "type": "boolean",
+          "default": false
         }
       },
-      "required": [
-        "root"
-      ]
+      "required": []
     }
   },
   {
@@ -2015,6 +2364,10 @@
         "repository_id": {
           "type": "string",
           "default": ""
+        },
+        "global_only": {
+          "type": "boolean",
+          "default": false
         },
         "extension": {
           "type": "string",
@@ -2169,6 +2522,167 @@
         }
       },
       "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_source_file_sync",
+    "description": "Incrementally sync one allowlisted local file into the scoped document graph under a stable connector key.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "path": {
+          "type": "string"
+        },
+        "scope_id": {
+          "type": "string",
+          "default": ""
+        },
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        },
+        "embed": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "path"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_source_github_sync",
+    "description": "Fetch one allowlisted UTF-8 text file from GitHub Contents API, validate its Git blob hash, and incrementally index it in the current document scope. Optional GITHUB_TOKEN enables private repository access.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "owner": {
+          "type": "string"
+        },
+        "repo": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string"
+        },
+        "ref": {
+          "type": "string",
+          "default": ""
+        },
+        "scope_id": {
+          "type": "string",
+          "default": ""
+        },
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        },
+        "embed": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "owner",
+        "repo",
+        "path"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_source_drive_sync",
+    "description": "Fetch one downloadable UTF-8 text file or Google Doc by Drive file ID, using a host-provided OAuth access token, then incrementally index it in the current document scope.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "file_id": {
+          "type": "string"
+        },
+        "scope_id": {
+          "type": "string",
+          "default": ""
+        },
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        },
+        "embed": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "file_id"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_source_record_upsert",
+    "description": "Upsert one bounded unverified UTF-8 record using stable URI, revision and scope; text is redacted before staging.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "source_uri": {
+          "type": "string"
+        },
+        "revision": {
+          "type": "string"
+        },
+        "content": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string",
+          "default": ""
+        },
+        "scope_id": {
+          "type": "string",
+          "default": ""
+        },
+        "repository_id": {
+          "type": "string",
+          "default": ""
+        },
+        "embed": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "source_uri",
+        "revision",
+        "content"
+      ]
+    }
+  },
+  {
+    "name": "memory_wiki_source_list",
+    "description": "List bounded connector source metadata in the current document scope.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "default": 50
+        }
+      },
+      "required": []
+    }
+  },
+  {
+    "name": "memory_wiki_source_delete",
+    "description": "Soft-delete one connector source by its opaque key and remove its staged record file.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "source_key": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_key"
+      ]
     }
   },
   {

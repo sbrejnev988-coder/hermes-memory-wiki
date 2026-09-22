@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-memory-wiki"
-version = "1.22.3"
+version = "1.24.0"
 description = "Security-hardened active-memory wiki provider for Hermes Agent"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
@@ -18,7 +18,10 @@ classifiers = [
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
 ]
-dependencies = []
+dependencies = [
+  "python-dotenv>=1.0,<2",
+  "tzdata>=2024.1",
+]
 
 [project.entry-points."hermes_agent.memory_providers"]
 memory-wiki = "memory_wiki:register"

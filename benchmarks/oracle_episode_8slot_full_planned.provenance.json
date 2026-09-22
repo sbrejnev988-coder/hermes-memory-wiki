@@ -1,0 +1,133 @@
+{
+  "artifacts": {
+    "dataset": {
+      "declared_sha256": "821a2034d219ab45846873dd14c14f12cfe7776e73527a483f9dac095d38620c",
+      "matches_result_declaration": true,
+      "official_oracle_sha256_match": true,
+      "sha256": "821a2034d219ab45846873dd14c14f12cfe7776e73527a483f9dac095d38620c"
+    },
+    "result": {
+      "sha256": "b4c98c624e7f50ae5318ed2b19100cdb8db042a44f57822b78d5939a30169b11"
+    }
+  },
+  "benchmark": {
+    "dataset_questions": 500,
+    "effective_config": {
+      "episode_query_max_chars": 2400,
+      "episode_query_max_results": 8,
+      "episode_query_mode": "auto",
+      "episode_slots": 5,
+      "top_k": 8
+    },
+    "evaluated_questions": 500,
+    "guard_mode": "non-strict local guard; shared core unavailable",
+    "retrieval_mode": "offline FTS; no OpenRouter/Qdrant or answer generation"
+  },
+  "format": "memory-wiki-benchmark-provenance",
+  "format_version": 1,
+  "generated_at": "2026-09-21T21:18:03.091739Z",
+  "git": {
+    "dirty": true,
+    "head": "5982a96eeeff127e495cb259d9faeacbcf54a42c"
+  },
+  "reproduction": {
+    "argv": [
+      "python",
+      "benchmarks/full_oracle_episode_probe.py",
+      "--dataset",
+      "<DATASET_JSON>",
+      "--limit",
+      "500",
+      "--top-k",
+      "8",
+      "--episode-slots",
+      "5",
+      "--progress-every",
+      "50"
+    ],
+    "command": "python benchmarks/full_oracle_episode_probe.py --dataset <DATASET_JSON> --limit 500 --top-k 8 --episode-slots 5 --progress-every 50 > <RESULT_JSON>",
+    "environment": {
+      "MEMORY_WIKI_EPISODIC_QUERY_MAX_CHARS": "2400",
+      "MEMORY_WIKI_EPISODIC_QUERY_MAX_RESULTS": "8",
+      "MEMORY_WIKI_EPISODIC_QUERY_MODE": "auto"
+    },
+    "stdout": "<RESULT_JSON>"
+  },
+  "runtime": {
+    "platform": {
+      "machine": "AMD64",
+      "release": "11",
+      "system": "Windows",
+      "version": "10.0.26100"
+    },
+    "python": {
+      "implementation": "CPython",
+      "version": "3.12.10"
+    },
+    "sqlite": {
+      "runtime_version": "3.49.1",
+      "threadsafety": 3
+    }
+  },
+  "sources": {
+    "files": {
+      "__init__.py": "e13a6d414b478e65b17fe763efabd8a2aa55aa8e1a3f33f8a56996b02019732c",
+      "background_jobs.py": "3a99924757ac30c7addfd9df75c8385354d70a44309d65996808b564951d91ea",
+      "benchmarks/answer_eval.py": "26ea7eba58b253fa28d96e74134cf8d587e0c71486d0b23838cc62a36af39e6e",
+      "benchmarks/audit_retrieval.py": "a6cc00e5c22f156dca56f8cdfee1fb0c914e7aa7be1869a927a3c969fdce5653",
+      "benchmarks/benchmark_provenance.py": "783af197c8eade6c555c22f9a3f5e1ddb3c737801bf3ba1015a31a2108a8e30a",
+      "benchmarks/episodic_fallback_probe.py": "12bc08af5c9de318a4c1a60587d9b32c76128493d653fa76e468c64cd2799b11",
+      "benchmarks/full_oracle_episode_probe.py": "fdc983fcdea02b160a6c3b0510cb641c1ea33f8c409feb4265b0272ae5c716f2",
+      "benchmarks/locomo_adapter.py": "4d88430a0f47a0750bc0fe6d262655728a683354399f5934395f17235ebdc130",
+      "benchmarks/locomo_episode_probe.py": "aeb18e3bb00b36105dca5ba376a313f2cf656a0bc5b97ce155fe5ae03cbd937f",
+      "benchmarks/longmemeval_adapter.py": "2cc28cd6713a23cf941c51442faa167728f8de8cd2c4fe36ce811467763f207a",
+      "benchmarks/longmemeval_ingestion_probe.py": "1e66f3dc778171079f2a750ad0005a9dcac100b3033dde9184b300d0246b3b35",
+      "benchmarks/longmemeval_v2_adapter.py": "0a711b902f7188b75f5da9e8198afa4e5a2d4164fc3addc0cbb7ea9bdb7622e2",
+      "benchmarks/official_longmemeval_judge.py": "19b065405042686084fea9d954dfae424625fa173b3e71ec3b1cd2c6c43ad25e",
+      "benchmarks/paired_hybrid_fts.py": "5323e28b7a6dd2b1c5200bdd87f7ce26a90272d8acd941e4f627d6c45385e556",
+      "benchmarks/qa_reader.py": "45628e3848dd5e891e04c85caa8977b049937514055f3ee9ba53de5d433a5edc",
+      "benchmarks/quality_eval.py": "63651ae0e718875c1d2661fbbc696063dd1ef4e35dc4da649556a5e8bc83885d",
+      "benchmarks/retrieval_diversity_ab.py": "c31c6420a0c5f8e4d6158d62d00543836b5cf7b6ba76902faf6f5e8cd90bc4b0",
+      "benchmarks/scale_episode_fts.py": "6632a860fa7d1c2ad6e9ca6e70d88e221733888579b2dc280119628bb91484bd",
+      "benchmarks/scale_event_ledger.py": "c583076a0489fb09111d9e0e204cf06966d921099f788659d95e229070cf8202",
+      "code_knowledge_graph.py": "521c74e32e37e37b3cd7179f9e4e6de8425b1097731c588a1a4b67f744cee06b",
+      "collapse.py": "4c32febe43efd255e927487c8b4977400a024046055fc66edcb585b550617032",
+      "decay.py": "23b921756f0723286b4ae87e6cbd5715f6de5376580a9c4e7e9fa9f66d510207",
+      "document_extractors.py": "b7002a84b95934a5f98fdb73bdf9cfbe3739810c3ffcd9b3872622364c90a905",
+      "document_knowledge_graph.py": "322babdee616ab96b30c27a6d0e48ff8df6abca050864323a54a272f6f5771b3",
+      "document_worker.py": "102149cdfa99d9e6fe265c0ba39cfffc4576a43e32dd56a9a6fd7030bf3c53e7",
+      "entity_relation_extractor.py": "024ae2147414a5b77df71e63cb33fea62eeb6d9acea9db330611ff8d4eabfbfd",
+      "episodic_memory.py": "5d3a2422beb4080be4bbb86f947b077f407db404795b0a24ef139ae48e048060",
+      "extractor.py": "71974375378e23bd63baa7b3447161ad7b87832e1826b4245b3ccbd1896185c1",
+      "github_source_adapter.py": "09cfa6108a69337bad2e53897302b632034228b7f2773b0ed3690d3f2df0ee8c",
+      "google_drive_source_adapter.py": "6da207754624152c0b4b2c58cccea8392b915385711230e46882c6f11dbb2f1e",
+      "graph_stats.json": "19b7895624218cc088097c3bc799fe9d279094c39a2fda90e5a332aff29d843c",
+      "guard.py": "9039ecc81bba1a41c1cd9d1656d75cfbbe1e172f263d87a50cc7f45817d3ba25",
+      "http_safety.py": "bbbbda1a1b0d7febcc0f895a40c150060db409b6ff7c5b3b1f8b615d0f145e19",
+      "memory_events.py": "1172f9d5d18b7a34ceb635eae45d365749c6c69714c93a355363806299db69a9",
+      "memory_observations.py": "bf085d2bc63727a4e12a74f72b87688c6939b514f9f8d5a9fa70df36c746a558",
+      "migrations.py": "fb6fe91c8964be591004ebf9378b6dd7bb8084a6e84ae02a4515fc6b7bfa3310",
+      "online_metrics.py": "69beb5507b89527e0963605d35abb008800f93dce23b0dbd87a0afe5c092496e",
+      "patch_secret_context_plugin.py": "ec01694c68a8b0b099fef8f87f018579c7effc324ab8646cab18358f8929e09d",
+      "plugin.yaml": "f297fa38db2876ccfcdb4dadc717ddad6fead890459825fedc988ff23037ca3f",
+      "privacy_erasure.py": "0a201b3f4fdefa001946a6ce9caa877a28652503574ee27bdf15485a51f08be0",
+      "pyproject.toml": "a839a51874069f2a18d1d864598e50169796d43a0c2d4e1c5717c77d2a87b65c",
+      "recall_orchestrator.py": "6020917c4c88935acf5b7b7228495789e0e2c2479da4591a3f6420f2e52ef82e",
+      "recall_planner.py": "24d5aee0ede94db12438b27a97347c0bd41d2e7d84df0849d07c930b788b328f",
+      "rerank-rules.json": "e3aaf7336de4020dd88e6ffbe49ad8a2a2c396f7778f9cf51534915be665ff39",
+      "schema.sql": "572bfac1d9e333e5f1341a5c52c62e8dec46d21352980b0c955091882e51f8fc",
+      "sdk.py": "7b55e322fde6f136e434bd07a40ea65a845a210aecb9c6aaac6d933c6642db77",
+      "secret_context_bridge.py": "cc2e5bf3850e6c2e1e17693e7aa9873889b4fa149876b9601b115ed16da12767",
+      "setup.py": "cb184df928263e32fd4015c38d41dd71345979d6cb4ecad1c4d44b9090f19780",
+      "shared_blocks.py": "7efe0f73e2ff99e06b4a62e5a440fb60fad5819f41354933674238a999ce0b79",
+      "source_connectors.py": "41226d059ce10f909f08dc293c7bf93695f9cb19c7bdbcf6d3cbf3bc564ebe6c",
+      "uv.lock": "6f5d3fd75ce63359f6fac7d68dd211f30ab252e0c697950868111ba25d0b45db",
+      "vault.py": "375398f03a2acdb18190ed50fad6e9e345308fb3ffa83d69ddf22bbba7f1d316",
+      "vault_aead.py": "d10ab9282226428a34b786f55827dc548d37d861472a0a8437cd422d82141a4b",
+      "vault_registry_adapter.py": "a563de9dd760a4bbe02f96d943c14f2415bfabf093fb3384ee7016345d4368e2",
+      "visual_evidence.py": "256e5e8bdabb2b35d0e01dea9144e1cf4950897b295daf6d81ede0ac82146042"
+    },
+    "selection": "repository-root *.py and production data/config files; benchmarks/*.py",
+    "tree_sha256": "ac666a2cf13120024537b5aaf1663f0950bbd5cbf017f5430b80c2894ecee5f3"
+  }
+}

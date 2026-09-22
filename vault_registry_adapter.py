@@ -83,6 +83,7 @@ def _home(home: Optional[Path] = None) -> Path:
 
 
 def registry_path(home: Optional[Path] = None) -> Path:
+    base = _home(home)
     explicit = (
         os.environ.get("MEMORY_WIKI_SECRET_REGISTRY")
         or os.environ.get("SECRET_CONTEXT_REGISTRY")
@@ -93,7 +94,23 @@ def registry_path(home: Optional[Path] = None) -> Path:
     # The new DPAPI store owns a separate metadata-only registry. Legacy
     # $HERMES_HOME/vault registries are never read implicitly because they may
     # predate the no-plaintext registry contract.
-    return Path(explicit).expanduser() if explicit else _home(home) / "secret-vault" / "secrets_registry.json"
+    local = base / "secret-vault" / "secrets_registry.json"
+    if not explicit:
+        return local
+    override = Path(explicit).expanduser()
+    if home is not None and base.resolve(strict=False) != _home().resolve(strict=False):
+        # A shared Desktop process may retain another profile's env override.
+        # Only an override inside that profile's own secret-vault can be followed.
+        # The default home may contain profiles/*, which are separate vaults.
+        try:
+            if not override.is_absolute():
+                return local
+            override.resolve(strict=False).relative_to(
+                (base / "secret-vault").resolve(strict=False)
+            )
+        except (OSError, ValueError):
+            return local
+    return override
 
 
 def _is_sensitive_key(key: Any) -> bool:

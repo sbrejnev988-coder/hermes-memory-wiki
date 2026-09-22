@@ -84,6 +84,80 @@ def test_rebuild_replays_direct_patch_outcome_and_revision_invalidation_without_
                 os.environ[key] = value
 
 
+def test_legacy_identity_invalidation_registers_replayable_aliases() -> None:
+    """A legacy alias must not archive a claim and then fail journaling."""
+    keys = ("HERMES_HOME", "HERMES_SECURITY_STRICT", "MEMORY_WIKI_SEMANTIC")
+    previous = {key: os.environ.get(key) for key in keys}
+    try:
+        with tempfile.TemporaryDirectory(prefix="mw-legacy-invalidation-recovery-") as tmp:
+            os.environ.update({"HERMES_HOME": tmp, "HERMES_SECURITY_STRICT": "0", "MEMORY_WIKI_SEMANTIC": "0"})
+            module = load_provider("memory_wiki_legacy_invalidation_recovery_test")
+            provider = module.MemoryWikiProvider()
+            provider.initialize("legacy-invalidation-recovery", hermes_home=tmp, agent_context="test")
+            provider._make_secret_index_from_raw = lambda *_args, **_kwargs: ""
+            try:
+                token = "ghp_" + "a" * 36
+                raw_repository_id = f"repo-{token}"
+                raw_file_path = f"src/{token}.py"
+                old_hash = hashlib.sha256(b"legacy old").hexdigest()
+                new_hash = hashlib.sha256(b"legacy new").hexdigest()
+                claim_id = provider._code_claim_add({
+                    "claim": "Verified legacy invalidation recovery behavior for a code revision.",
+                    "topic": "code-shrinker",
+                    "repository_id": raw_repository_id,
+                    "file_path": raw_file_path,
+                    "symbol_id": "legacy_symbol",
+                    "content_hash": old_hash,
+                    "evidence": "verified source and revision metadata",
+                    "confidence": 0.95,
+                    "salience": 0.9,
+                })["id"]
+
+                # Model a database written before opaque-ID provenance was
+                # persisted. Its code-claim metadata still uses the v1 aliases.
+                with provider._connect() as conn:
+                    conn.execute("DELETE FROM code_graph_identity_provenance")
+
+                result = json.loads(provider.handle_tool_call("memory_wiki_invalidate_revision", {
+                    "repository_id": raw_repository_id,
+                    "file_path": raw_file_path,
+                    "new_content_hash": new_hash,
+                }))
+                assert result["success"] is True, result
+                assert provider._connect().execute(
+                    "SELECT status FROM claims WHERE id=?", (claim_id,)
+                ).fetchone()[0] == "archived"
+
+                aliases = {
+                    provider._code_graph_identity(raw_repository_id),
+                    provider._code_graph_identity(raw_file_path),
+                }
+                assert provider._connect().execute(
+                    "SELECT COUNT(*) FROM code_graph_identity_provenance "
+                    "WHERE opaque_id IN (?,?)",
+                    tuple(aliases),
+                ).fetchone()[0] == len(aliases)
+                after = [
+                    event for event in provider._iter_journal_events()
+                    if event.get("op") == "memory_wiki_invalidate_revision" and event.get("phase") == "after"
+                ]
+                assert after
+                recovery = after[-1]["result"]["recovery"]
+                assert recovery["kind"] == "revision_invalidation"
+                assert provider._replay_code_recovery_reference(recovery)["invalidated"] == 0
+                assert token not in provider.journal_path.read_text(encoding="utf-8")
+            finally:
+                if provider._conn is not None:
+                    provider._conn.close()
+                    provider._conn = None
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 if __name__ == "__main__":
     test_rebuild_replays_direct_patch_outcome_and_revision_invalidation_without_journaling_rollback_text()
     print("PASS test_rebuild_replays_direct_patch_outcome_and_revision_invalidation_without_journaling_rollback_text")
