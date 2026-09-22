@@ -29,12 +29,15 @@ def test_colocated_wrapper_can_target_isolated_development_home(tmp_path):
 
 def test_installed_other_profile_plugin_is_rejected(tmp_path):
     module = _server()
-    module.HERMES_HOME = tmp_path
-    target_install = tmp_path / "plugins" / "memory-wiki" / "__init__.py"
+    module.HERMES_HOME = tmp_path / "current"
+    target_install = module.HERMES_HOME / "plugins" / "memory-wiki" / "__init__.py"
     target_install.parent.mkdir(parents=True)
     target_install.write_text("# synthetic plugin\n", encoding="utf-8")
-    module.PLUGIN_PATH = SERVER.parent.parent / "__init__.py"
-    module.SCHEMAS_FILE = tmp_path / "cache" / "memory-wiki" / "schemas.json"
+    foreign_wrapper = tmp_path / "foreign" / "plugins" / "memory-wiki" / "mcp-wrapper"
+    foreign_wrapper.mkdir(parents=True)
+    module.BASE_DIR = foreign_wrapper
+    module.PLUGIN_PATH = foreign_wrapper.parent / "__init__.py"
+    module.SCHEMAS_FILE = module.HERMES_HOME / "cache" / "memory-wiki" / "schemas.json"
     with pytest.raises(RuntimeError, match="profile home mismatch"):
         module.assert_profile_paths_consistent()
 
