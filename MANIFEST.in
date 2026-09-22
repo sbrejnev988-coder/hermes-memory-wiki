@@ -1,7 +1,10 @@
 # Source distribution and wheel hygiene: never package local execution artifacts.
+include *.py
+include plugin.yaml
+graft mcp-wrapper
+graft context-coordination
 global-exclude *.py[cod]
-global-exclude __pycache__
-recursive-exclude * __pycache__ *
+prune __pycache__
 prune build
 prune dist
 prune .venv
