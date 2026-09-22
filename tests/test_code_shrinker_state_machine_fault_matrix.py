@@ -1032,14 +1032,36 @@ spec = importlib.util.spec_from_file_location(module_name, plugin, submodule_sea
 module = importlib.util.module_from_spec(spec); sys.modules[module_name] = module; spec.loader.exec_module(module)
 provider = module.MemoryWikiProvider(); provider.initialize(module_name, hermes_home=home, agent_context="test")
 Path(ready).write_text("ready", encoding="utf-8")
-deadline = time.monotonic() + 20
+deadline = time.monotonic() + 180
 while not Path(start).exists() and time.monotonic() < deadline: time.sleep(0.01)
 result = provider._claim_code_shrinker_event(Path(retry))
 print(json.dumps({"won": result is not None, "operation_id": result[1] if result else ""}))
 """
     processes = []
     ready_paths = [tmp_path / f"ready-{index}" for index in range(2)]
+
+    def wait_for_ready(process: subprocess.Popen[str], ready: Path) -> None:
+        deadline = time.monotonic() + 60
+        while not ready.exists():
+            if process.poll() is not None:
+                stdout, stderr = process.communicate()
+                pytest.fail(
+                    "claim worker exited before ready: "
+                    f"returncode={process.returncode}, stdout={stdout!r}, stderr={stderr!r}"
+                )
+            if time.monotonic() >= deadline:
+                pytest.fail(
+                    "claim worker did not become ready within 60 seconds: "
+                    f"pid={process.pid}, returncode={process.poll()}"
+                )
+            time.sleep(0.02)
+
     try:
+        # The assertion below concerns cross-process *claiming*. Bootstrap each
+        # full provider independently before the race: concurrent SQLite/schema
+        # initialization is not part of the claim invariant and is too sensitive
+        # to hosted Windows filesystem scheduling.
+        _close(provider)
         for index, ready in enumerate(ready_paths):
             process = subprocess.Popen(
                 [
@@ -1052,10 +1074,7 @@ print(json.dumps({"won": result is not None, "operation_id": result[1] if result
                 text=True,
             )
             processes.append(process)
-        deadline = time.monotonic() + 30
-        while not all(path.exists() for path in ready_paths):
-            assert time.monotonic() < deadline, "claim workers did not become ready"
-            time.sleep(0.02)
+            wait_for_ready(process, ready)
         start.touch()
         outputs = []
         for process in processes:
