@@ -1,4 +1,4 @@
-"""memory-wiki v1.23.3+r19-token-governor+audit-fix-r1+document-cache-r2+document-secret-r3+prefetch-observability-r4+secret-context-r5+vault-registry-r6+adapter-resolution-r7+semantic-recovery-r8+code-knowledge-graph-v1+embedding-provider-fix+secret-broker-v2.2+qdrant-contract-r9+pack-context-guard-r9+alias-bootstrap-r9+partition-cache-r20: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.24.0: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -239,7 +239,7 @@ try:
 except ImportError:
     import online_metrics as _online_metrics
 
-PLUGIN_VERSION = "1.23.3"
+PLUGIN_VERSION = "1.24.0"
 BUILTIN_PREFERENCE_RULES = (
     ("pref_current_instruction", "Fresh explicit user instruction in the current turn overrides durable memory and autonomy defaults.", 1000, "global", "system"),
     ("pref_user_correction", "Explicit user corrections supersede older inferred or assistant-written claims.", 940, "global", "system"),
@@ -1032,6 +1032,94 @@ _QDRANT_PROFILE_DEFAULTS = {
 _IMPORT_HERMES_HOME = Path(
     os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
 ).expanduser().resolve()
+_GLOBAL_SEARCH_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_GLOBAL_SEARCH_PUBLIC_ENV = {
+    "MEMORY_WIKI_GLOBAL_SEARCH_ENABLED",
+    "MEMORY_WIKI_GLOBAL_SEARCH_PROFILES",
+    "MEMORY_WIKI_GLOBAL_SEARCH_CANDIDATE_LIMIT",
+}
+
+
+def _profile_public_env(home: Path, names: Iterable[str]) -> Dict[str, str]:
+    """Read a small allowlist of non-secret settings from one profile .env.
+
+    The desktop can host several profiles in one process, so the ambient process
+    environment is not authoritative for a foreign profile.  This reader never
+    returns credentials and intentionally accepts only the supplied allowlist.
+    """
+    wanted = {str(name) for name in names}
+    selected: Dict[str, str] = {}
+    env_path = Path(home).expanduser() / ".env"
+    if not env_path.is_file():
+        return selected
+    try:
+        with env_path.open("r", encoding="utf-8-sig") as handle:
+            for line in handle:
+                key, separator, value = line.partition("=")
+                key = key.strip().removeprefix("export ").strip()
+                if not separator or key not in wanted:
+                    continue
+                value = value.strip()
+                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                    value = value[1:-1]
+                selected[key] = value
+    except (OSError, UnicodeError):
+        return {}
+    return selected
+
+
+def _global_search_settings(home: Path) -> Dict[str, Any]:
+    """Return explicit, profile-local authorization for read-only fleet search."""
+    resolved = Path(home).expanduser().resolve()
+    values = _profile_public_env(resolved, _GLOBAL_SEARCH_PUBLIC_ENV)
+    # Process-level variables are the supported user-environment rollout path;
+    # a profile-local allowlisted value takes precedence when intentionally set.
+    for name in _GLOBAL_SEARCH_PUBLIC_ENV:
+        values.setdefault(name, os.environ.get(name, ""))
+    enabled = str(values.get("MEMORY_WIKI_GLOBAL_SEARCH_ENABLED", "0")).strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    raw_profiles = str(values.get("MEMORY_WIKI_GLOBAL_SEARCH_PROFILES", "") or "")
+    profiles: List[str] = []
+    for item in raw_profiles.split(","):
+        name = item.strip().lower()
+        if name and _GLOBAL_SEARCH_PROFILE_NAME_RE.fullmatch(name) and name not in profiles:
+            profiles.append(name)
+    try:
+        candidate_limit = int(values.get("MEMORY_WIKI_GLOBAL_SEARCH_CANDIDATE_LIMIT", "400") or 400)
+    except (TypeError, ValueError):
+        candidate_limit = 400
+    return {
+        "enabled": enabled,
+        "profiles": profiles,
+        "candidate_limit": max(20, min(candidate_limit, 1000)),
+    }
+
+
+def _global_search_profile_homes(home: Path) -> List[Tuple[str, Path]]:
+    """Resolve configured profile labels without accepting arbitrary tool paths."""
+    resolved = Path(home).expanduser().resolve()
+    settings = _global_search_settings(resolved)
+    if not settings["enabled"]:
+        return []
+    fleet_root = resolved.parent.parent if resolved.parent.name.lower() == "profiles" else resolved
+    fleet_root = fleet_root.resolve()
+    profiles_root = (fleet_root / "profiles").resolve()
+    homes: List[Tuple[str, Path]] = []
+    for label in settings["profiles"]:
+        candidate = fleet_root if label == "default" else profiles_root / label
+        try:
+            candidate = candidate.resolve()
+        except OSError:
+            continue
+        # Names are normalized above; still enforce that non-default targets
+        # remain direct children of the profile root after resolution.
+        if label != "default" and candidate.parent != profiles_root:
+            continue
+        if not (candidate / "memory-wiki" / "memory_wiki.sqlite3").is_file():
+            continue
+        homes.append((label, candidate))
+    return homes
 _PROFILE_SECRET_KEYS = {
     "MEMORY_WIKI_EMBED_API_KEY", "MEMORY_WIKI_RERANK_API_KEY",
     "MEMORY_WIKI_GRAPH_EXTRACT_API_KEY",
@@ -3152,8 +3240,11 @@ PREFETCH_CLAIM_LIMIT = _env_int("MEMORY_WIKI_PREFETCH_CLAIM_LIMIT", 12, 5, 50)
 PREFETCH_MIN_RELEVANT_CLAIMS = _env_int("MEMORY_WIKI_PREFETCH_MIN_RELEVANT_CLAIMS", 4, 0, 20)
 PREFETCH_MIN_RELEVANT_CHARS = _env_int("MEMORY_WIKI_PREFETCH_MIN_RELEVANT_CHARS", 2000, 0, 12000)
 PREFETCH_EXPANSION_FACTOR = _env_int("MEMORY_WIKI_PREFETCH_EXPANSION_FACTOR", 3, 1, 10)
-PREFETCH_CANDIDATE_LIMIT = max(
-    PREFETCH_CLAIM_LIMIT, min(50, PREFETCH_CLAIM_LIMIT * PREFETCH_EXPANSION_FACTOR)
+PREFETCH_CANDIDATE_LIMIT = _env_int(
+    "MEMORY_WIKI_PREFETCH_CANDIDATE_LIMIT",
+    PREFETCH_CLAIM_LIMIT * PREFETCH_EXPANSION_FACTOR,
+    PREFETCH_CLAIM_LIMIT,
+    200,
 )
 PREFETCH_CLAIM_MAX_CHARS = _env_int("MEMORY_WIKI_PREFETCH_CLAIM_MAX_CHARS", 1200, 300, 2400)
 PREFETCH_EVIDENCE_MAX_CHARS = _env_int("MEMORY_WIKI_PREFETCH_EVIDENCE_MAX_CHARS", 600, 0, 1600)
@@ -7682,6 +7773,7 @@ class MemoryWikiProvider(MemoryProvider):
         P = lambda props, req=(): {"type":"object","properties":props,"required":list(req)}
         return [
             {"name":"memory_wiki_query","description":"Search memory-wiki claims with FTS + salience/freshness scoring.","parameters":P({"query":{"type":"string"},"limit":{"type":"integer","default":10},"include_stale":{"type":"boolean","default":True},"topic":{"type":"string"}}, ["query"])},
+            {"name":"memory_wiki_global_search","description":"Explicit opt-in read-only hybrid search across configured local Hermes profiles. Fans out FTS5 + Qdrant semantic retrieval, revalidates every match against each profile SQLite source of truth, and returns active redacted non-secret claims without copying or mutating profile data.","parameters":{**P({"query":{"type":"string","minLength":1,"maxLength":4000},"limit":{"type":"integer","default":30,"minimum":1,"maximum":200},"mode":{"type":"string","enum":["hybrid","fts","vector"],"default":"hybrid"}}, ["query"]),"additionalProperties":False}},
             {"name":"memory_wiki_query_episodes","description":"Search bounded, untrusted host-attested dialogue excerpts for this bot/chat. Disabled unless MEMORY_WIKI_EPISODIC_ENABLED=1; scope is fixed by host configuration.","parameters":{**P({"query":{"type":"string"},"limit":{"type":"integer","default":2}}, ["query"]),"additionalProperties":False}},
             {"name":"memory_wiki_add_claim","description":"Add an unverified claim in the current chat with optional event time.","parameters":P({"claim":{"type":"string"},"topic":{"type":"string","default":"general"},"evidence":{"type":"string","default":""},"confidence":{"type":"number","default":0.75},"salience":{"type":"number","default":0.7},"event_at":{"type":"integer","default":0},"event_timezone":{"type":"string","default":"UTC"}}, ["claim"])},
             {"name":"memory_wiki_query_secrets","description":"Query safe secret metadata from Memory Wiki plus read-through secret-context metadata. Plaintext and capability tokens are never returned by this tool.","parameters":{**P({"query":{"type":"string","minLength":2},"limit":{"type":"integer","default":10}}, ["query"]),"additionalProperties":False}},
@@ -8056,6 +8148,11 @@ class MemoryWikiProvider(MemoryProvider):
             if tool_name == "memory_wiki_query":
                 rows = self._search(a.get("query",""), int(a.get("limit",10)), bool(a.get("include_stale",True)), a.get("topic"))
                 return tool_result(success=True, claims=[self._rowdict(r) for r in rows])
+            if tool_name == "memory_wiki_global_search":
+                result = self._global_search(
+                    a.get("query", ""), int(a.get("limit", 30)), a.get("mode", "hybrid"),
+                )
+                return tool_result(success=bool(result.get("enabled")) and not bool(result.get("error")), **result)
             if tool_name == "memory_wiki_add_claim":
                 topic = safe_auxiliary_text(a.get("topic") or "general", "topic") if not _journal_replay else a.get("topic") or "general"
                 if not _journal_replay and a.get("source"):
@@ -8703,7 +8800,7 @@ class MemoryWikiProvider(MemoryProvider):
     def _nonmutating_journal_tools() -> set[str]:
         """Tool calls that neither change durable knowledge nor need replay."""
         return {
-            "memory_wiki_query", "memory_wiki_query_episodes", "memory_wiki_query_secrets", "memory_wiki_recall_plan", "memory_wiki_recall",
+            "memory_wiki_query", "memory_wiki_global_search", "memory_wiki_query_episodes", "memory_wiki_query_secrets", "memory_wiki_recall_plan", "memory_wiki_recall",
             "memory_wiki_active_dashboard", "memory_wiki_list_backups", "memory_wiki_list_scoped_backups", "memory_wiki_dashboard",
             "memory_wiki_get_page", "memory_wiki_graph_query", "memory_wiki_graph_extract_claim", "memory_wiki_pack_context",
             "memory_wiki_memory_diff", "memory_wiki_preference_layer", "memory_wiki_health",
@@ -16327,8 +16424,230 @@ class MemoryWikiProvider(MemoryProvider):
         _debug_log(f"SEMANTIC hydrated={hydrated} requested={len(claim_ids)}")
         return hydrated
 
+    @staticmethod
+    def _global_search_row_allowed(row: sqlite3.Row) -> bool:
+        """Apply a strict, profile-independent non-secret read boundary."""
+        try:
+            if str(row["status"] or "") != "active":
+                return False
+            if str(row["risk"] or "low") == "secret" or int(row["quarantined_at"] or 0) > 0:
+                return False
+            if str(row["trust_class"] or "fact") in {"tool_log", "raw_blob", "secret"}:
+                return False
+            if str(row["type"] or "fact") == "source_artifact":
+                return False
+            if float(row["quality"] or 0.0) < 0.20:
+                return False
+            text = "\n".join((
+                str(row["claim"] or ""),
+                str(row["normalized_claim"] or ""),
+                str(row["evidence"] or ""),
+            ))
+            return not bool(secret_scan(text).get("raw_secret"))
+        except (KeyError, TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _global_search_output_row(
+        row: sqlite3.Row,
+        profile: str,
+        score: float,
+        lexical: float,
+        semantic: float,
+    ) -> Dict[str, Any]:
+        """Expose only redacted, non-owner fields from a foreign profile row."""
+        claim = redact_secrets(scrub_memory_artifacts(str(row["claim"] or "")))
+        evidence = redact_secrets(scrub_memory_artifacts(str(row["evidence"] or "")))
+        sources = []
+        if lexical > 0:
+            sources.append("fts")
+        if semantic > 0:
+            sources.append("qdrant")
+        return {
+            "id": str(row["id"]),
+            "global_id": f"{profile}:{row['id']}",
+            "profile": profile,
+            "claim": short(claim, 2400),
+            "evidence": short(evidence, 1200),
+            "topic": str(row["topic"] or ""),
+            "status": str(row["status"] or ""),
+            "confidence": float(row["confidence"] or 0.0),
+            "salience": float(row["salience"] or 0.0),
+            "freshness_at": int(row["freshness_at"] or 0),
+            "score": round(float(score), 6),
+            "score_parts": {
+                "rrf": round(float(score), 6),
+                "lexical": round(float(lexical), 6),
+                "semantic": round(float(semantic), 6),
+            },
+            "retrieval_sources": sources,
+        }
+
+    def _global_search(
+        self,
+        query: str,
+        limit: int = 30,
+        mode: str = "hybrid",
+    ) -> Dict[str, Any]:
+        """Read-only federation over explicitly configured local profile homes.
+
+        This is intentionally not automatic prefetch and does not merge SQLite
+        databases or Qdrant collections.  Each profile remains the source of
+        truth; this tool fans out a lexical and semantic query, revalidates the
+        returned IDs locally, then returns only redacted active non-secret rows.
+        """
+        settings = _global_search_settings(self.home)
+        q = str(query or "").strip()
+        requested_mode = str(mode or "hybrid").strip().lower()
+        if requested_mode not in {"hybrid", "fts", "vector"}:
+            return {"enabled": True, "error": "invalid_retrieval_mode"}
+        if not settings["enabled"]:
+            return {"enabled": False, "error": "global_search_disabled"}
+        if not q:
+            return {"enabled": True, "error": "query_required"}
+        homes = _global_search_profile_homes(self.home)
+        if not homes:
+            return {"enabled": True, "error": "no_configured_profile_databases"}
+        result_limit = max(1, min(int(limit or 30), 200))
+        candidate_limit = max(
+            result_limit,
+            min(int(settings["candidate_limit"]), 1000),
+        )
+        candidates: Dict[str, Tuple[str, sqlite3.Row]] = {}
+        lexical_scores: Dict[str, float] = {}
+        semantic_scores: Dict[str, float] = {}
+        diagnostics: List[Dict[str, Any]] = []
+        safe_fts = safe_fts_query(q, max_terms=24, mode="or")
+        like = f"%{q[:180]}%"
+        base_where = (
+            "claims.status='active' AND COALESCE(claims.risk,'low')!='secret' "
+            "AND COALESCE(claims.quarantined_at,0)=0 "
+            "AND COALESCE(claims.trust_class,'fact') NOT IN ('tool_log','raw_blob','secret') "
+            "AND COALESCE(claims.type,'fact')!='source_artifact' "
+            "AND COALESCE(claims.quality,0)>=0.20"
+        )
+        for profile, home in homes:
+            diag: Dict[str, Any] = {
+                "profile": profile,
+                "lexical_candidates": 0,
+                "semantic_candidates": 0,
+                "semantic_available": False,
+            }
+            db_path = home / "memory-wiki" / "memory_wiki.sqlite3"
+            conn: Optional[sqlite3.Connection] = None
+            try:
+                conn = sqlite3.connect(str(db_path), timeout=5.0)
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA query_only=ON")
+                rows_by_id: Dict[str, sqlite3.Row] = {}
+                if requested_mode != "vector":
+                    try:
+                        fts_rows = conn.execute(
+                            "SELECT claims.*, bm25(claims_fts) AS rank "
+                            "FROM claims_fts JOIN claims ON claims_fts.id=claims.id "
+                            f"WHERE claims_fts MATCH ? AND {base_where} "
+                            "ORDER BY rank LIMIT ?",
+                            (safe_fts, candidate_limit),
+                        ).fetchall()
+                    except (sqlite3.DatabaseError, sqlite3.OperationalError):
+                        fts_rows = []
+                    for row in fts_rows:
+                        if not self._global_search_row_allowed(row):
+                            continue
+                        claim_id = str(row["id"])
+                        key = f"{profile}:{claim_id}"
+                        rows_by_id[claim_id] = row
+                        candidates[key] = (profile, row)
+                        lexical_scores[key] = max(
+                            lexical_scores.get(key, 0.0),
+                            bm25_norm(float(row["rank"] or 0.0)),
+                        )
+                    try:
+                        like_rows = conn.execute(
+                            "SELECT claims.* FROM claims WHERE " + base_where
+                            + " AND (claims.claim LIKE ? OR claims.normalized_claim LIKE ? OR claims.evidence LIKE ?) "
+                            "LIMIT ?",
+                            (like, like, like, candidate_limit),
+                        ).fetchall()
+                    except (sqlite3.DatabaseError, sqlite3.OperationalError):
+                        like_rows = []
+                    for row in like_rows:
+                        if not self._global_search_row_allowed(row):
+                            continue
+                        claim_id = str(row["id"])
+                        key = f"{profile}:{claim_id}"
+                        rows_by_id.setdefault(claim_id, row)
+                        candidates[key] = (profile, rows_by_id[claim_id])
+                        lexical_scores[key] = max(lexical_scores.get(key, 0.0), 0.05)
+                diag["lexical_candidates"] = len(rows_by_id)
+                if requested_mode != "fts" and SEMANTIC_ENABLED:
+                    with _profile_qdrant_scope(home):
+                        if _semantic_available():
+                            diag["semantic_available"] = True
+                            vector = _embed_query(q)
+                            if vector:
+                                matches = _qdrant_search(vector, candidate_limit)
+                                semantic_ids = [str(item[0]) for item in matches if str(item[0])]
+                                if semantic_ids:
+                                    for offset in range(0, len(semantic_ids), 400):
+                                        chunk = semantic_ids[offset:offset + 400]
+                                        placeholders = ",".join("?" for _ in chunk)
+                                        hydrated = conn.execute(
+                                            "SELECT claims.* FROM claims WHERE id IN ("
+                                            + placeholders + ") AND " + base_where,
+                                            chunk,
+                                        ).fetchall()
+                                        for row in hydrated:
+                                            if not self._global_search_row_allowed(row):
+                                                continue
+                                            claim_id = str(row["id"])
+                                            key = f"{profile}:{claim_id}"
+                                            rows_by_id[claim_id] = row
+                                            candidates[key] = (profile, row)
+                                    for claim_id, value in matches:
+                                        key = f"{profile}:{claim_id}"
+                                        if key in candidates:
+                                            semantic_scores[key] = max(
+                                                semantic_scores.get(key, 0.0), float(value),
+                                            )
+                diag["semantic_candidates"] = sum(
+                    1 for key in semantic_scores if key.startswith(profile + ":")
+                )
+            except (OSError, sqlite3.DatabaseError, sqlite3.OperationalError):
+                diag["database_available"] = False
+            finally:
+                if conn is not None:
+                    conn.close()
+            diagnostics.append(diag)
+        fused = _rrf_fusion(lexical_scores, semantic_scores, RRF_K)
+        output = []
+        for key, (profile, row) in candidates.items():
+            item = self._global_search_output_row(
+                row,
+                profile,
+                fused.get(key, 0.0),
+                lexical_scores.get(key, 0.0),
+                semantic_scores.get(key, 0.0),
+            )
+            if item["retrieval_sources"]:
+                output.append(item)
+        output.sort(key=lambda item: (-float(item["score"]), item["profile"], item["id"]))
+        return {
+            "enabled": True,
+            "query": redact_secrets(q),
+            "mode": requested_mode,
+            "configured_profiles": [name for name, _home in homes],
+            "searched_profiles": [item["profile"] for item in diagnostics],
+            "profile_diagnostics": diagnostics,
+            "candidate_limit_per_profile": candidate_limit,
+            "limit": result_limit,
+            "claims": output[:result_limit],
+            "automatic_prefetch": False,
+            "mutated": False,
+        }
+
     def _search(self, query: str, limit=10, include_stale=True, topic: Optional[str]=None, session_id: str="", retrieval_mode: str="hybrid", record_retrieval: bool=True, include_all_projects: bool=False, apply_rerank: bool=True, *, conn: Optional[sqlite3.Connection] = None) -> List[Dict[str, Any]]:
-        limit = max(1, min(int(limit or 10), 50)); q = query or ""; qt = tokens(q); c = conn or self._connect()
+        limit = max(1, min(int(limit or 10), 200)); q = query or ""; qt = tokens(q); c = conn or self._connect()
         retrieval_mode = str(retrieval_mode or "hybrid").strip().lower()
         if retrieval_mode not in {"hybrid", "fts", "vector"}:
             raise ValueError("retrieval_mode must be one of: hybrid, fts, vector")

@@ -114,10 +114,35 @@ def _document_profile_scope(home: Path):
         _DOCUMENT_PROFILE_SCOPE.reset(token)
 
 
+_PROFILE_GLOBAL_FEATURE_DEFAULTS = frozenset({
+    # These only tune optional processing.  They neither select a filesystem
+    # root nor widen document/project authorization, so an administrator may
+    # set one user-level default for every independent profile.
+    "MEMORY_WIKI_DOCUMENT_AUTO_SCAN_CACHE",
+    "MEMORY_WIKI_DOCUMENT_AUTO_EMBED",
+    "MEMORY_WIKI_DOCUMENT_AUTO_MIN_AGE_SECONDS",
+    "MEMORY_WIKI_DOCUMENT_AUTO_SCAN_MAX_CHANGED",
+    "MEMORY_WIKI_DOCUMENT_AUTO_SCAN_MAX_FILES",
+    "MEMORY_WIKI_DOCUMENT_AUTO_SCAN_SECONDS",
+    "MEMORY_WIKI_DOCUMENT_AUTO_TRUST_STAT_FAST_PATH",
+    "MEMORY_WIKI_DOCUMENT_PREFETCH",
+    "MEMORY_WIKI_DOCUMENT_PREFETCH_CHARS",
+    "MEMORY_WIKI_DOCUMENT_PREFETCH_HITS",
+    "MEMORY_WIKI_DOCUMENT_RERANK",
+})
+
+
 def _document_env(name: str, default: Optional[str] = None) -> Optional[str]:
     scope = _DOCUMENT_PROFILE_SCOPE.get()
     if scope is not None and scope["strict"]:
-        return scope["settings"].get(name, default)
+        if name in scope["settings"]:
+            return scope["settings"][name]
+        # Keep roots, cache locations, scopes, repository IDs, external URLs,
+        # and cross-scope permission profile-local.  Only this fixed allowlist
+        # can inherit a non-secret, OS user-level performance default.
+        if name in _PROFILE_GLOBAL_FEATURE_DEFAULTS:
+            return os.environ.get(name, default)
+        return default
     return os.environ.get(name, default)
 
 

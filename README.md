@@ -1,8 +1,24 @@
-# Hermes Memory Wiki v1.23.3
+# Hermes Memory Wiki v1.24.0
 
-Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 120 MCP tools.
+Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 121 MCP tools.
 
 The supported security properties and private reporting path are documented in [`SECURITY.md`](SECURITY.md).
+
+## Explicit profile-fleet search (v1.24.0)
+
+`memory_wiki_global_search` is an explicit, read-only opt-in for one trusted local Hermes profile fleet. It fans one query out across the configured profiles, runs local FTS5/BM25 plus each profile's Qdrant semantic index, hydrates every vector ID from that profile's authoritative SQLite database, and uses RRF to produce one ranked list.
+
+It **does not** merge databases, reuse a foreign profile's SQLite connection, copy claims into a shared collection, write to a profile, or participate in automatic prompt prefetch. Results carry `profile` and a non-mutable `global_id` (`profile:claim_id`). The cross-profile path returns only active, redacted, non-secret, non-quarantined, non-artifact claims and rejects arbitrary paths: its profile list contains normalized sibling profile names only.
+
+Enable it independently in each participating profile with the same named fleet:
+
+```env
+MEMORY_WIKI_GLOBAL_SEARCH_ENABLED=1
+MEMORY_WIKI_GLOBAL_SEARCH_PROFILES=default,gaming,learning,work
+MEMORY_WIKI_GLOBAL_SEARCH_CANDIDATE_LIMIT=600  # 20–1000 per profile
+```
+
+The tool accepts `mode=hybrid|fts|vector`, returns at most 200 rows, and never widens secret-vault access, shared recovery, session-history, or audit-log permissions. Those remain separately opt-in because they have different authorization semantics.
 
 Reproducible benchmark runners live under `benchmarks/`; run `python benchmarks/audit_retrieval.py` for the offline startup/retrieval check. Ad hoc local reports and run outputs are ignored; the audited full LongMemEval evidence artifact and its provenance manifest are versioned as the release baseline.
 
@@ -188,6 +204,9 @@ Plaintext returned intentionally by `secret_context_lookup` can still enter the 
 | `MEMORY_WIKI_QDRANT_API_KEY` | (empty) | Qdrant API key if auth enabled |
 | `MEMORY_WIKI_QDRANT_HISTORICAL_COLLECTIONS` | (empty) | Comma-separated collection names explicitly owned by this profile for old vector cleanup |
 | `MEMORY_WIKI_QDRANT_HISTORICAL_ENDPOINTS` | (empty) | Comma-separated Qdrant endpoint URLs explicitly owned by this profile for old vector cleanup |
+| `MEMORY_WIKI_GLOBAL_SEARCH_ENABLED` | `0` | Enable the explicit read-only profile-fleet search tool; never changes automatic prefetch |
+| `MEMORY_WIKI_GLOBAL_SEARCH_PROFILES` | (empty) | Comma-separated normalized sibling profile names authorized for the fleet search, e.g. `default,gaming,learning,work` |
+| `MEMORY_WIKI_GLOBAL_SEARCH_CANDIDATE_LIMIT` | `400` | Candidate cap per participating profile, range 20–1000; tool results remain capped at 200 |
 | `MEMORY_WIKI_PREFETCH_CLAIM_LIMIT` | `20` | Maximum main claims in automatic prompt-time recall |
 | `MEMORY_WIKI_PREFETCH_DEADLINE_SECONDS` | `5.5` | Hard prompt-time budget, clamped to 5–6 seconds |
 | `MEMORY_WIKI_PREFETCH_NETWORK_RESERVE_SECONDS` | `0.25` | Time reserved after every bounded network operation |
@@ -197,7 +216,8 @@ Plaintext returned intentionally by `secret_context_lookup` can still enter the 
 | `MEMORY_WIKI_ONLINE_METRICS_ENABLED` | `true` | Keep fixed-dimension, content-free daily prefetch and explicit-recall aggregates; set `0` to disable |
 | `MEMORY_WIKI_ONLINE_METRICS_DAYS` | `30` | Retain aggregates for 1–90 days; health shows at most the latest seven days |
 | `MEMORY_WIKI_PREFETCH_MIN_RELEVANT_CHARS` | `2000` | Soft relevant-content target used for shortfall diagnostics |
-| `MEMORY_WIKI_PREFETCH_EXPANSION_FACTOR` | `3` | Candidate-pool multiplier, capped at 50 rows |
+| `MEMORY_WIKI_PREFETCH_EXPANSION_FACTOR` | `3` | Candidate-pool multiplier when no explicit candidate limit is set |
+| `MEMORY_WIKI_PREFETCH_CANDIDATE_LIMIT` | claim limit × expansion | Explicit candidate-pool cap for automatic recall, range `claim_limit`–200 |
 | `MEMORY_WIKI_PREFETCH_DIAGNOSTICS` | `anomalies` | `off`, `anomalies`, or `always`; records searched/rendered/quarantined/size |
 | `MEMORY_WIKI_PREFETCH_CLAIM_MAX_CHARS` | `1200` | Maximum sanitized text per rendered claim |
 | `MEMORY_WIKI_PREFETCH_EVIDENCE_MAX_CHARS` | `600` | Maximum guard-safe evidence text per claim |

@@ -77,3 +77,19 @@ def test_nested_document_scopes_restore_each_profiles_configuration(tmp_path, mo
             assert module._document_cache_root() == learning_file.parent
             assert module._document_env("MEMORY_WIKI_DOCUMENT_AUTO_SCOPE_ID") == "learning-scope"
         assert module._document_cache_root() == default_file.parent
+
+
+def test_document_profile_scope_allows_only_safe_global_feature_defaults(tmp_path, monkeypatch):
+    module = _module()
+    default, _ = _home(tmp_path, "default")
+    gaming, _ = _home(tmp_path, "gaming")
+    monkeypatch.setenv("HERMES_HOME", str(default))
+    monkeypatch.setenv("MEMORY_WIKI_DOCUMENT_PREFETCH", "1")
+    monkeypatch.setenv("MEMORY_WIKI_DOCUMENT_RERANK", "1")
+    monkeypatch.setenv("MEMORY_WIKI_DOCUMENT_ACCESS_SCOPE_ID", "must-not-leak")
+
+    with module._document_profile_scope(gaming):
+        assert module._document_env("MEMORY_WIKI_DOCUMENT_PREFETCH") == "1"
+        assert module._document_env("MEMORY_WIKI_DOCUMENT_RERANK") == "1"
+        # Global safe feature defaults must not widen file/scope authorization.
+        assert module._document_env("MEMORY_WIKI_DOCUMENT_ACCESS_SCOPE_ID") is None

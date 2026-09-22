@@ -26,6 +26,39 @@
     }
   },
   {
+    "name": "memory_wiki_global_search",
+    "description": "Explicit opt-in read-only hybrid search across configured local Hermes profiles. Fans out FTS5 + Qdrant semantic retrieval, revalidates every match against each profile SQLite source of truth, and returns active redacted non-secret claims without copying or mutating profile data.",
+    "parameters": {
+      "type": "object",
+      "properties": {
+        "query": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4000
+        },
+        "limit": {
+          "type": "integer",
+          "default": 30,
+          "minimum": 1,
+          "maximum": 200
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "hybrid",
+            "fts",
+            "vector"
+          ],
+          "default": "hybrid"
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "additionalProperties": false
+    }
+  },
+  {
     "name": "memory_wiki_query_episodes",
     "description": "Search bounded, untrusted host-attested dialogue excerpts for this bot/chat. Disabled unless MEMORY_WIKI_EPISODIC_ENABLED=1; scope is fixed by host configuration.",
     "parameters": {
