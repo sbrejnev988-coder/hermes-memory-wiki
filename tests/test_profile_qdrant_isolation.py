@@ -8,6 +8,8 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
 
 PLUGIN = Path(__file__).resolve().parents[1] / "__init__.py"
 
@@ -60,6 +62,74 @@ def _provider(module, home: Path, monkeypatch):
     return provider
 
 
+def test_shared_process_root_profile_keeps_canonical_alias_when_not_importer(
+    tmp_path, monkeypatch,
+):
+    """The fleet root must not inherit the importing named profile alias."""
+    root = _home(tmp_path, "default")
+    profiles = root / "profiles"
+    profiles.mkdir()
+    importer = _home(profiles, "learning")
+    root_env = root / ".env"
+    root_env.write_text(
+        root_env.read_text(encoding="utf-8").replace(
+            "MEMORY_WIKI_QDRANT_ALIAS=default_active\n", ""
+        ),
+        encoding="utf-8",
+    )
+    module = _module(
+        tmp_path, monkeypatch, importer=importer, ambient_home=importer,
+        name="mw_root_alias_missing_from_file",
+    )
+    with module._profile_qdrant_scope(root):
+        assert module._semantic_profile_ready()
+        assert module._qdrant_collection() == "default_claims"
+        assert module._qdrant_alias() == "memory_wiki_claims_active"
+
+    named = _home(profiles, "gaming")
+    named_env = named / ".env"
+    named_env.write_text(
+        named_env.read_text(encoding="utf-8").replace(
+            "MEMORY_WIKI_QDRANT_ALIAS=gaming_active\n", ""
+        ),
+        encoding="utf-8",
+    )
+    with module._profile_qdrant_scope(named):
+        assert not module._semantic_profile_ready()
+
+
+@pytest.mark.parametrize("already_hashed", [False, True], ids=["plain-base", "hashed-base"])
+def test_force_reindex_staging_target_is_owned_without_widening_profile_scope(
+    tmp_path, monkeypatch, already_hashed,
+):
+    home = _home(tmp_path, "default")
+    base = "default_claims_8278d1218cc6" if already_hashed else "default_claims"
+    (home / ".env").write_text(
+        "MEMORY_WIKI_QDRANT_URL=http://127.0.0.1:6333\n"
+        f"MEMORY_WIKI_QDRANT_COLLECTION={base}\n"
+        "MEMORY_WIKI_QDRANT_ALIAS=default_active\n"
+        "MEMORY_WIKI_EPISODIC_QDRANT_COLLECTION=default_episodes\n",
+        encoding="utf-8",
+    )
+    module = _module(
+        tmp_path, monkeypatch, importer=home, ambient_home=home,
+        name=f"mw_force_target_{'hashed' if already_hashed else 'plain'}",
+    )
+    with module._profile_qdrant_scope(home):
+        physical = module._physical_collection_name()
+        staging = f"{physical}_force_1790000000"
+        assert module._is_managed_claim_collection(staging)
+        assert module._profile_target_allowed(staging)
+        for foreign in (
+            f"{physical}_force_arbitrary", f"{physical}_force_1790000000_extra",
+            "other_claims_8278d1218cc6_force_1790000000",
+        ):
+            assert not module._is_managed_claim_collection(foreign)
+            assert not module._profile_target_allowed(foreign)
+        if not already_hashed:
+            assert not module._profile_target_allowed(f"{base}_force_1790000000")
+
+
 def test_mixed_import_routes_default_and_learning_to_their_own_targets(
     tmp_path, monkeypatch,
 ):
@@ -73,11 +143,25 @@ def test_mixed_import_routes_default_and_learning_to_their_own_targets(
     monkeypatch.setattr(module, "_ensure_collection", lambda _collection=None: True)
     monkeypatch.setattr(module, "_embed_document", lambda _text: [0.0] * module.QDRANT_VECTOR_SIZE)
     requests = []
-    monkeypatch.setattr(
-        module, "_qdrant_req",
-        lambda method, path, body=None, timeout=10.0: requests.append((method, path))
-        or {"result": {"status": "completed"}},
-    )
+    points = {}
+
+    def request(method, path, body=None, timeout=10.0):
+        requests.append((method, path))
+        collection = path.split("/")[2] if path.startswith("/collections/") else ""
+        if method == "PUT" and path.endswith("/points?wait=true"):
+            for point in body["points"]:
+                points[(collection, str(point["id"]))] = dict(point)
+            return {"result": {"status": "completed"}}
+        if method == "POST" and path.endswith("/points"):
+            assert body.get("with_payload") is True and body.get("with_vector") is False
+            return {"result": [
+                {"id": point["id"], "payload": dict(point["payload"])}
+                for point_id in body["ids"]
+                if (point := points.get((collection, str(point_id)))) is not None
+            ]}
+        return {"result": {"status": "completed"}}
+
+    monkeypatch.setattr(module, "_qdrant_req", request)
     provider = _provider(module, default, monkeypatch)
     assert (default / "memory-wiki" / "embedding_manifest.json").is_file()
     assert not (learning / "memory-wiki" / "embedding_manifest.json").exists()

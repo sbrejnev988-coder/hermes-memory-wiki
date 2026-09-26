@@ -33,7 +33,7 @@ def test_metadata_registry_query_works_without_legacy_secret_core(tmp_path: Path
                 "version": 1,
                 "entries": [
                     {
-                        "secret_id": "sec_safe_registry_test",
+                        "secret_id": "sec_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                         "lookup_key": "safe-test/hermes/ssh",
                         "aliases": [],
                         "secret_type": "ssh_credential",
@@ -82,7 +82,7 @@ def test_metadata_registry_query_skips_legacy_index_by_default_when_core_exists(
                 "version": 1,
                 "entries": [
                     {
-                        "secret_id": "sec_default_no_legacy_test",
+                        "secret_id": "sec_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
                         "lookup_key": "safe-test/default/ssh",
                         "aliases": [],
                         "secret_type": "ssh_credential",

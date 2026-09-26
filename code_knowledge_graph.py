@@ -2122,6 +2122,14 @@ def _query_code_graph_on_connection(
     repository_id = _graph_lookup_identity(
         provider, str(args.get("repository_id") or "").strip(), conn=conn,
     )
+    project_scope = _graph_lookup_identity(
+        provider, str(getattr(provider, "project_scope", "") or "").strip(), conn=conn,
+    )
+    if not project_scope:
+        raise PermissionError("code graph query requires an active project scope")
+    if repository_id and repository_id != project_scope:
+        raise PermissionError("code graph repository is outside the active project scope")
+    repository_id = project_scope
     limit = max(1, min(int(args.get("limit") or 12), 50))
     lexical_limit = max(20, min(int(args.get("candidate_limit") or limit * 8), 300))
     symbol_rows = _fts_rows(conn, "code_graph_symbols_fts", repository_id, query,
@@ -2688,8 +2696,16 @@ def maybe_prefetch_code_context(provider: Any, query: str, max_chars: int = 8000
         return ""
     conn, owns_conn = _open_graph_reader_connection(provider)
     try:
+        # Prefetch is model-facing: repository names in a prompt or the graph
+        # table are not authority to read outside the active project.
+        project_scope = _graph_lookup_identity(
+            provider, str(getattr(provider, "project_scope", "") or "").strip(), conn=conn,
+        )
+        if not project_scope:
+            return ""
         repos = [str(r[0]) for r in conn.execute(
-            "SELECT repository_id FROM code_graph_repositories ORDER BY updated_at DESC LIMIT 20"
+            "SELECT repository_id FROM code_graph_repositories WHERE repository_id=? "
+            "ORDER BY updated_at DESC LIMIT 20", (project_scope,),
         ).fetchall()]
     finally:
         _close_graph_writer_connection(conn, owns_conn)

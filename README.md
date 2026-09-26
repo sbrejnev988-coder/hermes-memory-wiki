@@ -136,7 +136,7 @@ Plaintext returned intentionally by `secret_context_lookup` can still enter the 
 
 ## Requirements
 
-- Python 3.11 or 3.12 (the supported range is `>=3.11,<3.13`)
+- Python 3.11–3.14 (the supported range is `>=3.11,<3.15`)
 - SQLite 3.35+ (FTS5)
 - Qdrant (optional, for semantic search)
 - OpenRouter API key (only when embeddings or rerank are enabled)

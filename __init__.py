@@ -1155,6 +1155,20 @@ def _profile_qdrant_settings(home: Path) -> Dict[str, str]:
                     if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
                         value = value[1:-1]
                     selected[key] = value
+        # The fleet root historically relies on the canonical alias default.
+        # A named profile may import this module first in Desktop; that must
+        # not make the root profile incompatible or borrow the importer's alias.
+        # Named/other foreign homes still require their own explicit alias.
+        importer_root = (
+            _IMPORT_HERMES_HOME.parent.parent
+            if _IMPORT_HERMES_HOME.parent.name.lower() == "profiles"
+            else _IMPORT_HERMES_HOME
+        )
+        if (Path(home).expanduser().resolve() == importer_root
+                and not selected.get("MEMORY_WIKI_QDRANT_ALIAS")):
+            selected["MEMORY_WIKI_QDRANT_ALIAS"] = _QDRANT_PROFILE_DEFAULTS[
+                "MEMORY_WIKI_QDRANT_ALIAS"
+            ]
         compatible = all(
             key not in selected or selected[key].rstrip("/") == value.rstrip("/")
             for key, value in _PROFILE_EMBED_CONTRACT.items()
@@ -3751,6 +3765,12 @@ _QDRANT_CLAIM_RECONCILIATION_FIELDS = (
     "origin_chat_hash",
     "project_id",
 )
+_QDRANT_CLAIM_STATE_FIELDS = (
+    "id", "claim_id", "topic", "vector_text_hash", "memory_revision",
+    "updated_at", "visibility_scope", "origin_bot_id", "origin_session_id",
+    "origin_chat_hash", "project_id", "event_at", "manifest_hash",
+    "payload_version",
+)
 
 
 def _payload_field(metadata: Any, key: str, default: Any = "") -> Any:
@@ -3811,7 +3831,12 @@ def _qdrant_claim_reconciliation_state(payload: Any) -> Dict[str, Any]:
     Presence is committed separately from the value so a legacy payload with a
     missing ACL field never compares equal to an intentional empty field.
     """
-    source = dict(payload or {}) if isinstance(payload, dict) else {}
+    # Qdrant's optional `claim` preview is not needed for reconciliation.
+    # Do not request or hash it: a reindexer may not read another chat's text.
+    source = {
+        field: payload[field] for field in _QDRANT_CLAIM_STATE_FIELDS
+        if isinstance(payload, dict) and field in payload
+    }
     acl_manifest = {
         field: {
             "present": field in source,
@@ -4018,7 +4043,36 @@ def _qdrant_upsert(claim_id: str, vector: List[float], payload: dict, collection
         },
     )
     operation_status = (result or {}).get("result", {}).get("status")
-    return operation_status in {"completed", "acknowledged"}
+    if operation_status not in {"completed", "acknowledged"}:
+        return False
+    # The write acknowledgement does not prove the indexed point has the
+    # visibility/manifest fields required by Qdrant's server-side filter.
+    # Verify the exact point before marking either claim or episode indexed.
+    # Fetch metadata only, never the vector; do not log the payload.
+    readback = _qdrant_req(
+        "POST", f"/collections/{coll}/points",
+        {"ids": [_qdrant_point_id(claim_id)],
+         "with_payload": True, "with_vector": False},
+    )
+    points = (readback or {}).get("result")
+    if (not isinstance(points, list) or len(points) != 1
+            or not isinstance(points[0], dict)
+            or str(points[0].get("id")) != str(_qdrant_point_id(claim_id))):
+        # A timeout or absent point is ambiguous, not proof that the payload
+        # is wrong. Keep the outbox retryable without deleting a valid vector.
+        return False
+    observed = points[0].get("payload")
+    if not isinstance(observed, dict):
+        return False
+    if observed != stored_payload:
+        # An ACL mismatch must never be declared indexed. Episodes have an
+        # explicit cleanup contract; for claims, keep the pending intent and
+        # retry rather than deleting a point on ambiguous remote state.
+        if stored_payload.get("object_type") == "episode":
+            if not _qdrant_delete(claim_id, collection=coll):
+                _debug_log("episode payload mismatch cleanup failed")
+        return False
+    return True
 
 def _qdrant_delete(claim_id: str, collection: str = None) -> bool:
     """Delete one claim vector from Qdrant by its stable point ID."""
@@ -4180,7 +4234,7 @@ def _qdrant_claim_state(
     while len(found) < max_points:
         body: Dict[str, Any] = {
             "limit": min(512, max_points - len(found)),
-            "with_payload": True,
+            "with_payload": list(_QDRANT_CLAIM_STATE_FIELDS),
             "with_vector": False,
         }
         if offset is not None:
@@ -4191,10 +4245,21 @@ def _qdrant_claim_state(
         page = (result.get("result") or {})
         points = page.get("points") or []
         for point in points:
-            payload = point.get("payload") or {}
+            if not isinstance(point, dict):
+                return None
+            payload = point.get("payload")
+            if not isinstance(payload, dict):
+                return None
             claim_id = payload.get("claim_id", payload.get("id"))
-            if claim_id not in (None, ""):
-                found[str(claim_id)] = _qdrant_claim_reconciliation_state(payload)
+            if claim_id in (None, ""):
+                return None
+            claim_id = str(claim_id)
+            if (str(point.get("id")) != str(_qdrant_point_id(claim_id))
+                    or claim_id in found):
+                # Payload IDs alone do not prove a claim owns the point; an
+                # absent/duplicate/wrong physical ID makes reconciliation unsafe.
+                return None
+            found[claim_id] = _qdrant_claim_reconciliation_state(payload)
         next_offset = page.get("next_page_offset")
         if next_offset is None or not points:
             break
@@ -4214,6 +4279,60 @@ def _qdrant_claim_ids(collection: str, max_points: int = 200000) -> Optional[set
     """Compatibility wrapper returning only claim IDs."""
     state = _qdrant_claim_state(collection, max_points=max_points)
     return None if state is None else set(state)
+
+
+def _qdrant_registered_claim_vector_for_reindex(
+    db: sqlite3.Connection, claim_id: str, metadata: Any, manifest_hash: str,
+) -> Optional[Tuple[List[float], Dict[str, Any]]]:
+    """Copy a foreign claim only from a verified, profile-owned active point.
+
+    The caller has no permission to read its SQLite text. An old target row is
+    only a location hint; the Qdrant point must match the current ACL/revision
+    and embedding manifest before its vector can be reused.
+    """
+    endpoint = _normalized_qdrant_endpoint()
+    rows = db.execute(
+        """SELECT collection,endpoint,manifest_hash,vector_target_hash
+             FROM claim_vector_targets
+            WHERE claim_id=? AND endpoint=? AND manifest_hash=? AND status='active'
+            ORDER BY indexed_at DESC,updated_at DESC""",
+        (claim_id, endpoint, manifest_hash),
+    ).fetchall()
+    for row in rows:
+        collection = str(row["collection"] or "")
+        if (not collection or collection == _qdrant_alias()
+                or not _profile_target_allowed(collection)
+                or str(row["vector_target_hash"] or "") != _claim_vector_target_hash(
+                    collection=collection, endpoint=endpoint, manifest_hash=manifest_hash,
+                )):
+            continue
+        response = _qdrant_req(
+            "POST", f"/collections/{urllib.parse.quote(collection, safe='')}/points",
+            {"ids": [_qdrant_point_id(claim_id)],
+             "with_payload": list(_QDRANT_CLAIM_STATE_FIELDS), "with_vector": True},
+        )
+        points = response.get("result") if isinstance(response, dict) else None
+        if not isinstance(points, list) or len(points) != 1 or not isinstance(points[0], dict):
+            continue
+        point = points[0]
+        source_payload = point.get("payload")
+        if (str(point.get("id") or "") != str(_qdrant_point_id(claim_id))
+                or not isinstance(source_payload, dict)
+                or "claim" in source_payload
+                or str(source_payload.get("claim_id") or "") != claim_id):
+            continue
+        text_hash = str(source_payload.get("vector_text_hash") or "")
+        if not re.fullmatch(r"[0-9a-f]{64}", text_hash):
+            continue
+        payload = _qdrant_claim_payload(claim_id, "", metadata, manifest_hash=manifest_hash)
+        payload.pop("claim")
+        payload["vector_text_hash"] = text_hash
+        if _qdrant_claim_reconciliation_state(source_payload) != _qdrant_claim_reconciliation_state(payload):
+            continue
+        vector = _validate_embedding_vector(point.get("vector"), "registered claim point")
+        if vector is not None:
+            return vector, payload
+    return None
 
 def _qdrant_search(
     vector: List[float],
@@ -4394,6 +4513,10 @@ def _is_managed_claim_collection(collection: str) -> bool:
     if not value.startswith(base + "_"):
         return False
     suffix = value[len(base) + 1:]
+    # An explicitly hashed base is already the physical collection. A forced
+    # reindex appends the timestamp directly, without another manifest hash.
+    if base == _physical_collection_name() and re.fullmatch(r"force_[0-9]+", suffix):
+        return True
     return bool(re.fullmatch(r"[0-9a-f]{12}(?:_force_[0-9]+)?", suffix))
 
 
@@ -6337,7 +6460,18 @@ class MemoryWikiProvider(MemoryProvider):
         return True
 
     def _has_foreign_claims(self) -> bool:
-        return any(not self._claim_visible(row) for row in self._connect().execute("SELECT * FROM claims"))
+        # The guard itself must not load foreign claim/evidence text merely to
+        # decide that a whole-store diagnostic is forbidden.
+        try:
+            return any(
+                not self._claim_visible(row)
+                for row in self._connect().execute(
+                    "SELECT visibility_scope,origin_bot_id,origin_chat_hash,"
+                    "origin_session_id,project_id FROM claims"
+                )
+            )
+        except sqlite3.DatabaseError:
+            return True  # Missing ACL metadata cannot authorize a shared read.
 
     def _format_claim_time(self, row: Any) -> str:
         keys = set(row.keys()) if hasattr(row, "keys") else set(row)
@@ -8086,7 +8220,7 @@ class MemoryWikiProvider(MemoryProvider):
                 "memory_wiki_compress_topic", "memory_wiki_compile_topic",
                 "memory_wiki_gc", "memory_wiki_decay_scan", "memory_wiki_decay_stats",
                 "memory_wiki_decay_archive", "memory_wiki_maintenance",
-                "memory_wiki_repair", "memory_wiki_reindex",
+                "memory_wiki_repair",
                 "memory_wiki_doctor",
                 "memory_wiki_snapshot",
             }
@@ -8621,7 +8755,7 @@ class MemoryWikiProvider(MemoryProvider):
             if tool_name == "memory_wiki_repository_context":
                 result=self._repository_context(a)
                 return tool_result(success=True, **self._visible_code_claim_result(result,"claims"))
-            if tool_name == "memory_wiki_invalidate_revision": return tool_result(success=True, **self._invalidate_revision(a))
+            if tool_name == "memory_wiki_invalidate_revision": return tool_result(success=True, **self._invalidate_revision(a, model_scope=not _journal_replay))
             if tool_name == "memory_wiki_patch_outcome_add": return tool_result(success=True, **self._patch_outcome_add(a))
             if tool_name == "memory_wiki_compare_search": return tool_result(success=True, **self._compare_search(a.get("query",""), int(a.get("limit",10)), a.get("topic")))
             if tool_name == "memory_wiki_query_mode": return tool_result(success=True, **self._query_mode_tool(a.get("query","")))
@@ -8745,6 +8879,7 @@ class MemoryWikiProvider(MemoryProvider):
                 conn: Optional[sqlite3.Connection] = None
                 try:
                     conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30.0)
+                    conn.create_function("memory_wiki_fts_document", 4, claim_search_text)
                     conn.row_factory = sqlite3.Row
                     conn.execute("PRAGMA busy_timeout=30000")
                     conn.execute("PRAGMA foreign_keys=ON")
@@ -12836,6 +12971,7 @@ class MemoryWikiProvider(MemoryProvider):
         conn: Optional[sqlite3.Connection] = None,
         trusted_opaque_graph_ids: bool = False,
         pre_sanitized_graph_identities: bool = False,
+        model_scope: bool = False,
     ) -> Dict[str, Any]:
         """Archive stale code claims, optionally inside a caller-owned transaction.
 
@@ -12906,12 +13042,39 @@ class MemoryWikiProvider(MemoryProvider):
                 where.append("m.content_hash<>?")
                 params.append(new_content_hash)
             suffix = "".join(labels)
-            rows = active_conn.execute(
-                "SELECT c.*,m.file_path,m.symbol_id,m.content_hash "
+            sql = (
                 "FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id "
-                "WHERE " + " AND ".join(where),
-                params,
-            ).fetchall()
+                "WHERE " + " AND ".join(where)
+            )
+            if model_scope:
+                # Use the model mutation boundary, not just the reader ACL:
+                # project/bot/global claims can be readable without being editable.
+                # Check metadata before loading any claim or evidence text.
+                candidates = active_conn.execute(
+                    "SELECT c.id,c.visibility_scope,c.origin_bot_id,c.origin_chat_hash,"
+                    "c.origin_session_id,c.project_id " + sql, params,
+                ).fetchall()
+                visible_ids = [
+                    str(candidate["id"]) for candidate in candidates
+                    if str(candidate["visibility_scope"] or "") in {"chat", "private"}
+                    and self._claim_visible(candidate)
+                ]
+                rows = [
+                    active_conn.execute(
+                        "SELECT c.*,m.file_path,m.symbol_id,m.content_hash " +
+                        "FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id "
+                        "WHERE c.id=? AND c.status='active'", (claim_id,),
+                    ).fetchone()
+                    for claim_id in visible_ids
+                ]
+                rows = [row for row in rows if row is not None]
+            else:
+                # Signed internal graph events and journal recovery retain their
+                # transactional lifecycle; only the model route is constrained.
+                rows = active_conn.execute(
+                    "SELECT c.*,m.file_path,m.symbol_id,m.content_hash " + sql,
+                    params,
+                ).fetchall()
             for row in rows:
                 cid = str(row["id"])
                 before = dict(row)
@@ -16197,22 +16360,39 @@ class MemoryWikiProvider(MemoryProvider):
             "rows=" + ",".join(sorted(f"{r.get('id','')}:{r.get('updated_at',0)}" for r in prefix)),
         ))
         cache_key = sha(cache_seed)
+
+        def fuse_current_order(ranked: List[Tuple[str, float, int]]) -> List[Dict[str, Any]]:
+            """Fuse cached model ranks with THIS call's local RRF order."""
+            reranker_weight = _rerank_weight(query_mode)
+            base_weight = 1.0 - reranker_weight
+            orig_rank = {str(row.get("id")): i for i, row in enumerate(prefix, 1)}
+            reranker_rank = {cid: rank for cid, _score, rank in ranked}
+            relevance = {cid: score for cid, score, _rank in ranked}
+            fused_prefix = sorted(
+                prefix,
+                key=lambda row: (
+                    base_weight / (RRF_K + orig_rank[str(row.get("id"))])
+                    + reranker_weight / (RRF_K + reranker_rank.get(str(row.get("id")), len(prefix) + 1))
+                ),
+                reverse=True,
+            )
+            ordered: List[Dict[str, Any]] = []
+            for row in fused_prefix:
+                cid = str(row.get("id"))
+                item = dict(row)
+                item["rerank_score"] = round(float(relevance.get(cid, 0.0)), 6)
+                item["rerank_rank"] = int(reranker_rank.get(cid, len(prefix) + 1))
+                ordered.append(item)
+            used = {str(row.get("id")) for row in ordered}
+            ordered.extend(row for row in original if str(row.get("id")) not in used)
+            return ordered
+
         if RERANK_CACHE_TTL > 0:
             with _RERANK_LOCK:
                 cached = _RERANK_CACHE.get(cache_key)
                 if cached and cached[0] > now_mono:
                     _RERANK_STATS["cache_hits"] += 1
-                    row_by_id = {str(r.get("id")): r for r in original}
-                    ordered: List[Dict[str, Any]] = []
-                    for cid, score, rank in cached[1]:
-                        if cid in row_by_id:
-                            item = dict(row_by_id[cid])
-                            item["rerank_score"] = score
-                            item["rerank_rank"] = rank
-                            ordered.append(item)
-                    used = {str(r.get("id")) for r in ordered}
-                    ordered.extend(r for r in original if str(r.get("id")) not in used)
-                    return ordered
+                    return fuse_current_order(cached[1])
                 for key in [k for k, value in _RERANK_CACHE.items() if value[0] <= now_mono]:
                     _RERANK_CACHE.pop(key, None)
 
@@ -16283,30 +16463,8 @@ class MemoryWikiProvider(MemoryProvider):
             if len(ranked) < RERANK_MIN_CANDIDATES:
                 raise ValueError(f"rerank returned only {len(ranked)} valid results")
 
-            reranker_weight = _rerank_weight(query_mode)
-            base_weight = 1.0 - reranker_weight
-            orig_rank = {str(r.get("id")): i for i, r in enumerate(prefix, 1)}
-            reranker_rank = {cid: rank for cid, _score, rank in ranked}
-            relevance = {cid: score for cid, score, _rank in ranked}
-            fused_prefix = sorted(
-                prefix,
-                key=lambda r: (
-                    base_weight / (RRF_K + orig_rank[str(r.get("id"))])
-                    + reranker_weight / (RRF_K + reranker_rank.get(str(r.get("id")), len(prefix) + 1))
-                ),
-                reverse=True,
-            )
-            ordered: List[Dict[str, Any]] = []
-            cached_meta: List[Tuple[str, float, int]] = []
-            for row in fused_prefix:
-                cid = str(row.get("id"))
-                item = dict(row)
-                item["rerank_score"] = round(float(relevance.get(cid, 0.0)), 6)
-                item["rerank_rank"] = int(reranker_rank.get(cid, len(prefix) + 1))
-                ordered.append(item)
-                cached_meta.append((cid, item["rerank_score"], item["rerank_rank"]))
-            used = {str(r.get("id")) for r in ordered}
-            ordered.extend(r for r in original if str(r.get("id")) not in used)
+            ordered = fuse_current_order(ranked)
+            cached_meta = [(cid, round(float(score), 6), int(rank)) for cid, score, rank in ranked]
 
             latency_ms = int((time.monotonic() - started) * 1000)
             usage = obj.get("usage") or {}
@@ -16362,11 +16520,14 @@ class MemoryWikiProvider(MemoryProvider):
             where.append("risk!='secret' AND quarantined_at=0 AND trust_class NOT IN ('tool_log','raw_blob','secret') AND type!='source_artifact' AND quality>=0.20")
         if topic_slug:
             where.append("topic=?"); params.append(topic_slug)
-        like_terms=[t for t in str(query or "").lower().split() if len(t)>2]
+        like_terms=[t for t in str(query or "").lower().split()
+                    if len(t)>2 or "%" in t or "_" in t]
         if like_terms:
-            like_clauses=["(claim LIKE ? OR topic LIKE ?)" for _ in like_terms]
+            like_clauses=["(claim LIKE ? ESCAPE '\\' OR topic LIKE ? ESCAPE '\\')" for _ in like_terms]
             where.append("("+" AND ".join(like_clauses)+")")
-            for t in like_terms: params.extend([f"%{t}%",f"%{t}%"])
+            for t in like_terms:
+                literal = f"%{self._escape_like(t)}%"
+                params.extend([literal, literal])
         sql = "SELECT * FROM claims WHERE " + " AND ".join(where) + " ORDER BY salience DESC, updated_at DESC LIMIT ?"
         rows = c.execute(sql, [*params, min(500, max(50, limit * 10))]).fetchall()
         out: List[Dict[str, Any]] = []
@@ -16652,6 +16813,19 @@ class MemoryWikiProvider(MemoryProvider):
         if retrieval_mode not in {"hybrid", "fts", "vector"}:
             raise ValueError("retrieval_mode must be one of: hybrid, fts, vector")
         semantic_enabled = bool(SEMANTIC_ENABLED and retrieval_mode != "fts")
+        if conn is None and retrieval_mode != "vector" and not c.in_transaction:
+            try:
+                marker = c.execute(
+                    "SELECT value FROM meta WHERE key='claims_fts_format'"
+                ).fetchone()
+                if not marker or marker[0] != "v3":
+                    self._ensure_fts_current()
+            except sqlite3.DatabaseError as exc:
+                _debug_log(f"FTS parity repair failed: {_safe_exception_label(exc)}")
+                return self._search_fallback(
+                    query, limit, include_stale, topic,
+                    session_id=session_id, include_all_projects=include_all_projects,
+                )
         # --- v1.6: Auto-repair FTS on corruption ---
         try:
             c.execute("SELECT count(*) FROM claims_fts").fetchone()
@@ -16760,8 +16934,8 @@ class MemoryWikiProvider(MemoryProvider):
                     except Exception as rebuild_err:
                         self._audit('fts5', 'rebuild_failed', _safe_exception_label(rebuild_err))
                 except Exception: pass
-            like = f"%{q.strip()[:180]}%"
-            add_rows(f"SELECT * FROM claims WHERE {base_where} AND (claim LIKE ? OR normalized_claim LIKE ? OR evidence LIKE ?)", base_params + [like, like, like], 80)
+            like = f"%{self._escape_like(q.strip()[:180])}%"
+            add_rows(f"SELECT * FROM claims WHERE {base_where} AND (claim LIKE ? ESCAPE '\\' OR normalized_claim LIKE ? ESCAPE '\\' OR evidence LIKE ? ESCAPE '\\')", base_params + [like, like, like], 80)
         if retrieval_mode == "hybrid":
             add_rows(f"SELECT * FROM claims WHERE {base_where} ORDER BY pinned DESC, salience DESC, usefulness DESC, trust_score DESC, updated_at DESC", base_params, 120)
             add_rows(f"SELECT * FROM claims WHERE {base_where} ORDER BY updated_at DESC", base_params, 160)
@@ -16854,7 +17028,7 @@ class MemoryWikiProvider(MemoryProvider):
                 doc = claim_search_text(r["claim"], normalized, r["topic"], r["evidence"])
                 c.execute(
                     "INSERT INTO claims_fts(id,claim,normalized,topic,evidence,search_text) VALUES(?,?,?,?,?,?)",
-                    (cid, r["claim"], normalized, r["topic"], r["evidence"], doc),
+                    (cid, "", "", "", "", doc),
                 )
                 self._set_meta_max(
                     "fts_latest_revision",
@@ -16875,13 +17049,29 @@ class MemoryWikiProvider(MemoryProvider):
             "trg_claims_reactivate_indexes",
             "trg_claims_active_content_indexes",
             "trg_claims_delete_indexes",
+            "trg_claims_dirty_fts",
         ):
             conn.execute(f"DROP TRIGGER IF EXISTS {trigger_name}")
+        for trigger_name in (
+            "trg_claims_reactivate_fts_local",
+            "trg_claims_active_content_fts_local",
+        ):
+            conn.execute(f"DROP TRIGGER IF EXISTS temp.{trigger_name}")
 
     def _install_index_sync_triggers(self, conn) -> None:
         """Install status/content triggers after the FTS table is available."""
         try:
             self._drop_index_sync_triggers(conn)
+            # A durable trigger cannot invoke Python: graph/journal writers use
+            # independent SQLite connections. Invalidate safely for all writers;
+            # provider-owned TEMP triggers refill the canonical redacted document.
+            conn.execute("""CREATE TRIGGER trg_claims_dirty_fts
+                BEFORE UPDATE OF claim,normalized_claim,topic,evidence,status ON claims
+                WHEN OLD.status='active' OR NEW.status='active'
+                BEGIN
+                    DELETE FROM claims_fts WHERE id=OLD.id;
+                    UPDATE meta SET value='stale' WHERE key='claims_fts_format';
+                END""")
             conn.execute("""CREATE TRIGGER trg_claims_deactivate_indexes
                 AFTER UPDATE OF status ON claims
                 WHEN OLD.status='active' AND NEW.status<>'active'
@@ -16945,13 +17135,6 @@ class MemoryWikiProvider(MemoryProvider):
                 AFTER UPDATE OF status ON claims
                 WHEN OLD.status<>'active' AND NEW.status='active'
                 BEGIN
-                    DELETE FROM claims_fts WHERE id=NEW.id;
-                    INSERT INTO claims_fts(id,claim,normalized,topic,evidence,search_text)
-                    VALUES(
-                        NEW.id,NEW.claim,COALESCE(NULLIF(NEW.normalized_claim,''),NEW.claim),
-                        NEW.topic,NEW.evidence,
-                        NEW.claim || ' ' || COALESCE(NEW.normalized_claim,'') || ' ' || NEW.topic || ' ' || NEW.evidence
-                    );
                     DELETE FROM index_outbox
                      WHERE object_type='claim' AND object_id=NEW.id
                        AND status!='processing'
@@ -16982,13 +17165,6 @@ class MemoryWikiProvider(MemoryProvider):
                 AFTER UPDATE OF claim,normalized_claim,topic,evidence ON claims
                 WHEN NEW.status='active' AND OLD.status='active'
                 BEGIN
-                    DELETE FROM claims_fts WHERE id=NEW.id;
-                    INSERT INTO claims_fts(id,claim,normalized,topic,evidence,search_text)
-                    VALUES(
-                        NEW.id,NEW.claim,COALESCE(NULLIF(NEW.normalized_claim,''),NEW.claim),
-                        NEW.topic,NEW.evidence,
-                        NEW.claim || ' ' || COALESCE(NEW.normalized_claim,'') || ' ' || NEW.topic || ' ' || NEW.evidence
-                    );
                     DELETE FROM index_outbox
                      WHERE object_type='claim' AND object_id=NEW.id
                        AND status!='processing'
@@ -17104,6 +17280,25 @@ class MemoryWikiProvider(MemoryProvider):
                            AND status IN ('pending','failed') AND operation='delete'
                      );
                 END""")
+            # TEMP triggers belong only to this provider connection, where the
+            # redactor is registered. External graph writers only run the durable
+            # invalidation trigger and cannot index unsanitized evidence.
+            conn.execute("""CREATE TEMP TRIGGER trg_claims_reactivate_fts_local
+                AFTER UPDATE OF status ON main.claims
+                WHEN OLD.status<>'active' AND NEW.status='active'
+                BEGIN
+                    INSERT INTO claims_fts(id,claim,normalized,topic,evidence,search_text)
+                    VALUES(NEW.id,'','','','',memory_wiki_fts_document(
+                        NEW.claim,NEW.normalized_claim,NEW.topic,NEW.evidence));
+                END""")
+            conn.execute("""CREATE TEMP TRIGGER trg_claims_active_content_fts_local
+                AFTER UPDATE OF claim,normalized_claim,topic,evidence ON main.claims
+                WHEN NEW.status='active' AND OLD.status='active'
+                BEGIN
+                    INSERT INTO claims_fts(id,claim,normalized,topic,evidence,search_text)
+                    VALUES(NEW.id,'','','','',memory_wiki_fts_document(
+                        NEW.claim,NEW.normalized_claim,NEW.topic,NEW.evidence));
+                END""")
         except Exception as index_trigger_exc:
             _debug_log(f"index synchronization trigger install failed: {_safe_exception_label(index_trigger_exc)}")
 
@@ -17111,21 +17306,45 @@ class MemoryWikiProvider(MemoryProvider):
         """Avoid replacing the shared FTS table on every provider startup.
 
         A format marker is written only after a complete rebuild. Index triggers
-        maintain subsequent claim changes transactionally; a count mismatch or
-        unreadable FTS table still forces a repair.
+        maintain subsequent claim changes transactionally; ID and search-document
+        parity (not just row counts) determine whether a warm index is current.
         """
         c = self._connect()
         try:
             marker = c.execute(
                 "SELECT value FROM meta WHERE key='claims_fts_format'"
             ).fetchone()
-            if marker and marker[0] == "v2":
-                active = int(c.execute(
+            if marker and marker[0] in {"v3", "stale"}:
+                active_count = c.execute(
                     "SELECT count(*) FROM claims WHERE status='active'"
-                ).fetchone()[0])
-                indexed = int(c.execute("SELECT count(*) FROM claims_fts").fetchone()[0])
-                if active == indexed:
-                    return "current"
+                ).fetchone()[0]
+                seen = set()
+                for row in c.execute(
+                    """SELECT f.id,f.claim AS f_claim,f.normalized AS f_normalized,
+                              f.topic AS f_topic,f.evidence AS f_evidence,
+                              f.search_text,c.status,c.claim,c.normalized_claim,
+                              c.topic,c.evidence
+                         FROM claims_fts AS f LEFT JOIN claims AS c ON c.id=f.id"""
+                ):
+                    cid = row["id"]
+                    if (cid in seen or row["status"] != "active" or
+                            any(row[field] for field in (
+                                "f_claim", "f_normalized", "f_topic", "f_evidence"
+                            )) or
+                            row["search_text"] != claim_search_text(
+                                row["claim"], row["normalized_claim"] or row["claim"],
+                                row["topic"], row["evidence"],
+                            )):
+                        break
+                    seen.add(cid)
+                else:
+                    if len(seen) == active_count:
+                        if marker[0] == "stale":
+                            was_in_transaction = c.in_transaction
+                            c.execute("UPDATE meta SET value='v3' WHERE key='claims_fts_format'")
+                            if not was_in_transaction:
+                                c.commit()
+                        return "current"
         except sqlite3.DatabaseError:
             pass
         self._rebuild_fts()
@@ -17154,7 +17373,7 @@ class MemoryWikiProvider(MemoryProvider):
                         f"INSERT INTO {shadow}(id,claim,normalized,topic,evidence,search_text) "
                         "VALUES(?,?,?,?,?,?)",
                         (
-                            r["id"], r["claim"], normalized, r["topic"], r["evidence"],
+                            r["id"], "", "", "", "",
                             claim_search_text(r["claim"], normalized, r["topic"], r["evidence"]),
                         ),
                     )
@@ -17165,7 +17384,7 @@ class MemoryWikiProvider(MemoryProvider):
                     "fts_latest_revision", self._meta_int("memory_revision"), conn=c
                 )
                 c.execute(
-                    "INSERT OR REPLACE INTO meta(key,value) VALUES('claims_fts_format','v2')"
+                    "INSERT OR REPLACE INTO meta(key,value) VALUES('claims_fts_format','v3')"
                 )
         except Exception as exc:
             _debug_log(f"FTS rebuild failed: {_safe_exception_label(exc)}")
@@ -20534,6 +20753,38 @@ class MemoryWikiProvider(MemoryProvider):
         manifest_hash = _manifest_hash(manifest)
         base_target = _physical_collection_name(manifest)
         c = self._connect()
+        metadata_columns = (
+            "id,topic,memory_revision,updated_at,visibility_scope,"
+            "origin_bot_id,origin_session_id,origin_chat_hash,project_id,event_at"
+        )
+
+        def visible_document(row: sqlite3.Row) -> Optional[str]:
+            """Read text by ID only while its independently checked ACL is unchanged."""
+            if not self._claim_visible(row):
+                return None
+            acl_fields = (
+                "visibility_scope", "origin_bot_id", "origin_session_id",
+                "origin_chat_hash", "project_id", "memory_revision",
+                "updated_at", "topic", "event_at",
+            )
+            match = " AND ".join(f"{field} IS ?" for field in acl_fields)
+            current = c.execute(
+                "SELECT normalized_claim FROM claims WHERE id=? AND status='active' "
+                "AND normalized_claim IS NOT NULL AND normalized_claim!='' AND " + match,
+                (str(row["id"]), *(row[field] for field in acl_fields)),
+            ).fetchone()
+            return str(current["normalized_claim"]) if current is not None else None
+
+        def expected_row_state(row: sqlite3.Row) -> Optional[Dict[str, Any]]:
+            cid = str(row["id"])
+            if self._claim_visible(row):
+                text = visible_document(row)
+                return (
+                    _expected_qdrant_claim_state(cid, text, row, manifest_hash)
+                    if text is not None else None
+                )
+            verified = _qdrant_registered_claim_vector_for_reindex(c, cid, row, manifest_hash)
+            return _qdrant_claim_reconciliation_state(verified[1]) if verified else None
 
         # A force+limit run must resume the same generated target instead of creating
         # a fresh timestamped collection on every call.
@@ -20548,10 +20799,12 @@ class MemoryWikiProvider(MemoryProvider):
             ).fetchone()
             target_coll = (
                 str(running_force["target_collection"])
-                if running_force else f"{base_target}_force_{int(time.time())}"
+                if running_force else f"{base_target}_force_{time.time_ns()}"
             )
 
         job_id = f"reindex_{manifest_hash}_{hashlib.sha256(target_coll.encode()).hexdigest()[:8]}"
+        if not _profile_target_allowed(target_coll):
+            return {"ok": False, "error": "shared_reindex_target_out_of_profile"}
 
         if not _ensure_collection(target_coll):
             return {
@@ -20570,16 +20823,11 @@ class MemoryWikiProvider(MemoryProvider):
         if active_target == target_coll and existing_count == total_active and not force:
             revision_before = self._meta_int("memory_revision")
             expected_rows = c.execute(
-                "SELECT id,normalized_claim,topic,memory_revision,updated_at,visibility_scope,"
-                "origin_bot_id,origin_session_id,origin_chat_hash,project_id,event_at "
-                "FROM claims WHERE status='active' "
+                f"SELECT {metadata_columns} FROM claims WHERE status='active' "
                 "AND normalized_claim IS NOT NULL AND normalized_claim!=''"
             ).fetchall()
             expected_state = {
-                str(row["id"]): _expected_qdrant_claim_state(
-                    str(row["id"]), str(row["normalized_claim"] or ""), row,
-                    manifest_hash,
-                )
+                str(row["id"]): expected_row_state(row)
                 for row in expected_rows
             }
             target_state = _qdrant_claim_state(target_coll)
@@ -20678,7 +20926,21 @@ class MemoryWikiProvider(MemoryProvider):
             nonlocal ok_count, last_error
             cid = str(row["id"])
             try:
-                vector = _embed_document(row["normalized_claim"])
+                if self._claim_visible(row):
+                    text = visible_document(row)
+                    if text is None:
+                        raise ValueError("visible claim changed during reindex")
+                    vector = _embed_document(text)
+                    payload = _qdrant_claim_payload(
+                        cid, text, row, manifest_hash=manifest_hash,
+                    )
+                else:
+                    verified = _qdrant_registered_claim_vector_for_reindex(
+                        c, cid, row, manifest_hash,
+                    )
+                    if verified is None:
+                        raise ValueError("foreign claim has no compatible registered vector")
+                    vector, payload = verified
                 if not vector or len(vector) != QDRANT_VECTOR_SIZE:
                     raise ValueError("embedding unavailable or wrong vector size")
                 target_endpoint = _normalized_qdrant_endpoint()
@@ -20691,13 +20953,7 @@ class MemoryWikiProvider(MemoryProvider):
                 )
                 c.commit()
                 if not _qdrant_upsert(
-                    cid,
-                    vector,
-                    _qdrant_claim_payload(
-                        cid, str(row["normalized_claim"] or ""), row,
-                        manifest_hash=manifest_hash,
-                    ),
-                    collection=target_coll,
+                    cid, vector, payload, collection=target_coll,
                 ):
                     raise RuntimeError("Qdrant upsert rejected")
                 _record_claim_vector_target(
@@ -20722,8 +20978,7 @@ class MemoryWikiProvider(MemoryProvider):
                     still_failed.extend(retry_order[retry_index:])
                     break
                 row = c.execute(
-                    "SELECT id,normalized_claim,topic,memory_revision,updated_at,visibility_scope,"
-                    "origin_bot_id,origin_session_id,origin_chat_hash,project_id,event_at FROM claims "
+                    f"SELECT {metadata_columns} FROM claims "
                     "WHERE id=? AND status='active' AND normalized_claim IS NOT NULL AND normalized_claim!=''",
                     (cid,),
                 ).fetchone()
@@ -20740,8 +20995,7 @@ class MemoryWikiProvider(MemoryProvider):
             if attempt_budget is not None:
                 page_limit = min(page_limit, attempt_budget - attempts)
             rows = c.execute(
-                "SELECT id,normalized_claim,topic,memory_revision,updated_at,visibility_scope,"
-                "origin_bot_id,origin_session_id,origin_chat_hash,project_id,event_at FROM claims "
+                f"SELECT {metadata_columns} FROM claims "
                 "WHERE status='active' AND normalized_claim IS NOT NULL AND normalized_claim!='' "
                 "ORDER BY id LIMIT ? OFFSET ?",
                 (page_limit, processed),
@@ -20776,17 +21030,12 @@ class MemoryWikiProvider(MemoryProvider):
             for _pass in range(3):
                 revision_before = self._meta_int("memory_revision")
                 active_rows = c.execute(
-                    "SELECT id,normalized_claim,topic,memory_revision,updated_at,visibility_scope,"
-                    "origin_bot_id,origin_session_id,origin_chat_hash,project_id,event_at "
-                    "FROM claims WHERE status='active' "
+                    f"SELECT {metadata_columns} FROM claims WHERE status='active' "
                     "AND normalized_claim IS NOT NULL AND normalized_claim!=''"
                 ).fetchall()
                 active_by_id = {str(row["id"]): row for row in active_rows}
                 expected_state = {
-                    cid: _expected_qdrant_claim_state(
-                        cid, str(row["normalized_claim"] or ""), row,
-                        manifest_hash,
-                    )
+                    cid: expected_row_state(row)
                     for cid, row in active_by_id.items()
                 }
                 target_state = _qdrant_claim_state(target_coll)

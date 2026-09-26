@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 
-def load_provider(tmp_path: Path):
+def load_provider(tmp_path: Path, *, project_id: str = ""):
     os.environ["HERMES_HOME"] = str(tmp_path)
     os.environ["MEMORY_WIKI_SEMANTIC"] = "0"
     plugin = Path(__file__).resolve().parents[1] / "__init__.py"
@@ -18,7 +18,7 @@ def load_provider(tmp_path: Path):
     assert spec and spec.loader
     spec.loader.exec_module(module)
     provider = module.MemoryWikiProvider()
-    provider.initialize("bridge-test", hermes_home=str(tmp_path))
+    provider.initialize("bridge-test", hermes_home=str(tmp_path), project_id=project_id)
     # This bridge test is not a secret-broker integration test. Keep the fixture
     # hermetic when hermes_secret_core is not installed in the test runner.
     provider._make_secret_index_from_raw = lambda *_a, **_k: ""
@@ -813,7 +813,9 @@ def test_snapshot_recovery_artifact_scrubs_arbitrary_json_keys(tmp_path):
 
 
 def test_qdrant_reindex_builds_physical_collection_before_alias_switch(tmp_path):
-    provider = load_provider(tmp_path)
+    # The code claim belongs to this project; a different consumer cannot
+    # embed it merely because it shares the SQLite database.
+    provider = load_provider(tmp_path, project_id="owner/repo")
     module = provider._test_module
     result = provider._code_claim_add({
         "claim": "Verified Hermes configuration runbook: semantic indexing and restore procedure were checked.",

@@ -141,7 +141,7 @@ def test_reconciliation_rejects_correct_hash_with_legacy_acl_payload(tmp_path, m
 
     def request(_method, _path, _body=None, timeout=10.0):
         return {"result": {"points": [
-            {"id": "opaque", "payload": legacy},
+            {"id": module._qdrant_point_id("c_legacy"), "payload": legacy},
         ], "next_page_offset": None}}
 
     monkeypatch.setattr(module, "_qdrant_req", request)
