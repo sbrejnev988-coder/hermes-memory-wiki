@@ -31,7 +31,8 @@ def load_provider(module_name: str, tmp_path: Path, monkeypatch):
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     provider = module.MemoryWikiProvider()
-    provider.initialize(module_name, hermes_home=str(tmp_path), agent_context="test")
+    provider.initialize(module_name, hermes_home=str(tmp_path),
+                        project_id=REPOSITORY_ID, agent_context="test")
     return module, provider
 
 
@@ -677,6 +678,9 @@ def test_graph_redacts_secret_bearing_identity_and_untrusted_hash_fields(tmp_pat
         # The caller may still address the graph with its source-side identity;
         # lookup maps it to the deterministic opaque storage key.
         status = graph_module.code_graph_status(provider, {"repository_id": raw_repo})
+        # The project scope uses the source-side key; the query boundary maps
+        # both it and the request to the same opaque storage identity.
+        provider.project_scope = raw_repo
         query = graph_module.query_code_graph(provider, {
             "query": "identity redaction", "repository_id": raw_repo, "limit": 3,
         })

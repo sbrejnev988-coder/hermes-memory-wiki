@@ -127,6 +127,69 @@ def test_capture_enqueues_canonical_episode_payload_and_worker_upserts(tmp_path,
         provider.shutdown()
 
 
+def test_episode_upsert_does_not_acknowledge_empty_qdrant_payload(tmp_path, monkeypatch):
+    """A completed PUT is not proof that the episode ACL payload was stored."""
+    module = _module("memory_wiki_episode_empty_payload_guard", tmp_path, monkeypatch)
+    provider = _provider(module, tmp_path)
+    try:
+        text = "A synthetic observatory note for payload integrity."
+        provider.sync_turn(text, "")
+        episode_id = _episode_id(provider, text)
+        monkeypatch.setattr(module, "_embed_document", lambda _text: [0.0] * module.QDRANT_VECTOR_SIZE)
+        monkeypatch.setattr(module, "_ensure_collection", lambda *_args: True)
+        calls = []
+
+        def qdrant_request(method, path, body=None, **_kwargs):
+            calls.append((method, path))
+            if method == "PUT" and path.endswith("/points?wait=true"):
+                return {"result": {"status": "completed"}}
+            if method == "POST" and path.endswith("/points"):
+                return {"result": [{"id": module._qdrant_point_id(episode_id), "payload": {}}]}
+            if method == "POST" and path.endswith("/points/delete?wait=true"):
+                return {"result": {"status": "completed"}}
+            raise AssertionError("unexpected Qdrant call")
+
+        monkeypatch.setattr(module, "_qdrant_req", qdrant_request)
+        outcome = module._outbox_process(
+            batch_size=20, db_path=str(provider.db_path), worker_id="missing-payload-test",
+        )
+        assert outcome["ok"] == 0 and outcome["fail"] == 1
+        assert [method for method, _path in calls] == ["PUT", "POST", "POST"]
+        row = provider._connect().execute(
+            "SELECT vector_manifest_hash,vector_target_hash FROM episodic_turns WHERE id=?",
+            (episode_id,),
+        ).fetchone()
+        assert row[0] == "" and row[1] == ""
+    finally:
+        provider.shutdown()
+
+
+def test_episode_upsert_ambiguous_readback_does_not_delete_point(tmp_path, monkeypatch):
+    """A timeout is not evidence that the just-written ACL payload is wrong."""
+    module = _module("memory_wiki_episode_readback_timeout", tmp_path, monkeypatch)
+    monkeypatch.setattr(module, "_ensure_collection", lambda *_args: True)
+    deleted = []
+
+    def qdrant_request(method, path, body=None, **_kwargs):
+        if method == "PUT" and path.endswith("/points?wait=true"):
+            return {"result": {"status": "completed"}}
+        if method == "POST" and path.endswith("/points"):
+            return None  # Transport timeout after PUT succeeded.
+        raise AssertionError("unexpected Qdrant request")
+
+    monkeypatch.setattr(module, "_qdrant_req", qdrant_request)
+    monkeypatch.setattr(
+        module, "_qdrant_delete",
+        lambda *args, **kwargs: deleted.append((args, kwargs)) or True,
+    )
+    assert not module._qdrant_upsert(
+        "ep_synthetic", [0.0] * module.QDRANT_VECTOR_SIZE,
+        {"object_type": "episode", "episode_id": "ep_synthetic"},
+        collection="synthetic-episodes",
+    )
+    assert deleted == []
+
+
 def test_enabling_semantic_backfills_existing_safe_episodes_once(tmp_path, monkeypatch):
     module = _module("memory_wiki_episode_semantic_backfill", tmp_path, monkeypatch)
     provider = _provider(module, tmp_path)

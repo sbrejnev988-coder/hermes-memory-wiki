@@ -25,6 +25,51 @@ def _call(provider, tool_name: str, **arguments):
     return json.loads(provider.handle_tool_call(tool_name, arguments))
 
 
+def test_foreign_claim_guard_reads_only_acl_metadata(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MEMORY_WIKI_SEMANTIC", "0")
+    monkeypatch.setenv("HERMES_SECURITY_STRICT", "0")
+    module = _module()
+    provider = module.MemoryWikiProvider()
+    provider.initialize("viewer-session", hermes_home=str(tmp_path),
+                        bot_id="viewer-bot", project_id="viewer-project",
+                        agent_context="test")
+    try:
+        conn = provider._connect()
+        with conn:
+            for id_, scope, bot, project in (
+                ("visible-global", "global", "", ""),
+                ("hidden-project", "project", "owner-bot", "other-project"),
+            ):
+                conn.execute(
+                    """INSERT INTO claims(id,claim,topic,status,confidence,salience,
+                       source,evidence,created_at,updated_at,freshness_at,access_count,
+                       last_accessed,hash,scope,visibility_scope,origin_session_id,
+                       origin_bot_id,project_id,quality,risk,quarantined_at)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (id_, "unread sentinel", "acl-test", "active", .9, .9,
+                     "test", "private evidence sentinel", module.now(), module.now(),
+                     module.now(), 0, 0, id_, "global", scope, "owner-session",
+                     bot, project, .9, "low", 0),
+                )
+        statements = []
+        conn.set_trace_callback(statements.append)
+        try:
+            assert provider._has_foreign_claims() is True
+        finally:
+            conn.set_trace_callback(None)
+        selects = [s.lower() for s in statements if "from claims" in s.lower()]
+        assert len(selects) == 1
+        projection = selects[0].split("from claims", 1)[0]
+        assert "*" not in projection
+        assert "claim," not in projection and "normalized_claim" not in projection
+        assert "evidence" not in projection
+    finally:
+        if provider._conn is not None:
+            provider._conn.close()
+            provider._conn = None
+
+
 def test_bulk_and_direct_reads_do_not_cross_visibility(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("MEMORY_WIKI_SEMANTIC", "0")

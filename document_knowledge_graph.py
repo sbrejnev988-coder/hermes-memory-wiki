@@ -1295,25 +1295,18 @@ def _make_chunks(source: Dict[str, Any], units: List[Dict[str, Any]]) -> List[Di
 def _archive_claims(
     conn: sqlite3.Connection,
     claim_ids: Iterable[str],
-    *,
-    retiring_source_ids: Iterable[str] = (),
 ) -> int:
-    """Archive unreferenced document claims while preserving shared active chunks."""
+    """Low-level link-safe update; callers must authorize claim IDs first."""
     ids = sorted({str(x) for x in claim_ids if str(x)})
     if not ids:
         return 0
-    retiring = sorted({str(source_id) for source_id in retiring_source_ids if str(source_id)})
     archivable: list[str] = []
     for claim_id in ids:
-        if retiring:
-            placeholders = ",".join("?" for _ in retiring)
-            shared = conn.execute(
-                "SELECT 1 FROM document_chunks WHERE embedding_claim_id=? AND active=1 "
-                f"AND source_id NOT IN ({placeholders}) LIMIT 1",
-                [claim_id, *retiring],
-            ).fetchone()
-            if shared:
-                continue
+        if conn.execute(
+            "SELECT 1 FROM document_chunks WHERE embedding_claim_id=? AND active=1 LIMIT 1",
+            (claim_id,),
+        ).fetchone():
+            continue
         archivable.append(claim_id)
     if not archivable:
         return 0
@@ -1323,6 +1316,71 @@ def _archive_claims(
         [_now(), *archivable],
     )
     return int(cur.rowcount or 0)
+
+
+def _archive_visible_claims(
+    conn: sqlite3.Connection,
+    provider: Any,
+    linked_chunks: Iterable[sqlite3.Row],
+) -> int:
+    """Retire visible claims proven to belong to the retiring document chunks.
+
+    Links can be edited independently of claim provenance. Snapshot the chunks
+    before retirement/scope migration so their original identity is checked.
+    """
+    visible_to_provider = getattr(provider, "_claim_visible", None)
+    if not callable(visible_to_provider):
+        return 0
+    links: Dict[str, List[sqlite3.Row]] = defaultdict(list)
+    for chunk in linked_chunks:
+        if chunk["embedding_claim_id"]:
+            links[str(chunk["embedding_claim_id"])].append(chunk)
+    authorized = []
+    for claim_id, chunks in links.items():
+        claim = conn.execute(
+            "SELECT topic,source,evidence,visibility_scope,origin_bot_id,origin_chat_hash,"
+            "origin_session_id,project_id FROM claims WHERE id=? AND status='active'",
+            (claim_id,),
+        ).fetchone()
+        if (claim is None or not visible_to_provider(claim)
+                or claim["topic"] != _TOPIC or claim["source"] != "artifact:document-index"
+                or claim["visibility_scope"] not in {"bot", "project", "global"}):
+            continue
+        for chunk in chunks:
+            source_id = str(chunk["source_id"] or "")
+            content_hash = str(chunk["content_hash"] or "")
+            project_id = str(chunk["repository_id"] or chunk["scope_id"] or "")
+            if (not source_id or not content_hash or
+                    (claim["visibility_scope"] == "project" and claim["project_id"] != project_id)):
+                continue
+            prefix = (
+                "document_chunk_ref:" + _evidence_ref(f"{source_id}\0{content_hash}")
+                + "; source_ref:" + _evidence_ref(source_id)
+                + "; revision_ref:"
+            )
+            evidence = str(claim["evidence"] or "")
+            if not evidence.startswith(prefix):
+                continue
+            # A reused claim may cite an earlier revision of the same chunk.
+            # Require that revision to actually exist for this source/content.
+            revisions = conn.execute(
+                "SELECT DISTINCT c.revision_id FROM document_chunks c "
+                "JOIN document_revisions r ON r.revision_id=c.revision_id AND r.source_id=c.source_id "
+                "WHERE c.source_id=? AND c.content_hash=?",
+                (source_id, content_hash),
+            )
+            if any(evidence == prefix + _evidence_ref(row[0]) for row in revisions):
+                authorized.append(claim_id)
+                break
+    return _archive_claims(conn, authorized)
+
+
+def _linked_document_chunks(conn: sqlite3.Connection, source_id: str) -> List[sqlite3.Row]:
+    return conn.execute(
+        "SELECT embedding_claim_id,source_id,content_hash,scope_id,repository_id "
+        "FROM document_chunks WHERE source_id=? AND active=1 AND embedding_claim_id<>''",
+        (source_id,),
+    ).fetchall()
 
 
 def ingest_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -1404,13 +1462,9 @@ def ingest_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
             and str(existing["parser"] or "") == parser
             and str(existing["parser_version"] or "") == parser_version
             and int(existing["active"] or 0) == 1):
-        old_claims = [str(row[0]) for row in conn.execute(
-            "SELECT embedding_claim_id FROM document_chunks WHERE source_id=? AND active=1 AND embedding_claim_id<>''",
-            (source_id,),
-        ).fetchall()]
+        old_links = _linked_document_chunks(conn, source_id)
         ts = _now()
         with conn:
-            archived = _archive_claims(conn, old_claims, retiring_source_ids={source_id})
             conn.execute(
                 "UPDATE document_sources SET scope_id=?,repository_id=?,updated_at=? WHERE source_id=?",
                 (scope_id, repository_id, ts, source_id),
@@ -1420,6 +1474,7 @@ def ingest_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
                 "WHERE source_id=? AND active=1",
                 (scope_id, repository_id, ts, source_id),
             )
+            archived = _archive_visible_claims(conn, provider, old_links)
         pending = conn.execute(
             "SELECT COUNT(*) FROM document_chunks WHERE source_id=? AND active=1 AND embedding_claim_id=''",
             (source_id,),
@@ -1439,18 +1494,15 @@ def ingest_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     units = list(payload.get("units") or [])
     chunks = _make_chunks(payload, units)
     ts = _now()
-    old_claims: List[str] = []
+    old_links: List[sqlite3.Row] = []
     if existing:
-        old_claims = [str(r[0]) for r in conn.execute(
-            "SELECT embedding_claim_id FROM document_chunks WHERE source_id=? AND active=1 AND embedding_claim_id<>''",
-            (source_id,),
-        ).fetchall()]
+        old_links = _linked_document_chunks(conn, source_id)
 
     with conn:
-        archived = _archive_claims(conn, old_claims, retiring_source_ids={source_id})
         conn.execute("UPDATE document_units SET active=0,updated_at=? WHERE source_id=? AND active=1", (ts, source_id))
         conn.execute("UPDATE document_chunks SET active=0,updated_at=? WHERE source_id=? AND active=1", (ts, source_id))
         conn.execute("UPDATE document_edges SET active=0,updated_at=? WHERE source_id=? AND active=1", (ts, source_id))
+        archived = _archive_visible_claims(conn, provider, old_links)
         conn.execute("DELETE FROM document_units_fts WHERE source_id=?", (source_id,))
         conn.execute("DELETE FROM document_chunks_fts WHERE source_id=?", (source_id,))
         conn.execute("UPDATE document_revisions SET status='superseded' WHERE source_id=? AND status='active'", (source_id,))
@@ -1880,7 +1932,10 @@ def embed_pending_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, An
     )
     limit = max(1, min(int(args.get("limit") or 500), 10_000))
     conn = provider._connect(); install_document_graph_schema(conn)
-    clauses = ["c.active=1", "c.embedding_claim_id=''", "s.active=1"]
+    # A nonempty link is still pending when its claim was archived or removed.
+    # Only owner-scoped chunks below can be repaired; never revive the old claim.
+    clauses = ["c.active=1", "s.active=1", "NOT EXISTS (SELECT 1 FROM claims linked "
+               "WHERE linked.id=c.embedding_claim_id AND linked.status='active')"]
     params: List[Any] = []
     connector_filter, connector_params = _connector_visibility_clause(conn, provider, "s.source_id")
     if connector_filter: clauses.append(connector_filter); params.extend(connector_params)
@@ -1913,17 +1968,25 @@ def embed_pending_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, An
             if "no such table" not in str(exc).lower():
                 raise
             connector_owned = False
+        # Reuse only claims visible to this provider. A matching evidence key
+        # is not proof of access in a database containing several projects.
+        # Project only ACL metadata: do not load foreign claim text.
+        reuse_columns = (
+            "id,visibility_scope,origin_bot_id,origin_chat_hash,"
+            "origin_session_id,project_id"
+        )
         if connector_owned:
-            prior = conn.execute(
-                "SELECT id FROM claims WHERE topic=? AND status='active' AND evidence LIKE ? "
-                "AND visibility_scope='bot' AND origin_bot_id=? ORDER BY updated_at DESC LIMIT 1",
+            candidates = conn.execute(
+                f"SELECT {reuse_columns} FROM claims WHERE topic=? AND status='active' AND evidence LIKE ? "
+                "AND visibility_scope='bot' AND origin_bot_id=? ORDER BY updated_at DESC LIMIT 100",
                 (_TOPIC, f"%{evidence_key}%", str(provider.bot_id)),
-            ).fetchone()
+            ).fetchall()
         else:
-            prior = conn.execute(
-                "SELECT id FROM claims WHERE topic=? AND status='active' AND evidence LIKE ? ORDER BY updated_at DESC LIMIT 1",
+            candidates = conn.execute(
+                f"SELECT {reuse_columns} FROM claims WHERE topic=? AND status='active' AND evidence LIKE ? ORDER BY updated_at DESC LIMIT 100",
                 (_TOPIC, f"%{evidence_key}%"),
-            ).fetchone()
+            ).fetchall()
+        prior = next((row for row in candidates if provider._claim_visible(row)), None)
         try:
             if prior:
                 claim_id = str(prior[0]); reused += 1
@@ -2283,13 +2346,13 @@ def delete_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     if not source: raise ValueError("document source not found")
     _assert_source_access(provider, source)
     _assert_connector_owner(provider, source_id)
-    claim_ids = [str(r[0]) for r in conn.execute("SELECT embedding_claim_id FROM document_chunks WHERE source_id=? AND active=1 AND embedding_claim_id<>''", (source_id,)).fetchall()]
+    old_links = _linked_document_chunks(conn, source_id)
     with conn:
-        archived = _archive_claims(conn, claim_ids, retiring_source_ids={source_id})
         conn.execute("UPDATE document_sources SET active=0,status='deleted',updated_at=? WHERE source_id=?", (_now(), source_id))
         conn.execute("UPDATE document_units SET active=0,updated_at=? WHERE source_id=?", (_now(), source_id))
         conn.execute("UPDATE document_chunks SET active=0,updated_at=? WHERE source_id=?", (_now(), source_id))
         conn.execute("UPDATE document_edges SET active=0,updated_at=? WHERE source_id=?", (_now(), source_id))
+        archived = _archive_visible_claims(conn, provider, old_links)
         conn.execute("DELETE FROM document_units_fts WHERE source_id=?", (source_id,))
         conn.execute("DELETE FROM document_chunks_fts WHERE source_id=?", (source_id,))
     return {"status": "deleted", "source_id": source_id, "archived_claims": archived}

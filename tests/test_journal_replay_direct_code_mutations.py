@@ -113,11 +113,17 @@ def test_legacy_identity_invalidation_registers_replayable_aliases() -> None:
                     "salience": 0.9,
                 })["id"]
 
-                # Model a database written before opaque-ID provenance was
-                # persisted. Its code-claim metadata still uses the v1 aliases.
+                # Model a legacy v1 alias in an owned private claim. A project
+                # claim can be read but is not mutable through model-facing tools.
                 with provider._connect() as conn:
                     conn.execute("DELETE FROM code_graph_identity_provenance")
+                    conn.execute(
+                        "UPDATE claims SET visibility_scope='private',origin_bot_id=?,"
+                        "origin_session_id=? WHERE id=?",
+                        (provider.bot_id, provider.session_id, claim_id),
+                    )
 
+                assert provider._require_model_mutable_claim(claim_id)
                 result = json.loads(provider.handle_tool_call("memory_wiki_invalidate_revision", {
                     "repository_id": raw_repository_id,
                     "file_path": raw_file_path,

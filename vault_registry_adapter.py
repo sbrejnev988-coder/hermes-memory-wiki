@@ -84,33 +84,10 @@ def _home(home: Optional[Path] = None) -> Path:
 
 def registry_path(home: Optional[Path] = None) -> Path:
     base = _home(home)
-    explicit = (
-        os.environ.get("MEMORY_WIKI_SECRET_REGISTRY")
-        or os.environ.get("SECRET_CONTEXT_REGISTRY")
-        or os.environ.get("HERMES_SECRET_REGISTRY")
-        or os.environ.get("HERMES_VAULT_REGISTRY")
-        or ""
-    ).strip()
-    # The new DPAPI store owns a separate metadata-only registry. Legacy
-    # $HERMES_HOME/vault registries are never read implicitly because they may
-    # predate the no-plaintext registry contract.
-    local = base / "secret-vault" / "secrets_registry.json"
-    if not explicit:
-        return local
-    override = Path(explicit).expanduser()
-    if home is not None and base.resolve(strict=False) != _home().resolve(strict=False):
-        # A shared Desktop process may retain another profile's env override.
-        # Only an override inside that profile's own secret-vault can be followed.
-        # The default home may contain profiles/*, which are separate vaults.
-        try:
-            if not override.is_absolute():
-                return local
-            override.resolve(strict=False).relative_to(
-                (base / "secret-vault").resolve(strict=False)
-            )
-        except (OSError, ValueError):
-            return local
-    return override
+    shared = base.parent.parent if base.parent.name == "profiles" else base
+    # No environment override: legacy registry formats may contain private
+    # values, and a process-local override could bypass cross-profile routing.
+    return shared / "secret-vault" / "secrets_registry.json"
 
 
 def _is_sensitive_key(key: Any) -> bool:
@@ -173,46 +150,61 @@ def _looks_like_record(value: Any) -> bool:
     return bool(lowered.intersection(_ID_KEYS) or lowered.intersection(_SAFE_META_KEYS) or any(_is_sensitive_key(k) for k in value))
 
 
+_PUBLIC_ID = re.compile(r"sec_[0-9a-f]{32}\Z")
+_PUBLIC_ALIAS = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]{2,127}\Z")
+_PUBLIC_TYPE = re.compile(r"[A-Za-z][A-Za-z0-9_.-]{0,99}\Z")
+_PUBLIC_EXECUTOR = re.compile(r"[a-z][a-z0-9_-]{0,31}\Z")
+_PUBLIC_FIELDS = {
+    "secret_id", "lookup_key", "aliases", "secret_type", "status",
+    "has_value", "revision", "policy",
+}
+
+
+def _valid_public_entry(record: Any) -> bool:
+    """Accept only VaultStore's exact metadata projection, never legacy data."""
+    if not isinstance(record, dict) or not {"secret_id", "lookup_key", "secret_type", "status", "has_value", "policy"}.issubset(record):
+        return False
+    if not set(record).issubset(_PUBLIC_FIELDS):
+        return False
+    if not isinstance(record["secret_id"], str) or not _PUBLIC_ID.fullmatch(record["secret_id"]):
+        return False
+    if not isinstance(record["lookup_key"], str) or not _PUBLIC_ALIAS.fullmatch(record["lookup_key"]):
+        return False
+    value_type = record["secret_type"]
+    if (not isinstance(value_type, str) or not value_type or len(value_type) > 100
+            or value_type != value_type.strip()
+            or any(ord(char) < 32 for char in value_type)):
+        return False
+    if not isinstance(record["status"], str) or record["status"] not in {"active", "disabled", "deleted"}:
+        return False
+    if type(record["has_value"]) is not bool:
+        return False
+    if "revision" in record and (type(record["revision"]) is not int or record["revision"] < 1):
+        return False
+    aliases = record.get("aliases", [])
+    if not isinstance(aliases, list) or any(not isinstance(a, str) or not _PUBLIC_ALIAS.fullmatch(a) for a in aliases):
+        return False
+    policy = record["policy"]
+    if not isinstance(policy, dict) or set(policy) != {"allowed_executors", "require_user_approval"}:
+        return False
+    allowed = policy["allowed_executors"]
+    return (type(policy["require_user_approval"]) is bool and isinstance(allowed, list)
+            and all(isinstance(a, str) and _PUBLIC_EXECUTOR.fullmatch(a) for a in allowed))
+
+
 def _iter_records(payload: Any) -> Iterator[Tuple[str, Any]]:
-    """Yield ``(lookup_key, raw_record)`` for common registry schemas."""
-    seen: set[Tuple[str, int]] = set()
-
-    def walk(node: Any, fallback: str = "", depth: int = 0) -> Iterator[Tuple[str, Any]]:
-        if depth > 7:
-            return
-        if isinstance(node, list):
-            for index, item in enumerate(node):
-                yield from walk(item, fallback=f"{fallback}.{index}" if fallback else str(index), depth=depth + 1)
-            return
-        if not isinstance(node, dict):
-            if fallback:
-                marker = (fallback, id(node))
-                if marker not in seen:
-                    seen.add(marker)
-                    yield fallback, node
-            return
-
-        ident = _record_identifier(node, fallback)
-        if ident and _looks_like_record(node):
-            marker = (ident, id(node))
-            if marker not in seen:
-                seen.add(marker)
-                yield ident, node
-
-        for raw_key, child in node.items():
-            key = str(raw_key)
-            key_l = key.lower()
-            if key_l in _CONTAINER_KEYS:
-                yield from walk(child, fallback="", depth=depth + 1)
-                continue
-            if isinstance(child, (dict, list)):
-                child_fallback = key if not fallback else f"{fallback}.{key}"
-                yield from walk(child, fallback=child_fallback, depth=depth + 1)
-            elif depth <= 1 and key_l not in _SAFE_META_KEYS and not _is_sensitive_key(key):
-                # A top-level mapping of key -> scalar secret.
-                yield key, child
-
-    yield from walk(payload)
+    """Yield only validated flat v1 entries. Never recurse into private data."""
+    if not isinstance(payload, dict) or set(payload) != {"version", "entries"}:
+        return
+    if type(payload["version"]) is not int or payload["version"] != 1:
+        return
+    entries = payload["entries"]
+    if not isinstance(entries, list) or len(entries) > 100_000:
+        return
+    if not all(_valid_public_entry(record) for record in entries):
+        return
+    for record in entries:
+        yield record["lookup_key"], record
 
 
 def _aliases(record: Dict[str, Any]) -> List[str]:
@@ -326,7 +318,7 @@ def search_registry_metadata(query: str, limit: int = 10, home: Optional[Path] =
         hay_parts = [
             key, meta.get("subject", ""), meta.get("scope", ""),
             meta.get("locator", ""), meta.get("purpose", ""),
-            meta.get("username", ""), " ".join(meta.get("aliases", [])),
+            meta.get("username", ""), " ".join(raw.get("aliases", [])),
         ]
         hay = " ".join(str(part) for part in hay_parts).lower()
         score = sum(5 if term == key.lower() else 3 if term in key.lower() else 1 for term in terms if term in hay)
@@ -353,7 +345,7 @@ def lookup_registry_exact(lookup_key: str, home: Optional[Path] = None) -> Optio
             str(candidate_key).casefold(),
             str(meta.get("id") or "").casefold(),
             str(meta.get("lookup_key") or "").casefold(),
-            *(str(alias).casefold() for alias in meta.get("aliases") or []),
+            *(str(alias).casefold() for alias in raw.get("aliases") or []),
         }
         if key_l in identifiers:
             return meta
