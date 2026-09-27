@@ -175,6 +175,7 @@ def test_document_source_fails_closed_if_shared_guard_raises(isolated):
     assert instruction not in str(result)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows case-insensitive file alias fence")
 def test_owned_connector_cannot_be_reindexed_as_same_scope_windows_alias(isolated, monkeypatch):
     graph, provider, root = isolated
     indexed = root / "ÉTRANGER.md"
