@@ -147,8 +147,8 @@ def test_document_embedding_reuses_only_visible_claim() -> None:
         assert provider.evidence == []
 
 
-def test_owner_embedding_repairs_archived_link_but_not_foreign_scope(tmp_path) -> None:
-    """A live chunk cannot keep an archived claim after an authorized repair."""
+def test_owner_embedding_leaves_archived_link_pending_and_foreign_scope_untouched(tmp_path) -> None:
+    """An archived link may express intent; source access alone cannot undo it."""
     conn = sqlite3.connect(str(tmp_path / "graph.sqlite3"))
     conn.row_factory = sqlite3.Row
     try:
@@ -184,17 +184,7 @@ def test_owner_embedding_repairs_archived_link_but_not_foreign_scope(tmp_path) -
             )
         conn.commit()
 
-        class CreatingProvider(Provider):
-            def _add_claim(self, _claim: str, **kwargs) -> str:
-                self.conn.execute("""INSERT INTO claims(id,topic,status,evidence,updated_at,
-                    visibility_scope,origin_bot_id,origin_chat_hash,origin_session_id,project_id)
-                    VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                    ("c_replacement", kwargs["topic"], "active", kwargs["evidence"],
-                     2, kwargs["visibility_scope"], "", "", "", kwargs["project_id"]),
-                )
-                return "c_replacement"
-
-        provider = CreatingProvider(conn)
+        provider = Provider(conn)
         fts_before = conn.execute("SELECT COUNT(*) FROM document_chunks_fts").fetchone()[0]
         result = mod.embed_pending_documents(provider, {})
         owner_link = conn.execute(
@@ -205,8 +195,10 @@ def test_owner_embedding_repairs_archived_link_but_not_foreign_scope(tmp_path) -
         ).fetchone()[0]
         fts_after = conn.execute("SELECT COUNT(*) FROM document_chunks_fts").fetchone()[0]
         assert result["pending_before"] == 1 and result["processed"] == 1
-        assert result["created"] == 1 and result["failed"] == 0
-        assert owner_link == "c_replacement" and foreign_link == "c_foreign"
+        assert result["pending_after"] == 1 and result["created"] == result["failed"] == 0
+        assert result["skipped_reasons"] == {"linked_claim_inactive": 1}
+        assert owner_link == "c_mine" and foreign_link == "c_foreign"
+        assert provider.evidence == []
         assert fts_after == fts_before
     finally:
         conn.close()

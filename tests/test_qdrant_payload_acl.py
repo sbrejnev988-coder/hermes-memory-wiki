@@ -124,6 +124,37 @@ def test_canonical_payload_contains_hash_and_complete_acl(tmp_path, monkeypatch)
     assert missing_scope["visibility_scope"] != "global"
 
 
+def test_incremental_upsert_never_publishes_raw_topic_secret(tmp_path, monkeypatch):
+    module = load_module("memory_wiki_qdrant_topic_redaction", tmp_path, monkeypatch)
+    provider = make_provider(module, tmp_path)
+    claim_id = add_chat_claim(provider)
+    canary = "FtsSyntheticCredentialOrchid941"
+    topic = f"garden api_key={canary}"
+    module.SEMANTIC_ENABLED = True
+    with provider._connect() as conn:
+        conn.execute("UPDATE meta SET value='1' WHERE key='semantic_enabled'")
+        conn.execute("UPDATE claims SET topic=? WHERE id=?", (topic, claim_id))
+
+    payloads = []
+    current = module._physical_collection_name()
+    monkeypatch.setattr(module, "_qdrant_resolved_active_collection", lambda: current)
+    monkeypatch.setattr(module, "_embed_document", lambda _text: [0.0] * module.QDRANT_VECTOR_SIZE)
+
+    def upsert(cid, _vector, payload, collection=None):
+        assert cid == claim_id and collection == current
+        payloads.append(payload)
+        return True
+
+    monkeypatch.setattr(module, "_qdrant_upsert", upsert)
+    result = module._outbox_process(
+        batch_size=10, db_path=str(provider.db_path), worker_id="topic-redaction",
+    )
+    assert result["fail"] == 0, result
+    assert payloads
+    assert all(canary not in json.dumps(payload) for payload in payloads)
+    assert all("garden" in payload["topic"] for payload in payloads)
+
+
 def test_reconciliation_rejects_correct_hash_with_legacy_acl_payload(tmp_path, monkeypatch):
     module = load_module("memory_wiki_qdrant_reconcile_contract", tmp_path, monkeypatch)
     canonical = module._qdrant_claim_payload(
@@ -708,6 +739,103 @@ def test_reindex_repairs_write_that_lands_during_alias_switch(tmp_path, monkeypa
     assert provider._connect().execute(
         "SELECT normalized_claim FROM claims WHERE id=?", (claim_id,),
     ).fetchone()[0] == new_text
+
+
+def test_old_target_cleanup_preserves_upsert_queued_during_put(tmp_path, monkeypatch):
+    module = load_module("memory_wiki_qdrant_target_race", tmp_path, monkeypatch)
+    allow_historical_targets(module, tmp_path, "claims-v1")
+    provider = make_provider(module, tmp_path)
+    claim_id = add_chat_claim(provider)
+    module.SEMANTIC_ENABLED = True
+    endpoint = module._normalized_qdrant_endpoint()
+    current = module._physical_collection_name()
+    with provider._connect() as conn:
+        conn.execute("UPDATE meta SET value='1' WHERE key='semantic_enabled'")
+        conn.execute("DELETE FROM index_outbox")
+        module._record_claim_vector_target(
+            conn, claim_id, endpoint=endpoint, collection="claims-v1",
+            manifest_hash="legacy-v1", status="active", indexed_at=1,
+        )
+        module._outbox_enqueue(
+            "embed_and_upsert", "claim", claim_id,
+            {"collection": current, "endpoint": endpoint, "reason": "initial_put"},
+            conn=conn,
+        )
+
+    monkeypatch.setattr(module, "_qdrant_resolved_active_collection", lambda: current)
+    monkeypatch.setattr(module, "_embed_document", lambda _text: [0.0] * module.QDRANT_VECTOR_SIZE)
+    inserted = []
+
+    def in_flight_upsert(cid, _vector, _payload, collection=None):
+        assert cid == claim_id and collection == current
+        with provider._connect() as conn:
+            inserted.append(module._outbox_enqueue(
+                "embed_and_upsert", "claim", claim_id,
+                {"collection": current, "endpoint": endpoint, "reason": "newer_write"},
+                conn=conn,
+            ))
+        return True
+
+    monkeypatch.setattr(module, "_qdrant_upsert", in_flight_upsert)
+    outcome = module._outbox_process(
+        batch_size=1, db_path=str(provider.db_path), worker_id="synthetic-race",
+    )
+    assert outcome["fail"] == 0, outcome
+    assert inserted and inserted[0]
+    with provider._connect() as conn:
+        pending = conn.execute(
+            "SELECT id FROM index_outbox WHERE object_id=? AND operation='embed_and_upsert' "
+            "AND status='pending'", (claim_id,),
+        ).fetchall()
+        cleanup = conn.execute(
+            "SELECT payload_json FROM index_outbox WHERE object_id=? AND operation='delete' "
+            "AND status='pending'", (claim_id,),
+        ).fetchall()
+    assert [row[0] for row in pending] == inserted
+    assert any(json.loads(row[0])["collection"] == "claims-v1" for row in cleanup)
+
+
+def test_rewritten_claim_keeps_protective_delete_if_new_embed_fails(tmp_path, monkeypatch):
+    module = load_module("memory_wiki_qdrant_rewrite_delete", tmp_path, monkeypatch)
+    provider = make_provider(module, tmp_path)
+    claim_id = add_chat_claim(provider)
+    module.SEMANTIC_ENABLED = True
+    endpoint = module._normalized_qdrant_endpoint()
+    current = module._physical_collection_name()
+    with provider._connect() as conn:
+        conn.execute("UPDATE meta SET value='1' WHERE key='semantic_enabled'")
+        module._record_claim_vector_target(
+            conn, claim_id, endpoint=endpoint, collection=current,
+            manifest_hash="previous-content", status="active", indexed_at=1,
+        )
+        conn.execute(
+            "UPDATE claims SET evidence=? WHERE id=?",
+            ("Synthetic evidence after rewriting.", claim_id),
+        )
+        module._outbox_enqueue(
+            "embed_and_upsert", "claim", claim_id,
+            {"collection": current, "endpoint": endpoint, "reason": "explicit_claim_upsert"},
+            conn=conn,
+        )
+        queued = conn.execute(
+            "SELECT payload_json FROM index_outbox WHERE object_id=? AND operation='delete' "
+            "AND status='pending'", (claim_id,),
+        ).fetchall()
+    assert any(json.loads(row[0])["reason"] == "claim_content_rewritten" for row in queued)
+
+    deletes = []
+    monkeypatch.setattr(module, "_qdrant_resolved_active_collection", lambda: current)
+    monkeypatch.setattr(module, "_embed_document", lambda _text: None)
+    monkeypatch.setattr(module, "_qdrant_claim_point_state", lambda _cid, _col: {"claim": "previous content"})
+    monkeypatch.setattr(
+        module, "_qdrant_delete_target",
+        lambda cid, *, collection, endpoint="": deletes.append((cid, collection)) or True,
+    )
+    result = module._outbox_process(
+        batch_size=20, db_path=str(provider.db_path), worker_id="rewrite-delete",
+    )
+    assert result["fail"] >= 1, result  # The replacement embedding is unavailable.
+    assert (claim_id, current) in deletes  # The old published point is still scrubbed.
 
 
 def test_historical_endpoint_outage_keeps_retry_through_checkpoint_recovery(tmp_path, monkeypatch):

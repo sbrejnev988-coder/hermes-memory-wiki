@@ -99,6 +99,23 @@ def test_upsert_indexes_redacted_document_not_raw_evidence(wiki):
     assert _matches(conn, "cedar") == {cid}
 
 
+def test_topic_secret_is_redacted_by_upsert_trigger_and_rebuild(wiki):
+    provider, module = wiki
+    canary = "FtsSyntheticCredentialOrchid941"
+    topic = f"garden api_key={canary}"
+    assert canary not in module.claim_search_text("Synthetic garden calibration remains searchable.",
+                                                  "", topic, "")
+    cid = _seed(provider, module, text="Synthetic garden calibration remains searchable.")
+    conn = provider._connect()
+    with conn:
+        conn.execute("UPDATE claims SET topic=? WHERE id=?", (topic, cid))
+    assert _matches(conn, canary) == set()
+    assert _matches(conn, "garden") == {cid}
+    provider._rebuild_fts()
+    assert _matches(conn, canary) == set()
+    assert _matches(conn, "garden") == {cid}
+
+
 def test_rebuild_does_not_reindex_raw_evidence(wiki):
     provider, module = wiki
     canary = "FtsSyntheticCredentialTopaz936"

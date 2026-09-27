@@ -254,11 +254,14 @@ def test_inverse_import_and_foreign_delete_job_fail_closed(tmp_path, monkeypatch
         assert module._profile_target_allowed(module._physical_collection_name())
 
 
-def test_llm_pack_uses_bound_home_config_in_mixed_process(tmp_path, monkeypatch):
+def test_llm_pack_uses_bound_home_dedicated_key_in_mixed_process(tmp_path, monkeypatch):
     default = _home(tmp_path, "default")
     learning = _home(tmp_path, "learning")
     with (default / ".env").open("a", encoding="utf-8") as out:
-        out.write("MEMORY_WIKI_LLM_PACK=1\n")
+        out.write("MEMORY_WIKI_LLM_PACK=1\n"
+                  "MEMORY_WIKI_LLM_BASE_URL=http://127.0.0.1:18646/v1\n"
+                  "MEMORY_WIKI_LLM_API_KEY=synthetic-dedicated-default-key\n"
+                  "MEMORY_WIKI_LLM_MODEL=synthetic-model\n")
     (default / "config.yaml").write_text(
         "base_url: http://127.0.0.1:18646/v1\n"
         "api_key: synthetic-default-key\nmodel: synthetic-model\n", encoding="utf-8",
@@ -284,7 +287,7 @@ def test_llm_pack_uses_bound_home_config_in_mixed_process(tmp_path, monkeypatch)
     assert provider._llm_pack_context("synthetic query", "Synthetic candidate.", 1500)
     assert requests == [
         ("http://127.0.0.1:18646/v1/chat/completions",
-         "Bearer synthetic-default-key"),
+         "Bearer synthetic-dedicated-default-key"),
     ]
 
 

@@ -1409,8 +1409,8 @@ def _collection_config(collection: str) -> Optional[dict]:
     ) or {}
 
 
-def _ensure_collection(collection: Optional[str] = None) -> bool:
-    """Create a physical collection or verify its vector contract."""
+def _ensure_collection(collection: Optional[str] = None, *, create: bool = True) -> bool:
+    """Verify the vector contract, creating a missing collection only for writes."""
     coll = collection or _physical_collection_name()
     existing = _collection_config(coll)
     if existing is not None:
@@ -1429,6 +1429,8 @@ def _ensure_collection(collection: Optional[str] = None) -> bool:
             )
             return False
         return True
+    if not create:
+        return False
     result = _qdrant_req(
         "PUT",
         f"/collections/{coll}",
@@ -1536,6 +1538,17 @@ def _ensure_outbox(db_path: Optional[str] = None) -> None:
                 db.execute(f"ALTER TABLE index_outbox ADD COLUMN {name} {ddl}")
         db.executescript(_OUTBOX_INDEXES)
         db.executescript(_CLAIM_VECTOR_TARGETS_INDEXES)
+        # Legacy completed embeds kept input text after success. The target
+        # registry and routing fields are authoritative; no completed task
+        # needs a plaintext copy of its embedding input.
+        db.execute(
+            """UPDATE index_outbox
+               SET payload_json=json_remove(payload_json, '$.text')
+             WHERE status='completed' AND operation='embed_and_upsert'
+               AND json_valid(payload_json)=1
+               AND CASE WHEN json_valid(payload_json)=1
+                        THEN json_type(payload_json, '$.text') END IS NOT NULL"""
+        )
         db.commit()
     except Exception as exc:
         _debug_log(f"outbox init failed: {_safe_exception_label(exc)}")
@@ -1545,7 +1558,10 @@ def _ensure_outbox(db_path: Optional[str] = None) -> None:
             db.close()
 
 
-def _outbox_enqueue(operation: str, object_type: str, object_id: str, payload: dict, conn=None) -> str:
+def _outbox_enqueue(
+    operation: str, object_type: str, object_id: str, payload: dict, conn=None,
+    *, historical_target_cleanup: bool = False,
+) -> str:
     """Enqueue the latest desired index state and coalesce obsolete pending work."""
     oid = uuid.uuid4().hex[:16]
     ts = int(time.time())
@@ -1616,7 +1632,13 @@ def _outbox_enqueue(operation: str, object_type: str, object_id: str, payload: d
                     (object_id,),
                 ).fetchall()
                 for pending in pending_deletes:
-                    if target_matches(pending[1], episode=False):
+                    if (target_matches(pending[1], episode=False)
+                            and json.loads(str(pending[1] or "{}")).get("reason") not in {
+                                "claim_content_rewritten", "claim_secret_scrub",
+                                "revision_invalidation",
+                            }):
+                        # A failed replacement embed must not leave the old
+                        # published text behind by canceling its scrub intent.
                         db.execute("DELETE FROM index_outbox WHERE id=?", (pending[0],))
         elif operation == "delete":
             # Privacy deletion must scrub the text of a running embed as well
@@ -1680,13 +1702,27 @@ def _outbox_enqueue(operation: str, object_type: str, object_id: str, payload: d
                             )
                         return str(pending[0])
             elif object_type == "claim":
-                db.execute(
-                    """DELETE FROM index_outbox
-                        WHERE object_type='claim' AND object_id=?
-                          AND status!='processing'
-                          AND operation IN ('upsert','embed_and_upsert')""",
-                    (object_id,),
+                # Migration has already proved this target is historical. An
+                # active claim still needs its canonical upsert; only a privacy
+                # deletion (or a non-historical delete) cancels all its embeds.
+                keep_active_upsert = (
+                    historical_target_cleanup
+                    and str(payload.get("reason") or "") in {
+                        "claim_target_recovery", "claim_retargeted_or_rewritten",
+                    }
+                    and db.execute(
+                        "SELECT 1 FROM claims WHERE id=? AND status='active'",
+                        (object_id,),
+                    ).fetchone() is not None
                 )
+                if not keep_active_upsert:
+                    db.execute(
+                        """DELETE FROM index_outbox
+                            WHERE object_type='claim' AND object_id=?
+                              AND status!='processing'
+                              AND operation IN ('upsert','embed_and_upsert')""",
+                        (object_id,),
+                    )
                 pending_deletes = db.execute(
                     """SELECT id,payload_json,status FROM index_outbox
                         WHERE object_type='claim' AND object_id=?
@@ -2609,6 +2645,7 @@ def _outbox_process_scoped(batch_size=50, *, db_path: Optional[str] = None, work
                                 _outbox_enqueue(
                                     "delete", "claim", str(row["object_id"]),
                                     delete_payload, conn=done_db,
+                                    historical_target_cleanup=True,
                                 )
                                 done_db.execute(
                                     """UPDATE claim_vector_targets
@@ -3231,13 +3268,27 @@ def _rerank_weight(query_mode: str) -> float:
 
 _RERANK_LOCK = threading.RLock()
 _RERANK_CACHE: Dict[str, Tuple[float, List[Tuple[str, float, int]]]] = {}
-_RERANK_FAILURE_COUNT = 0
-_RERANK_CIRCUIT_UNTIL = 0.0
 _RERANK_STATS: Dict[str, Any] = {
     "requests": 0, "successes": 0, "failures": 0, "cache_hits": 0,
     "skipped": 0, "search_units": 0, "cost_usd": 0.0,
     "last_latency_ms": 0, "last_error": "",
 }
+_RERANK_DEFAULT_STATE = {"cache": _RERANK_CACHE, "stats": _RERANK_STATS,
+                         "failure_count": 0, "circuit_until": 0.0}
+_RERANK_PROFILE_STATES: Dict[str, Dict[str, Any]] = {}
+
+
+def _rerank_scope_state() -> Dict[str, Any]:
+    """Keep a failed profile's circuit, cache and diagnostics out of its peers."""
+    home = str(_bound_profile_home().resolve())
+    if home == str(_IMPORT_HERMES_HOME):
+        return _RERANK_DEFAULT_STATE
+    with _RERANK_LOCK:
+        return _RERANK_PROFILE_STATES.setdefault(home, {
+            "cache": {}, "stats": {key: ("" if key == "last_error" else 0)
+                                   for key in _RERANK_STATS},
+            "failure_count": 0, "circuit_until": 0.0,
+        })
 # --- P6: Fault injection hooks for automated testing (DEBUG only) ---
 _FAULT_INJECT_FTS_CORRUPT = os.environ.get("MW_FAULT_INJECT_FTS_CORRUPT", "0") == "1"
 _FAULT_INJECT_STALE = os.environ.get("MW_FAULT_INJECT_STALE", "0") == "1"
@@ -3464,8 +3515,8 @@ def _embed_query(text: str) -> Optional[List[float]]:
         ),
     )
 
-def _openrouter_available() -> bool:
-    """Check model availability using OpenRouter's documented model list, then probe if needed."""
+def _openrouter_available(*, allow_probe: bool = True) -> bool:
+    """Check model availability; only operational health may fall back to an embedding."""
     if not _embed_api_key() or not EMBED_CONTRACT_VALID:
         return False
     if EMBED_PROVIDER == "nous":
@@ -3481,6 +3532,8 @@ def _openrouter_available() -> bool:
         }
         if EMBED_MODEL in available_ids:
             return True
+        if not allow_probe:
+            return False
         _debug_log(f"Embedding model not present in Nous model list: {EMBED_MODEL}; probing endpoint")
         return _openrouter_embed(
             "memory-wiki embedding health probe",
@@ -3502,9 +3555,12 @@ def _openrouter_available() -> bool:
         }
         if EMBED_MODEL in available_ids:
             return True
-        _debug_log(f"Embedding model not present in filtered model list: {EMBED_MODEL}; probing endpoint")
+        if allow_probe:
+            _debug_log(f"Embedding model not present in filtered model list: {EMBED_MODEL}; probing endpoint")
     except Exception as exc:
-        _debug_log(f"OpenRouter model-list check failed; probing endpoint: {type(exc).__name__}")
+        _debug_log(f"OpenRouter model-list check failed: {type(exc).__name__}")
+    if not allow_probe:
+        return False
     return _openrouter_embed(
         "memory-wiki embedding health probe",
         input_type="search_query",
@@ -3890,7 +3946,7 @@ def _qdrant_claim_payload(
         "payload_version": QDRANT_CLAIM_PAYLOAD_VERSION,
         "id": str(claim_id),
         "claim_id": str(claim_id),
-        "topic": str(_payload_field(metadata, "topic", "") or ""),
+        "topic": redact_secrets(scrub_memory_artifacts(str(_payload_field(metadata, "topic", "") or ""))),
         "claim": short(text, 300),
         "vector_text_hash": sha(text),
         "memory_revision": int(_payload_field(metadata, "memory_revision", 0) or 0),
@@ -4074,6 +4130,16 @@ def _qdrant_upsert(claim_id: str, vector: List[float], payload: dict, collection
         return False
     return True
 
+def _qdrant_delete_accepted(response: Any) -> bool:
+    """Only a completed wait=true operation confirms Qdrant deletion."""
+    if not isinstance(response, dict) or str(response.get("status") or "ok") != "ok":
+        return False
+    operation = response.get("result")
+    if not isinstance(operation, dict) or not operation:
+        return False
+    return operation.get("status") == "completed"
+
+
 def _qdrant_delete(claim_id: str, collection: str = None) -> bool:
     """Delete one claim vector from Qdrant by its stable point ID."""
     coll = collection or _active_collection_name()
@@ -4082,9 +4148,7 @@ def _qdrant_delete(claim_id: str, collection: str = None) -> bool:
         f"/collections/{coll}/points/delete?wait=true",
         {"points": [_qdrant_point_id(claim_id)]},
     )
-    status = (result or {}).get("result", {}).get("status")
-    # Qdrant versions differ: some return an operation object without status.
-    return result is not None and status in (None, "completed", "acknowledged")
+    return _qdrant_delete_accepted(result)
 
 
 def _qdrant_collection_confirmed_absent(collection: str, endpoint: str) -> bool:
@@ -4172,8 +4236,7 @@ def _qdrant_delete_target(
         with _urlopen_no_redirect(request, timeout=timeout) as response:
             raw = response.read()
         result = json.loads(raw) if raw else {}
-        status = (result or {}).get("result", {}).get("status")
-        return status in (None, "completed", "acknowledged")
+        return _qdrant_delete_accepted(result)
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
             return _qdrant_collection_confirmed_absent(collection, target_endpoint)
@@ -4217,8 +4280,7 @@ def _qdrant_delete_many(claim_ids: Iterable[str], collection: Optional[str] = No
             f"/collections/{coll}/points/delete?wait=true",
             {"points": [_qdrant_point_id(value) for value in ids[offset:offset + 256]]},
         )
-        status = (result or {}).get("result", {}).get("status")
-        if result is None or status not in (None, "completed", "acknowledged"):
+        if not _qdrant_delete_accepted(result):
             return False
     return True
 
@@ -4687,6 +4749,7 @@ def _migrate_and_resume_claim_vector_targets(db_path: str) -> Dict[str, int]:
             )
             if _outbox_enqueue(
                 "delete", "claim", str(row["claim_id"]), payload, conn=db,
+                historical_target_cleanup=claim_status == "active",
             ):
                 queued += 1
                 db.execute(
@@ -4732,8 +4795,8 @@ def _switch_alias(new_collection: str) -> bool:
     return result is not None and str(result.get("status") or "ok") == "ok"
 
 
-def _semantic_available() -> bool:
-    """Check the embedding contract, effective provider and Qdrant before semantic operations."""
+def _semantic_available(*, read_only: bool = False) -> bool:
+    """Check embedding/Qdrant; diagnostic reads must not embed or create collections."""
     if not SEMANTIC_ENABLED or not _semantic_profile_ready():
         return False
     if not EMBED_CONTRACT_VALID:
@@ -4741,8 +4804,10 @@ def _semantic_available() -> bool:
             _debug_log(f"semantic disabled: {error}")
         return False
     if EMBED_PROVIDER in ("openrouter", "nous"):
-        if not _openrouter_health_swr():
-            _debug_log("OpenRouter/Nous embeddings unavailable (stale cached state; refresh running in background)")
+        available = (_openrouter_available(allow_probe=False) if read_only
+                     else _openrouter_health_swr())
+        if not available:
+            _debug_log("OpenRouter/Nous embeddings unavailable by model-list check")
             return False
     else:
         embed_health = _embed_req("GET", "/health")
@@ -4768,6 +4833,8 @@ def _semantic_available() -> bool:
                 _debug_log(f"embedding service returned invalid vector_size: {reported_size!r}")
                 return False
         else:
+            if read_only:
+                return False  # A diagnostic must not infer dimensions via POST.
             probe = _embed_for_qdrant("memory-wiki embedding health probe", "search_query")
             if probe is None or len(probe) != QDRANT_VECTOR_SIZE:
                 _debug_log("embedding service health lacks vector_size and probe failed")
@@ -4779,7 +4846,8 @@ def _semantic_available() -> bool:
     if qdrant_status.get("status") != "ok":
         _debug_log(f"unexpected Qdrant response: {qdrant_status}")
         return False
-    return _qdrant_ensure_collection()
+    return (_ensure_collection(create=False) if read_only
+            else _qdrant_ensure_collection())
 
 
 def _episodic_semantic_available() -> bool:
@@ -5133,7 +5201,7 @@ def claim_search_text(claim: str, normalized: str = "", topic: str = "", evidenc
     parts = [
         redact_secrets(scrub_memory_artifacts(claim or "")),
         redact_secrets(scrub_memory_artifacts(normalized or claim or "")),
-        topic or "",
+        redact_secrets(scrub_memory_artifacts(topic or "")),
         redact_secrets(scrub_memory_artifacts(evidence or "")),
     ]
     return "\n".join([parts[0], parts[0], parts[1], parts[1], parts[2], parts[3]])
@@ -7559,6 +7627,40 @@ class MemoryWikiProvider(MemoryProvider):
             "injection_signals": inspected.get("injection_signals", []),
         }
 
+    def _model_safe_row(self, row: Any, *, source: str = "memory_wiki") -> Optional[Dict[str, Any]]:
+        """Guard every text field before a stored row reaches model-facing output.
+
+        Filtering the whole row also covers alternate/derived claim text such as
+        normalized_claim, custody, revision JSON and evidence. Never publish a
+        partial row whose primary claim or auxiliary metadata was rejected.
+        """
+        output = dict(row)
+        for field, value in output.items():
+            if not isinstance(value, str) or not value:
+                continue
+            inspected = self._inspect_recall_text(
+                value, source=f"{source}:{field}", mem_type="claim",
+                item_id=str(output.get("id") or output.get("claim_id") or ""),
+                audit=False, max_len=len(value),
+            )
+            if inspected.get("status") != "safe" or not inspected.get("content"):
+                return None
+            output[field] = str(inspected["content"])
+        return self._sanitize_row(output)
+
+    def _model_safe_claim_rows(self, rows: Iterable[Any], limit: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Apply reader ACL and the same Injection Guard to bulk claim reads."""
+        visible = []
+        for row in rows:
+            if not self._claim_visible(row):
+                continue
+            safe = self._model_safe_row(row)
+            if safe is not None:
+                visible.append(safe)
+                if limit is not None and len(visible) >= limit:
+                    break
+        return visible
+
     def on_memory_write(self, action: str, target: str, content: str, metadata: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         outcome: Dict[str, Any] = {
             "action": str(action or ""), "claim_ids": [], "count": 0,
@@ -8280,8 +8382,20 @@ class MemoryWikiProvider(MemoryProvider):
                         captures.pop(capture_id, None)
         try:
             if tool_name == "memory_wiki_query":
-                rows = self._search(a.get("query",""), int(a.get("limit",10)), bool(a.get("include_stale",True)), a.get("topic"))
-                return tool_result(success=True, claims=[self._rowdict(r) for r in rows])
+                requested = max(1, min(int(a.get("limit", 10) or 10), 200))
+                # The guard can reject a ranked candidate. Budget candidates
+                # separately from returned rows so a safe runner-up survives.
+                candidate_limit = min(200, max(requested + 10, requested * 2))
+                rows = self._search(
+                    a.get("query", ""), candidate_limit,
+                    bool(a.get("include_stale", True)), a.get("topic"),
+                    record_retrieval=False,
+                )
+                claims = self._model_safe_claim_rows(rows, requested)
+                # Search candidates are not necessarily emitted. Count only
+                # rows that passed the model-facing guard and reached output.
+                self._record_recall_rows(claims, injected=False, source="query")
+                return tool_result(success=True, claims=claims)
             if tool_name == "memory_wiki_global_search":
                 result = self._global_search(
                     a.get("query", ""), int(a.get("limit", 30)), a.get("mode", "hybrid"),
@@ -8381,14 +8495,15 @@ class MemoryWikiProvider(MemoryProvider):
                 # Search once for both canonical rows and the memory-diff guard.
                 # Coverage suppression is applied to every claim-derived output path,
                 # not only the main rows rendered below.
-                all_rows = self._search(
+                all_rows = self._model_safe_claim_rows(self._search(
                     str(a.get("query", "")),
                     limit=min(60, max_chars // 100),
                     include_stale=True,
                     # A caller-provided coverage manifest is retrieval metadata,
                     # never authority to cross the active project boundary.
                     include_all_projects=False,
-                )
+                    record_retrieval=False,
+                ))
                 rows = [
                     row for row in all_rows
                     if not self._is_stale(int(row.get("freshness_at") or 0))
@@ -8569,6 +8684,8 @@ class MemoryWikiProvider(MemoryProvider):
                             "pack_context coverage classification "
                             f"{suppression_status}: {suppression_error}"
                         )
+                all_rows = self._model_safe_claim_rows(all_rows)
+                rows = self._model_safe_claim_rows(rows)
                 result = self._pack_context(
                     a.get("query") or "",
                     max_chars,
@@ -8807,18 +8924,33 @@ class MemoryWikiProvider(MemoryProvider):
                 cid = a.get("claim_id", "")
                 limit = int(a.get("limit", 20))
                 c = self._connect()
-                self._require_visible_claim(cid, conn=c)
-                rows = [self._sanitize_row(r) for r in c.execute(
+                claim = self._require_visible_claim(cid, conn=c)
+                if self._model_safe_row(claim, source="memory_wiki_claim_history") is None:
+                    raise ValueError("claim not found")
+                rows = [safe for r in c.execute(
                     "SELECT * FROM claims_history WHERE claim_id=? ORDER BY changed_at DESC LIMIT ?",
-                    (cid, limit)).fetchall()]
-                current = self._table_row("claims", cid)
+                    (cid, limit)).fetchall()
+                    if (safe := self._model_safe_row(r, source="memory_wiki_claim_history:revision")) is not None]
+                current = self._model_safe_row(self._table_row("claims", cid))
+                if current is None:
+                    raise ValueError("claim not found")
                 return tool_result(success=True, claim_id=cid, current=current, history=rows)
             if tool_name == "memory_wiki_secrecy_report":
                 c = self._connect()
                 dist = {}
-                for r in c.execute("SELECT COALESCE(secrecy_level,'public') as lvl, count(*) n FROM claims WHERE status='active' GROUP BY lvl").fetchall():
-                    dist[r["lvl"]] = r["n"]
-                total_secrets = c.execute("SELECT count(*) n FROM secret_index WHERE status='active'").fetchone()["n"]
+                ownership = "visibility_scope,origin_bot_id,origin_session_id,origin_chat_hash,project_id"
+                for r in c.execute(
+                    f"SELECT secrecy_level,{ownership} FROM claims WHERE status='active'"
+                ):
+                    if self._claim_visible(r):
+                        level = str(r["secrecy_level"] or "public")
+                        dist[level] = dist.get(level, 0) + 1
+                total_secrets = sum(
+                    self._owned_aux_row_visible(r, "MEMORY_WIKI_ALLOW_SHARED_SECRET_METADATA")
+                    for r in c.execute(
+                        f"SELECT {ownership} FROM secret_index WHERE status='active'"
+                    )
+                )
                 return tool_result(success=True, distribution=dist, secret_index_entries=total_secrets)
             return tool_error(f"unknown memory-wiki tool: {tool_name}")
         except sqlite3.OperationalError as e:
@@ -10145,7 +10277,9 @@ class MemoryWikiProvider(MemoryProvider):
             parsed = json.loads(result) if isinstance(result, str) else dict(result or {})
         except Exception:
             parsed = {}
-        if parsed.get("success") is False or str(parsed.get("status") or "").lower() in {"unchanged", "disabled", "missing"}:
+        status = str(parsed.get("status") or "").lower()
+        if (parsed.get("success") is False or status in {"disabled", "missing"}
+                or (status == "unchanged" and parsed.get("file_identity_updated") is not True)):
             return {}
         try:
             checkpoint = self._journal_checkpoint(f"after-{op}", publish=False)
@@ -10394,58 +10528,81 @@ class MemoryWikiProvider(MemoryProvider):
             raise RuntimeError(
                 "refusing checkpoint while code graph opaque-ID migration failed"
             ) from exc
-        tables: Dict[str, List[Dict[str, Any]]] = {}
-        counts: Dict[str, int] = {}
-        for table in self._checkpoint_tables():
-            try:
-                if table not in {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}:
-                    continue
-                rows: List[Dict[str, Any]] = []
-                for r in c.execute(f"SELECT * FROM {table}").fetchall():
-                    d = dict(r)
-                    structured_identity_json: Dict[str, str] = {}
-                    trusted_opaque_graph_ids = _checkpoint_trusted_opaque_graph_ids(
-                        table, d, c,
-                    )
-                    for k, v in list(d.items()):
-                        if isinstance(v, str):
-                            safe_identity_json = _checkpoint_safe_graph_identity_json(
-                                table, str(k), v, c,
-                            )
-                            if safe_identity_json is not None:
-                                d[k] = safe_identity_json
-                                # _json_safe must not revisit this serialized
-                                # JSON text, or its generic token detector
-                                # would re-redact the independently verified
-                                # scalar IDs we just preserved.
-                                structured_identity_json[str(k)] = safe_identity_json
-                                continue
-                            d[k] = (
-                                v.strip()
-                                if (
-                                    _is_integrity_identifier(str(k), v)
-                                    or v.strip() in trusted_opaque_graph_ids
+        c.execute("SAVEPOINT journal_checkpoint_snapshot")
+        try:
+            tables: Dict[str, List[Dict[str, Any]]] = {}
+            counts: Dict[str, int] = {}
+            for table in self._checkpoint_tables():
+                try:
+                    if table not in {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}:
+                        continue
+                    rows: List[Dict[str, Any]] = []
+                    for r in c.execute(f"SELECT * FROM {table}").fetchall():
+                        d = dict(r)
+                        structured_identity_json: Dict[str, str] = {}
+                        trusted_opaque_graph_ids = _checkpoint_trusted_opaque_graph_ids(
+                            table, d, c,
+                        )
+                        for k, v in list(d.items()):
+                            if isinstance(v, str):
+                                safe_identity_json = _checkpoint_safe_graph_identity_json(
+                                    table, str(k), v, c,
                                 )
-                                else redact_secrets(scrub_memory_artifacts(v))
-                            )
-                    if table == "secret_index":
-                        d["value"] = ""
-                        d["value_redacted_in_checkpoint"] = True
-                    safe_row = self._json_safe(
-                        d,
-                        16000,
-                        redact_value_fields=False,
-                        preserve_sha256_fields=True,
-                        trusted_opaque_graph_ids=trusted_opaque_graph_ids,
-                    )
-                    if isinstance(safe_row, dict):
-                        safe_row.update(structured_identity_json)
-                    rows.append(safe_row)
-                tables[table] = rows
-                counts[table] = len(rows)
-            except Exception as e:
-                tables[table] = [{"checkpoint_error": _safe_exception_label(e)}]
-                counts[table] = -1
+                                if safe_identity_json is not None:
+                                    d[k] = safe_identity_json
+                                    # _json_safe must not revisit this serialized
+                                    # JSON text, or its generic token detector
+                                    # would re-redact the independently verified
+                                    # scalar IDs we just preserved.
+                                    structured_identity_json[str(k)] = safe_identity_json
+                                    continue
+                                d[k] = (
+                                    v.strip()
+                                    if (
+                                        _is_integrity_identifier(str(k), v)
+                                        or v.strip() in trusted_opaque_graph_ids
+                                    )
+                                    else redact_secrets(scrub_memory_artifacts(v))
+                                )
+                        if table == "secret_index":
+                            d["value"] = ""
+                            d["value_redacted_in_checkpoint"] = True
+                        safe_row = self._json_safe(
+                            d,
+                            16000,
+                            redact_value_fields=False,
+                            preserve_sha256_fields=True,
+                            trusted_opaque_graph_ids=trusted_opaque_graph_ids,
+                        )
+                        if isinstance(safe_row, dict):
+                            safe_row.update(structured_identity_json)
+                        rows.append(safe_row)
+                    tables[table] = rows
+                    counts[table] = len(rows)
+                except Exception as e:
+                    tables[table] = [{"checkpoint_error": _safe_exception_label(e)}]
+                    counts[table] = -1
+            # Only IDs are retained here: the outbox payload may contain claim
+            # text, vectors, leases and routing details unsuitable for a logical
+            # checkpoint. The worker reconstructs the delivery from canonical
+            # claims after a rebuild. Episode jobs have a different payload/target
+            # contract and cannot be reconstructed by this claim-only path.
+            claim_upsert_ids = sorted({
+                str(row[0]) for row in c.execute(
+                    """SELECT object_id FROM index_outbox
+                         WHERE object_type='claim'
+                           AND operation IN ('upsert','embed_and_upsert')
+                           AND status IN ('pending','processing')"""
+                ).fetchall()
+            })
+            if any(not re.fullmatch(r"c_[0-9a-f]{12}", item) for item in claim_upsert_ids):
+                raise RuntimeError("refusing checkpoint with unsafe claim outbox identifier")
+            pending_episode_jobs = c.execute(
+                """SELECT COUNT(*) FROM index_outbox WHERE object_type='episode'
+                     AND status IN ('pending','processing')"""
+            ).fetchone()[0]
+        finally:
+            c.execute("RELEASE SAVEPOINT journal_checkpoint_snapshot")
         meta = self._read_journal_meta()
         payload = {
             "id": cid,
@@ -10458,6 +10615,11 @@ class MemoryWikiProvider(MemoryProvider):
             "secret_values_note": "secret_index.value is always excluded",
             "db_path": str(self.db_path),
             "counts": counts,
+            "semantic_outbox_intents": {
+                "schema": "claim_upsert_intents/v1",
+                "claim_ids": claim_upsert_ids,
+                "pending_episode_jobs": pending_episode_jobs,
+            },
             "tables": tables,
         }
         tmp = path.with_suffix(path.suffix + ".tmp")
@@ -10622,6 +10784,74 @@ class MemoryWikiProvider(MemoryProvider):
             "memory_wiki_document_embed_pending", "memory_wiki_document_delete",
             "memory_wiki_document_ingest_inbox",
         }
+
+    def _checkpoint_claim_upsert_intents(self, payload: Dict[str, Any]) -> List[str]:
+        """Validate a signed ID-only checkpoint contract before touching live SQLite."""
+        intent = payload.get("semantic_outbox_intents")
+        if not isinstance(intent, dict) or intent.get("schema") != "claim_upsert_intents/v1":
+            raise RuntimeError(
+                "checkpoint lacks supported semantic outbox intent manifest; "
+                "cannot prove pending work safe to rebuild; live database left unchanged"
+            )
+        claim_ids = intent.get("claim_ids")
+        episode_jobs = intent.get("pending_episode_jobs")
+        if (
+            not isinstance(claim_ids, list)
+            or any(not isinstance(item, str) or not re.fullmatch(r"c_[0-9a-f]{12}", item)
+                   for item in claim_ids)
+            or len(set(claim_ids)) != len(claim_ids)
+            or type(episode_jobs) is not int or episode_jobs < 0
+        ):
+            raise RuntimeError("invalid checkpoint semantic outbox intent manifest; live database left unchanged")
+        if episode_jobs:
+            raise RuntimeError(
+                "checkpoint has pending episode outbox jobs unsupported by logical rebuild; "
+                "live database left unchanged"
+            )
+        table_payload = payload.get("tables")
+        counts = payload.get("counts")
+        claims = table_payload.get("claims") if isinstance(table_payload, dict) else None
+        if (
+            not isinstance(claims, list)
+            or not isinstance(counts, dict)
+            or type(counts.get("claims")) is not int
+            or counts["claims"] != len(claims)
+            or any(not isinstance(row, dict) or "checkpoint_error" in row for row in claims)
+        ):
+            raise RuntimeError("checkpoint claims table is incomplete; live database left unchanged")
+        return claim_ids
+
+    def _restore_checkpoint_claim_upserts(self, claim_ids: List[str]) -> int:
+        """Requeue only still-active claims in temporary SQLite, without I/O."""
+        c = self._connect()
+        queued = 0
+        with c:
+            for claim_id in claim_ids:
+                active = c.execute(
+                    """SELECT 1 FROM claims WHERE id=? AND status='active'
+                         AND COALESCE(NULLIF(normalized_claim,''),claim)!=''""",
+                    (claim_id,),
+                ).fetchone()
+                if active is None:
+                    continue
+                # Replayed updates may already have queued this claim. Replace
+                # stale text/leases with one canonical ID-only retry hint.
+                c.execute(
+                    """DELETE FROM index_outbox WHERE object_type='claim'
+                         AND object_id=? AND operation IN ('upsert','embed_and_upsert')
+                         AND status IN ('pending','processing')""",
+                    (claim_id,),
+                )
+                stamp = int(time.time())
+                c.execute(
+                    """INSERT INTO index_outbox(
+                         id,operation,object_type,object_id,payload_json,
+                         created_at,updated_at,next_retry_at)
+                       VALUES(?,'embed_and_upsert','claim',?,'{}',?,?,?)""",
+                    (uuid.uuid4().hex[:16], claim_id, stamp, stamp, stamp),
+                )
+                queued += 1
+        return queued
 
     def _rebuild_from_journal(self, apply: bool = False, checkpoint: str = "", max_events: int = 0) -> Dict[str, Any]:
         """Read/rebuild only after any open journal operation has completed."""
@@ -10798,10 +11028,25 @@ class MemoryWikiProvider(MemoryProvider):
                     incomplete.append(pending_event)
         for retry_errors in retryable_code_shrinker_errors.values():
             incomplete.extend(retry_errors)
+        checkpoint_claim_ids: List[str] = []
+        checkpoint_intent_error: Optional[RuntimeError] = None
+        semantic_outbox_recovery: Dict[str, Any] = {"status": "journal_only", "checkpoint_claim_upserts": 0}
+        if checkpoint_payload:
+            try:
+                checkpoint_claim_ids = self._checkpoint_claim_upsert_intents(checkpoint_payload)
+                semantic_outbox_recovery = {
+                    "status": "supported", "checkpoint_claim_upserts": len(checkpoint_claim_ids),
+                }
+            except RuntimeError as exc:
+                checkpoint_intent_error = exc
+                semantic_outbox_recovery = {
+                    "status": "blocked", "reason": _safe_exception_label(exc),
+                }
         plan = {
             "apply": apply,
             "checkpoint": str(cp_path) if cp_path else "",
             "checkpoint_seq": checkpoint_seq,
+            "semantic_outbox_recovery": semantic_outbox_recovery,
             "events_to_replay": len(candidates),
             "ops": {},
             "unrecoverable_events": len(unrecoverable),
@@ -10827,6 +11072,32 @@ class MemoryWikiProvider(MemoryProvider):
                 "journal contains unrecoverable or incomplete mutations that recovery cannot replay; "
                 f"live database left unchanged ({sample})"
             )
+        if checkpoint_intent_error is not None:
+            raise checkpoint_intent_error
+        claim_upsert_ids = checkpoint_claim_ids
+        # A checkpoint can predate a pending delivery. Include live ID-only
+        # intent as well: replayed source rows may still be active even when
+        # the older signed manifest contains no job for them. No payload text
+        # or remote target is trusted from the live queue.
+        live_outbox = self._connect()
+        newer_ids = {
+            str(row[0]) for row in live_outbox.execute(
+                """SELECT object_id FROM index_outbox WHERE object_type='claim'
+                     AND operation IN ('upsert','embed_and_upsert')
+                     AND status IN ('pending','processing')"""
+            ).fetchall()
+        }
+        if any(not re.fullmatch(r"c_[0-9a-f]{12}", item) for item in newer_ids):
+            raise RuntimeError("unsafe live claim outbox identifier; live database left unchanged")
+        if live_outbox.execute(
+            """SELECT 1 FROM index_outbox WHERE object_type='episode'
+                 AND status IN ('pending','processing') LIMIT 1"""
+        ).fetchone():
+            raise RuntimeError(
+                "live database has pending episode outbox jobs unsupported by logical rebuild; "
+                "live database left unchanged"
+            )
+        claim_upsert_ids = sorted(set(claim_upsert_ids) | newer_ids)
         safety = self._backup("pre-journal-rebuild safety backup") if self.db_path.exists() else {}
         original_db = self.db_path
         original_conn = self._conn
@@ -10964,6 +11235,7 @@ class MemoryWikiProvider(MemoryProvider):
             if self._privacy_erasure is None:
                 raise RuntimeError("privacy erasure ledger unavailable")
             self._privacy_erasure.replay(self, _runtime_module(), force=True)
+            recovered_claim_upserts = self._restore_checkpoint_claim_upserts(claim_upsert_ids)
             self._rebuild_fts(); self._render_all(); self._render_active_dashboard()
             qc = self._connect().execute("PRAGMA quick_check").fetchone()[0]
             if qc != "ok":
@@ -11059,7 +11331,7 @@ class MemoryWikiProvider(MemoryProvider):
                 self._background_worker.wake()
             audit_status = "ok" if not derived_reindex_failures and not outbox_recovery_error else "partial"
             self._audit("journal_rebuild", audit_status, f"checkpoint={cp_path} replayed={replayed} failed={failed} deferred_reindex={len(deferred_reindex_refs)}")
-            return {**plan, "applied": True, "safety_backup": safety, "rebuilt_db": str(original_db), "replayed": replayed, "failed": failed, "skipped": skipped, "errors": errors[:20], "derived_reindex": derived_reindex, "derived_reindex_failures": derived_reindex_failures, "outbox_recovery_error": outbox_recovery_error, "background_recovery": background_recovery}
+            return {**plan, "applied": True, "safety_backup": safety, "rebuilt_db": str(original_db), "replayed": replayed, "failed": failed, "skipped": skipped, "errors": errors[:20], "recovered_claim_upserts": recovered_claim_upserts, "derived_reindex": derived_reindex, "derived_reindex_failures": derived_reindex_failures, "outbox_recovery_error": outbox_recovery_error, "background_recovery": background_recovery}
         except Exception:
             try:
                 if self._conn is not None:
@@ -12017,12 +12289,16 @@ class MemoryWikiProvider(MemoryProvider):
         row_source = (
             list(preselected_rows)
             if preselected_rows is not None
-            else self._search(query, lim, True)
+            else self._search(
+                query, min(200, max(lim + 10, lim * 2)), True,
+                record_retrieval=False,
+            )
         )
         rows = [
             row for row in row_source
             if str(row.get('id', '')) not in excluded
-        ][:lim]
+        ]
+        rows = self._model_safe_claim_rows(rows, lim)
         remembered=[]; confirmed=[]; changed=[]; stale_unverified=[]
         neg_re=re.compile(r"(?i)\b(?:not|never|no|without|disable|disabled|obsolete|deprecated|do not|does not|don't|не|нет|никогда|без|отключ|устарел|не использовать)\b")
         def neg(s: str) -> bool:
@@ -12053,6 +12329,10 @@ class MemoryWikiProvider(MemoryProvider):
             basis='Use confirmed memory together with verified_now; treat stale_or_unverified items as background only.'
         else:
             basis='No verified/current facts were supplied. Use remembered items only as recall; probe files/services/web/current state before relying on volatile facts.'
+        # A standalone diff recalls the rows it actually publishes. A context
+        # pack supplies its own candidates and owns their retrieval accounting.
+        if preselected_rows is None:
+            self._record_recall_rows(rows, injected=False, source="memory_diff")
         return {'query':query, 'remembered':remembered, 'verified_now':facts, 'confirmed':confirmed, 'changed_or_conflicting':changed, 'stale_or_unverified':stale_unverified, 'answer_basis':basis, 'policy':['fresh verified facts > explicit user correction > pinned preference > recent high-trust claim > stale/unverified memory']}
 
     def _sanitize_row(self, row: Dict[str, Any] | sqlite3.Row) -> Dict[str, Any]:
@@ -12131,9 +12411,15 @@ class MemoryWikiProvider(MemoryProvider):
 
     def _why_believe(self, claim_id: str) -> Dict[str, Any]:
         c=self._connect(); r=self._require_visible_claim(claim_id, conn=c)
-        ev=[self._sanitize_row(x) for x in c.execute("SELECT * FROM evidence WHERE claim_id=? ORDER BY created_at DESC LIMIT 12", (claim_id,)).fetchall()]
-        cons=[self._sanitize_row(x) for x in c.execute("SELECT * FROM contradictions WHERE (claim_a=? OR claim_b=?) ORDER BY created_at DESC LIMIT 12", (claim_id,claim_id)).fetchall() if self._contradiction_visible(x, c)]
-        mutations=[self._sanitize_row(x) for x in c.execute("SELECT * FROM memory_mutations WHERE target_table='claims' AND target_id=? ORDER BY created_at DESC LIMIT 8", (claim_id,)).fetchall()]
+        r=self._model_safe_row(r, source="memory_wiki_why_believe")
+        if r is None:
+            raise ValueError("claim not found")
+        ev=[safe for x in c.execute("SELECT * FROM evidence WHERE claim_id=? ORDER BY created_at DESC LIMIT 12", (claim_id,)).fetchall()
+            if (safe := self._model_safe_row(x, source="memory_wiki_why_believe:evidence")) is not None]
+        cons=[safe for x in c.execute("SELECT * FROM contradictions WHERE (claim_a=? OR claim_b=?) ORDER BY created_at DESC LIMIT 12", (claim_id,claim_id)).fetchall()
+              if self._contradiction_visible(x, c) and (safe := self._model_safe_row(x, source="memory_wiki_why_believe:contradiction")) is not None]
+        mutations=[safe for x in c.execute("SELECT * FROM memory_mutations WHERE target_table='claims' AND target_id=? ORDER BY created_at DESC LIMIT 8", (claim_id,)).fetchall()
+                   if (safe := self._model_safe_row(x, source="memory_wiki_why_believe:mutation")) is not None]
         recalls=[self._sanitize_row(x) for x in c.execute("SELECT id,claim_id,'' AS query,score,used,created_at FROM recall_events WHERE claim_id=? ORDER BY created_at DESC LIMIT 8", (claim_id,)).fetchall()]
         custody={}
         try: custody=json.loads(r["custody"] or "{}") if "custody" in r.keys() else {}
@@ -12156,7 +12442,7 @@ class MemoryWikiProvider(MemoryProvider):
             "last_recalled": r["last_recalled"] if "last_recalled" in r.keys() else 0,
             "stale": self._is_stale(r["freshness_at"]),
         }
-        return {"claim": self._sanitize_row(r), "evidence": ev, "contradictions": cons, "mutations": mutations, "recalls": recalls, "why": trust}
+        return {"claim": r, "evidence": ev, "contradictions": cons, "mutations": mutations, "recalls": recalls, "why": trust}
 
     def _topic_alias(self, topic: str, claim: str = "") -> str:
         t=canonical_topic(topic, claim); c=self._connect()
@@ -15599,6 +15885,8 @@ class MemoryWikiProvider(MemoryProvider):
             if ex:
                 if not self._claims_share_visibility_partition(ex,p):
                     raise ValueError('claim hash identity crosses a visibility partition')
+                if str(ex["status"] or "") == "archived" and not p.get("_revive_archived", True):
+                    raise PermissionError("archived_claim_hash_collision")
                 cid = ex["id"]
                 c.execute("UPDATE claims SET status=CASE WHEN status='archived' THEN 'active' ELSE status END, temporal_status=CASE WHEN status='archived' THEN 'current' ELSE temporal_status END, superseded_by_id=CASE WHEN status='archived' THEN '' ELSE superseded_by_id END, topic=?, source=?, source_type=?, type=?, normalized_claim=?, scope=?, project_id=?, evidence=CASE WHEN ?!='' THEN ? ELSE evidence END, confidence=max(confidence,?), salience=max(salience,?), quality=max(quality,?), pinned=max(pinned,?), trust_class=?, trust_score=max(trust_score,?), risk=?, custody=?, quality_flags=?, source_ref=CASE WHEN source_ref='' THEN ? ELSE source_ref END, review_state=?, quarantined_at=CASE WHEN ? THEN ? ELSE quarantined_at END, verification_status=?, last_verified_at=?, updated_at=?, freshness_at=? WHERE id=?", (topic, source, stype, ctype, normalized, scope, project_id,
  evidence, evidence, clamp(confidence), clamp(salience), quality, pinned,
@@ -15757,10 +16045,11 @@ class MemoryWikiProvider(MemoryProvider):
             )
         return cid
 
-    def _add_claim(self, claim: str, topic="general", evidence="", source="tool", confidence=.7, salience=.7, conn=None, *, visibility_scope="", project_id="", event_at=0, event_timezone="UTC") -> str:
+    def _add_claim(self, claim: str, topic="general", evidence="", source="tool", confidence=.7, salience=.7, conn=None, *, visibility_scope="", project_id="", event_at=0, event_timezone="UTC", revive_archived=True) -> str:
         prepared = self._prepare_claim(claim, topic, evidence, source, confidence, salience, visibility_scope=visibility_scope, project_id=project_id, event_at=event_at, event_timezone=event_timezone)
         if isinstance(prepared, str) and prepared.startswith("rq_"):
             return prepared
+        prepared["_revive_archived"] = bool(revive_archived)
         if conn is not None:
             return self._add_claim_tx(conn, prepared, confidence, salience)
         with self._connect() as own_conn:
@@ -16238,7 +16527,8 @@ class MemoryWikiProvider(MemoryProvider):
 
     def _rerank_status(self) -> Dict[str, Any]:
         with _RERANK_LOCK:
-            status = dict(_RERANK_STATS)
+            state = _rerank_scope_state()
+            status = dict(state["stats"])
             rules_blob = json.dumps(RERANK_RULES, ensure_ascii=False, sort_keys=True) if RERANK_RULES_ENABLED else ""
             status.update({
                 "enabled": RERANK_ENABLED,
@@ -16253,15 +16543,17 @@ class MemoryWikiProvider(MemoryProvider):
                 "rules_position": RERANK_RULES_POSITION,
                 "rules_hash": sha(rules_blob)[:16] if rules_blob else "none",
                 "skip_exact_technical": RERANK_SKIP_EXACT_TECHNICAL,
-                "cache_entries": len(_RERANK_CACHE),
-                "circuit_open_s": round(max(0.0, _RERANK_CIRCUIT_UNTIL - time.monotonic()), 3),
+                "cache_entries": len(state["cache"]),
+                "circuit_open_s": round(max(0.0, state["circuit_until"] - time.monotonic()), 3),
             })
             status["cost_usd"] = round(float(status.get("cost_usd", 0.0)), 6)
             return status
 
     def _rerank_rows(self, query: str, scored: List[Dict[str, Any]], query_mode: str) -> List[Dict[str, Any]]:
         """Rerank a safe top-K with instruction-aware rules and fuse it with RRF."""
-        global _RERANK_FAILURE_COUNT, _RERANK_CIRCUIT_UNTIL
+        state = _rerank_scope_state()
+        stats = state["stats"]
+        cache = state["cache"]
         original = list(scored or [])
         q = str(query or "").strip()
         if (
@@ -16273,11 +16565,11 @@ class MemoryWikiProvider(MemoryProvider):
             or len(original) < RERANK_MIN_CANDIDATES
         ):
             with _RERANK_LOCK:
-                _RERANK_STATS["skipped"] += 1
+                stats["skipped"] += 1
             return original
         if secret_scan(q).get("raw_secret"):
             with _RERANK_LOCK:
-                _RERANK_STATS["skipped"] += 1
+                stats["skipped"] += 1
             _debug_log("RERANK skipped because the query contains a raw secret")
             return original
 
@@ -16288,14 +16580,14 @@ class MemoryWikiProvider(MemoryProvider):
             and (float(top_parts.get("exact", 0.0)) > 0.0 or float(top_parts.get("bm25", 0.0)) >= 0.85)
         ):
             with _RERANK_LOCK:
-                _RERANK_STATS["skipped"] += 1
+                stats["skipped"] += 1
             _debug_log("RERANK skip exact-dominant technical query")
             return original
 
         now_mono = time.monotonic()
         with _RERANK_LOCK:
-            if _RERANK_CIRCUIT_UNTIL > now_mono:
-                _RERANK_STATS["skipped"] += 1
+            if state["circuit_until"] > now_mono:
+                stats["skipped"] += 1
                 return original
 
         prefix: List[Dict[str, Any]] = []
@@ -16312,7 +16604,7 @@ class MemoryWikiProvider(MemoryProvider):
             prefix.append(row)
         if len(prefix) < RERANK_MIN_CANDIDATES:
             with _RERANK_LOCK:
-                _RERANK_STATS["skipped"] += 1
+                stats["skipped"] += 1
             return original
 
         # Fetch code metadata once for the whole top-K. This makes repository,
@@ -16389,12 +16681,12 @@ class MemoryWikiProvider(MemoryProvider):
 
         if RERANK_CACHE_TTL > 0:
             with _RERANK_LOCK:
-                cached = _RERANK_CACHE.get(cache_key)
+                cached = cache.get(cache_key)
                 if cached and cached[0] > now_mono:
-                    _RERANK_STATS["cache_hits"] += 1
+                    stats["cache_hits"] += 1
                     return fuse_current_order(cached[1])
-                for key in [k for k, value in _RERANK_CACHE.items() if value[0] <= now_mono]:
-                    _RERANK_CACHE.pop(key, None)
+                for key in [k for k, value in cache.items() if value[0] <= now_mono]:
+                    cache.pop(key, None)
 
         headers = {
             "Authorization": f"Bearer {_rerank_api_key()}",
@@ -16469,31 +16761,31 @@ class MemoryWikiProvider(MemoryProvider):
             latency_ms = int((time.monotonic() - started) * 1000)
             usage = obj.get("usage") or {}
             with _RERANK_LOCK:
-                _RERANK_FAILURE_COUNT = 0
-                _RERANK_CIRCUIT_UNTIL = 0.0
-                _RERANK_STATS["requests"] += 1
-                _RERANK_STATS["successes"] += 1
-                _RERANK_STATS["search_units"] += int(usage.get("search_units") or 0)
-                _RERANK_STATS["cost_usd"] += float(usage.get("cost") or 0.0)
-                _RERANK_STATS["last_latency_ms"] = latency_ms
-                _RERANK_STATS["last_error"] = ""
+                state["failure_count"] = 0
+                state["circuit_until"] = 0.0
+                stats["requests"] += 1
+                stats["successes"] += 1
+                stats["search_units"] += int(usage.get("search_units") or 0)
+                stats["cost_usd"] += float(usage.get("cost") or 0.0)
+                stats["last_latency_ms"] = latency_ms
+                stats["last_error"] = ""
                 if RERANK_CACHE_TTL > 0:
-                    if len(_RERANK_CACHE) >= RERANK_CACHE_MAX:
-                        oldest = min(_RERANK_CACHE, key=lambda k: _RERANK_CACHE[k][0])
-                        _RERANK_CACHE.pop(oldest, None)
-                    _RERANK_CACHE[cache_key] = (time.monotonic() + RERANK_CACHE_TTL, cached_meta)
+                    if len(cache) >= RERANK_CACHE_MAX:
+                        oldest = min(cache, key=lambda k: cache[k][0])
+                        cache.pop(oldest, None)
+                    cache[cache_key] = (time.monotonic() + RERANK_CACHE_TTL, cached_meta)
             return ordered
         except Exception as exc:
             latency_ms = int((time.monotonic() - started) * 1000)
             with _RERANK_LOCK:
-                _RERANK_FAILURE_COUNT += 1
-                _RERANK_STATS["requests"] += 1
-                _RERANK_STATS["failures"] += 1
-                _RERANK_STATS["last_latency_ms"] = latency_ms
-                _RERANK_STATS["last_error"] = _safe_exception_label(exc)
-                if _RERANK_FAILURE_COUNT >= RERANK_CIRCUIT_FAILURES:
-                    _RERANK_CIRCUIT_UNTIL = time.monotonic() + RERANK_CIRCUIT_SECONDS
-                    _RERANK_FAILURE_COUNT = 0
+                state["failure_count"] += 1
+                stats["requests"] += 1
+                stats["failures"] += 1
+                stats["last_latency_ms"] = latency_ms
+                stats["last_error"] = _safe_exception_label(exc)
+                if state["failure_count"] >= RERANK_CIRCUIT_FAILURES:
+                    state["circuit_until"] = time.monotonic() + RERANK_CIRCUIT_SECONDS
+                    state["failure_count"] = 0
             return original
 
     def _search_fallback(
@@ -16585,10 +16877,14 @@ class MemoryWikiProvider(MemoryProvider):
         _debug_log(f"SEMANTIC hydrated={hydrated} requested={len(claim_ids)}")
         return hydrated
 
-    @staticmethod
-    def _global_search_row_allowed(row: sqlite3.Row) -> bool:
-        """Apply a strict, profile-independent non-secret read boundary."""
+    def _global_search_row_allowed(self, row: sqlite3.Row, *, same_profile: bool) -> bool:
+        """Keep foreign profiles global-only and enforce caller ACL locally."""
         try:
+            visibility = str(row["visibility_scope"] or "")
+            if not visibility or (not same_profile and visibility != "global"):
+                return False
+            if not self._claim_visible(row):
+                return False
             if str(row["status"] or "") != "active":
                 return False
             if str(row["risk"] or "low") == "secret" or int(row["quarantined_at"] or 0) > 0:
@@ -16604,7 +16900,21 @@ class MemoryWikiProvider(MemoryProvider):
                 str(row["normalized_claim"] or ""),
                 str(row["evidence"] or ""),
             ))
-            return not bool(secret_scan(text).get("raw_secret"))
+            if secret_scan(text).get("raw_secret"):
+                return False
+            for field in ("claim", "normalized_claim", "evidence", "topic"):
+                value = redact_secrets(scrub_memory_artifacts(str(row[field] or "")))
+                if not value:
+                    continue
+                inspected = self._inspect_recall_text(
+                    value, source=f"memory_wiki_global_search:{field}",
+                    mem_type="claim", audit=False, max_len=len(value),
+                )
+                # The output serializer still reads the row. Do not return a
+                # row if its inspected text would differ from that serializer.
+                if inspected.get("status") != "safe" or inspected.get("content") != value:
+                    return False
+            return True
         except (KeyError, TypeError, ValueError):
             return False
 
@@ -16630,7 +16940,7 @@ class MemoryWikiProvider(MemoryProvider):
             "profile": profile,
             "claim": short(claim, 2400),
             "evidence": short(evidence, 1200),
-            "topic": str(row["topic"] or ""),
+            "topic": redact_secrets(scrub_memory_artifacts(str(row["topic"] or ""))),
             "status": str(row["status"] or ""),
             "confidence": float(row["confidence"] or 0.0),
             "salience": float(row["salience"] or 0.0),
@@ -16688,6 +16998,29 @@ class MemoryWikiProvider(MemoryProvider):
             "AND COALESCE(claims.quality,0)>=0.20"
         )
         for profile, home in homes:
+            same_profile = home.resolve() == self.home.resolve()
+            # Filter before LIMIT as well as after hydration; a foreign bot's
+            # private hits must not crowd out globally visible candidates.
+            if same_profile:
+                effective_session = str(self.session_id or "default")
+                profile_where = base_where + (
+                    " AND (LOWER(claims.visibility_scope)='global'"
+                    " OR (LOWER(claims.visibility_scope)='bot' AND claims.origin_bot_id=?)"
+                    " OR (LOWER(claims.visibility_scope)='chat' AND claims.origin_bot_id=?"
+                    " AND claims.origin_chat_hash=?)"
+                    " OR (LOWER(claims.visibility_scope)='private' AND claims.origin_bot_id=?"
+                    " AND claims.origin_session_id=?)"
+                    " OR (LOWER(claims.visibility_scope)='project' AND claims.project_id=?"
+                    " AND ?!=''))"
+                )
+                visibility_params = (
+                    self.bot_id, self.bot_id, self._chat_hash(effective_session),
+                    self.bot_id, effective_session,
+                    str(self.project_scope or ""), str(self.project_scope or ""),
+                )
+            else:
+                profile_where = base_where + " AND claims.visibility_scope='global'"
+                visibility_params = ()
             diag: Dict[str, Any] = {
                 "profile": profile,
                 "lexical_candidates": 0,
@@ -16704,16 +17037,32 @@ class MemoryWikiProvider(MemoryProvider):
                 if requested_mode != "vector":
                     try:
                         fts_rows = conn.execute(
-                            "SELECT claims.*, bm25(claims_fts) AS rank "
+                            "SELECT claims.*, bm25(claims_fts) AS rank, "
+                            "claims_fts.claim AS indexed_claim, "
+                            "claims_fts.normalized AS indexed_normalized, "
+                            "claims_fts.topic AS indexed_topic, "
+                            "claims_fts.evidence AS indexed_evidence, "
+                            "claims_fts.search_text AS indexed_search_text "
                             "FROM claims_fts JOIN claims ON claims_fts.id=claims.id "
-                            f"WHERE claims_fts MATCH ? AND {base_where} "
+                            f"WHERE claims_fts MATCH ? AND {profile_where} "
                             "ORDER BY rank LIMIT ?",
-                            (safe_fts, candidate_limit),
+                            (safe_fts, *visibility_params, candidate_limit),
                         ).fetchall()
                     except (sqlite3.DatabaseError, sqlite3.OperationalError):
                         fts_rows = []
                     for row in fts_rows:
-                        if not self._global_search_row_allowed(row):
+                        # Foreign profile FTS may still be v2 or v3 before a
+                        # redaction change. A raw topic token must not reveal
+                        # even the existence of an otherwise safe global row.
+                        if any(row[field] for field in (
+                            "indexed_claim", "indexed_normalized",
+                            "indexed_topic", "indexed_evidence",
+                        )) or row["indexed_search_text"] != claim_search_text(
+                            row["claim"], row["normalized_claim"] or row["claim"],
+                            row["topic"], row["evidence"],
+                        ):
+                            continue
+                        if not self._global_search_row_allowed(row, same_profile=same_profile):
                             continue
                         claim_id = str(row["id"])
                         key = f"{profile}:{claim_id}"
@@ -16725,15 +17074,19 @@ class MemoryWikiProvider(MemoryProvider):
                         )
                     try:
                         like_rows = conn.execute(
-                            "SELECT claims.* FROM claims WHERE " + base_where
+                            "SELECT claims.* FROM claims WHERE " + profile_where
                             + " AND (claims.claim LIKE ? OR claims.normalized_claim LIKE ? OR claims.evidence LIKE ?) "
                             "LIMIT ?",
-                            (like, like, like, candidate_limit),
+                            (*visibility_params, like, like, like, candidate_limit),
                         ).fetchall()
                     except (sqlite3.DatabaseError, sqlite3.OperationalError):
                         like_rows = []
                     for row in like_rows:
-                        if not self._global_search_row_allowed(row):
+                        if not any(q[:180].casefold() in redact_secrets(
+                            scrub_memory_artifacts(str(row[field] or ""))
+                        ).casefold() for field in ("claim", "normalized_claim", "evidence")):
+                            continue
+                        if not self._global_search_row_allowed(row, same_profile=same_profile):
                             continue
                         claim_id = str(row["id"])
                         key = f"{profile}:{claim_id}"
@@ -16743,11 +17096,27 @@ class MemoryWikiProvider(MemoryProvider):
                 diag["lexical_candidates"] = len(rows_by_id)
                 if requested_mode != "fts" and SEMANTIC_ENABLED:
                     with _profile_qdrant_scope(home):
-                        if _semantic_available():
+                        if _semantic_available(read_only=True):
                             diag["semantic_available"] = True
                             vector = _embed_query(q)
                             if vector:
-                                matches = _qdrant_search(vector, candidate_limit)
+                                if same_profile:
+                                    effective_session = str(self.session_id or "default")
+                                    query_filter = _qdrant_visibility_filter(
+                                        bot_id=str(self.bot_id or ""),
+                                        chat_hash=self._chat_hash(effective_session),
+                                        session_id=effective_session,
+                                        project_id=str(self.project_scope or ""),
+                                    )
+                                else:
+                                    # A foreign profile is global-only, even when
+                                    # owner fields happen to match the caller.
+                                    query_filter = {"must": [{
+                                        "key": "visibility_scope", "match": {"value": "global"},
+                                    }]}
+                                matches = _qdrant_search(
+                                    vector, candidate_limit, query_filter=query_filter,
+                                )
                                 semantic_ids = [str(item[0]) for item in matches if str(item[0])]
                                 if semantic_ids:
                                     for offset in range(0, len(semantic_ids), 400):
@@ -16755,11 +17124,11 @@ class MemoryWikiProvider(MemoryProvider):
                                         placeholders = ",".join("?" for _ in chunk)
                                         hydrated = conn.execute(
                                             "SELECT claims.* FROM claims WHERE id IN ("
-                                            + placeholders + ") AND " + base_where,
-                                            chunk,
+                                            + placeholders + ") AND " + profile_where,
+                                            (*chunk, *visibility_params),
                                         ).fetchall()
                                         for row in hydrated:
-                                            if not self._global_search_row_allowed(row):
+                                            if not self._global_search_row_allowed(row, same_profile=same_profile):
                                                 continue
                                             claim_id = str(row["id"])
                                             key = f"{profile}:{claim_id}"
@@ -17891,7 +18260,7 @@ class MemoryWikiProvider(MemoryProvider):
         return out
 
     def _render_topic(self, topic: str) -> str:
-        topic=slug(topic); c=self._connect(); rows=[r for r in c.execute("SELECT * FROM claims WHERE topic=? ORDER BY status, salience DESC, updated_at DESC",(topic,)).fetchall() if self._claim_visible(r)]
+        topic=slug(topic); c=self._connect(); rows=self._model_safe_claim_rows(c.execute("SELECT * FROM claims WHERE topic=? ORDER BY status, salience DESC, updated_at DESC",(topic,)))
         total=len(rows); rows=rows[:MAX_RENDER_CLAIMS_PER_TOPIC]
         ids=[r["id"] for r in rows]
         lines=[f"# {topic}","",f"Updated: {time.strftime('%Y-%m-%d %H:%M:%S')}",""]
@@ -17902,11 +18271,15 @@ class MemoryWikiProvider(MemoryProvider):
             if int(r["pinned"] or 0): flags.append("pinned")
             if self._is_stale(r["freshness_at"]): flags.append("stale")
             lines.append(f"- `{r['id']}` **{r['status']}** conf={r['confidence']:.2f} sal={r['salience']:.2f} {' '.join('`'+f+'`' for f in flags)}: {r['claim']}")
-            for e in self._top_evidence(r["id"],3): lines.append(f"  - {e['kind']} from {e['source']}: {short(e['text'],220)}")
-        backlinks=self._backlinks_for(ids)
+            for e in self._top_evidence(r["id"],3):
+                safe=self._model_safe_row(e, source="memory_wiki_get_page:evidence")
+                if safe is not None:
+                    lines.append(f"  - {safe['kind']} from {safe['source']}: {short(safe['text'],220)}")
+        backlinks=self._model_safe_claim_rows(self._backlinks_for(ids))
         if backlinks:
             lines += ["","## Backlinks"] + [f"- `{b['id']}` ({b['topic']}): {short(b['claim'],220)}" for b in backlinks]
-        contr=[row for row in self._related_contradictions(ids) if self._contradiction_visible(row, c)]
+        contr=[safe for row in self._related_contradictions(ids) if self._contradiction_visible(row, c)
+               if (safe := self._model_safe_row(row, source="memory_wiki_get_page:contradiction")) is not None]
         if contr:
             lines += ["","## Open contradictions"] + [f"- `{k['id']}` {k['claim_a']} ↔ {k['claim_b']}: {k['reason']}" for k in contr]
         content="\n".join(lines)+"\n"
@@ -17919,7 +18292,7 @@ class MemoryWikiProvider(MemoryProvider):
 
     def _dashboard(self, limit=20) -> Dict[str,Any]:
         c=self._connect(); limit=max(1,min(limit,100))
-        visible=[r for r in c.execute("SELECT * FROM claims").fetchall() if self._claim_visible(r)]
+        visible=self._model_safe_claim_rows(c.execute("SELECT * FROM claims"))
         counts={status:sum(r["status"]==status for r in visible) for status in {r["status"] for r in visible}}
         topic_rows={}
         for r in visible: topic_rows.setdefault(r["topic"], []).append(r)
@@ -17927,7 +18300,8 @@ class MemoryWikiProvider(MemoryProvider):
         topics=sorted(topics,key=lambda r:r["n"],reverse=True)[:limit]
         active=[r for r in visible if r["status"]=="active"]
         stale=[self._sanitize_row(r) for r in sorted(active,key=lambda r:r["freshness_at"] or 0)[:limit] if self._is_stale(r["freshness_at"])]
-        contr=[dict(r) for r in c.execute("SELECT * FROM contradictions WHERE status='open' ORDER BY created_at DESC",()).fetchall() if self._contradiction_visible(r,c)][:limit]
+        contr=[safe for r in c.execute("SELECT * FROM contradictions WHERE status='open' ORDER BY created_at DESC",()).fetchall()
+               if self._contradiction_visible(r,c) and (safe := self._model_safe_row(r, source="memory_wiki_dashboard:contradiction")) is not None][:limit]
         top=[self._sanitize_row(r) for r in sorted(active,key=lambda r:(r["salience"],r["confidence"]),reverse=True)[:limit]]
         has_review_queue = c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_queue'").fetchone() is not None
         review_pending = sum(1 for row in c.execute("SELECT * FROM review_queue WHERE status='pending'")
@@ -18086,7 +18460,7 @@ class MemoryWikiProvider(MemoryProvider):
         return {"version":PLUGIN_VERSION,"health_score":round(score,3),"metrics":metrics,"shared_memory":shared_memory,"issues":issues,"schema_anomalies":schema_anomalies,"low_quality":bad,"bad_topics":topics,"raw_blobs":blobs,"secret_hits":secrets}
 
     def _explain_recall(self, query: str, limit: int = 10, topic: Optional[str]=None) -> List[Dict[str, Any]]:
-        rows = self._search(query, limit, True, topic); qt=tokens(query); out=[]
+        rows = self._model_safe_claim_rows(self._search(query, limit, True, topic, record_retrieval=False)); qt=tokens(query); out=[]
         for r in rows:
             blob = claim_search_text(r.get("claim",""), r.get("normalized_claim",""), r.get("topic",""), r.get("evidence","")); overlap=sorted(qt & tokens(blob))
             parts = r.get("score_parts", {}) or {}
@@ -18381,7 +18755,7 @@ class MemoryWikiProvider(MemoryProvider):
         # The legacy secret and task tables have no consumer ownership field.
         # Their content must not be copied to a model-visible dashboard.
         lines += ["", "## High-salience active claims", ""]
-        visible=[r for r in c.execute("SELECT * FROM claims WHERE status='active' ORDER BY salience DESC, updated_at DESC").fetchall() if self._claim_visible(r)][:30]
+        visible=self._model_safe_claim_rows(c.execute("SELECT * FROM claims WHERE status='active' ORDER BY salience DESC, updated_at DESC"), 30)
         for r in visible:
             lines.append(f"- `{r['id']}` topic={r['topic']} type={r['type']} conf={r['confidence']:.2f} sal={r['salience']:.2f}: {short(r['claim'],220)}")
         path=self.dashboard_dir/"active.md"; path.write_text("\n".join(lines)+"\n", encoding="utf-8")
@@ -19779,8 +20153,8 @@ class MemoryWikiProvider(MemoryProvider):
         """v1.6: Generate a structured summary of a topic."""
         t=self._topic_alias(topic or "general"); c=self._connect()
         limit=max(1,min(int(limit or 30),100))
-        rows=[r for r in c.execute("""SELECT * FROM claims WHERE topic=? AND status='active'
-            ORDER BY pinned DESC, salience DESC, confidence DESC, updated_at DESC""", (t,)).fetchall() if self._claim_visible(r)][:limit]
+        rows=self._model_safe_claim_rows(c.execute("""SELECT * FROM claims WHERE topic=? AND status='active'
+            ORDER BY pinned DESC, salience DESC, confidence DESC, updated_at DESC""", (t,)), limit)
         if not rows: return {"topic":t,"summary":"","claim_count":0,"key_facts":[]}
         by_type={}; key_facts=[]
         for r in rows:
@@ -19795,9 +20169,10 @@ class MemoryWikiProvider(MemoryProvider):
                 parts.append(f"\n## {ct} ({len(group)})")
                 for r in group[:5]:
                     parts.append(f"- {short(redact_secrets(str(r['claim'])),180)} (conf={r['confidence']:.2f})")
-        conts=[row for row in c.execute("""SELECT * FROM contradictions WHERE status='open'
+        conts=[safe for row in c.execute("""SELECT * FROM contradictions WHERE status='open'
             AND (claim_a IN (SELECT id FROM claims WHERE topic=?) OR claim_b IN (SELECT id FROM claims WHERE topic=?))
-            LIMIT 100""",(t,t)).fetchall() if self._contradiction_visible(row,c)][:10]
+            LIMIT 100""",(t,t)).fetchall() if self._contradiction_visible(row,c)
+            if (safe := self._model_safe_row(row, source="memory_wiki_summarize_topic:contradiction")) is not None][:10]
         if conts:
             parts.append(f"\n## Open contradictions ({len(conts)})")
             for k in conts:
@@ -19811,12 +20186,13 @@ class MemoryWikiProvider(MemoryProvider):
         if project_id: where.append("(project_id=? OR claim LIKE ?)"); params.extend([project_id, f'%{project_id}%'])
         if scope: where.append("scope=?"); params.append(scope)
         sql="SELECT * FROM claims WHERE "+" AND ".join(where)+" ORDER BY updated_at DESC"
-        claims=[self._sanitize_row(r) for r in c.execute(sql, params).fetchall() if self._claim_visible(r)][:limit]
+        claims=self._model_safe_claim_rows(c.execute(sql, params), limit)
         claim_ids=[r['id'] for r in claims]
         evidence=[]
         if claim_ids:
             qs=','.join('?' for _ in claim_ids[:900])
-            evidence=[self._sanitize_row(r) for r in c.execute(f"SELECT * FROM evidence WHERE claim_id IN ({qs}) ORDER BY created_at DESC LIMIT ?", claim_ids[:900]+[limit]).fetchall()]
+            evidence=[safe for r in c.execute(f"SELECT * FROM evidence WHERE claim_id IN ({qs}) ORDER BY created_at DESC LIMIT ?", claim_ids[:900]+[limit]).fetchall()
+                      if (safe := self._model_safe_row(r, source="memory_wiki_export_bundle:evidence")) is not None]
         payload={
             'format':'memory-wiki-sync-bundle/v1', 'created_at':now(), 'source_home':str(self.home),
             'filters':{'topic':topic,'project_id':project_id,'scope':scope,'limit':limit},
@@ -20041,20 +20417,14 @@ class MemoryWikiProvider(MemoryProvider):
                 return ''
         else:
             llm_env = {key: os.environ.get(key, '') for key in llm_keys}
-        if not candidate_context.strip() or llm_env.get('MEMORY_WIKI_LLM_PACK','0').lower() in ('0','false','no','off'):
+        if not candidate_context.strip() or str(llm_env.get('MEMORY_WIKI_LLM_PACK') or '').lower() not in ('1','true','yes','on'):
             return ''
-        cfg_path=profile_home / 'config.yaml'
-        raw=''
-        try:
-            raw=cfg_path.read_text(encoding='utf-8', errors='ignore')
-        except Exception:
-            pass
-        def grab(key: str, default: str='') -> str:
-            m=re.search(rf'(?m)^\s*{re.escape(key)}:\s*([^\n#]+)', raw)
-            return (m.group(1).strip().strip('"\'') if m else default)
-        base_url=llm_env.get('MEMORY_WIKI_LLM_BASE_URL') or grab('base_url','http://127.0.0.1:18646/v1')
-        api_key=llm_env.get('MEMORY_WIKI_LLM_API_KEY') or grab('api_key','noop')
-        model=llm_env.get('MEMORY_WIKI_LLM_MODEL') or grab('model','gpt-5.5')
+        # Generic provider settings in config.yaml do not authorize this
+        # secondary endpoint: borrowing api_key/base_url could send another
+        # provider's credential or private context to an unrelated service.
+        base_url=llm_env.get('MEMORY_WIKI_LLM_BASE_URL') or 'http://127.0.0.1:18646/v1'
+        api_key=llm_env.get('MEMORY_WIKI_LLM_API_KEY') or ''
+        model=llm_env.get('MEMORY_WIKI_LLM_MODEL') or 'gpt-5.5'
         if not base_url:
             return ''
         validated_base, is_loopback = _validated_http_endpoint(base_url)
@@ -20076,7 +20446,10 @@ class MemoryWikiProvider(MemoryProvider):
               "Верни компактный packed context в markdown bullets, отсортированный по полезности.")
         payload={'model':model,'messages':[{'role':'system','content':system},{'role':'user','content':user}], 'max_tokens':max(512, min(8192, budget//2)), 'temperature':0}
         try:
-            req=urllib.request.Request(endpoint, data=json.dumps(payload, ensure_ascii=False).encode('utf-8'), headers={'Content-Type':'application/json','Authorization':f'Bearer {api_key}'}, method='POST')
+            headers={'Content-Type':'application/json'}
+            if api_key:
+                headers['Authorization']=f'Bearer {api_key}'
+            req=urllib.request.Request(endpoint, data=json.dumps(payload, ensure_ascii=False).encode('utf-8'), headers=headers, method='POST')
             timeout=max(1.0, min(float(llm_env.get('MEMORY_WIKI_LLM_TIMEOUT') or '45'), 60.0))
             with _urlopen_no_redirect(req, timeout=timeout) as resp:
                 raw_response=resp.read(1_000_001)
@@ -20086,7 +20459,12 @@ class MemoryWikiProvider(MemoryProvider):
             text=obj.get('choices',[{}])[0].get('message',{}).get('content','')
             text=redact_secrets(text)
             if text and not secret_scan(text).get('raw_secret'):
-                return text[:budget]
+                inspected=self._inspect_recall_text(
+                    text, source='memory_wiki_pack_context:llm_response',
+                    mem_type='llm_packed_context', audit=False, max_len=budget,
+                )
+                if inspected.get('status') == 'safe':
+                    return str(inspected.get('content') or '')[:budget]
         except Exception:
             return ''
         return ''
@@ -20140,6 +20518,8 @@ class MemoryWikiProvider(MemoryProvider):
             row for row in (diff_rows or [])
             if str(row.get('id', '')) not in suppressed_ids
         ]
+        rows = self._model_safe_claim_rows(rows)
+        diff_rows = self._model_safe_claim_rows(diff_rows)
         plan=self._recall_plan(query, 12, preselected_rows=rows)
         graph=self._graph_query(query, 12)
         secrets=self._query_secrets(query, 8) if plan.get('secrets_recommended') else []
@@ -20662,12 +21042,16 @@ class MemoryWikiProvider(MemoryProvider):
     def _export(self, limit=200) -> Dict[str,Any]:
         c=self._connect(); limit=max(1,min(limit,2000))
         clean = self._sanitize_row
-        claims=[r for r in c.execute("SELECT * FROM claims ORDER BY updated_at DESC").fetchall() if self._claim_visible(r)][:limit]
+        claims=self._model_safe_claim_rows(c.execute("SELECT * FROM claims ORDER BY updated_at DESC"), limit)
         ids=self._visible_claim_ids(claims)
-        evidence=[clean(r) for r in c.execute("SELECT * FROM evidence ORDER BY created_at DESC").fetchall() if r["claim_id"] in ids][:limit]
-        contradictions=[clean(r) for r in c.execute("SELECT * FROM contradictions ORDER BY created_at DESC").fetchall() if r["claim_a"] in ids and r["claim_b"] in ids][:limit]
-        changes=[clean(r) for r in c.execute("SELECT * FROM memory_changes ORDER BY created_at DESC").fetchall() if r["claim_id"] in ids][:limit]
-        mutations=[clean(r) for r in c.execute("SELECT * FROM memory_mutations ORDER BY created_at DESC").fetchall() if r["target_table"]=="claims" and r["target_id"] in ids][:limit]
+        evidence=[safe for r in c.execute("SELECT * FROM evidence ORDER BY created_at DESC").fetchall() if r["claim_id"] in ids
+                  if (safe := self._model_safe_row(r, source="memory_wiki_export:evidence")) is not None][:limit]
+        contradictions=[safe for r in c.execute("SELECT * FROM contradictions ORDER BY created_at DESC").fetchall() if r["claim_a"] in ids and r["claim_b"] in ids
+                        if (safe := self._model_safe_row(r, source="memory_wiki_export:contradiction")) is not None][:limit]
+        changes=[safe for r in c.execute("SELECT * FROM memory_changes ORDER BY created_at DESC").fetchall() if r["claim_id"] in ids
+                 if (safe := self._model_safe_row(r, source="memory_wiki_export:change")) is not None][:limit]
+        mutations=[safe for r in c.execute("SELECT * FROM memory_mutations ORDER BY created_at DESC").fetchall() if r["target_table"]=="claims" and r["target_id"] in ids
+                   if (safe := self._model_safe_row(r, source="memory_wiki_export:mutation")) is not None][:limit]
         profiles=[clean(r) for r in c.execute("SELECT * FROM project_profiles WHERE project_id=? ORDER BY updated_at DESC LIMIT ?",(self.project_scope,limit)).fetchall()] if self.project_scope else []
         entities=[clean(r) for r in c.execute('SELECT * FROM entities ORDER BY updated_at DESC') if self._graph_row_visible(r,conn=c)][:limit]
         relations=[clean(r) for r in c.execute('SELECT * FROM relations ORDER BY created_at DESC') if self._graph_row_visible(r,conn=c)][:limit]
@@ -20680,7 +21064,7 @@ class MemoryWikiProvider(MemoryProvider):
     # ═══════════════════════════════════════════════════════════
 
     def _semantic_status(self) -> Dict[str,Any]:
-        embed_ok = bool(_semantic_available())
+        embed_ok = bool(_semantic_available(read_only=True))
         pts = 0
         alias_supported = _qdrant_alias_supported()
         alias_target = _qdrant_alias_target(_qdrant_alias()) if alias_supported else ""
@@ -21193,12 +21577,17 @@ class MemoryWikiProvider(MemoryProvider):
         for d in rows:
             guard = self._inspect_recall_item(d, audit=False, max_len=PREFETCH_CLAIM_MAX_CHARS)
             status = str(guard.get("status") or "unknown")
-            if status == "safe": summary["guard_safe"] += 1
-            else: summary["guard_quarantined"] += 1
+            safe = self._model_safe_row(d, source="memory_wiki_debug_search")
+            if status != "safe" or safe is None:
+                summary["guard_quarantined"] += 1
+            else:
+                summary["guard_safe"] += 1
             if status == "runtime_failure_quarantined": summary["guard_runtime_failures"] += 1
             if guard.get("guard_disagreement"): summary["guard_disagreements"] += 1
+            if status != "safe" or safe is None:
+                continue
             items.append({
-                "id": d.get("id", ""), "topic": d.get("topic", ""),
+                "id": safe.get("id", ""), "topic": safe.get("topic", ""),
                 "lexical": round(d.get("score_parts", {}).get("lexical", 0), 4),
                 "bm25": round(d.get("score_parts", {}).get("bm25", 0), 4),
                 "rrf": round(d.get("score_parts", {}).get("rrf", 0), 4),
@@ -21210,7 +21599,7 @@ class MemoryWikiProvider(MemoryProvider):
                 "guard_trust_level": guard.get("trust_level", ""),
                 "guard_disagreement": bool(guard.get("guard_disagreement")),
                 "guard_signals": list(guard.get("injection_signals") or [])[:8],
-                "claim": short(d.get("claim", ""), 120),
+                "claim": short(safe.get("claim", ""), 120),
             })
         return {
             "query": q, "query_mode": qm, "results": items,
@@ -21221,7 +21610,8 @@ class MemoryWikiProvider(MemoryProvider):
     def _compare_search(self, query: str, limit: int = 10, topic: str = "") -> Dict[str,Any]:
         q = query or ""; top = max(1, min(limit, 20)); selected_topic = topic if topic else None
         def compact(rows):
-            return [{"id": d.get("id"), "score": d.get("score", 0), "claim": short(d.get("claim", ""), 80)} for d in rows]
+            return [{"id": d.get("id"), "score": d.get("score", 0), "claim": short(d.get("claim", ""), 80)}
+                    for d in self._model_safe_claim_rows(rows)]
         # Never mutate process-wide environment variables here. The former
         # implementation was thread-unsafe and did not affect the module-level
         # SEMANTIC_ENABLED constant after import.

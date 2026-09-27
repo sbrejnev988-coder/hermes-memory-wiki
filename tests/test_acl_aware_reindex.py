@@ -16,6 +16,7 @@ def _shared_reindex(tmp_path, monkeypatch, *, hashed_base=False):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("MEMORY_WIKI_SEMANTIC", "0")
     monkeypatch.setenv("MEMORY_WIKI_BACKGROUND_JOBS_ENABLED", "0")
+    monkeypatch.setenv("MEMORY_WIKI_QDRANT_URL", "http://127.0.0.1:6333")
     monkeypatch.setenv("HERMES_SECURITY_STRICT", "0")
     base = "fixture_claims_8278d1218cc6" if hashed_base else "fixture_claims"
     monkeypatch.setenv("MEMORY_WIKI_QDRANT_COLLECTION", base)

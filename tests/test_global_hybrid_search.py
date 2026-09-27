@@ -94,7 +94,7 @@ def test_global_hybrid_search_unifies_profiles_without_returning_secret_rows(
             source="phase6_curated_summary:test",
             confidence=0.9,
             salience=0.9,
-            visibility_scope="chat",
+            visibility_scope="global",
         )
         secret_id = providers["work"]._add_claim(
             "Synthetic confidential Atlas routing material must not be returned.",
@@ -108,7 +108,13 @@ def test_global_hybrid_search_unifies_profiles_without_returning_secret_rows(
             conn.execute("UPDATE claims SET risk='secret' WHERE id=?", (secret_id,))
 
         module.SEMANTIC_ENABLED = True
-        monkeypatch.setattr(module, "_semantic_available", lambda: True)
+        semantic_health_modes = []
+
+        def fake_semantic_available(*, read_only=False):
+            semantic_health_modes.append((module._bound_profile_home().name, read_only))
+            return True
+
+        monkeypatch.setattr(module, "_semantic_available", fake_semantic_available)
         monkeypatch.setattr(
             module, "_embed_query", lambda _query: [0.0] * module.QDRANT_VECTOR_SIZE,
         )
@@ -139,6 +145,9 @@ def test_global_hybrid_search_unifies_profiles_without_returning_secret_rows(
         assert result["mode"] == "hybrid"
         assert set(result["searched_profiles"]) == {"default", "gaming", "learning", "work"}
         assert set(qdrant_profiles) == {"default", "gaming", "learning", "work"}
+        assert semantic_health_modes
+        assert {profile for profile, _ in semantic_health_modes} == {"default", "gaming", "learning", "work"}
+        assert all(read_only is True for _, read_only in semantic_health_modes)
         returned = {(row["profile"], row["id"]) for row in result["claims"]}
         assert ("default", default_id) in returned
         assert ("work", work_id) in returned
@@ -147,6 +156,45 @@ def test_global_hybrid_search_unifies_profiles_without_returning_secret_rows(
     finally:
         for provider in providers.values():
             provider._connect().close()
+
+
+def test_foreign_legacy_fts_cannot_reveal_raw_topic_match(tmp_path, monkeypatch):
+    fleet_root = tmp_path / "default"
+    default = _home(fleet_root, "default")
+    work = _home(fleet_root, "work")
+    module = _load_module(default, monkeypatch)
+    monkeypatch.setattr(module, "_start_outbox_worker", lambda _path: None)
+    monkeypatch.setattr(module, "_wake_outbox_worker", lambda _path: None)
+    caller = _provider(module, default, "default")
+    foreign = _provider(module, work, "work")
+    try:
+        claim_id = foreign._add_claim(
+            "Legacy garden migration is an ordinary shared fixture fact.",
+            topic="garden", source="phase6_curated_summary:test",
+            visibility_scope="global", confidence=0.95, salience=0.95,
+        )
+        canary = "FtsSyntheticCredentialOrchid941"
+        with foreign._connect() as conn:
+            conn.execute("UPDATE claims SET topic=? WHERE id=?",
+                         (f"garden api_key={canary}", claim_id))
+            conn.execute("DELETE FROM claims_fts WHERE id=?", (claim_id,))
+            conn.execute(
+                "INSERT INTO claims_fts(id,claim,normalized,topic,evidence,search_text) "
+                "VALUES(?,'','',?,'','')", (claim_id, f"garden api_key={canary}"),
+            )
+            conn.execute("UPDATE meta SET value='v2' WHERE key='claims_fts_format'")
+
+        secret_result = caller._global_search(canary, mode="fts")
+        assert secret_result["claims"] == []
+        assert all(diag["lexical_candidates"] == 0
+                   for diag in secret_result["profile_diagnostics"])
+        safe_result = caller._global_search("migration", mode="fts")
+        assert ("work", claim_id) in {
+            (row["profile"], row["id"]) for row in safe_result["claims"]
+        }
+    finally:
+        caller.shutdown()
+        foreign.shutdown()
 
 
 def test_global_search_inherits_explicit_nonsecret_process_opt_in_for_a_profile(

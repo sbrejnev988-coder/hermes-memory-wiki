@@ -96,6 +96,116 @@ def test_checkpoint_includes_durable_code_and_document_graph_tables() -> None:
                 os.environ[key] = value
 
 
+def test_checkpoint_round_trips_document_file_identity_fence(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "identity-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_SECURITY_STRICT", "0")
+    monkeypatch.setenv("MEMORY_WIKI_SEMANTIC", "0")
+    module = load_provider("memory_wiki_document_identity_checkpoint_test")
+    provider = module.MemoryWikiProvider()
+    provider.initialize("synthetic-identity-chat", hermes_home=str(home), bot_id="fixture-bot")
+    source_id = "docsrc_" + "a" * 24
+    identity = (123456789, 987654321)
+    owner_key = f"file_identity_owner:{identity[0]}:{identity[1]}"
+    history_key = f"file_identities:{source_id}"
+    try:
+        with provider._connect() as conn:
+            conn.execute(
+                "INSERT INTO document_sources(source_id,source_path,scope_id,repository_id,active) "
+                "VALUES(?,?,? ,?,1)",
+                (source_id, str(home / "fixture.md"), "fixture", "fixture"),
+            )
+            conn.execute("INSERT INTO document_graph_meta(key,value) VALUES(?,?)",
+                         (owner_key, source_id))
+            conn.execute("INSERT INTO document_graph_meta(key,value) VALUES(?,?)",
+                         (history_key, json.dumps([list(identity)])))
+        checkpoint = provider._journal_checkpoint("synthetic-document-identity")
+        payload = json.loads(Path(checkpoint["path"]).read_text(encoding="utf-8"))
+        graph_meta = {row["key"]: row["value"] for row in payload["tables"]["document_graph_meta"]}
+        assert graph_meta[owner_key] == source_id
+        assert json.loads(graph_meta[history_key]) == [list(identity)]
+        restored_home = tmp_path / "restored-identity-home"
+        restored_home.mkdir()
+        restored = module.MemoryWikiProvider()
+        restored.initialize("synthetic-identity-chat", hermes_home=str(restored_home), bot_id="fixture-bot")
+        try:
+            restored._apply_checkpoint_payload(payload)
+            rows = {row[0]: row[1] for row in restored._connect().execute(
+                "SELECT key,value FROM document_graph_meta WHERE key IN (?,?)",
+                (owner_key, history_key),
+            )}
+            assert rows[owner_key] == source_id
+            assert json.loads(rows[history_key]) == [list(identity)]
+        finally:
+            if restored._conn is not None:
+                restored._conn.close(); restored._conn = None
+    finally:
+        if provider._conn is not None:
+            provider._conn.close(); provider._conn = None
+
+
+def test_checkpoint_keeps_checkpoint_safe_identity_history_near_limit(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "identity-cap-home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_SECURITY_STRICT", "0")
+    monkeypatch.setenv("MEMORY_WIKI_SEMANTIC", "0")
+    module = load_provider("memory_wiki_identity_near_cap_checkpoint_test")
+    provider = module.MemoryWikiProvider()
+    provider.initialize("identity-cap-chat", hermes_home=str(home), bot_id="fixture-bot")
+    source_id = "docsrc_" + "b" * 24
+    identities = [[123456789123456789 + i, 987654321987654321 + i] for i in range(299)]
+    serialized = json.dumps(identities, separators=(",", ":"))
+    assert len(serialized) < 12_000
+    try:
+        with provider._connect() as conn:
+            conn.execute(
+                "INSERT INTO document_sources(source_id,source_path,scope_id,repository_id,active) "
+                "VALUES(?,?,?,?,1)",
+                (source_id, str(home / "fixture.md"), "fixture", "fixture"),
+            )
+            conn.execute("INSERT INTO document_graph_meta(key,value) VALUES(?,?)",
+                         (f"file_identities:{source_id}", serialized))
+        checkpoint = provider._journal_checkpoint("synthetic-identity-near-cap")
+        payload = json.loads(Path(checkpoint["path"]).read_text(encoding="utf-8"))
+        row = next(item for item in payload["tables"]["document_graph_meta"]
+                   if item["key"] == f"file_identities:{source_id}")
+        assert json.loads(row["value"]) == identities
+    finally:
+        if provider._conn is not None:
+            provider._conn.close(); provider._conn = None
+
+
+def test_unchanged_document_file_identity_mutation_still_checkpoints(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_SECURITY_STRICT", "0")
+    monkeypatch.setenv("MEMORY_WIKI_SEMANTIC", "0")
+    monkeypatch.setenv("MEMORY_WIKI_JOURNAL_SAFETY_CHECKPOINTS", "1")
+    module = load_provider("memory_wiki_identity_checkpoint_gate_test")
+    provider = module.MemoryWikiProvider()
+    calls = []
+
+    def checkpoint(name, *, publish=True):
+        calls.append((name, publish))
+        return {"journal_seq": 17}
+
+    monkeypatch.setattr(provider, "_journal_checkpoint", checkpoint)
+    monkeypatch.setattr(provider, "_publish_journal_checkpoint",
+                        lambda _checkpoint: {"published": True})
+    result = provider._checkpoint_after_journal_mutation(
+        "memory_wiki_document_ingest",
+        {"status": "unchanged", "file_identity_updated": True}, 17,
+    )
+    assert result == {"published": True}
+    assert calls == [("after-memory_wiki_document_ingest", False)]
+    assert provider._checkpoint_after_journal_mutation(
+        "memory_wiki_document_ingest",
+        {"status": "unchanged", "file_identity_updated": False}, 17,
+    ) == {}
+    assert len(calls) == 1
+
+
 def test_ordinary_claim_journal_redacts_imitated_opaque_graph_id() -> None:
     """A caller cannot opt out of redaction by copying the graph-ID format."""
     keys = ("HERMES_HOME", "HERMES_SECURITY_STRICT", "MEMORY_WIKI_SEMANTIC")
