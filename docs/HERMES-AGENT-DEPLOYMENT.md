@@ -379,4 +379,3 @@ Template, **не результат rollout**:
 Gate = passed|failed|blocked|pending|not_applicable + evidence ref/time/exit code. Not_applicable с согласованной причиной, не скрытый failed. Authorized/completed sets/counts сравнивать программно. Completed только все applicable gates всех authorized profiles; иначе partial/blocked. Public projection без owner paths/памяти/секретов.
 
 **Ограничения этого аудита:** parser/routing и scratch metadata проверены, exact CI перечитан. Native install/replacement/rollback, live backups/restore/ACL, security delivery, credentials/entitlement, real extraction/embedding/rerank и owner injection не испытаны. Metadata overlay не deployment E2E/готовый installer. Публикация гайда сама по себе не разрешает менять профили.
-
