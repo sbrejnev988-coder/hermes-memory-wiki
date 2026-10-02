@@ -4,6 +4,77 @@ Native structured long-term memory provider for Hermes Agent. SQLite claims are 
 
 The supported security properties and private reporting path are documented in [`SECURITY.md`](SECURITY.md).
 
+## Profile-scoped session extraction (OpenRouter or Codex)
+
+Session-end and background-event extraction use one immutable settings snapshot
+from the owning provider's `config.yaml`. Enable **one explicit provider and exact
+model** under the native plugin settings:
+
+```yaml
+plugins:
+  entries:
+    memory-wiki:
+      settings:
+        extraction:
+          enabled: true
+          provider: openai-codex
+          model: gpt-6-luna
+          timeout: 30
+          max_tokens: 1800
+          reasoning_effort: low
+```
+
+For the paid OpenRouter route, use the same section with
+`provider: openrouter` and `model: xiaomi/mimo-v2.6-flash`. Its key must already
+exist as `OPENROUTER_API_KEY` in **that profile's** native `.env`; ambient keys and
+another profile's secrets are not used. Never put keys in YAML. Codex uses the
+owner's native OAuth grant in `auth.json`, not an OpenAI API key or a new auth
+store. Extraction reads only that owner's existing singleton grant or healthy
+OAuth pool row, without native pool selection/healing or root fallback. A present
+pool is authoritative; expired, exhausted, malformed or unknown-expiry grants
+fail closed. Token refresh, sign-in and quota recovery remain the user's/native
+app's responsibility, not an extraction side effect.
+An empty Codex pool also denies singleton fallback; an absent pool key permits it only without native `device_code` suppression.
+
+Both routes redact remote transcripts and apply the same local JSON schema,
+exact quote/index/speaker, source ownership, ACL and existing storage quality
+gates. They request only textual candidates: no tools or agent execution.
+`enabled: false`, malformed settings, missing owner credentials, quota and
+transport failures never switch providers or models; local heuristics remain.
+OpenRouter and Codex construct clients at their official endpoints with redirects
+and SDK/transport retries off. Codex uses Hermes' native OAuth headers and public
+`CodexAuxiliaryClient` Responses adapter directly: no provider resolver, quota
+probe, credential-pool healing, CLI adoption or auth-store writes.
+
+Codex's native adapter ignores `response_format`, temperature and the output-token
+cap. Therefore its prompt carries the schema and the host validates the response;
+`max_tokens` is **not a server-enforced Codex spending/output cap**. Host response
+size/candidate limits apply after receipt. The caller binds an absolute stream
+acceptance deadline (`timeout`, 1–60 seconds), within the native 600-second hard
+ceiling, and rejects a late final response.
+
+OpenRouter also rejects results after an absolute monotonic acceptance deadline.
+Its synchronous transport guard stops and closes a slow-drip response at the
+next transport yield; per-I/O timeouts are capped to the remaining budget when
+the request is sent. **This is not guaranteed cancellation at the exact wall-clock
+deadline:** an already blocked native I/O must yield or time out before closing,
+and OS DNS/setup delays can overrun the budget. Extraction does not return while
+a background future keeps inference running, but closing a client does not prove
+the remote provider stopped computation or billing. Native Codex's stream guard
+has its own cancellation semantics; the same OS/setup caveat applies.
+
+SDK/transport retries are off, but the existing background-job scheduler may
+retry failed extraction jobs (up to its five-attempt limit). Retries keep the
+explicit owner/provider/model; they do not introduce a paid fallback.
+
+Legacy `MW_EXTRACTION_*` OpenRouter environment settings remain available to the
+standalone entrypoint and the process launch home when no native extraction section
+exists; routed/mirrored profile homes require YAML, including no-argument callers.
+Older native cores retain the current owner and accept profile YAML, but legacy stays disabled if launch identity cannot be proven.
+An explicit native disabled/malformed
+section always takes precedence over legacy enablement. This feature does not
+change the chat model, other profiles, graph schema or live process activation.
+
 ## Explicit profile-fleet search (v1.24.0)
 
 `memory_wiki_global_search` is an explicit, read-only opt-in for one trusted local Hermes profile fleet. It fans one query out across the configured profiles, runs local FTS5/BM25 plus each profile's Qdrant semantic index, hydrates every vector ID from that profile's authoritative SQLite database, and uses RRF to produce one ranked list.

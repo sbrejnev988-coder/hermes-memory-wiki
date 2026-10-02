@@ -473,13 +473,14 @@ except ImportError:
         def collapse_tokenize(text: str) -> set: return set()
 
 try:
-    from .extractor import extract_session_claims, extractor_score_session
+    from .extractor import extract_session_claims, extractor_score_session, read_extraction_settings
 except ImportError:
     try:
-        from extractor import extract_session_claims, extractor_score_session
+        from extractor import extract_session_claims, extractor_score_session, read_extraction_settings
     except ImportError:
         def extract_session_claims(exchanges, session_id="", **kw): return {"extracted": 0, "entries": [], "error": "module absent"}
         def extractor_score_session(exchanges): return {"total": 0.0}
+        def read_extraction_settings(home): return None
 
 try:
     from .decay import scan_decay, archive_stale_claims, get_decay_stats
@@ -7828,6 +7829,7 @@ class MemoryWikiProvider(MemoryProvider):
                 add_claim_callback=self._add_claim,
                 redact_secret_callback=redact_secrets,
                 secret_scan_callback=secret_scan,
+                extraction_settings=read_extraction_settings(self.home),
             )
             if result.get("extracted", 0) > 0 or result.get("errors") or result.get("error"):
                 extraction_failed = bool(result.get("errors") or result.get("error"))

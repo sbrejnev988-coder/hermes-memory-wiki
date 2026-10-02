@@ -13,8 +13,11 @@ import ipaddress
 import json
 import os
 import re
+import time
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 try:
@@ -161,6 +164,103 @@ def _settings() -> Dict[str, Any]:
         "timeout": _env_int("MW_EXTRACTION_TIMEOUT", 30, 1, 60),
         "max_tokens": _env_int("MW_EXTRACTION_MAX_TOKENS", 1800, 256, 3000),
     }
+
+
+@dataclass(frozen=True)
+class ExtractionSettings:
+    """One call's routing snapshot; credentials are never queued or rendered."""
+
+    enabled: bool = False
+    provider: str = "openai-codex"
+    model: str = "gpt-6-luna"
+    timeout: int = 30
+    max_tokens: int = 1800
+    reasoning_effort: str = "low"
+    home: Path = field(default_factory=Path, repr=False)
+    endpoint: str = field(default="", repr=False)
+    api_key: str = field(default="", repr=False)
+    error: str = ""
+
+
+def read_extraction_settings(home: Optional[Path] = None) -> ExtractionSettings:
+    """Read only the owning profile, never bridge YAML into process environment.
+
+    Legacy environment settings belong only to the process launch home, not a
+    routed override or a home mirrored into HERMES_HOME by an embedding host.
+    """
+    noarg = home is None
+    try:
+        import hermes_constants as core
+    except ModuleNotFoundError as exc:
+        if exc.name != "hermes_constants":  # A broken native dependency is not standalone.
+            return ExtractionSettings(home=Path(home) if home is not None else Path(),
+                                      error="native extraction routing unavailable")
+        core = None
+    except Exception:
+        return ExtractionSettings(home=Path(home) if home is not None else Path(),
+                                  error="native extraction routing unavailable")
+    if core is None:  # Genuine standalone legacy users without Hermes core.
+        ambient_root = os.environ.get("HERMES_HOME")
+        if home is None:
+            home = Path(ambient_root or "~/.hermes")
+        allow_legacy = noarg or bool(
+            ambient_root and Path(home).expanduser().resolve() == Path(ambient_root).expanduser().resolve())
+    else:
+        try:
+            if home is None:
+                home = core.get_hermes_home()
+            home = Path(home).expanduser().resolve()
+        except Exception:
+            return ExtractionSettings(home=Path(home) if home is not None else Path(),
+                                      error="native extraction routing unavailable")
+        allow_legacy = False
+        try:
+            routing_home = getattr(core, "get_routing_process_hermes_home", None)
+            # Optional launch discovery gates only ambient legacy, not owner YAML.
+            allow_legacy = routing_home is not None and home == Path(routing_home()).expanduser().resolve()
+        except Exception:
+            pass  # Unproven launch identity leaves ambient legacy disabled.
+    home = Path(home).expanduser().resolve()
+    try:
+        path = home / "config.yaml"
+        if path.exists():
+            try:
+                import hermes_yaml as yaml  # Native Hermes parser, no new plugin dependency.
+            except ImportError:
+                import yaml  # Standalone legacy installations.
+            config = yaml.safe_load(path.read_text(encoding="utf-8-sig"))
+            section = config
+            missing = object()
+            for key in ("plugins", "entries", "memory-wiki", "settings", "extraction"):
+                if not isinstance(section, dict):
+                    raise ValueError("invalid extraction settings")
+                section = section.get(key, missing)
+                if section is missing:
+                    break
+            if section is not missing:
+                allowed = {"enabled", "provider", "model", "timeout", "max_tokens", "reasoning_effort"}
+                if not isinstance(section, dict) or set(section) - allowed:
+                    raise ValueError("invalid extraction settings")
+                settings = ExtractionSettings(home=home, **section)
+                model_pattern = (r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}" if settings.provider == "openai-codex"
+                                 else r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._:/-]{0,160}")
+                if (type(settings.enabled) is not bool or settings.provider not in {"openai-codex", "openrouter"}
+                        or (settings.enabled and not {"provider", "model"} <= set(section))
+                        or not isinstance(settings.model, str)
+                        or not re.fullmatch(model_pattern, settings.model)
+                        or type(settings.timeout) is not int or not 1 <= settings.timeout <= 60
+                        or type(settings.max_tokens) is not int or not 256 <= settings.max_tokens <= 3000
+                        or settings.reasoning_effort not in {"low", "medium", "high", "xhigh", "max"}):
+                    raise ValueError("invalid extraction settings")
+                return settings
+        if not allow_legacy:
+            return ExtractionSettings(home=home)
+        legacy = _settings()
+        if legacy["model"] == "gpt-6-luna" or legacy["model"].startswith("openai-codex/"):
+            return ExtractionSettings(home=home, error="native extraction settings required")
+        return ExtractionSettings(home=home, provider="legacy", **legacy)
+    except Exception:
+        return ExtractionSettings(home=home, error="invalid extraction settings")
 
 
 def _coerce_event_at(value: Any) -> int:
@@ -362,8 +462,17 @@ def _strict_json_object(raw: str) -> Dict[str, Any]:
     fenced = re.fullmatch(r"```(?:json)?\s*([\s\S]*?)\s*```", text, flags=re.I)
     if fenced:
         text = fenced.group(1).strip()
-    parsed = json.loads(text)
-    if not isinstance(parsed, dict) or set(parsed) != {"claims"} or not isinstance(parsed["claims"], list):
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate extraction field")
+            result[key] = value
+        return result
+
+    parsed = json.loads(text, object_pairs_hook=unique_object)
+    if (not isinstance(parsed, dict) or set(parsed) != {"claims"}
+            or not isinstance(parsed["claims"], list) or len(parsed["claims"]) > _MAX_ENTRIES):
         raise ValueError("extraction response does not match the claim schema")
     return parsed
 
@@ -449,6 +558,13 @@ def _normalize_llm_entry(
 ) -> Optional[Dict[str, Any]]:
     if not isinstance(entry, dict) or set(entry) != _ENTRY_KEYS:
         return None
+    if (any(not isinstance(entry[key], str) for key in _ENTRY_KEYS - {"message_index", "confidence"})
+            or type(entry["message_index"]) is not int or entry["message_index"] < 0
+            or type(entry["confidence"]) not in {int, float} or not 0 <= entry["confidence"] <= 1
+            or entry["type"] not in _VALID_TYPES or entry["speaker"] not in {"user", "assistant"}
+            or len(entry["claim"]) > 2000 or len(entry["topic"]) > 120
+            or len(entry["evidence_quote"]) > _MAX_MESSAGE_CHARS):
+        return None
     try:
         message_index = int(entry["message_index"])
         confidence = float(entry["confidence"])
@@ -517,21 +633,207 @@ def _read_response(response: Any) -> bytes:
     return data
 
 
+def _own_codex_grant(settings: ExtractionSettings) -> str:
+    """Read one usable owner OAuth grant without native pool healing or root fallback.
+
+    A present pool is authoritative: an exhausted/unknown pool must not be
+    bypassed by its singleton mirror. Refresh and quota recovery belong to the
+    native app, never to this extraction call.
+    """
+    from hermes_cli.auth_constants import _decode_jwt_claims
+
+    auth = json.loads((settings.home / "auth.json").read_text(encoding="utf-8-sig"))
+    if not isinstance(auth, dict):
+        raise ValueError("invalid own Codex auth")
+    pools, suppression = auth.get("credential_pool", {}), auth.get("suppressed_sources", {})
+    if not isinstance(pools, dict) or not isinstance(suppression, dict):
+        raise ValueError("invalid own Codex authority")
+    suppressed = suppression.get("openai-codex", [])
+    # Native legacy mappings use their keys; values do not change membership.
+    if (not isinstance(suppressed, (list, dict))
+            or any(not isinstance(source, str) or not source for source in suppressed)):
+        raise ValueError("invalid own Codex suppression")
+    if "openai-codex" in pools:
+        pool = pools["openai-codex"]
+        if not isinstance(pool, list) or any(not isinstance(row, dict) for row in pool):
+            raise ValueError("invalid own Codex pool")
+        candidates = [row for row in pool if row.get("auth_type") == "oauth"]
+    else:
+        # Suppression gates native singleton seeding, not independent manual pool accounts.
+        if "device_code" in suppressed:
+            raise ValueError("own Codex singleton suppressed")
+        state = auth.get("providers", {}).get("openai-codex", {})
+        candidates = [state.get("tokens", {})] if state.get("auth_mode") == "chatgpt" else []
+    required_until = time.time() + settings.timeout
+    for row in candidates:
+        if not isinstance(row, dict) or row.get("last_status") not in (None, "", "ok"):
+            continue
+        if row.get("last_error_code") or row.get("last_error_reason") or row.get("last_error_reset_at"):
+            continue
+        # Native model cooldowns/entitlements bench only this exact model,
+        # independently of credential-wide status; elapsed benches stay read-only.
+        model_until = (row.get("model_cooldowns") or {}).get(settings.model)
+        if isinstance(model_until, (int, float)) and model_until > time.time():
+            continue
+        access, refresh = row.get("access_token"), row.get("refresh_token")
+        if not all(isinstance(value, str) and value.strip() for value in (access, refresh)):
+            continue
+        # JWT expiry is authoritative when present; stored expiry also constrains
+        # a pool grant. Unknown or malformed expiry is not permission to infer.
+        expiries = [value for value in (_decode_jwt_claims(access).get("exp"), row.get("expires_at"))
+                    if value is not None]
+        if (expiries and all(type(value) in (int, float) and required_until < value < float("inf")
+                             for value in expiries)):
+            return access
+    raise ValueError("own Codex OAuth requires native refresh or reauthentication")
+
+
+def _codex_content(settings: ExtractionSettings, messages: List[Dict[str, Any]]) -> str:
+    """Use the public native Responses adapter, not the mutating provider resolver."""
+    from agent.auxiliary_client import CodexAuxiliaryClient, aux_stream_deadline
+    from agent.codex_headers import CODEX_AUX_BASE_URL, codex_cloudflare_headers
+    from agent.secret_scope import set_secret_scope, reset_secret_scope, current_secret_scope_home
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from openai import OpenAI, DefaultHttpxClient
+
+    deadline = time.monotonic() + settings.timeout
+    access = _own_codex_grant(settings)
+    home_token = set_hermes_home_override(settings.home)
+    try:
+        secret_token = set_secret_scope({"HERMES_CODEX_BASE_URL": CODEX_AUX_BASE_URL},
+                                        profile_home=str(settings.home))
+        try:
+            with aux_stream_deadline(deadline):
+                if current_secret_scope_home() != str(settings.home):
+                    raise ValueError("Codex owner scope mismatch")
+                http_client = DefaultHttpxClient(follow_redirects=False, trust_env=False)
+                client = None
+                try:
+                    real_client = OpenAI(
+                        api_key=access, base_url=CODEX_AUX_BASE_URL,
+                        default_headers=codex_cloudflare_headers(access, base_url=CODEX_AUX_BASE_URL),
+                        timeout=settings.timeout, max_retries=0, http_client=http_client,
+                        organization="", project="",
+                    )
+                    client = CodexAuxiliaryClient(real_client, settings.model)
+                    if (client.api_key != access
+                            or str(client.base_url).rstrip("/") != CODEX_AUX_BASE_URL
+                            or real_client._client.follow_redirects is not False):
+                        raise ValueError("Codex owner route mismatch")
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Codex setup exceeded budget")
+                    response = client.chat.completions.create(
+                        model=settings.model, messages=messages, timeout=settings.timeout,
+                        max_tokens=settings.max_tokens,
+                        extra_body={"reasoning": {"effort": settings.reasoning_effort}},
+                    )
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("Codex response exceeded budget")
+                    if response.model != settings.model or response.choices[0].message.tool_calls:
+                        raise ValueError("Codex non-text response")
+                    return response.choices[0].message.content
+                finally:
+                    if client is not None:
+                        client.close()
+                    else:
+                        http_client.close()
+        finally:
+            reset_secret_scope(secret_token)
+    finally:
+        reset_hermes_home_override(home_token)
+
+
+def _openrouter_content(settings: ExtractionSettings, messages: List[Dict[str, Any]]) -> str:
+    """Explicit paid route, using only the owner's existing native .env secrets."""
+    from agent.secret_scope import build_profile_secret_scope
+    from openai import OpenAI, DefaultHttpxClient
+    import httpx
+
+    deadline = time.monotonic() + settings.timeout
+    key = build_profile_secret_scope(settings.home).get("OPENROUTER_API_KEY", "")
+    if not isinstance(key, str) or not key.strip():
+        raise ValueError("own OpenRouter key required")
+
+    def check_deadline():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("OpenRouter response exceeded budget")
+
+    class DeadlineStream(httpx.SyncByteStream):
+        # Synchronous ownership is deliberate: never return while a background
+        # inference continues. A blocked native I/O completes/times out before
+        # this guard can close it; the next yield is rejected, not accepted late.
+        def __init__(self, stream):
+            self.stream = stream
+
+        def __iter__(self):
+            try:
+                check_deadline()
+                for chunk in self.stream:
+                    check_deadline()
+                    yield chunk
+                    check_deadline()
+            finally:
+                self.close()
+
+        def close(self):
+            self.stream.close()
+
+    def bound_request(request):
+        check_deadline()
+        remaining = deadline - time.monotonic()
+        request.extensions["timeout"] = {name: remaining for name in ("connect", "read", "write", "pool")}
+
+    def bound_response(response):
+        try:
+            check_deadline()
+        except TimeoutError:
+            response.close()
+            raise
+        response.stream = DeadlineStream(response.stream)
+
+    http_client = DefaultHttpxClient(follow_redirects=False, trust_env=False,
+                                    event_hooks={"request": [bound_request], "response": [bound_response]})
+    client = None
+    try:
+        client = OpenAI(api_key=key, base_url="https://openrouter.ai/api/v1", timeout=settings.timeout,
+                        max_retries=0, http_client=http_client, organization="", project="")
+        response = client.chat.completions.create(
+            model=settings.model, messages=messages, max_tokens=settings.max_tokens,
+            timeout=settings.timeout,
+            extra_body={"reasoning": {"effort": settings.reasoning_effort}},
+            response_format={"type": "json_schema", "json_schema": _response_schema()},
+        )
+        check_deadline()
+        if response.choices[0].message.tool_calls:
+            raise ValueError("OpenRouter non-text response")
+        return response.choices[0].message.content
+    finally:
+        if client is not None:
+            client.close()
+        else:
+            http_client.close()
+
+
 def _llm_extract(
     messages: List[Dict[str, Any]], session_id: str = "", *,
     redact_callback: Optional[Callable[[str], str]] = None,
     secret_scan_callback: Optional[Callable[[str], Dict[str, Any]]] = None,
+    extraction_settings: Optional[ExtractionSettings] = None,
 ) -> Dict[str, Any]:
-    settings = _settings()
-    if not settings["enabled"]:
+    settings = extraction_settings if extraction_settings is not None else read_extraction_settings()
+    if not settings.enabled:
         return {"extracted": 0, "entries": [], "error": "extraction disabled"}
-    valid_endpoint, endpoint_error = _validate_endpoint(settings["endpoint"])
-    if not valid_endpoint:
-        return {"extracted": 0, "entries": [], "error": endpoint_error}
-    hostname = urllib.parse.urlsplit(settings["endpoint"]).hostname.casefold().rstrip(".")
-    is_loopback = hostname in {"localhost", "127.0.0.1", "::1"}
-    if not settings["api_key"] and not is_loopback:
-        return {"extracted": 0, "entries": [], "error": "extraction key missing"}
+    is_codex = settings.provider == "openai-codex"
+    is_native = settings.provider in {"openai-codex", "openrouter"}
+    is_loopback = False
+    if not is_native:
+        valid_endpoint, endpoint_error = _validate_endpoint(settings.endpoint)
+        if not valid_endpoint:
+            return {"extracted": 0, "entries": [], "error": endpoint_error}
+        hostname = urllib.parse.urlsplit(settings.endpoint).hostname.casefold().rstrip(".")
+        is_loopback = hostname in {"localhost", "127.0.0.1", "::1"}
+        if not settings.api_key and not is_loopback:
+            return {"extracted": 0, "entries": [], "error": "extraction key missing"}
 
     try:
         outbound_messages = messages if is_loopback else _sanitize_remote_messages(
@@ -556,22 +858,30 @@ def _llm_extract(
         "TRANSCRIPT_JSON:\n" + json.dumps(transcript, ensure_ascii=False, separators=(",", ":"))
     )
     try:
-        body = json.dumps({
-            "model": settings["model"],
-            "messages": [
-                {"role": "system", "content": "You are a conservative evidence-grounded memory extractor. Output only schema-valid JSON."},
-                {"role": "user", "content": prompt},
-            ],
-            "temperature": 0, "max_tokens": settings["max_tokens"],
-            "response_format": {"type": "json_schema", "json_schema": _response_schema()},
-        }, ensure_ascii=False).encode("utf-8")
-        headers = {"Content-Type": "application/json", "Accept": "application/json"}
-        if settings["api_key"]:
-            headers["Authorization"] = f"Bearer {settings['api_key']}"
-        request = urllib.request.Request(settings["endpoint"], data=body, headers=headers, method="POST")
-        with _urlopen_no_redirect(request, timeout=settings["timeout"]) as response:
-            payload = json.loads(_read_response(response).decode("utf-8"))
-        content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+        system = "You are a conservative evidence-grounded memory extractor. Output only schema-valid JSON."
+        if is_codex:
+            # Hermes' Codex shim does not forward response_format to Responses.
+            system += (" No tools, markdown, or commentary. Output must match this JSON schema:\n"
+                       + json.dumps(_response_schema()["schema"], ensure_ascii=False)
+                       + '\nEmpty result example: {"claims":[]}')
+        request_messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
+        if is_codex:
+            content = _codex_content(settings, request_messages)
+        elif settings.provider == "openrouter":
+            content = _openrouter_content(settings, request_messages)
+        else:
+            body = json.dumps({
+                "model": settings.model, "messages": request_messages,
+                "temperature": 0, "max_tokens": settings.max_tokens,
+                "response_format": {"type": "json_schema", "json_schema": _response_schema()},
+            }, ensure_ascii=False).encode("utf-8")
+            headers = {"Content-Type": "application/json", "Accept": "application/json"}
+            if settings.api_key:
+                headers["Authorization"] = f"Bearer {settings.api_key}"
+            request = urllib.request.Request(settings.endpoint, data=body, headers=headers, method="POST")
+            with _urlopen_no_redirect(request, timeout=settings.timeout) as response:
+                payload = json.loads(_read_response(response).decode("utf-8"))
+            content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
         result = _strict_json_object(content)
         by_index = {int(message["message_index"]): message for message in messages}
         entries = []
@@ -653,17 +963,19 @@ def extract_session_claims(
     add_claim_callback: Optional[Callable[..., Any]] = None,
     redact_secret_callback: Optional[Callable[[str], str]] = None,
     secret_scan_callback: Optional[Callable[[str], Dict[str, Any]]] = None,
+    extraction_settings: Optional[ExtractionSettings] = None,
     **_: Any,
 ) -> Dict[str, Any]:
     """Extract and optionally persist source-grounded, chat-scoped claims."""
     messages = _normalize_exchanges(exchanges)
-    settings = _settings()
+    settings = extraction_settings if extraction_settings is not None else read_extraction_settings()
     heuristic_entries = _heuristic_extract(messages)
     llm_result = _llm_extract(
         messages, session_id,
         redact_callback=redact_secret_callback,
         secret_scan_callback=secret_scan_callback,
-    ) if settings["enabled"] else {"extracted": 0, "entries": [], "error": ""}
+        extraction_settings=settings,
+    ) if settings.enabled else {"extracted": 0, "entries": [], "error": settings.error}
     entries = _deduplicate([*heuristic_entries, *llm_result.get("entries", [])])
 
     persisted_ids: List[str] = []
@@ -685,7 +997,7 @@ def extract_session_claims(
                 errors.append(type(exc).__name__)
     return {
         "extracted": len(entries), "persisted": len(persisted_ids), "persisted_ids": persisted_ids,
-        "entries": entries, "session_id": session_id, "heuristic_only": not settings["enabled"],
+        "entries": entries, "session_id": session_id, "heuristic_only": not settings.enabled,
         "errors": errors, "error": llm_result.get("error", ""),
     }
 

@@ -784,6 +784,7 @@ def _run_job(
             add_claim_callback=persist_if_current,
             redact_secret_callback=module.redact_secrets,
             secret_scan_callback=module.secret_scan,
+            extraction_settings=module.read_extraction_settings(worker.home),
         )
         # Graph jobs only refer to new, still active claims; execution repeats
         # full graph eligibility checks against authoritative current rows.

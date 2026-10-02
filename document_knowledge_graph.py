@@ -861,30 +861,192 @@ def _worker_env(worker: Path) -> Dict[str, str]:
     return env
 
 
+def _linux_stat_session(stat_text: str) -> int:
+    # comm may contain spaces and ')' characters; fields after its LAST ')' are
+    # state, ppid, pgrp, session. Never split the complete stat record.
+    fields = stat_text[stat_text.rindex(")") + 1:].split()
+    return int(fields[3])
+
+
+def _linux_process_session(pid: int) -> int:
+    return _linux_stat_session(Path(f"/proc/{pid}/stat").read_text(encoding="utf-8"))
+
+
+def _linux_worker_exited(proc: subprocess.Popen[Any]) -> bool:
+    # WNOWAIT retains the root's numeric SID anchor even after it exits. ECHILD
+    # is an error, not permission to discover by a potentially reused SID.
+    return os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+
+
+def _linux_worker_preflight(worker: Path) -> None:
+    """Refuse parser admission without usable pidfd/proc/non-reaping wait.
+
+    A trusted no-input Python probe observes actual wait ownership (including
+    SA_NOCLDWAIT/external reaping), without changing gateway SIGCHLD policy.
+    """
+    import signal
+    fd = None
+    probe = None
+    until = time.monotonic() + 1.0
+    try:
+        if not all(callable(getattr(obj, name, None)) for obj, name in (
+            (os, "pidfd_open"), (os, "waitid"), (signal, "pidfd_send_signal"),
+        )) or not all(hasattr(os, name) for name in ("P_PID", "WEXITED", "WNOHANG", "WNOWAIT")):
+            raise RuntimeError("required Linux cleanup APIs missing")
+        if signal.getsignal(signal.SIGCHLD) == signal.SIG_IGN:
+            raise RuntimeError("SIGCHLD ignores wait ownership")
+        _linux_process_session(os.getpid())
+        with os.scandir("/proc") as entries:
+            next(entries, None)
+        fd = os.pidfd_open(os.getpid())
+        signal.pidfd_send_signal(fd, 0)
+        os.close(fd)
+        fd = None
+        probe = subprocess.Popen([sys.executable, "-c", "pass"],
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, env=_worker_env(worker))
+        fd = os.pidfd_open(probe.pid)
+        signal.pidfd_send_signal(fd, 0)
+        while not _linux_worker_exited(probe):
+            if time.monotonic() >= until:
+                raise RuntimeError("Linux wait ownership probe timed out")
+            time.sleep(0.005)
+        if not _linux_worker_exited(probe):
+            raise RuntimeError("Linux wait ownership probe lost")
+    except Exception as exc:
+        raise RuntimeError("Linux document worker cleanup unavailable") from exc
+    finally:
+        try:
+            if probe is not None:
+                if fd is not None:
+                    try:
+                        signal.pidfd_send_signal(fd, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                else:
+                    # Only a verified direct, still-waitable child: its PID
+                    # cannot be reused before this controller reaps it.
+                    _linux_worker_exited(probe)
+                    probe.kill()
+                probe.wait(timeout=max(0.0, until - time.monotonic()))
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+
+class _LinuxWorkerSession:
+    """Bounded best-effort cleanup of the original SID, not all ancestry.
+
+    Descendants that setsid(), fork races or inaccessible proc entries are not
+    containment guarantees. Keep the direct root unreaped through final scan.
+    """
+    def __init__(self, proc: subprocess.Popen[Any]):
+        self.proc = proc
+        self.pins: Dict[int, int] = {}
+        try:
+            self.pins[proc.pid] = os.pidfd_open(proc.pid)
+            _linux_worker_exited(proc)
+            if _linux_process_session(proc.pid) != proc.pid:
+                raise RuntimeError("Linux document worker session not established")
+        except BaseException:
+            import signal
+            try:
+                if proc.pid in self.pins:
+                    signal.pidfd_send_signal(self.pins[proc.pid], signal.SIGKILL)
+                else:
+                    _linux_worker_exited(proc)
+                    proc.kill()
+            finally:
+                for fd in self.pins.values():
+                    os.close(fd)
+                self.pins.clear()
+            raise
+
+    def cleanup(self, deadline: float) -> None:
+        import select
+        import signal
+
+        def signal_pin(fd: int) -> None:
+            try:
+                signal.pidfd_send_signal(fd, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+        try:
+            _linux_worker_exited(self.proc)
+            signal_pin(self.pins[self.proc.pid])
+            while True:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Linux document worker session cleanup timed out")
+                _linux_worker_exited(self.proc)
+                with os.scandir("/proc") as entries:
+                    for entry in entries:
+                        if time.monotonic() >= deadline:
+                            raise RuntimeError("Linux document worker session scan timed out")
+                        if not entry.name.isdecimal():
+                            continue
+                        pid = int(entry.name)
+                        if pid in self.pins:
+                            continue
+                        fd = None
+                        try:
+                            # Pin FIRST, read SID SECOND, signal THIRD.
+                            fd = os.pidfd_open(pid)
+                            sid = _linux_process_session(pid)
+                            if sid != self.proc.pid or select.select([fd], [], [], 0)[0]:
+                                continue
+                            if len(self.pins) >= 128:
+                                raise RuntimeError("Linux document worker pidfd limit exceeded")
+                            self.pins[pid] = fd
+                            fd = None
+                            signal_pin(self.pins[pid])
+                        except ProcessLookupError:
+                            pass
+                        except FileNotFoundError:
+                            pass
+                        finally:
+                            if fd is not None:
+                                os.close(fd)
+                active = False
+                for pid, fd in list(self.pins.items()):
+                    if select.select([fd], [], [], 0)[0]:
+                        if pid != self.proc.pid:
+                            os.close(fd)
+                            del self.pins[pid]
+                    else:
+                        active = True
+                if not active:
+                    # Complete scan, NOT atomic protection against fork/setsid.
+                    _linux_worker_exited(self.proc)
+                    return
+                time.sleep(min(0.005, max(0.0, deadline - time.monotonic())))
+        except BaseException:
+            # Never rescan a SID after ownership loss. Known pins stay safe.
+            for fd in self.pins.values():
+                try:
+                    signal_pin(fd)
+                except OSError:
+                    pass
+            raise
+        finally:
+            for fd in self.pins.values():
+                os.close(fd)
+            self.pins.clear()
+
+
 def _terminate_worker_tree(proc: subprocess.Popen[Any]) -> None:
     """Terminate the parser and descendants after timeout or output overflow."""
-    if proc.poll() is not None:
-        return
     try:
         if os.name == "posix":
+            # The session/process group remains ours after the root exits.
             import signal
             os.killpg(proc.pid, signal.SIGKILL)
-        elif os.name == "nt":
-            # /T covers grandchildren when a parser delegates to an external
-            # office/OCR binary. This is the safe fallback when no Job Object is
-            # available in the host Python build.
-            subprocess.run(
-                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, timeout=10, check=False,
-            )
-        else:
+        elif proc.poll() is None:
+            # Windows tree ownership must be established by suspended Job
+            # admission, never inferred from a running PID/taskkill traversal.
             proc.kill()
-    except Exception:
-        try:
-            proc.kill()
-        except Exception:
-            pass
+    except ProcessLookupError:
+        pass
 
 
 def _worker_launch_kwargs(worker: Path, *, platform: Optional[str] = None) -> Dict[str, Any]:
@@ -913,8 +1075,8 @@ def _windows_worker_limit_config() -> Dict[str, int]:
     }
 
 
-def _assign_windows_worker_job(proc: subprocess.Popen[Any]) -> Any:
-    """Attach an isolated worker to a kill-on-close, CPU/memory-capped Job."""
+def _assign_windows_worker_job(proc: Optional[subprocess.Popen[Any]]) -> Any:
+    """Configure a Job; optionally admit a caller-owned suspended process."""
     if os.name != "nt":
         return None
     import ctypes
@@ -971,22 +1133,171 @@ def _assign_windows_worker_job(proc: subprocess.Popen[Any]) -> Any:
         info.ProcessMemoryLimit = limits["process_memory_bytes"]
         if not set_info(job, 9, ctypes.byref(info), ctypes.sizeof(info)):
             raise ctypes.WinError(ctypes.get_last_error())
-        handle = getattr(proc, "_handle", None)
-        if handle is None or not assign(job, handle):
-            raise ctypes.WinError(ctypes.get_last_error())
+        if proc is not None:
+            _admit_windows_worker(proc, (job, close))
         return (job, close)
-    except Exception:
+    except BaseException:
         close(job)
         raise
 
 
-def _close_windows_worker_job(job: Any) -> None:
-    if job:
-        handle, close = job
-        try:
-            close(handle)
-        except Exception:
-            pass
+def _admit_windows_worker(proc: subprocess.Popen[Any], job: Any) -> None:
+    """Native assignment and membership proof while the launcher is suspended."""
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    assign = kernel32.AssignProcessToJobObject
+    assign.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    assign.restype = wintypes.BOOL
+    member = kernel32.IsProcessInJob
+    member.argtypes = [wintypes.HANDLE, wintypes.HANDLE, ctypes.POINTER(wintypes.BOOL)]
+    member.restype = wintypes.BOOL
+    if not job or not assign(job[0], proc._handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+    contained = wintypes.BOOL()
+    if not member(proc._handle, job[0], ctypes.byref(contained)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if not contained.value:
+        raise RuntimeError("Windows document worker Job membership not established")
+
+
+def _resume_windows_worker_thread(thread: Any) -> None:
+    import ctypes
+    from ctypes import wintypes
+    resume = ctypes.WinDLL("kernel32", use_last_error=True).ResumeThread
+    resume.argtypes = [wintypes.HANDLE]
+    resume.restype = wintypes.DWORD
+    previous = resume(thread)
+    if previous != 1:
+        raise RuntimeError(f"Windows document worker resume failed ({previous})")
+
+
+def _launch_windows_worker(command: List[str], **kwargs: Any) -> Tuple[subprocess.Popen[Any], Any]:
+    """Reuse Popen pipe/wait ownership, replacing only its Windows creation seam.
+
+    CPython's normal Windows Popen closes hThread. Retain it until verified Job
+    admission, without a process-wide monkeypatch or a running redirector race.
+    Only this worker's three pipe handles are inherited. Unsupported Popen
+    options fail before creation rather than expanding this into a Popen clone.
+    """
+    import _winapi
+    job = _assign_windows_worker_job(None)
+    if not job:
+        raise RuntimeError("Windows document worker Job unavailable")
+
+    class SuspendedWorker(subprocess.Popen):
+        def _execute_child(self, args, executable, preexec_fn, close_fds,
+                           pass_fds, cwd, env, startupinfo, creationflags, shell,
+                           p2cread, p2cwrite, c2pread, c2pwrite, errread, errwrite,
+                           *unused):
+            hp = ht = None
+            try:
+                if shell or preexec_fn or pass_fds or not close_fds or startupinfo is not None:
+                    raise ValueError("unsupported Windows document worker launch options")
+                if not isinstance(args, list) or -1 in (p2cread, c2pwrite, errwrite):
+                    raise ValueError("Windows document worker requires argv and three pipes")
+                startup = subprocess.STARTUPINFO()
+                startup.dwFlags |= _winapi.STARTF_USESTDHANDLES
+                startup.hStdInput, startup.hStdOutput, startup.hStdError = p2cread, c2pwrite, errwrite
+                startup.lpAttributeList = {"handle_list": [int(p2cread), int(c2pwrite), int(errwrite)]}
+                executable = os.fsdecode(executable or args[0])
+                command_line = subprocess.list2cmdline(args)
+                cwd = os.fsdecode(cwd) if cwd is not None else None
+                sys.audit("subprocess.Popen", executable, command_line, cwd, env)
+                hp, ht, self.pid, _ = _winapi.CreateProcess(
+                    executable, command_line, None, None, True,
+                    creationflags | 0x00000004, env, cwd, startup,
+                )
+                self._handle = subprocess.Handle(hp)
+                self._child_created = True
+                _admit_windows_worker(self, job)
+                _resume_windows_worker_thread(ht)
+            except BaseException:
+                if hp is not None:
+                    # Every failed admission is still suspended (or contained
+                    # if ResumeThread returned an unexpected suspend count).
+                    _winapi.TerminateProcess(hp, 1)
+                    self.wait(timeout=1.0)
+                    self._handle.Close()
+                raise
+            finally:
+                if ht is not None:
+                    _winapi.CloseHandle(ht)
+                self._close_pipe_fds(p2cread, p2cwrite, c2pread, c2pwrite, errread, errwrite)
+
+    try:
+        proc = SuspendedWorker(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, **kwargs)
+        return proc, job
+    except BaseException:
+        _close_windows_worker_job(job)
+        raise
+
+
+def _close_windows_worker_job(job: Any, *, deadline: Optional[float] = None) -> None:
+    """Stop the owned Job and prove native completion before releasing it.
+
+    Kill-on-close requests termination but does not wait for process handles to
+    signal. Keep the Job and pin its current members while terminating it.
+    """
+    if not job:
+        return
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    for name, args, result in (
+        ("QueryInformationJobObject", [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID, wintypes.DWORD, wintypes.LPVOID], wintypes.BOOL),
+        ("TerminateJobObject", [wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+        ("OpenProcess", [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+        ("WaitForSingleObject", [wintypes.HANDLE, wintypes.DWORD], wintypes.DWORD),
+    ):
+        fn = getattr(kernel32, name)
+        fn.argtypes, fn.restype = args, result
+    handle, close = job
+    until = deadline if deadline is not None else time.monotonic() + 1.0
+    pins = []
+    capacity = 64
+    try:
+        while True:
+            class ProcessIds(ctypes.Structure):
+                _fields_ = [("assigned", wintypes.DWORD), ("listed", wintypes.DWORD),
+                            ("pids", ctypes.c_size_t * capacity)]
+            members = ProcessIds()
+            complete = kernel32.QueryInformationJobObject(handle, 3, ctypes.byref(members), ctypes.sizeof(members), None)
+            if complete and members.listed == members.assigned:
+                break
+            error = 234 if complete else ctypes.get_last_error()
+            if error != 234 or time.monotonic() >= until:  # ERROR_MORE_DATA
+                raise ctypes.WinError(error)
+            capacity = max(capacity * 2, members.assigned)
+        for pid in members.pids[:members.listed]:
+            pin = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+            if pin:
+                pins.append(pin)
+            elif ctypes.get_last_error() != 87:  # A member may already have exited.
+                raise ctypes.WinError(ctypes.get_last_error())
+        if not kernel32.TerminateJobObject(handle, 1):
+            raise ctypes.WinError(ctypes.get_last_error())
+        for pin in pins:
+            wait = kernel32.WaitForSingleObject(pin, max(0, int((until - time.monotonic()) * 1000)))
+            if wait != 0:
+                raise RuntimeError("Windows document worker Job termination did not complete")
+        # Terminated members cannot spawn new children. A zero-member readback
+        # also covers members created during the snapshot/termination window.
+        empty = ProcessIds()
+        while True:
+            if not kernel32.QueryInformationJobObject(handle, 3, ctypes.byref(empty), ctypes.sizeof(empty), None):
+                raise ctypes.WinError(ctypes.get_last_error())
+            if empty.assigned == 0:
+                break
+            if time.monotonic() >= until:
+                raise RuntimeError("Windows document worker Job still has active processes")
+            time.sleep(0.005)
+    finally:
+        for pin in pins:
+            close(pin)
+        if not close(handle):
+            raise ctypes.WinError(ctypes.get_last_error())
 
 
 def _extract(path: Path, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -995,18 +1306,33 @@ def _extract(path: Path, args: Dict[str, Any]) -> Dict[str, Any]:
     request = _json({"path": str(path), "options": _worker_options(args)}).encode("utf-8")
     max_out = _env_int("MEMORY_WIKI_DOCUMENT_WORKER_OUTPUT_MB", 512, 8, 4096) * 1024 * 1024
     kwargs = _worker_launch_kwargs(worker)
-    proc = subprocess.Popen(
-        [sys.executable, str(worker)],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        **kwargs,
-    )
     worker_job = None
-    try:
-        if os.name == "nt":
-            worker_job = _assign_windows_worker_job(proc)
-    except Exception as exc:
-        _terminate_worker_tree(proc)
-        raise RuntimeError(f"unable to establish Windows document worker sandbox: {type(exc).__name__}") from exc
+    linux_session = None
+    if sys.platform == "linux":
+        _linux_worker_preflight(worker)
+    if os.name == "nt":
+        try:
+            proc, worker_job = _launch_windows_worker([sys.executable, str(worker)], **kwargs)
+        except Exception as exc:
+            raise RuntimeError(f"unable to establish Windows document worker sandbox: {type(exc).__name__}") from exc
+    else:
+        proc = subprocess.Popen(
+            [sys.executable, str(worker)],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            **kwargs,
+        )
+    if sys.platform == "linux":
+        try:
+            linux_session = _LinuxWorkerSession(proc)
+        except BaseException:
+            until = time.monotonic() + 1.0
+            try:
+                proc.wait(timeout=max(0.0, until - time.monotonic()))
+            finally:
+                for stream in (proc.stdin, proc.stdout, proc.stderr):
+                    if stream is not None:
+                        stream.close()
+            raise
     streams = {"stdout": proc.stdout, "stderr": proc.stderr}
     buffers: Dict[str, List[bytes]] = {"stdout": [], "stderr": []}
     sizes = {"stdout": 0, "stderr": 0}
@@ -1014,10 +1340,28 @@ def _extract(path: Path, args: Dict[str, Any]) -> Dict[str, Any]:
     lock = threading.Lock()
     timed_out = False
 
+    tree_stopped = False
+
+    def terminate_worker() -> None:
+        nonlocal worker_job, tree_stopped
+        if tree_stopped:
+            return
+        if linux_session is not None:
+            linux_session.cleanup(cleanup_deadline)
+        elif worker_job:
+            # Kill the assigned Windows tree directly, not through taskkill /T.
+            _close_windows_worker_job(worker_job, deadline=cleanup_deadline)
+            worker_job = None
+        else:
+            _terminate_worker_tree(proc)
+        tree_stopped = True
+
     def read_bounded(name: str, stream: Any) -> None:
         try:
             while True:
-                block = stream.read(64 * 1024)
+                # One underlying read reports available bytes without waiting
+                # to fill a 64 KiB block (including a flushed cap+1 byte).
+                block = stream.read1(64 * 1024)
                 if not block:
                     return
                 kill = False
@@ -1030,7 +1374,7 @@ def _extract(path: Path, args: Dict[str, Any]) -> Dict[str, Any]:
                         overflow.set()
                         kill = True
                 if kill:
-                    _terminate_worker_tree(proc)
+                    # The controller owns termination and the Job handle.
                     return
         finally:
             try:
@@ -1038,49 +1382,85 @@ def _extract(path: Path, args: Dict[str, Any]) -> Dict[str, Any]:
             except Exception:
                 pass
 
+    write_errors: List[Exception] = []
+
+    def write_request() -> None:
+        # This thread alone owns stdin; the controller must stay interruptible.
+        assert proc.stdin is not None
+        try:
+            proc.stdin.write(request)
+        except Exception as exc:
+            write_errors.append(exc)
+        finally:
+            try:
+                proc.stdin.close()
+            except Exception as exc:
+                if not write_errors:
+                    write_errors.append(exc)
+
     readers = [
         threading.Thread(target=read_bounded, args=(name, stream), daemon=True)
         for name, stream in streams.items() if stream is not None
     ]
+    writer = threading.Thread(target=write_request, daemon=True)
+    deadline = time.monotonic() + timeout
+    cleanup_errors: List[Exception] = []
     try:
         for reader in readers:
             reader.start()
-        assert proc.stdin is not None
-        proc.stdin.write(request)
-        proc.stdin.close()
-        deadline = time.monotonic() + timeout
-        while proc.poll() is None:
+        writer.start()
+        while True:
             if overflow.is_set():
-                _terminate_worker_tree(proc)
                 break
             if time.monotonic() >= deadline:
                 timed_out = True
-                _terminate_worker_tree(proc)
+                break
+            if write_errors or (_linux_worker_exited(proc) if linux_session is not None else proc.poll() is not None):
+                # Root exit does not release descendant-owned pipes. Stop the
+                # owned tree immediately, then let readers drain buffered data.
                 break
             time.sleep(0.02)
-        try:
-            proc.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            _terminate_worker_tree(proc)
-            proc.wait(timeout=10)
     finally:
+        # One absolute cleanup budget for native tree and all pipe owners.
+        cleanup_deadline = time.monotonic() + 1.0
         try:
-            if proc.stdin is not None:
-                proc.stdin.close()
-        except Exception:
-            pass
-        for reader in readers:
-            reader.join(timeout=10)
-        if proc.poll() is None:
-            _terminate_worker_tree(proc)
-        _close_windows_worker_job(worker_job)
+            try:
+                terminate_worker()
+            except Exception as exc:
+                # Native cleanup failure must not skip root/pipe-owner waits.
+                cleanup_errors.append(exc)
+            try:
+                proc.wait(timeout=max(0.0, cleanup_deadline - time.monotonic()))
+            except Exception as exc:
+                cleanup_errors.append(exc)
+            for owner in [writer, *readers]:
+                if owner.ident is not None:
+                    try:
+                        owner.join(timeout=max(0.0, cleanup_deadline - time.monotonic()))
+                    except Exception as exc:
+                        cleanup_errors.append(exc)
+            if any(owner.is_alive() for owner in [writer, *readers]):
+                cleanup_errors.append(RuntimeError("document worker pipe cleanup did not complete"))
+        finally:
+            if os.name == "nt" and proc.returncode is not None:
+                try:
+                    proc._handle.Close()
+                except Exception as exc:
+                    cleanup_errors.append(exc)
 
+    cleanup_error = (cleanup_errors[0] if len(cleanup_errors) == 1 else
+                     ExceptionGroup("document worker cleanup failures", cleanup_errors)
+                     if cleanup_errors else None)
     stdout = b"".join(buffers["stdout"])
     stderr = b"".join(buffers["stderr"])
     if overflow.is_set():
-        raise RuntimeError("document worker output exceeds configured limit")
+        raise RuntimeError("document worker output exceeds configured limit") from cleanup_error
     if timed_out:
-        raise RuntimeError(f"document worker exceeded timeout ({timeout}s)")
+        raise RuntimeError(f"document worker exceeded timeout ({timeout}s)") from cleanup_error
+    if write_errors:
+        raise write_errors[0] from cleanup_error
+    if cleanup_error is not None:
+        raise RuntimeError("document worker cleanup failed") from cleanup_error
     if proc.returncode:
         raise RuntimeError(f"document worker failed ({proc.returncode}): {stderr.decode('utf-8', 'replace')[-1500:]}")
     try:
