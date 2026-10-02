@@ -4,6 +4,8 @@ Native structured long-term memory provider for Hermes Agent. SQLite claims are 
 
 The supported security properties and private reporting path are documented in [`SECURITY.md`](SECURITY.md).
 
+**Для Hermes-агентов:** [практический runbook безопасной установки и обновления](docs/HERMES-AGENT-DEPLOYMENT.md) — immutable pin, profile isolation, scanner/PM, Codex/OpenRouter, `voyageai/rerank-3`, проверки, owner activation и rollback. Документ отделяет проверенные примеры от неиспытанных путей и не является подтверждением развёртывания.
+
 ## Profile-scoped session extraction (OpenRouter or Codex)
 
 Session-end and background-event extraction use one immutable settings snapshot
