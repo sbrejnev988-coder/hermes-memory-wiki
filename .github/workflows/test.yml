@@ -24,6 +24,19 @@ jobs:
       MEMORY_WIKI_DOCUMENT_AUTO_SCAN_CACHE: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Checkout immutable native Hermes core
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: NousResearch/hermes-agent
+          ref: 5307e93252ac655cd13fadbd561c0995142138c6
+          path: .native-hermes
+          persist-credentials: false
+          sparse-checkout: |
+            agent
+            hermes_cli
+            pm
+            tools
+            gateway
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
         with:
           python-version: ${{ matrix.python-version }}
@@ -33,6 +46,8 @@ jobs:
           uv lock --check
           python packaging/verify_release.py
       - name: Run regression suite
-        run: uv run --with pytest python -m pytest -q
+        # Real core source + minimal offline import dependencies on every Python/OS.
+        # Do not sync the full core project: optional tool/provider stacks are not needed.
+        run: uv run --with pytest --with PyYAML==6.0.3 --with ruamel.yaml==0.18.16 --with openai==2.24.0 --with httpx==0.28.1 --with pydantic==2.13.4 python packaging/run_native_regressions.py --core .native-hermes
       - name: Build wheel
         run: uv build --wheel
