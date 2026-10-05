@@ -79,6 +79,47 @@ _POLARITY_WORDS = frozenset({
     "не", "нет", "никогда", "всегда", "все", "всё", "каждый", "только", "нельзя", "обязательно",
 })
 
+_LEXICAL_NEGATION_RE = re.compile(
+    r"(?<![\w+/#-])(?<!\w\.)(?:not|no|never|neither|nor|cannot|without|"
+    r"[a-z]+n['’]t|не|нет|никогда|ни|нельзя|без|неверно)(?![\w+/#-]|\.\w)", re.I,
+)
+_LEXICAL_NOT_ONLY_RE = re.compile(r"\b(?:not\s+only|не\s+только)\b", re.I)
+_LEXICAL_DENIAL_RE = re.compile(r"\b(?:not\s+(?:really|true|anymore|at\s+all)|не\s+(?:так|верно|вообще|больше))\b", re.I)
+_LEXICAL_ABBREVIATION_RE = re.compile(
+    r"(?:\b(?:mr|mrs|ms|dr|prof|inc|ltd|vs|etc|e\.g|i\.e)|\b[A-ZА-Я])\.$", re.I,
+)
+
+
+def _negation_spans(text: str) -> List[Tuple[int, int]]:
+    """Recognized lexical negators, excluding additive not-only and identifiers."""
+    additive = [match.span() for match in _LEXICAL_NOT_ONLY_RE.finditer(text)]
+    return [match.span() for match in _LEXICAL_NEGATION_RE.finditer(text)
+            if not any(start <= match.start() < end for start, end in additive)]
+
+
+def _lexical_sentence_spans(
+    text: str, protected: Iterable[Tuple[int, int]] = (),
+) -> List[Tuple[int, int]]:
+    """Bound lexical scope without splitting dotted names or known abbreviations.
+
+    This is deliberately not natural-language parsing. Ambiguous constructions
+    must not acquire positive polarity merely by cropping their citation.
+    """
+    protected = tuple(protected)
+    spans = []
+    start = 0
+    for match in re.finditer(r"[.!?;](?=\s|$)", text):
+        if text[match.start()] == '.' and (
+                _LEXICAL_ABBREVIATION_RE.search(text[:match.end()])
+                or any(left <= match.start() < right for left, right in protected)):
+            continue
+        spans.append((start, match.end()))
+        start = match.end()
+    if start < len(text):
+        spans.append((start, len(text)))
+    return spans
+
+
 _DEFAULT_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 _DEFAULT_MODEL = "openai/gpt-4.1-mini"
 _MAX_MESSAGES = 32
@@ -244,12 +285,13 @@ def read_extraction_settings(home: Optional[Path] = None) -> ExtractionSettings:
                 settings = ExtractionSettings(home=home, **section)
                 model_pattern = (r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}" if settings.provider == "openai-codex"
                                  else r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._:/-]{0,160}")
+                max_tokens_limit = 9000 if settings.provider == "openai-codex" else 3000
                 if (type(settings.enabled) is not bool or settings.provider not in {"openai-codex", "openrouter"}
                         or (settings.enabled and not {"provider", "model"} <= set(section))
                         or not isinstance(settings.model, str)
                         or not re.fullmatch(model_pattern, settings.model)
                         or type(settings.timeout) is not int or not 1 <= settings.timeout <= 60
-                        or type(settings.max_tokens) is not int or not 256 <= settings.max_tokens <= 3000
+                        or type(settings.max_tokens) is not int or not 256 <= settings.max_tokens <= max_tokens_limit
                         or settings.reasoning_effort not in {"low", "medium", "high", "xhigh", "max"}):
                     raise ValueError("invalid extraction settings")
                 return settings
@@ -551,6 +593,214 @@ def _entry_event_at(raw_event_at: Any, quote: str, source_message: Dict[str, Any
     return proposed if proposed == source_time or (raw and raw.casefold() in quote.casefold()) else source_time
 
 
+_LEXICAL_ACTION = (
+    r"(?:uses?|using|prefers?|loves?|hates?|runs?|owns?|supports?|depends?|requires?|"
+    r"completed|implemented|configured|verified|tested|paid|"
+    r"использу(?:ю|ет|ют|ем|ете)|предпочита(?:ю|ет|ют|ем)|люблю|ненавижу|"
+    r"работает|владеет|поддерживает|зависит|требует|завершил|проверил)\b"
+)
+_LEXICAL_ACTORS = frozenset((
+    'i', 'we', 'you', 'he', 'she', 'it', 'they', 'user', 'assistant',
+    'я', 'мы', 'ты', 'вы', 'он', 'она', 'они', 'пользователь', 'ассистент',
+))
+_LEXICAL_AUX_WORDS = frozenset((
+    'do', 'does', 'did', 'is', 'are', 'was', 'were', 'can', 'cannot',
+    'not', 'no', 'never', 'only', 'also', 'не', 'никогда', 'только', 'также', 'и',
+))
+_LEXICAL_SEPARATOR_RE = re.compile(
+    r",?\s*\b(and|or|but|however|whereas|while|и|или|но|а|зато)\b\s*|,\s*|[\r\n]+", re.I,
+)
+
+
+def _lexical_terms(text: str) -> Tuple[str, ...]:
+    # Full identifiers, not five-character prefixes or a bag of overlapping words.
+    return tuple(word.casefold().rstrip('.') for word in _WORD_RE.findall(text))
+
+
+def _lexical_actor_prefix(prefix: str) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """Recognize an explicit pronoun/name; retain unknown modifiers verbatim.
+
+    No guessed adverb vocabulary. An opaque prefix can only survive a literal
+    same-span comparison, never support a projected assertion.
+    """
+    words = [word.rstrip('.') for word in _WORD_RE.findall(prefix)
+             if word.casefold().rstrip('.') not in _LEXICAL_AUX_WORDS
+             and not _negation_spans(word)]
+    if not words:
+        return (), ()
+    if words[0].casefold() in _LEXICAL_ACTORS:
+        return (words[0].casefold(),), tuple(word.casefold() for word in words[1:])
+    count = 0
+    for word in words:
+        if word[:1].isupper() or any(ch in word for ch in '._/#-'):
+            count += 1
+        else:
+            break
+    return tuple(word.casefold() for word in words[:count]), tuple(word.casefold() for word in words[count:])
+
+
+def _lexical_object_scope(text: str) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
+    """Keep a full endpoint and its qualifier; terminal denials are not scopes."""
+    body = re.sub(
+        r"\b(?:at\s+all|by\s+any\s+means|in\s+any\s+(?:environment|way)|"
+        r"at\s+any\s+time|under\s+any\s+circumstances|whatsoever|anymore|"
+        r"generally|вообще|совсем|больше)\s*[ ,.;!?]*$", '', text, flags=re.I,
+    )
+    terms = _lexical_terms(body)
+    markers = list(re.finditer(r"\b(?:for|on|in|at|by|under|для|по|на|в|под)\b", body, re.I))
+    # A leading marker is part of the endpoint, never an empty-name wildcard.
+    # Keep internal markers; only the final suffix is a possible scope.
+    marker = markers[-1] if markers and markers[-1].start() else None
+    head = body[:marker.start()] if marker else body
+    name = _lexical_terms(head)
+    return name, terms[len(name):]
+
+
+def _lexical_assertions(
+    text: str, action_pattern: str = _LEXICAL_ACTION,
+    protected: Iterable[Tuple[int, int]] = (), *, require_complete: bool = False,
+) -> List[Dict[str, Any]]:
+    """Bind a local actor, one action, its adjacent object and its own polarity.
+
+    This limited grammar does not infer through unknown prefixes, shared
+    negative coordination or another action. Spans always refer to raw text.
+    """
+    action_pattern = r"(?<!\w)(?:" + action_pattern + ")"
+    assertions = []
+    for lower, upper in _lexical_sentence_spans(text, protected):
+        parts = []
+        start, join = lower, ''
+        for sep in _LEXICAL_SEPARATOR_RE.finditer(text, lower, upper):
+            kind = (sep.group(1) or '').casefold()
+            tail = text[sep.end():upper]
+            verb = re.search(action_pattern, tail, re.I)
+            actor, residue = _lexical_actor_prefix(tail[:verb.start()]) if verb else ((), ())
+            negative_object = (any(a == 0 for a, _ in _negation_spans(tail))
+                               and not _LEXICAL_DENIAL_RE.match(tail))
+            # A comma/newline is not proof of a new assertion: require a
+            # completed action on its left before dropping a controlling frame.
+            left_action = re.search(action_pattern, text[start:sep.start()], re.I)
+            if kind or (left_action and ((actor and not residue)
+                                        or (negative_object and not sep.group().isspace()))):
+                parts.append((start, sep.start(), join))
+                start, join = sep.end(), kind or 'explicit'
+        parts.append((start, upper, join))
+        previous = None
+        for left, right, join in parts:
+            verbs = [v for v in re.finditer(action_pattern, text, re.I)
+                     if left <= v.start() < v.end() <= right
+                     and not any(a <= v.start() < b for a, b in protected)]
+            if not verbs:
+                negators = _negation_spans(text[left:right])
+                if previous and negators:
+                    first, end = negators[0]
+                    prefix = text[left:left + first]
+                    actor, residue = _lexical_actor_prefix(prefix)
+                    # Require an actor-bearing elliptical frame, not an opaque modifier.
+                    named_actor = (actor and (actor[0] in _LEXICAL_ACTORS
+                                   or re.search(r"\b(?:do|does|did|is|are|was|were|can)\s*$", prefix, re.I)))
+                    other_actor = named_actor and not residue and actor != previous['actor']
+                    named_object, qualifier = _lexical_object_scope(text[left + end:right])
+                    different_object = (not _lexical_terms(prefix) and named_object
+                                        and _lexical_terms(text[left + end:right]) not in
+                                            (previous['object'], previous['object_name'])
+                                        and named_object != previous['object']
+                                        and (named_object != previous['object_name']
+                                             or (qualifier and previous['qualifier']
+                                                 and qualifier != previous['qualifier'])))
+                    if (not other_actor and (join in {'or', 'или'} or not different_object
+                                             or _LEXICAL_DENIAL_RE.search(text[left:right]))):
+                        previous['negative'] = None
+                if require_complete and _lexical_terms(text[left:right]):
+                    # Unparsed claimed assertions must not silently disappear
+                    # while the recognized clauses receive support.
+                    assertions.append({'negative': None})
+                continue
+            verb = verbs[0]
+            actor, residue = _lexical_actor_prefix(text[left:verb.start()])
+            explicit = bool(actor)
+            if not actor and previous and join:
+                actor = previous['actor']
+            negators = [(left + a, left + b) for a, b in _negation_spans(text[left:right])]
+            polarity = bool(negators)
+            if len(verbs) != 1 or not actor:
+                polarity = None
+            elif (not explicit and previous and join in {'and', 'or', 'и', 'или'}
+                  and (previous['negative'] is not False or polarity)):
+                polarity = None  # No lexical authority to choose shared negation.
+            obj_start = verb.end()
+            while obj_start < right and text[obj_start].isspace():
+                obj_start += 1
+            object_name, qualifier = _lexical_object_scope(text[obj_start:right])
+            assertion = dict(actor=actor, action=_lexical_terms(verb.group()),
+                             object=_lexical_terms(text[obj_start:right]), negative=polarity,
+                             object_name=object_name, qualifier=qualifier,
+                             residue=residue, start=left, end=right,
+                             action_start=verb.start(), action_end=verb.end(), object_start=obj_start,
+                             negators=negators, literal=' '.join(text[left:right].split()).strip(' ,.;!?'))
+            if not assertion['object']:
+                assertion['negative'] = None
+            assertions.append(assertion)
+            previous = assertion
+    return assertions
+
+
+def _quote_preserves_negation(claim: str, quote: str, source: str) -> bool:
+    """Compare complete local assertions, never cross-clause word subsequences.
+
+    Existing support/role/privacy guards remain mandatory. Unknown modifiers
+    only permit identical literal assertions, not semantic projections.
+    """
+    if not quote or bool(_negation_spans(claim)) != bool(_negation_spans(quote)):
+        return False
+    proposed = _lexical_assertions(claim, require_complete=True)
+    asserted = _lexical_assertions(source)
+    if not proposed or any(part['negative'] is None for part in proposed):
+        return False
+    occurrences = list(re.finditer(r"(?=" + re.escape(quote) + r")", source))
+    if not occurrences:
+        return False
+    sentences = _lexical_sentence_spans(source)
+    for occurrence in occurrences:
+        lower, upper = occurrence.start(), occurrence.start() + len(quote)
+        cited_scopes = [(a, b) for a, b in sentences if a < upper and lower < b]
+        for part in proposed:
+            for row in asserted:
+                if ((row['actor'], row['action']) != (part['actor'], part['action'])
+                        or not any(a <= row['action_start'] < b for a, b in cited_scopes)):
+                    continue
+                # Two explicit qualifiers denote different assertion scopes.
+                # An unqualified denial still covers the same full endpoint.
+                same_object = (row['object'] == part['object']
+                               or row['object'] == part['object_name']
+                               or part['object'] == row['object_name']
+                               or (row['object_name'] and row['object_name'] == part['object_name']
+                                   and (row['qualifier'] == part['qualifier']
+                                        or not row['qualifier'] or not part['qualifier'])))
+                if same_object and (row['negative'] is None
+                                    or row['negative'] != part['negative']
+                                    or (row['residue'] and row['literal'] != part['literal'])):
+                    return False
+            matching = [row for row in asserted
+                        if lower <= row['action_start'] < row['action_end'] <= upper
+                        and row['object_start'] < upper
+                        and (row['actor'], row['action'], row['object']) ==
+                            (part['actor'], part['action'], part['object'])]
+            if not matching:
+                return False
+            for row in matching:
+                if row['negative'] is None or row['negative'] != part['negative']:
+                    return False
+                if any(not lower <= a < b <= upper for a, b in row['negators']):
+                    return False
+                if (row['residue'] or part['residue']) and row['literal'] != part['literal']:
+                    return False
+                # Every object anchor must itself be inside this exact quote.
+                if _lexical_terms(source[row['object_start']:min(row['end'], upper)]) != row['object']:
+                    return False
+    return True
+
+
 def _normalize_llm_entry(
     entry: Any, messages_by_index: Dict[int, Dict[str, Any]], *,
     reject_secret_material: bool = False,
@@ -589,7 +839,8 @@ def _normalize_llm_entry(
             ))
             or _INJECTION_RE.search(claim) or _INJECTION_RE.search(quote) or _INJECTION_RE.search(source_message["content"])
             or (quote.lstrip().startswith(("{", "[")) and re.search(r'"claims?"\s*:', quote, re.I))
-            or not _claim_supported(claim, quote)):
+            or not _claim_supported(claim, quote)
+            or not _quote_preserves_negation(claim, quote, source_message["content"])):
         return None
     if speaker == "assistant":
         if claim_type == "preference" or not _ASSISTANT_OUTCOME_RE.search(quote) or _ASSISTANT_FUTURE_RE.search(quote):

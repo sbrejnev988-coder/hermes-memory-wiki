@@ -1,4 +1,4 @@
-# Hermes Memory Wiki v1.24.0
+# Hermes Memory Wiki v1.24.0 — кандидат релиза
 
 Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 121 MCP tools.
 
@@ -6,11 +6,52 @@ The supported security properties and private reporting path are documented in [
 
 **Для Hermes-агентов:** [практический runbook безопасной установки и обновления](docs/HERMES-AGENT-DEPLOYMENT.md) — immutable pin, profile isolation, scanner/PM, Codex/OpenRouter, `voyageai/rerank-3`, проверки, owner activation и rollback. Документ отделяет проверенные примеры от неиспытанных путей и не является подтверждением развёртывания.
 
+## Статус релиза и границы проверки
+
+На срезе 4 октября 2026 года последний опубликованный GitHub Release — **v1.22.3**; следующие два — v1.22.2 и v1.22.1, оба помечены superseded. Число `1.24.0` в этом README, `plugin.yaml` и `pyproject.toml` — версия исходников кандидата, а не доказательство опубликованного v1.24.0.[4]
+
+Проверенный public `main` — `438e0b57cb44470c2d47b9210941bea177d379f1`. Локальная композиция поверх него ещё не принята целиком; финальный immutable SHA релиза, tag и CI этого SHA **не назначены**.[5] Исторический session-only PIN `2bda0efe7f1e5e90c1f0440a89e40f03314f9c21` не содержит новый Codex-маршрут графа. Для установки нужен отдельно принятый commit с требуемыми функциями, не branch/tag и не старый PIN с той же версией manifest.[2]
+
+[Заметки к кандидату 1.24.0](docs/RELEASE_NOTES_1_24_0_RU.md) отделяют предусмотренные изменения от незакрытых проверок. На исходном срезе остаются ошибки сохранения отрицания в session/graph extraction и проверки SQL `NULL` в contradiction recall; их исправление и проверки итоговой композиции здесь не подтверждены. Экранирование текста не означает универсальную семантическую защиту от prompt injection.
+
+Memory Wiki выпускается самостоятельно: `memory.provider: memory-wiki` остаётся выбором долгосрочной памяти. LCM-X — отдельный слой; захват неподдержанных видов истории ещё не готов и не является условием релиза Wiki. Документ не подтверждает автоматическую доступность памяти основному агенту или детям `delegate_task`.
+
+Публикация исходников, установка, сохранение настроек, свежий CLI и реально загруженный gateway/Desktop — отдельные этапы. Ни этот README, ни сохранённый YAML не подтверждают последние этапы. Примеры ниже — только для отдельно разрешённого rollout принятого PIN; текущие модели и профили владельца не заменяются.
+
+## Ограничения extraction и calendar intent
+
+Неполная конструкция «имя + нет» намеренно обрабатывается строго: если после
+положительной части появляется только имя и отрицание без явного местоимения,
+auxiliary или повторённого действия, извлечение может пропустить факт (fail closed).
+Например, `Aster работает на Helix, но Lyra нет.` **не** подтверждает сохраняемую
+положительную связь Aster → Helix в этом контракте. Одной заглавной буквы
+недостаточно для доказательства смены actor; это осознанная потеря полноты,
+а не универсальный разбор языка.
+
+Явные грамматические признаки по-прежнему учитываются: `Aster runs on Helix but
+Lyra does not.` (auxiliary) и `Aster runs on Helix but Lyra does not run on Helix
+at all.` (полное действие) отделяют отрицание другого actor. Местоимения и
+раздельные qualified scopes сохраняются в примере `We use Quartz for production
+but we do not use Quartz for development.` Наличие местоимения само по себе
+не разрешает противоречие того же actor/object или неизвестный modifier.
+
+Calendar intent — тоже ограниченная лексическая классификация: учитываются
+валидность даты, подтверждённая календарная запись и предшествующий контекст
+той же clause. `Архив после 2024-03-01, 2/3 часа обработки` остаётся temporal;
+`Длина со 3/8, 2 аршина` и `Помнишь смесь с 1.5 г,2 г соли?` — нет. Разделитель
+`/` и сокращение `г` сами по себе не доказывают календарь. Это не universal NLP
+и не обещание распознать каждую единицу, эллипсис или календарную формулировку.
+
+Переносимые проверки этих границ используют **ASTUNIT**: функции из фактических
+repo-relative файлов, без package initialization, SDK-подмен, запросов модели
+или persistence. Native/SDK, package/schema/cache, Windows/Linux CI и приёмка
+всего релиза остаются отдельными незавершёнными gates. Старый F04 с expected
+True и неуспешный исторический gate сохранены; новый отказ — отдельный
+owner-approved контракт, не переименование прежнего результата в GREEN.
+
 ## Profile-scoped session extraction (OpenRouter or Codex)
 
-Session-end and background-event extraction use one immutable settings snapshot
-from the owning provider's `config.yaml`. Enable **one explicit provider and exact
-model** under the native plugin settings:
+Предусмотрен один неизменяемый снимок owner-local `config.yaml` для session-end и background-event extraction. Пример ниже готовит выключенный маршрут; включение разрешено только после приёмки и установки нужного PIN, проверки actual reader и отдельного согласия на сеть/квоту. Выбрать один provider и точную согласованную модель:
 
 ```yaml
 plugins:
@@ -18,7 +59,7 @@ plugins:
     memory-wiki:
       settings:
         extraction:
-          enabled: true
+          enabled: false
           provider: openai-codex
           model: gpt-6-luna
           timeout: 30
@@ -48,9 +89,14 @@ and SDK/transport retries off. Codex uses Hermes' native OAuth headers and publi
 `CodexAuxiliaryClient` Responses adapter directly: no provider resolver, quota
 probe, credential-pool healing, CLI adoption or auth-store writes.
 
+YAML `max_tokens` accepts integers in 256–9000 for `openai-codex` and 256–3000
+for `openrouter`; out-of-range values fail closed, without clamping. Legacy
+`MW_EXTRACTION_MAX_TOKENS` remains clamped to 256–3000.
+
 Codex's native adapter ignores `response_format`, temperature and the output-token
 cap. Therefore its prompt carries the schema and the host validates the response;
-`max_tokens` is **not a server-enforced Codex spending/output cap**. Host response
+`max_tokens` is a client-side token-budget hint, **not a server-enforced Codex
+spending/output cap**. Host response
 size/candidate limits apply after receipt. The caller binds an absolute stream
 acceptance deadline (`timeout`, 1–60 seconds), within the native 600-second hard
 ceiling, and rejects a late final response.
@@ -76,6 +122,130 @@ Older native cores retain the current owner and accept profile YAML, but legacy 
 An explicit native disabled/malformed
 section always takes precedence over legacy enablement. This feature does not
 change the chat model, other profiles, graph schema or live process activation.
+
+## Graph-only extraction through Codex subscription
+
+Предусмотрен отдельный маршрут для `memory_wiki_graph_extract_claim` и опционального graph enrichment, независимо от session `extraction`. Он требует нового принятого feature-containing PIN; историческая session-only база не подходит. Пример готовит выключенный owner-local маршрут и не меняет основную модель:
+
+```yaml
+plugins:
+  entries:
+    memory-wiki:
+      settings:
+        graph_extraction:
+          enabled: false
+          provider: openai-codex
+          model: gpt-6-luna-900k
+          timeout: 30
+          reasoning_effort: low
+```
+
+Only `enabled`, `provider`, `model`, `timeout` and `reasoning_effort` are accepted.
+`enabled` is a boolean (default false); enabled sections require an explicit
+provider and effective model. Providers are `openai-codex` and `openrouter`.
+Timeout defaults to 30 seconds and must be a number in 1–60; reasoning defaults
+to `low` and accepts `low|medium|high|xhigh|max`. Unknown fields, wrong types,
+unsupported providers or invalid model literals fail closed. A disabled or
+malformed section cannot be re-enabled by legacy environment settings.
+
+**Exact model precedence when the graph section exists:**
+
+1. An already-existing owner-local `MEMORY_WIKI_GRAPH_EXTRACT_MODEL` value in
+   the plugin's profile scope (including its legacy `.env` surface).
+2. The same process environment variable, only if native launch-home discovery
+   proves this provider owns that process. Foreign/routed or unknown launch
+   owners cannot inherit an ambient model override.
+3. `graph_extraction.model` from the owner's YAML (default `gpt-6-luna` only
+   for a disabled section).
+
+The override replaces only the model, never the provider, enablement or timeout.
+It is read at call time with no additional trimming or model rewriting; the
+existing legacy `.env` parser still strips surrounding assignment whitespace
+and matching quotes. A present empty or invalid value is an error, not a silent
+fallback. Prefer YAML for new configuration. `MW_EXTRACTION_MODEL`, session
+`extraction` settings and the main
+chat model do not select graph routing. Without a graph section the existing
+explicit legacy OpenRouter graph path remains; the literal `gpt-6-luna-900k`
+alone is refused there instead of being sent to a paid route. To keep an explicit
+YAML OpenRouter graph route, set `provider: openrouter` and its intended model;
+its existing graph endpoint/key settings remain in use.
+
+Codex needs no `OPENROUTER_API_KEY`. It uses the unchanged session adapter's
+read-only `_own_codex_grant` and native `CodexAuxiliaryClient`, pinned to
+`https://chatgpt.com/backend-api/codex/responses` and the graph provider's owner.
+Graph URL/key overrides, ambient OpenAI credentials and another owner's grant
+cannot change that route. Missing/expired/unknown grants, authoritative empty or
+malformed pools, native singleton suppression, credential failures and active
+**exact-requested-model** cooldowns deny the call; no resolver, healing, refresh,
+CLI credential adoption, quota probe, SDK retry or paid fallback is performed.
+Auth files remain unchanged. Healthy independent manual OAuth pool rows remain
+usable even when native singleton seeding is suppressed.
+
+The requested literal `gpt-6-luna-900k` reaches the native adapter unchanged;
+the native context-variant conversion sends wire `gpt-6-luna`. This is not a
+model substitution.
+Исторические offline проверки native SDK с синтетическими auth/HTTP не являются приёмкой нового релизного SHA и не доказывают server entitlement, server model identity, квоту подписки или запрос на 900K контекста.
+
+Only bounded, visible, current, non-secret/non-quarantined claim text is sent.
+Grounding, predicate/confidence checks and the eight-proposal maximum are shared
+with the legacy route. `apply: false` persists no relations; applied edges still
+use journaled `memory_wiki_add_relation`. Recovery replays edges without making
+model calls. Automatic enrichment additionally requires the existing
+`MEMORY_WIKI_GRAPH_AUTO_EXTRACT=1` opt-in and its eligibility/deadline gates;
+it uses this same graph provider and model. No separate auto opt-in is implied
+by enabling the YAML section. Codex's server does not enforce the helper's
+700-token hint; host response limits/deadlines are not a server spending cap.
+Configuration does not reload a cached provider in an already-running gateway or
+Desktop backend. Activate only through the authorized native owner lifecycle;
+never bypass a self-restart guard. See the [deployment runbook](docs/HERMES-AGENT-DEPLOYMENT.md)
+for graph-specific settings and fresh-process versus loaded-runtime acceptance.
+
+### Migrate a legacy graph model override
+
+For a new configuration, prefer the supported profile-local writer:
+
+```bash
+hermes -p "$PROFILE" config set --force \
+  plugins.entries.memory-wiki.settings.graph_extraction \
+  '{"enabled":false,"provider":"openai-codex","model":"gpt-6-luna-900k"}'
+```
+
+`config set --force` здесь подтверждает только запись незнакомого core ключа, не поддержку функции плагином и не scanner consent. После проверки принятого deployed reader и отдельного согласия можно включить `graph_extraction.enabled`; auto-graph opt-in остаётся отдельным.
+
+If `MEMORY_WIKI_GRAPH_EXTRACT_MODEL` already exists in that profile and is no
+longer intended, remove **only that non-secret override** with
+`hermes -p "$PROFILE" config unset MEMORY_WIKI_GRAPH_EXTRACT_MODEL`. Skip the
+unset when the key is absent; do not suppress other configuration errors. In
+particular, an old `openai/gpt-4.1-mini` override outranks the new YAML model and
+is not a valid Codex slug. Read the actual owner's effective graph settings after
+migration. Preserve the main chat model, session extraction, other environment
+values and all unrelated profiles. Do not copy `.env` or `auth.json`.
+
+## Document indexing without turn-start delays
+
+`MEMORY_WIKI_DOCUMENT_AUTO_SCAN_CACHE=0` disables attachment-cache ingestion in
+`on_turn_start`; it does not delete cached files, disable ordinary file reading,
+or remove already indexed documents. This is the safe latency-first mode. Save
+it, when authorized, with the supported profile-local CLI:
+
+```bash
+hermes -p "$PROFILE" config set MEMORY_WIKI_DOCUMENT_AUTO_SCAN_CACHE 0
+```
+
+Index a selected useful file explicitly with `memory_wiki_document_ingest`, or
+refresh the attachment-cache index with `memory_wiki_document_scan` (an omitted
+`root` selects the configured attachment cache). Incremental ingestion skips
+unchanged supported files; `prune_missing` is false by default. Manual scans can
+still be expensive and retain ordinary journal/safety-checkpoint behavior.
+Choose text indexing first; OCR and semantic embedding are separate explicit
+options, with their own resource/privacy/cost budget.
+
+This flag does **not** move work to a background worker or a schedule. While
+automatic ingestion is enabled, increasing `MEMORY_WIKI_DOCUMENT_AUTO_SCAN_SECONDS`
+only throttles turn-start scans; a due scan can still delay a response. The
+journaled scan can invoke a full safety checkpoint even when no new document is
+indexed. A post-response/background queue is not implemented by this switch.
+Do not disable journal safety checkpoints to hide the latency.
 
 ## Explicit profile-fleet search (v1.24.0)
 
@@ -304,11 +474,11 @@ Plaintext returned intentionally by `secret_context_lookup` can still enter the 
 | `HERMES_HOME` | `~/.hermes` | Hermes data directory (DB at `{HERMES_HOME}/memory-wiki/memory_wiki.sqlite3`) |
 | `MEMORY_WIKI_ALLOW_SHARED_SECRET_METADATA` | `0` | Permit old ownerless secret metadata and the external read-through registry only in one shared authorization domain; owner-tagged local metadata uses its own ACL |
 | `MEMORY_WIKI_ALLOW_LEGACY_UNSCOPED_GRAPH` | `0` | Permit reads of pre-migration graph rows with unknown owner only in a deliberately shared authorization domain; new graph writes are scoped |
-| `MEMORY_WIKI_GRAPH_EXTRACT_ENABLED` | `0` | Enable remote relation extraction from one named, visible, bounded claim |
-| `MEMORY_WIKI_GRAPH_EXTRACT_MODEL` | unset | OpenRouter chat model for graph extraction; required unless `MEMORY_WIKI_LLM_MODEL` is set |
-| `MEMORY_WIKI_GRAPH_EXTRACT_URL` | OpenRouter chat completions | HTTPS or loopback endpoint; `MEMORY_WIKI_LLM_BASE_URL` is the fallback |
-| `MEMORY_WIKI_GRAPH_EXTRACT_API_KEY` | `OPENROUTER_API_KEY` | Optional separate graph extraction key |
-| `MEMORY_WIKI_GRAPH_AUTO_EXTRACT` | `0` | After session extraction, automatically enrich only newly persisted, grounded, relation-like chat claims; also requires `MEMORY_WIKI_GRAPH_EXTRACT_ENABLED=1` |
+| `MEMORY_WIKI_GRAPH_EXTRACT_ENABLED` | `0` | Legacy OpenRouter graph enablement when `graph_extraction` YAML is absent; explicit YAML enablement takes precedence |
+| `MEMORY_WIKI_GRAPH_EXTRACT_MODEL` | unset | Exact graph model override: owner-local value, then proven owner-process environment, then graph YAML; without YAML the legacy `MEMORY_WIKI_LLM_MODEL` fallback remains |
+| `MEMORY_WIKI_GRAPH_EXTRACT_URL` | OpenRouter chat completions | OpenRouter only: HTTPS or loopback endpoint; `MEMORY_WIKI_LLM_BASE_URL` is the fallback. Ignored by Codex |
+| `MEMORY_WIKI_GRAPH_EXTRACT_API_KEY` | `OPENROUTER_API_KEY` | Optional separate OpenRouter graph key; neither key is needed or used by Codex |
+| `MEMORY_WIKI_GRAPH_AUTO_EXTRACT` | `0` | After session extraction, enrich only newly persisted, grounded, relation-like chat claims; additionally requires graph YAML `enabled: true` or legacy `MEMORY_WIKI_GRAPH_EXTRACT_ENABLED=1` |
 | `MEMORY_WIKI_GRAPH_AUTO_EXTRACT_MAX_CLAIMS` | `2` | Maximum remote graph-extraction calls per session end, clamped to 1–4 |
 | `MEMORY_WIKI_GRAPH_AUTO_EXTRACT_TOTAL_DEADLINE_SECONDS` | `12` | Total automatic-enrichment budget, clamped to 1–30 seconds |
 | `MW_EXTRACTION_ENABLED` | `0` | Opt in to grounded session-end LLM extraction; local explicit-memory heuristics continue while disabled |
@@ -389,31 +559,25 @@ MEMORY_WIKI_CONTEXT_MAX_PER_TOPIC=8
 
 ## Installation
 
+Использовать [runbook](docs/HERMES-AGENT-DEPLOYMENT.md), а не mutable clone в live profile. Native installer принимает полный immutable commit SHA; фактический PIN будущего релиза в этом документе отсутствует.[2] Следующий шаблон — только для нового или доказанно неактивного target после discovery, code review, scanner/PM consent и проверенного host backup:
+
 ```bash
-# Clone into Hermes plugins directory
-cd ~/.hermes/plugins
-git clone https://github.com/sbrejnev988-coder/hermes-memory-wiki.git memory-wiki
-
-# The security-integrated build also requires these files:
-#   ~/.hermes/lib/hermes_core_loader.py
-#   ~/.hermes/lib/hermes_trust_core.py
-#   ~/.hermes/lib/hermes_secret_core.py (pinned by the loader)
-
-# Restart Hermes gateway
-hermes gateway restart
-
-# Windows (PowerShell):
-#   cd $env:USERPROFILE\.hermes\plugins
-#   git clone https://github.com/sbrejnev988-coder/hermes-memory-wiki.git memory-wiki
-#   hermes gateway restart
+: "${PROFILE:?выберите разрешённый профиль}" "${PROFILE_HOME:?обнаружьте его home}"
+: "${PM_PYTHON:?обнаружьте выбранный PM Python}" "${PIN:?задайте принятый полный commit SHA}"
+SOURCE_URL='https://github.com/sbrejnev988-coder/hermes-memory-wiki.git'
+"$PM_PYTHON" -I -B -c 'import re,sys; assert re.fullmatch(r"[0-9a-fA-F]{40}", sys.argv[1]), "invalid SHA"' "$PIN"
+HERMES_HOME="$PROFILE_HOME" hermes -p "$PROFILE" plugins install \
+  "$SOURCE_URL" --ref "$PIN" --no-enable
+HERMES_HOME="$PROFILE_HOME" hermes -p "$PROFILE" plugins list --user --json
 ```
 
-Before restart, run `python3 -m py_compile __init__.py collapse.py extractor.py decay.py`.
+`--no-enable` не отключает уже выбранный provider при replacement. Upgrade требует отдельного quiesce, сохранения исходной копии с untracked/ignored файлами, данных и rollback. `--force` не добавлять по умолчанию: replacement и scanner caution требуют своих решений; dangerous остаётся блокировкой. Строгие trust dependencies не подменять и security mode не снижать ради установки.
 
-On first init the plugin creates:
-- `{HERMES_HOME}/memory-wiki/memory_wiki.sqlite3` — SQLite database (source of truth)
-- Qdrant collection `memory_wiki_claims_{manifest_hash_12chars}`
-- Qdrant alias `memory_wiki_claims_active` → physical collection
+Профили одной установки могут участвовать в общем PM dependency environment.[3] Конфликт одинаковых buildable distributions — STOP; metadata-only overlay не считать доказанным способом установки. Не править shared lock/facts и не применять профильные настройки ко всему пользователю.
+
+Сверить installed SHA/payload и effective reader до разрешённой настройки `memory.provider`. Свежий процесс и реально загруженный owner проверяются раздельно. Restart возможен только с отдельным согласием через native lifecycle; self-restart guard не обходить. Компиляция Python не заменяет import/Doctor/feature/backup checks.
+
+Первый `initialize()` может создать owner DB `{HERMES_HOME}/memory-wiki/memory_wiki.sqlite3`, мигрировать таблицы и запустить workers; при включённой семантике возможны обращения к Qdrant. Его нельзя использовать как универсальный read-only metadata probe. Имена коллекций/aliases сверять с фактическими owner settings и manifest.
 
 ## Optional external MCP wrapper
 
@@ -582,7 +746,7 @@ their contents.
 
 New entity and relation rows carry `visibility_scope`, owner identity, optional `source_claim_id`, and a validity interval. A relation linked to a claim inherits its visibility and disappears from graph queries when the claim is superseded, retired, or expired. Graph queries can include a bounded second hop. Model-facing graph reads, exports, and context packing enforce the same boundary. Old rows acquire the `legacy` marker during schema migration; their owner cannot be inferred from the process that starts Hermes. They remain hidden unless `MEMORY_WIKI_ALLOW_LEGACY_UNSCOPED_GRAPH=1` is explicitly set for one shared authorization domain. To attribute old rows individually, use `python tools/migrate_legacy_graph.py --database PATH --mapping MAP.json` for a dry run, then repeat with `--apply --attest "I verified every graph row owner"` after reviewing the mapping. The apply path creates an SQLite backup. Example mapping: `{"records":[{"table":"entities","id":"ent_existing","visibility_scope":"chat","origin_bot_id":"verified-bot-id","origin_session_id":"verified-session-id"}]}`. The same tool accepts `preference_rules`, `review_queue`, and `secret_index` rows. Every mapping entry needs a verified owner; assign `global` only when the row was intentionally shared. Ownership migration of an old preference rule does **not** attest its content for the system prompt. Imported bundle graph rows remain gated because copying owner IDs across homes requires explicit remapping. New preference candidates and review items carry owner scope; old rows remain closed unless their respective shared-domain flag is set. Local admin secret metadata defaults to private visibility; its owner-tagged rows can be queried when the local index is enabled. Bulk claim maintenance that cannot yet filter by owner is denied whenever the database contains claims hidden from the current session.
 
-`memory_wiki_graph_extract_claim` requires `MEMORY_WIKI_GRAPH_EXTRACT_ENABLED=1`, a configured chat model and API key, and a specific visible claim ID. It sends at most 4,000 characters of that claim to the configured endpoint. Strict JSON parsing accepts up to eight directed relations whose subject, object, and evidence appear in the claim text; unsupported predicates or ungrounded output fail before any write. `apply=false` previews proposals. Applied relations go through `memory_wiki_add_relation` and the normal journal, so replay never calls the remote model. Model extraction can still misinterpret a stated relationship; review important edges and use corrections to supersede their source claim.
+`memory_wiki_graph_extract_claim` требует конкретный visible/current/public/non-quarantined claim и явное включение: новым принятым PIN через отдельный `graph_extraction`, либо legacy OpenRouter через `MEMORY_WIKI_GRAPH_EXTRACT_ENABLED=1`, его model/key при отсутствии YAML. Codex использует только owner OAuth, без OpenRouter key и paid fallback. Передаётся до 4,000 символов claim; strict JSON ограничивает предложения восемью, проверяет predicate/grounding. `apply:false` не пишет edges; запись идёт через обычный journaled `memory_wiki_add_relation`, replay не вызывает модель. На исходном срезе проверка отрицания имеет известный дефект; проверять важные edges и не выдавать такую extraction за принятую семантику до исправления и exact-source gate.
 
 `MEMORY_WIKI_GRAPH_AUTO_EXTRACT=1` adds a bounded synchronous step after grounded session claims are persisted. It never sends raw transcript text: only a new active/current public chat claim with `memory-wiki-extraction-evidence-v1` provenance can qualify. A conservative local relation-verb filter skips preferences and other claims unlikely to produce an allowed edge. Claims that already own any relation are not sent again. The per-session call cap and total deadline apply before each request; request or write failures are counted in a content-free audit record and never fail session shutdown. Relations keep the source claim's ACL and lifecycle through the ordinary journaled relation writer.
 
@@ -596,7 +760,7 @@ Full-store recovery artifacts have the same ownership gap, including old backups
 
 For model-facing recovery without that host flag, use `memory_wiki_scoped_backup`, `memory_wiki_list_scoped_backups`, and `memory_wiki_restore_scoped_backup` with the returned opaque `backup_id`. Scoped snapshots contain claims created by the same bot/session with a matching or empty project ID, plus their evidence, contradictions whose two claims are owned, and code claim metadata. Legacy rows without creator metadata, secret or quarantined claims, non-public claims, and claims with detected raw secrets in linked evidence or metadata are excluded. Remaining strings are redacted before writing. A host-local 256-bit key authenticates each JSON artifact; preserve `memory-wiki/.scoped-backup-key` together with `memory-wiki/backups/scoped/` for recovery after SQLite loss. Restore validates the signed owner and every claim/reference, rejects ID collisions with another creator, then merges the saved rows. It restores updates and physically deleted owned claims while preserving unrelated and later-created rows. It does not roll back claims added after the snapshot, restore audit/secret/graph data, or replace a whole database. The scoped backup files contain public claim content in plaintext and should receive the same filesystem protection as the SQLite database. The signing key is not a separate security boundary against code running as the same OS account. Use trusted-host full backups for excluded data.
 
-Full list: 120 tools in `plugin.yaml` (generated from `get_tool_schemas()`).
+Manifest кандидата объявляет 121 имя tool в `plugin.yaml`. Полное совпадение actual runtime schemas, manifest, MCP cache и финального пакета — отдельная незакрытая проверка; одно количество имён её не заменяет.
 
 ## Usage examples
 
@@ -694,7 +858,7 @@ memory_wiki_mark_used({
 
 The current defaults use a strict `4096 = 4096` dimensional contract for both `MEMORY_WIKI_EMBED_DIMENSIONS` and `MEMORY_WIKI_VECTOR_SIZE`. Here `4096` is the length of every vector, not the number of Qdrant points. If you intentionally select a 2560-dimensional embedding model, set both values to `2560` and run a manifest reindex. The local `stubs/embed_stub.py` reports its dimension and actual hashing model in `/health`; Memory Wiki refuses semantic indexing when the provider/Qdrant dimensions differ or the bundled hash-stub model identity is inconsistent. Embedding values are also rejected when they are non-numeric or contain `NaN`/`Inf`.
 
-Do not replace plugin files while a reindex call is actively running. Let the current call finish, stop/restart the gateway, install this build, then start the new manifest reindex. The installer included in the release package checks `reindex_jobs` and refuses installation while a running job is recorded unless explicitly overridden.
+Не заменять plugin files во время активного reindex. Завершить текущую операцию, согласовать quiesce/backup и действовать по [runbook](docs/HERMES-AGENT-DEPLOYMENT.md). Наличие installer в старом пакете не доказывает admission нового кандидата; отказ из-за active job не обходить. Restart и manifest reindex требуют отдельных разрешений.
 
 The embedding manifest was upgraded to v2 and now includes the input character limit and document-prefix hash. Query-instruction changes are tracked but intentionally excluded from the physical collection hash, because they do not change stored document vectors. Therefore a reindex that started with the previous code belongs to the previous physical collection. It may finish safely and remain active, but after installing this build run `memory_wiki_reindex({"force": false})` until `status="completed"`. The alias is not switched during a partial rebuild.
 
@@ -797,33 +961,19 @@ MEMORY_WIKI_DOCUMENT_AUTO_EMBED=0
 
 If `HERMES_HOME=/root/.hermes`, the explicit cache-dir line is optional.
 
-**Windows:** do not use `/root/.hermes/...`. The cache defaults to `%LOCALAPPDATA%\hermes\cache\documents`, so the cache-dir setting is optional. Persist only non-secret settings for future Desktop/gateway processes:
+**Windows и другие платформы:** использовать обнаруженный owner `$PROFILE_HOME`, а не чужой абсолютный путь или user-wide `setx`. Attachment cache по умолчанию расположен под `{HERMES_HOME}/cache/documents`; explicit cache-dir необязателен. Сохранить согласованные non-secret settings через native profile-local writer, например:
 
-```powershell
-setx MEMORY_WIKI_DOCUMENT_AUTO_SCOPE_ID "hermes-state-db"
-setx MEMORY_WIKI_DOCUMENT_AUTO_REPOSITORY_ID "hermes-state-db"
-setx MEMORY_WIKI_DOCUMENT_ACCESS_SCOPE_ID "hermes-state-db"
-setx MEMORY_WIKI_DOCUMENT_ACCESS_REPOSITORY_ID "hermes-state-db"
-setx MEMORY_WIKI_DOCUMENT_AUTO_SCAN_CACHE "1"
-setx MEMORY_WIKI_DOCUMENT_AUTO_SCAN_SECONDS "15"
-setx MEMORY_WIKI_DOCUMENT_AUTO_SCAN_MAX_FILES "200"
-setx MEMORY_WIKI_DOCUMENT_AUTO_SCAN_MAX_CHANGED "3"
-setx MEMORY_WIKI_DOCUMENT_AUTO_MIN_AGE_SECONDS "2"
-setx MEMORY_WIKI_DOCUMENT_AUTO_EMBED "0"
+```bash
+hermes -p "$PROFILE" config set MEMORY_WIKI_DOCUMENT_AUTO_SCAN_CACHE 0
 ```
 
-`setx` affects only new processes. Fully restart the Desktop/backend after setting these values, then place a non-sensitive test document in the cache and verify it with `memory_wiki_document_status` and a scoped `memory_wiki_document_query`.
+Ноль отключает automatic ingestion, а не создаёт post-response очередь; ручные document tools остаются доступны. Для opt-in автоматизации отдельно определить owner scope/repository, лимиты и согласие на embedding/OCR. Saved value, fresh reader и observed loaded-runtime timing — разные проверки; не создавать production test document без согласия.
 
 ### Strict security gate
 
-Keep `HERMES_SECURITY_STRICT=0` only as the explicitly accepted temporary fallback while the official signed `hermes_trust_core` (and its documented dependencies) are unavailable. Switch it back **only after** the signed artifact has been installed into the active profile and a fresh strict process passes both plugin import/doctor and a read-only Memory Wiki health probe:
+Строгий режим требует author-supplied trust/loader/secret components с проверенными происхождением и зависимостями. Missing dependency — STOP: не изготовлять замену и не снижать `HERMES_SECURITY_STRICT` ради успешного теста. Ранее отдельно разрешённый non-strict режим не считать strict-verified; это не рекомендация переключить режим.
 
-```powershell
-setx HERMES_SECURITY_STRICT "1"
-hermes gateway restart
-```
-
-`setx` alone never reloads an already-open Desktop chat. If strict import/doctor fails, leave the previous setting in place; do not fabricate a trust-core substitute or force a strict restart.
+До любого разрешённого restart нужны backup, import/Doctor и bounded read-only feature checks в согласованном окружении. Fresh process не обновляет открытый Desktop/gateway; activation передаётся настоящему owner через native lifecycle без обхода guards. Подробности и rollback — в [runbook](docs/HERMES-AGENT-DEPLOYMENT.md).
 
 ### Atomic claim edit batches
 
@@ -883,6 +1033,8 @@ Latency and reindex duration depend on the embedding provider, Qdrant placement,
 
 ## Changelog
 
+Это история заметок исходников, не список опубликованных GitHub Releases. Для кандидата 1.24.0 см. [release notes](docs/RELEASE_NOTES_1_24_0_RU.md); фактический последний Release на указанном срезе — v1.22.3.[4] Даты и результаты старых записей не являются проверками текущей композиции.
+
 - **v1.23.3 (2026-09-22)**: Binds Qdrant routing, outbox delivery, manifest writes and diagnostics to each provider's Hermes home in shared processes. Foreign profile collections and endpoints are rejected before Qdrant traffic; retained claim upserts use the bound active target instead of stale payload hints. Old delete intents remain pending until any historical collection and endpoint are explicitly listed in that profile's `.env`. OpenRouter health state is isolated per profile.
 - **v1.23.2 (2026-09-22)**: Treats a deleted Qdrant collection as an idempotent target only after a same-endpoint authenticated GET confirms HTTP 404. Targeted claim-delete retries no longer fan out to unrelated physical collections, and current canonical point payloads are protected from stale delete jobs. A verified complete reindex now closes its matching running checkpoint before returning.
 - **v1.23.1 (2026-09-22)**: Redacts JSON and escaped quoted secret assignments, including prefixed and camel-case credential keys and structured values. Project-profile stacks are recursively sanitized before SQLite, mutation, and export persistence. Existing installations should run the built-in secret scrub and reindex affected Qdrant collections after upgrading.
@@ -925,3 +1077,10 @@ This source package includes the runtime modules required by the advertised code
 - `memory_wiki_debug_search` now reports guard status/signals per post-filter candidate and does not increment recall counters.
 - `memory_wiki_semantic_status` exposes `last_prefetch` telemetry. Audit events use `op=prefetch` with searched/relevant/rendered/quarantined/output size.
 - Strict mode never bypasses a trust-core quarantine merely to meet the minimum. A guard disagreement is reported separately so false positives can be fixed without weakening security.
+
+## Sources
+
+[2] https://hermes-agent.nousresearch.com/docs/user-guide/features/plugins
+[3] https://hermes-agent.nousresearch.com/docs/reference/package-management
+[4] https://github.com/sbrejnev988-coder/hermes-memory-wiki/releases
+[5] https://api.github.com/repos/sbrejnev988-coder/hermes-memory-wiki/git/ref/heads/main

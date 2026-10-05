@@ -44,6 +44,9 @@ include-package-data = true
 [tool.setuptools.package-data]
 memory_wiki = [
   "plugin.yaml",
+  "schema.sql",
+  "rerank-rules.json",
+  "compatibility/mcp-api-v1.json",
   "mcp-wrapper/*.py",
   "mcp-wrapper/*.json",
   "context-coordination/*.py",

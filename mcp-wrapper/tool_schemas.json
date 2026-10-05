@@ -620,7 +620,7 @@
   },
   {
     "name": "memory_wiki_graph_extract_claim",
-    "description": "Explicit opt-in extraction of source-grounded graph relations from one visible claim using configured OpenRouter chat model; disabled unless MEMORY_WIKI_GRAPH_EXTRACT_ENABLED=1. Each applied edge inherits claim visibility and is journaled separately.",
+    "description": "Explicit opt-in extraction of source-grounded graph relations from one visible current claim using owner-local graph_extraction settings (Codex subscription or OpenRouter), or the enabled legacy route. No provider fallback. Each applied edge inherits claim visibility and is journaled separately.",
     "parameters": {
       "type": "object",
       "properties": {

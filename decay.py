@@ -9,6 +9,7 @@ from __future__ import annotations
 import math
 import sqlite3
 import time
+from contextlib import closing
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -33,7 +34,7 @@ def _decay_factor(
 
 def scan_decay(db_path=None, threshold: float = 0.15) -> List[Dict[str, Any]]:
     threshold = max(0.0, min(1.0, float(threshold)))
-    with sqlite3.connect(str(db_path or DEFAULT_DB)) as database:
+    with closing(sqlite3.connect(str(db_path or DEFAULT_DB))) as database:
         database.row_factory = sqlite3.Row
         rows = database.execute(
             """
@@ -48,8 +49,8 @@ def scan_decay(db_path=None, threshold: float = 0.15) -> List[Dict[str, Any]]:
         days = _days_since(int(row["freshness_at"] or row["updated_at"] or 0))
         factor = _decay_factor(
             days,
-            float(row["confidence"] or 0.7),
-            float(row["salience"] or 0.7),
+            float(0.7 if row["confidence"] is None else row["confidence"]),
+            float(0.7 if row["salience"] is None else row["salience"]),
             int(row["access_count"] or 0),
         )
         if factor < threshold:
@@ -71,7 +72,8 @@ def archive_stale_claims(
         if not int(item.get("pinned") or 0)
         and float(item.get("confidence") or 0.0) < 0.7
     ]
-    protected_ids = [item["id"] for item in stale if item["id"] not in set(ids)]
+    eligible_ids = set(ids)
+    protected_ids = [item["id"] for item in stale if item["id"] not in eligible_ids]
     result: Dict[str, Any] = {
         "stale": len(stale),
         "eligible": len(ids),
@@ -100,7 +102,7 @@ def archive_stale_claims(
 
 
 def get_decay_stats(db_path=None) -> Dict[str, Any]:
-    with sqlite3.connect(str(db_path or DEFAULT_DB)) as database:
+    with closing(sqlite3.connect(str(db_path or DEFAULT_DB))) as database:
         database.row_factory = sqlite3.Row
         row = database.execute(
             """
