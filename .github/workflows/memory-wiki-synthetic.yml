@@ -1,0 +1,229 @@
+name: Memory Wiki synthetic native FULL and recovery
+
+# Manual exact-commit execution only. Publishing/dispatch requires parent acceptance.
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Independently accepted full 40-hex Memory Wiki commit
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: memory-wiki-synthetic-${{ inputs.source_sha }}
+  cancel-in-progress: false
+
+jobs:
+  native:
+    name: ${{ matrix.os }} / ${{ matrix.python }} / ${{ matrix.stage }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.11', '3.12', '3.13', '3.14']
+        stage: [full, recovery]
+    defaults:
+      run:
+        shell: bash
+        working-directory: source
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+      CI_RUNROOT: ${{ runner.temp }}/memory-wiki-synthetic
+      UV_CACHE_DIR: ${{ runner.temp }}/memory-wiki-uv-cache
+      UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/memory-wiki-project-venv
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - name: Validate literal SHA and checkout byte policy
+        working-directory: ${{ github.workspace }}
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          git config --global core.autocrlf false
+      - name: Checkout exact independently accepted source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7, inherited public baseline pin
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Checkout actual official native SDK
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: NousResearch/hermes-agent
+          ref: d526f14714ce8a95cafd7f3a95d1eab5b6e0b910
+          path: native-hermes
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7, inherited public baseline pin
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6, inherited baseline pin
+        with:
+          enable-cache: false
+      - name: Standalone stdlib runner units (not native suite evidence)
+        timeout-minutes: 2
+        env:
+          MW_CI_METADATA_SOURCE: ${{ github.workspace }}/source
+          MW_CI_METADATA_SHA: ${{ inputs.source_sha }}
+          TMPDIR: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
+          MW_CI_UNIT_FIXTURES: ${{ runner.temp }}/memory-wiki-validator-units
+          MW_OUTPUT_FIXTURES: ${{ runner.temp }}/memory-wiki-output-units
+        run: |
+          mkdir -p "$MW_CI_UNIT_FIXTURES" "$MW_OUTPUT_FIXTURES"
+          python -B tests/ci_owned/contract_cases.py
+          python -B tests/ci_owned/binding_cases.py
+          python -B tests/ci_owned/test_output_admission.py
+      - name: Source and dependency lock metadata preflight
+        timeout-minutes: 3
+        run: |
+          git merge-base --is-ancestor 438e0b57cb44470c2d47b9210941bea177d379f1 "$SOURCE_SHA"
+          uv lock --check
+          python -B scripts/ci_owned/memory_wiki_ci.py preflight --source . --sha "$SOURCE_SHA" --core ../native-hermes --run-root "$CI_RUNROOT/gate"
+      - name: Full native suite or all six recovery assertions
+        timeout-minutes: 35
+        # Baseline's real offline import dependencies, extended with exact pins
+        # from the official core manifest and official pytest CI declaration.
+        # No native auth resolver/refresh, private cache, secret or LLM endpoint.
+        run: >-
+          uv run --locked
+          --with pytest==9.1.1
+          --with PyYAML==6.0.3
+          --with ruamel.yaml==0.18.16
+          --with openai==2.24.0
+          --with httpx==0.28.1
+          --with pydantic==2.13.4
+          --with python-dotenv==1.2.2
+          --with tzdata==2025.3
+          --with requests==2.33.0
+          --with truststore==0.10.4
+          --with packaging==26.0
+          python -B scripts/ci_owned/memory_wiki_ci.py run
+          --source . --sha "$SOURCE_SHA" --core ../native-hermes
+          --stage "${{ matrix.stage }}" --run-root "$CI_RUNROOT/gate"
+      - name: Admit explicit public artifact bytes (not native proof)
+        id: native_output_gate
+        if: always()
+        run: >-
+          python -B scripts/ci_owned/ci_output_admission.py native
+          --root "$CI_RUNROOT/gate/public"
+          --decision "$CI_RUNROOT/output-refusal/ci-output-admission.json"
+          --github-output "$GITHUB_OUTPUT"
+      - name: Retain only admitted explicit safe evidence, including failures
+        if: ${{ always() && steps.native_output_gate.outcome == 'success' && steps.native_output_gate.outputs.admitted == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-${{ matrix.os }}-${{ matrix.python }}-${{ matrix.stage }}
+          retention-days: 1
+          compression-level: 0
+          overwrite: false
+          if-no-files-found: error
+          include-hidden-files: false
+          path: |
+            ${{ runner.temp }}/memory-wiki-synthetic/gate/public/receipt.json
+            ${{ runner.temp }}/memory-wiki-synthetic/gate/public/execution.json
+            ${{ runner.temp }}/memory-wiki-synthetic/gate/public/source-inventory.json
+            ${{ runner.temp }}/memory-wiki-synthetic/gate/public/native-origins.json
+            ${{ runner.temp }}/memory-wiki-synthetic/gate/public/bindings.json
+            ${{ runner.temp }}/memory-wiki-synthetic/gate/public/launches.json
+            ${{ runner.temp }}/memory-wiki-synthetic/gate/public/binding-coverage.json
+            ${{ runner.temp }}/memory-wiki-synthetic/gate/public/phases.json
+            ${{ runner.temp }}/memory-wiki-synthetic/gate/public/junit.xml
+            ${{ runner.temp }}/memory-wiki-synthetic/gate/public/pytest.log
+            ${{ runner.temp }}/memory-wiki-synthetic/gate/public/pytest-detail.log
+            ${{ runner.temp }}/memory-wiki-synthetic/gate/public/recovery-observations.json
+      - name: Retain tiny refusal instead of withheld native evidence
+        if: ${{ always() && steps.native_output_gate.outcome == 'failure' && steps.native_output_gate.outputs.refusal == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-${{ matrix.os }}-${{ matrix.python }}-${{ matrix.stage }}
+          retention-days: 1
+          compression-level: 0
+          overwrite: false
+          if-no-files-found: error
+          include-hidden-files: false
+          path: ${{ runner.temp }}/memory-wiki-synthetic/output-refusal/ci-output-admission.json
+
+  coverage:
+    name: Exact matrix coverage (no skip counted as pass)
+    needs: native
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SOURCE_SHA: ${{ inputs.source_sha }}
+    steps:
+      - name: Validate literal SHA and checkout byte policy
+        shell: bash
+        run: |
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          git config --global core.autocrlf false
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ inputs.source_sha }}
+          path: source
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
+        with:
+          python-version: '3.14'
+      - name: Read only this run's explicit evidence artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: native-*
+          path: ${{ runner.temp }}/matrix-receipts
+          merge-multiple: false
+      - name: Admit downloaded product before any aggregate payload parse
+        id: matrix_input_gate
+        if: always()
+        shell: bash
+        run: >-
+          python -B source/scripts/ci_owned/ci_output_admission.py downloaded
+          --root "${{ runner.temp }}/matrix-receipts"
+          --decision "${{ runner.temp }}/matrix-output-refusal/ci-output-admission.json"
+          --github-output "$GITHUB_OUTPUT"
+      - name: Verify all sixteen lanes and cross-platform actual passes
+        if: ${{ success() && steps.matrix_input_gate.outcome == 'success' && steps.matrix_input_gate.outputs.admitted == 'true' }}
+        shell: bash
+        run: >-
+          python -B source/scripts/ci_owned/memory_wiki_ci.py aggregate
+          --source source --sha "$SOURCE_SHA"
+          --receipts "${{ runner.temp }}/matrix-receipts"
+          --run-root "${{ runner.temp }}/matrix-coverage"
+      - name: Admit explicit matrix output bytes (not native proof)
+        id: matrix_output_gate
+        if: ${{ always() && steps.matrix_input_gate.outcome == 'success' && steps.matrix_input_gate.outputs.admitted == 'true' }}
+        shell: bash
+        run: >-
+          python -B source/scripts/ci_owned/ci_output_admission.py aggregate
+          --root "${{ runner.temp }}/matrix-coverage/public"
+          --decision "${{ runner.temp }}/matrix-output-refusal/ci-output-admission.json"
+          --github-output "$GITHUB_OUTPUT"
+      - name: Retain admitted bounded matrix decision only
+        if: ${{ always() && steps.matrix_output_gate.outcome == 'success' && steps.matrix_output_gate.outputs.admitted == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: matrix-coverage
+          retention-days: 1
+          compression-level: 0
+          overwrite: false
+          if-no-files-found: error
+          include-hidden-files: false
+          path: |
+            ${{ runner.temp }}/matrix-coverage/public/matrix-coverage.json
+            ${{ runner.temp }}/matrix-coverage/public/receipt.json
+      - name: Retain tiny refusal instead of withheld matrix evidence
+        if: ${{ always() && ((steps.matrix_input_gate.outcome == 'failure' && steps.matrix_input_gate.outputs.refusal == 'true') || (steps.matrix_output_gate.outcome == 'failure' && steps.matrix_output_gate.outputs.refusal == 'true')) }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: matrix-coverage
+          retention-days: 1
+          compression-level: 0
+          overwrite: false
+          if-no-files-found: error
+          include-hidden-files: false
+          path: ${{ runner.temp }}/matrix-output-refusal/ci-output-admission.json
