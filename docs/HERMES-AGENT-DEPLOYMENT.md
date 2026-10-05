@@ -1,24 +1,63 @@
 # hermes-memory-wiki: безопасная установка и обновление — runbook для Hermes-агентов
 
-> **Проверенный документ, не отчёт о развёртывании.** Прочитаны исходники, актуальные docs Hermes и публичные GitHub metadata; локально проверены parser/config-routing и генерация PM metadata в scratch. Установка, рабочие backup/restore, платные запросы и перезапуски здесь не выполнялись. Команды — для отдельно разрешённого rollout; не отмечать профиль готовым заранее.
+> **Документационный overlay к кандидату 1.24.0, не отчёт о релизе или развёртывании.** Сверяются frozen source, CLI parser, readers и актуальные официальные docs. Изменённый код и итоговая композиция здесь не принимаются; установка, live backup/restore, запросы моделей и перезапуски не выполняются. Команды — только для отдельно разрешённого rollout принятого PIN; не отмечать профиль готовым заранее.
 
 ## 1. Версия и источники
 
 ```text
 URL: https://github.com/sbrejnev988-coder/hermes-memory-wiki.git
-SHA: 2bda0efe7f1e5e90c1f0440a89e40f03314f9c21
-Manifest/project: 1.24.0
+Manifest/project кандидата: 1.24.0
 Python: >=3.11,<3.15
+Финальный принятый SHA: не назначен
+Tag/Release/CI финального SHA: не подтверждены
 ```
 
-**Pinned feature source, не latest release.** При проверке 2 октября 2026 года: latest release `v1.22.3`, `main=7ca87609cdf8cabe636af7117abbbf56d9cd9696`; PIN — проверенная кодовая ревизия `feature/codex-session-extraction` в открытом **draft PR #4**, не merged. Последующий docs-only commit может изменить head ветки, но не этот PIN. [Exact-SHA CI](https://github.com/sbrejnev988-coder/hermes-memory-wiki/actions/runs/36947242379) успешен: восемь jobs Windows/Ubuntu × Python 3.11–3.14. Перечитать metadata перед будущим rollout. Версия/tag/зелёный CI другого commit не заменяют provenance; CI не доказывает target readiness.
+На срезе 4 октября 2026 года репозиторий public, default branch — main. Проверенный main SHA `438e0b57cb44470c2d47b9210941bea177d379f1` — база, а не immutable identity локальной композиции поверх него.[5] Последний GitHub Release — **v1.22.3**; следующие два — v1.22.2 и v1.22.1 (superseded), не v1.24.0.[4]
 
-Авторитетные источники: [индекс docs Hermes](https://hermes-agent.nousresearch.com/docs/llms.txt) → Plugins, Memory providers, Profiles, Configuration; [PM](https://hermes-agent.nousresearch.com/docs/reference/package-management).
-- Pinned plugin: [README](https://github.com/sbrejnev988-coder/hermes-memory-wiki/blob/2bda0efe7f1e5e90c1f0440a89e40f03314f9c21/README.md), [provider](https://github.com/sbrejnev988-coder/hermes-memory-wiki/blob/2bda0efe7f1e5e90c1f0440a89e40f03314f9c21/__init__.py), [extractor](https://github.com/sbrejnev988-coder/hermes-memory-wiki/blob/2bda0efe7f1e5e90c1f0440a89e40f03314f9c21/extractor.py), `SECURITY.md`, `plugin.yaml`, `pyproject.toml`, `sdk.py`.
+**Исторический session-only PIN:** `2bda0efe7f1e5e90c1f0440a89e40f03314f9c21` относился к исходной проверке session extraction; PR #4 уже merged в main. Этот PIN не содержит новый Codex-маршрут графа и **не является PIN будущего релиза**. Его старый CI, равная manifest version или CI main не принимают новую композицию.
+
+Для будущего rollout оператор задаёт `$PIN` только после независимой приёмки финального feature-containing commit и чтения CI **этого exact SHA**. Native install требует полный 40-character immutable commit; mutable branch/tag/short SHA не подходят.[2] Итоговые source/wheel/native ZIP должны соответствовать принятой ревизии, включая отдельно согласованные overlays. Проверить §8.1 readers и regression files до установки; не заполнять отсутствующий финальный SHA исторической базой.
+
+[Release notes 1.24.0](RELEASE_NOTES_1_24_0_RU.md) фиксируют предусмотренные изменения и pending gates. У исходного frozen среза остаются ошибки session/graph отрицания и contradiction recall с SQL `NULL`; исправления, polarity planner и CI-binding требуют нового review и тестов. Публикация, установка, сохранённый config, fresh CLI и loaded gateway/Desktop не заменяют друг друга.
+
+Wiki выпускается независимо от LCM-X. `memory.provider: memory-wiki` сохраняет роль долгосрочной памяти; неподдержанный LCM-X capture ещё не готов и не задерживает отдельный релиз Wiki. Автоматическая доступность памяти основному/дочерним агентам этим runbook не подтверждается.
+
+Авторитетные источники: [индекс docs Hermes](https://hermes-agent.nousresearch.com/docs/llms.txt), Plugins и PM.[2][3] Профили одной установки могут дополнять общий dependency environment, но settings и credentials остаются profile-local.[3] Feature contracts читать в exact `$PIN`: `README.md`, `SECURITY.md`, `plugin.yaml`, `pyproject.toml`, `__init__.py`, `extractor.py`, `entity_relation_extractor.py`, `sdk.py`; не переносить проверку другого commit.
 
 Читать pinned код/installed core. Plugin AGENTS.md не найден; если появился — читать. Core требует profile isolation/prompt caching.
 
 `$PROFILE`, `$PROFILE_HOME`, `$APP_ROOT`, `$PM_PYTHON`, `$AUDIT_DIR` обнаружить/согласовать до запуска. Bash — POSIX/Git Bash; native Windows paths `C:/...`, не `/c/...`. Без private paths/transcripts/secrets/дампов.
+
+## 1.1. Границы нового кандидата
+
+Неполная конструкция «имя + нет» намеренно обрабатывается строго: если после
+положительной части появляется только имя и отрицание без явного местоимения,
+auxiliary или повторённого действия, извлечение может пропустить факт (fail closed).
+Например, `Aster работает на Helix, но Lyra нет.` **не** подтверждает сохраняемую
+положительную связь Aster → Helix в этом контракте. Одной заглавной буквы
+недостаточно для доказательства смены actor; это осознанная потеря полноты,
+а не универсальный разбор языка.
+
+Явные грамматические признаки по-прежнему учитываются: `Aster runs on Helix but
+Lyra does not.` (auxiliary) и `Aster runs on Helix but Lyra does not run on Helix
+at all.` (полное действие) отделяют отрицание другого actor. Местоимения и
+раздельные qualified scopes сохраняются в примере `We use Quartz for production
+but we do not use Quartz for development.` Наличие местоимения само по себе
+не разрешает противоречие того же actor/object или неизвестный modifier.
+
+Calendar intent — тоже ограниченная лексическая классификация: учитываются
+валидность даты, подтверждённая календарная запись и предшествующий контекст
+той же clause. `Архив после 2024-03-01, 2/3 часа обработки` остаётся temporal;
+`Длина со 3/8, 2 аршина` и `Помнишь смесь с 1.5 г,2 г соли?` — нет. Разделитель
+`/` и сокращение `г` сами по себе не доказывают календарь. Это не universal NLP
+и не обещание распознать каждую единицу, эллипсис или календарную формулировку.
+
+Переносимые проверки этих границ используют **ASTUNIT**: функции из фактических
+repo-relative файлов, без package initialization, SDK-подмен, запросов модели
+или persistence. Native/SDK, package/schema/cache, Windows/Linux CI и приёмка
+всего релиза остаются отдельными незавершёнными gates. Старый F04 с expected
+True и неуспешный исторический gate сохранены; новый отказ — отдельный
+owner-approved контракт, не переименование прежнего результата в GREEN.
 
 ## 2. Согласие и STOP
 
@@ -116,7 +155,7 @@ Audit clone — новый каталог вне live homes, после разр
 
 ```bash
 SOURCE_URL='https://github.com/sbrejnev988-coder/hermes-memory-wiki.git'
-PIN='2bda0efe7f1e5e90c1f0440a89e40f03314f9c21'
+: "${PIN:?задайте независимо принятый полный SHA будущего релиза}"
 "$PM_PYTHON" -I -B -c 'import re,sys; assert re.fullmatch(r"[0-9a-fA-F]{40}", sys.argv[1]), "invalid SHA"' "$PIN"
 git clone --no-checkout "$SOURCE_URL" "$AUDIT_DIR"
 git -C "$AUDIT_DIR" checkout --detach "$PIN"
@@ -167,7 +206,7 @@ Restore rehearsal — закрытая пустая canary/copy без real cred
 
 PM объединяет selected plugins live profiles; `memory.provider` тоже member. Несколько buildable copies имени `hermes-memory-wiki` могут конфликтовать независимо от directory paths.
 
-**Локально подтверждено:** прочитана импортируемая установленная `pm/workspace.py`, её совпадение с исследуемой реализацией проверено. Scratch `_workspace_member` сохранил одно distribution name для двух buildable copies; после удаления только `[build-system]` secondary derivative получил unique virtual name `hermes-plugin-<directory>-<path-hash>`, сохранил requirements, inputs не изменились. Native provider loader читает profile directory до pip fallback и namespace-разделяет sources. Это metadata contract/чтение loader, **не deployment E2E**.
+**Статический контракт native source, не proof установки:** в `pm/workspace.py` buildable member сохраняет project distribution name. Для member без `[build-system]` и без `tool.uv.package=true` используется отдельное virtual name; dependencies сохраняются через declaration reader. Native provider loader и profile-local origins проверять в фактической версии core до такого решения. Историческая scratch metadata-проверка не подтверждает real admission, сохранение файлов или rollback нового релизного SHA.
 
 Отдельно согласованный derivative может оставить одну buildable copy и secondary metadata-only **в reviewed staging до admission**. В этой PM версии virtual: нет build-system и `tool.uv.package` не true. Manifest/runtime/requirements сохраняются; secondary теряет standalone wheel contract. Записывать upstream SHA/overlay отдельно.
 
@@ -204,6 +243,7 @@ h config set MEMORY_WIKI_GLOBAL_SEARCH_ENABLED 0
 h config set MEMORY_WIKI_EPISODIC_ENABLED 0
 h config set MEMORY_WIKI_ALLOW_SHARED_RECOVERY 0
 h config set plugins.entries.memory-wiki.settings.extraction.enabled false
+h config set --force plugins.entries.memory-wiki.settings.graph_extraction.enabled false
 ```
 
 Не production reset: ранее разрешённые features не выключать без scope; shared/legacy/cross-scope не включать ради красивого теста. Strict defaults to 1; проверить author-supplied trust/loader/secret components и provenance. Missing — STOP, не fake module. Отдельно заранее approved non-strict owner mode допустим только в указанном scope; фиксировать его как non-strict, не strict-verified. Нет такого approval — не снижать strict и не fabricating dependencies.
@@ -223,15 +263,54 @@ h config set plugins.entries.memory-wiki.settings.extraction.max_tokens 1800
 h config set plugins.entries.memory-wiki.settings.extraction.reasoning_effort low
 ```
 
-`read_extraction_settings(owner_home)` — immutable snapshot: enabled bool, timeout int 1–60, max_tokens int 256–3000, effort low|medium|high|xhigh|max. Unknown/malformed fail closed; valid disabled YAML выше legacy. Непроверенная launch identity запрещает ambient legacy. Readback **deployed actual reader**, только non-secret fields/error, не asdict с credentials.
+`read_extraction_settings(owner_home)` — immutable snapshot: enabled bool, timeout int 1–60, max_tokens int 256–9000 для openai-codex или 256–3000 для openrouter, effort low|medium|high|xhigh|max. YAML вне provider-specific диапазона fail closed без clamp; legacy MW_EXTRACTION_MAX_TOKENS сохраняет clamp 256–3000. Unknown/malformed fail closed; valid disabled YAML выше legacy. Непроверенная launch identity запрещает ambient legacy. Readback **deployed actual reader**, только non-secret fields/error, не asdict с credentials.
 
 - **Codex:** только own auth.json; present pool authoritative даже empty/invalid; singleton fallback лишь absent pool и без device_code suppression. Проверяются status/errors, expiry на весь timeout и exact-model cooldown. Native CodexAuxiliaryClient/fixed endpoint без resolver healing/refresh/quota recovery. Reauthentication — owner отдельно.
 - **OpenRouter:** только own OPENROUTER_API_KEY через profile secret scope; explicit official base, no ambient foreign/default key. Redirects/SDK retries выключены.
 - **Никакой provider/model подмены.** Heuristics могут вернуть entries при remote error — не LLM success. Generic fallback к основному paid runtime запрещён.
 
+**Pending quality gate:** исходный срез допускает потерю отрицания при вырезанной exact quote. Принятый новый PIN должен закрыть source-clause polarity regression; literal substring сам по себе не доказательство верного смысла.
+
 Перед real history — разрешённая synthetic no-storage проба actual `extract_session_claims(exchanges, session_id=..., extraction_settings=settings, add_claim_callback=None)`. Не включать всё production feature ради неё. Проверять quote/speaker/index, отрицание/типы, no-store/omissions на fixed rubric, error и persisted=0; JSON/heuristic_only=false не качество/полнота. Не отправлять system/tool/reasoning; сохранить source positions role-based empty placeholders исключённых slots.
 
-Codex token cap может игнорироваться adapter — не server budget. Timeout не гарантирует отмену remote computation/billing/blocked I/O; background retries — отдельный request budget. OAuth quota не zero cost/unlimited. После gates только разрешённое enabled=true; операция/worker удерживает snapshot, settings write не меняет уже отправленный request. Новый source требует reload.
+Codex max_tokens — клиентский token-budget hint, не server-enforced output/spending cap: native adapter игнорирует этот output-token limit. Timeout не гарантирует отмену remote computation/billing/blocked I/O; background retries — отдельный request budget. OAuth quota не zero cost/unlimited. После gates только разрешённое enabled=true; операция/worker удерживает snapshot, settings write не меняет уже отправленный request. Новый source требует reload.
+
+## 8.1. Независимый граф через подписку Codex
+
+**Требуется будущий принятый PIN с graph-only route и закрытыми quality gates.** Исторический `2bda0efe…` из §1 поддерживает session extraction, но не новый `graph_extraction`; команды §4 получают новый `$PIN` извне. Наличие `read_graph_extraction_settings`, `tests/test_graph_extractor_codex.py` и одинаковой manifest version `1.24.0` необходимо проверить, но оно само не доказывает правильность семантики или green CI. Исходный срез допускает положительное relation из отрицательной evidence; новое exact-source ревью и positive/negative tests остаются обязательными.
+
+Session `settings.extraction` не включает граф. После отдельно разрешённой публикации/установки и свежего import/Doctor выбрать graph provider/model в owner-local YAML:
+
+```bash
+h config set --force plugins.entries.memory-wiki.settings.graph_extraction \
+  '{"enabled":false,"provider":"openai-codex","model":"gpt-6-luna-900k"}'
+```
+
+Допустимы только `enabled`, `provider`, `model`, `timeout`, `reasoning_effort`: timeout 1–60 (default 30), effort low|medium|high|xhigh|max (default low). Это не меняет main model, session extractor, другой профиль или auto-graph opt-in.
+
+**До принятия настройки проверить старый `MEMORY_WIKI_GRAPH_EXTRACT_MODEL`.** Owner-local legacy override выше YAML model. Если он существует и больше не нужен, удалить только его штатным `h config unset MEMORY_WIKI_GRAPH_EXTRACT_MODEL`; при отсутствии ключа этот шаг пропустить. Старый `openai/gpt-4.1-mini` под Codex provider невалиден. Ошибки protected/managed writer не подавлять. Сверить каждую unrelated env строку и YAML value; не копировать credential files и не применять user-wide environment persistence.
+
+Сначала проверить `_graph_extraction_settings()` реально установленного native provider в выбранном PM Python/owner scope с enabled=false. `config set --force` не доказывает reader support и не относится к scanner override. Только после reader/quality/security gates и отдельного network/quota consent включить `h config set --force plugins.entries.memory-wiki.settings.graph_extraction.enabled true`, затем подтвердить enabled=true, provider=openai-codex, model буквально `gpt-6-luna-900k`, owner home, эффективный timeout/effort. Не выводить credentials. Helper использует own OAuth и official Codex Responses endpoint; OpenRouter key не требуется, paid fallback отсутствует. Empty/malformed authoritative pool, native suppression, exact-model cooldown, чужой или недостаточно действующий grant запрещают запрос без healing/refresh/CLI adoption.
+
+После отдельного network/quota consent выполнить один bounded synthetic no-storage вызов реального graph helper. Не инициализировать live DB и не создавать dummy claim в долговременной памяти. Проверить grounding/направление/predicate/evidence и actual HTTP 200 + `response.completed` model/status, а не model echo из chat shim. Requested `gpt-6-luna-900k` сохраняется до native adapter; для совместимого context variant wire/server slug `gpt-6-luna` — ожидаемое штатное преобразование, не fallback. Короткая проба не доказывает 900K capacity или entitlement другого владельца.
+
+Явный `memory_wiki_graph_extract_claim` дополнительно проверяет visible/current/public/non-quarantined source claim; `apply:false` не пишет edges. Автоматический graph enrichment отдельно требует `MEMORY_WIKI_GRAPH_AUTO_EXTRACT=1` и существующие eligibility/deadline gates. Не включать его без scope. Codex 700-token hint не server spending cap; расходуется квота подписки, клиентский timeout не обещает остановку server computation.
+
+Новая копия/сохранённый YAML и fresh-process success не доказывают обновление cached gateway/Desktop provider. Применение — только через разрешённый native owner lifecycle из внешнего контекста; self-restart guard не обходить. После activation сверить runtime identity и feature outcome (§11).
+
+## 8.2. Документы: быстрый ответ и явная индексация
+
+`MEMORY_WIKI_DOCUMENT_AUTO_SCAN_CACHE=0` отключает автоматическое ingestion кэша вложений в начале хода, но не чтение файлов, удаление/доступность старого индекса или ручные document tools. Компромисс: прочитать вложение для текущей задачи, а в долгую память индексировать конкретный полезный файл по явному намерению владельца.
+
+Для отдельно разрешённого изменения:
+
+```bash
+h config set MEMORY_WIKI_DOCUMENT_AUTO_SCAN_CACHE 0
+```
+
+`memory_wiki_document_ingest` индексирует один разрешённый файл; `memory_wiki_document_scan` без root использует настроенный attachment cache. Сохранять owner scope/project ACL и default `prune_missing:false`; не отправлять production документы на embedding/OCR без отдельного scope/budget. Локальный text/FTS-first режим не требует remote embeddings. Ручная индексация всё ещё может быть тяжёлой, но не обязана запускаться перед каждым ответом.
+
+Ноль **не создаёт schedule/фоновую очередь**. Увеличение `MEMORY_WIKI_DOCUMENT_AUTO_SCAN_SECONDS` лишь реже запускает синхронный due scan; journaled scan способен сделать полный safety checkpoint даже при indexed=0. Не отключать защитные checkpoints ради скорости. Post-response queue — отдельная доработка, а не реализованная здесь настройка. Saved value/fresh reader/owner-observed responsiveness и instrumented loaded-runtime timing — разные виды evidence.
 
 ## 9. Rerank: именно voyageai/rerank-3
 
@@ -362,8 +441,8 @@ Template, **не результат rollout**:
 ```json
 {
   "schema": "memory-wiki-rollout-evidence/v1",
-  "mode": "read_only_review",
-  "requested_sha": "2bda0efe7f1e5e90c1f0440a89e40f03314f9c21",
+  "mode": "documentation_template",
+  "requested_sha": null,
   "installed_sha": null,
   "overlay_ref": null,
   "consent_ref": null,
@@ -378,4 +457,11 @@ Template, **не результат rollout**:
 
 Gate = passed|failed|blocked|pending|not_applicable + evidence ref/time/exit code. Not_applicable с согласованной причиной, не скрытый failed. Authorized/completed sets/counts сравнивать программно. Completed только все applicable gates всех authorized profiles; иначе partial/blocked. Public projection без owner paths/памяти/секретов.
 
-**Ограничения этого аудита:** parser/routing и scratch metadata проверены, exact CI перечитан. Native install/replacement/rollback, live backups/restore/ACL, security delivery, credentials/entitlement, real extraction/embedding/rerank и owner injection не испытаны. Metadata overlay не deployment E2E/готовый installer. Публикация гайда сама по себе не разрешает менять профили.
+**Ограничения документационного overlay:** статическая сверка CLI/parser и reader contracts не является исполнением плагина. Exact-candidate CI, schemas/cache/package correspondence, installed import/Doctor, native PM replacement/rollback, live backup/restore/ACL, strict security delivery, owner credentials/entitlement, extraction/embedding/rerank и loaded-owner injection не подтверждены этим документом. Metadata-only overlay не готовый installer и не deployment E2E. Сохранены прежние ограничения G04/G05 и raw tilde; обратимое display encoding не доказывает универсальную semantic injection protection. У исходной композиции whole-source acceptance остаётся открытой. Публикация гайда не разрешает менять профили, auth, данные, процессы или cleanup.
+
+## Sources
+
+[2] https://hermes-agent.nousresearch.com/docs/user-guide/features/plugins
+[3] https://hermes-agent.nousresearch.com/docs/reference/package-management
+[4] https://github.com/sbrejnev988-coder/hermes-memory-wiki/releases
+[5] https://api.github.com/repos/sbrejnev988-coder/hermes-memory-wiki/git/ref/heads/main

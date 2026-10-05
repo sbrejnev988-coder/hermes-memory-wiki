@@ -62,6 +62,9 @@ _CLAIM_SNAPSHOT_FIELDS = (
     "project_id", "memory_revision", "event_at", "event_timezone", "visible",
 )
 _EVENT_SCOPES = frozenset({"chat", "bot", "project"})
+_CONFLICT_PAGE_SIZE = 40
+_CONFLICT_MAX_ROWS = 200
+_CONFLICT_TIMEOUT_SECONDS = 0.25
 
 
 def _mapping(row: Any) -> dict[str, Any]:
@@ -189,7 +192,7 @@ def _safe_number(value: Any, default: float = 0.0) -> float:
 def _safe_timestamp(value: Any) -> int:
     try:
         return max(0, int(value or 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 0
 
 
@@ -280,22 +283,76 @@ def _iter_graph_rows(payload: Any) -> Iterable[tuple[str, Any]]:
             yield "entity", row
 
 
-def _detect_conflicts(provider: Any, claim_ids: list[str]) -> bool:
-    """Detect an open, visible contradiction without exposing its raw reason."""
+def _detect_conflicts(provider: Any, claim_ids: list[str]) -> str:
+    """Check open contradictions for selected claims in one read snapshot.
+
+    Use the existing provider ACL on every row, not a duplicated SQL policy.
+    Paging and row limits bound materialized/ACL work; the deadline is
+    cooperative and cannot interrupt a single blocking provider/SQLite call.
+    Only an exhausted relevant scope proves absence. Never return raw rows,
+    reasons, hidden IDs, exception text or hidden-row counts to the caller.
+    """
     if not claim_ids:
-        return False
+        return "absent"
     try:
+        deadline = time.monotonic() + _CONFLICT_TIMEOUT_SECONDS
         conn = provider._connect()
-        placeholders = ",".join("?" for _ in claim_ids)
-        rows = conn.execute(
-            f"SELECT * FROM contradictions WHERE status='open' "
-            f"AND (claim_a IN ({placeholders}) OR claim_b IN ({placeholders})) "
-            "ORDER BY created_at DESC LIMIT 40",
-            tuple(claim_ids) + tuple(claim_ids),
-        ).fetchall()
-        return any(provider._contradiction_visible(row, conn) for row in rows)
+        savepoint = f"memory_wiki_conflicts_{id(claim_ids):x}"
+        conn.execute(f"SAVEPOINT {savepoint}")
+        try:
+            placeholders = ",".join("?" for _ in claim_ids)
+            cursor: tuple[Any, Any, int] | None = None
+            remaining = _CONFLICT_MAX_ROWS
+            while remaining > 0:
+                if time.monotonic() >= deadline:
+                    return "unknown"
+                page_size = min(_CONFLICT_PAGE_SIZE, remaining)
+                after = ""
+                cursor_params: tuple[Any, ...] = ()
+                if cursor is not None:
+                    stamp, conflict_id, row_key = cursor
+                    # TEXT PRIMARY KEY permits multiple NULL IDs in SQLite.
+                    # Match DESC NULL-last ordering explicitly; rowid is only
+                    # an internal, non-NULL tiebreaker within this read snapshot.
+                    after = (
+                        " AND (created_at<? OR (created_at=? AND "
+                        "(id<? OR (id IS NULL AND ? IS NOT NULL) "
+                        "OR (id IS ? AND rowid<?))))"
+                    )
+                    cursor_params = (stamp, stamp, conflict_id, conflict_id, conflict_id, row_key)
+                rows = conn.execute(
+                    f"SELECT rowid AS _conflict_rowid,* FROM contradictions WHERE status='open' "
+                    f"AND (claim_a IN ({placeholders}) OR claim_b IN ({placeholders}))"
+                    + after + " ORDER BY created_at DESC,id DESC,rowid DESC LIMIT ?",
+                    tuple(claim_ids) + tuple(claim_ids) + cursor_params + (page_size,),
+                ).fetchall()
+                if time.monotonic() >= deadline:
+                    return "unknown"
+                for row in rows:
+                    if time.monotonic() >= deadline:
+                        return "unknown"
+                    visible = provider._contradiction_visible(row, conn)
+                    if time.monotonic() >= deadline:
+                        return "unknown"
+                    if visible:
+                        return "present"
+                if len(rows) < page_size:
+                    return "absent"
+                remaining -= len(rows)
+                cursor = (rows[-1]["created_at"], rows[-1]["id"], rows[-1]["_conflict_rowid"])
+            return "unknown"  # Full pages do not prove the relevant scope ended.
+        finally:
+            try:
+                conn.execute(f"RELEASE {savepoint}")
+            except Exception:
+                try:
+                    conn.execute(f"ROLLBACK TO {savepoint}")
+                    conn.execute(f"RELEASE {savepoint}")
+                except Exception:
+                    pass
+                raise
     except Exception:
-        return False
+        return "unknown"
 
 
 def _claim_snapshot_fingerprint(row: Any) -> str:
@@ -395,11 +452,10 @@ def _final_visible_nonclaims(
         conn = provider._connect()
     except Exception:
         return set()
-    # Lightweight contract tests use a deliberately tiny DB double.  The real
-    # provider always returns sqlite3.Connection; production paths must pass the
-    # authoritative checks below and fail closed on every error.
+    # A cached fingerprint is not authoritative proof of current visibility.
+    # Reject unsupported connections; tests must not bypass this boundary.
     if not isinstance(conn, sqlite3.Connection):
-        return {key for key, value in expected.items() if value}
+        return set()
 
     valid: set[tuple[str, str, str]] = set()
     stamp = int(time.time())
@@ -797,6 +853,9 @@ def _final_visible_nonclaims(
         try:
             conn.execute(f"RELEASE {savepoint}")
         except Exception:
+            # A failed snapshot completion cannot authorize returned evidence,
+            # even when the best-effort savepoint cleanup subsequently succeeds.
+            valid.clear()
             try:
                 conn.execute(f"ROLLBACK TO {savepoint}")
                 conn.execute(f"RELEASE {savepoint}")
@@ -805,17 +864,32 @@ def _final_visible_nonclaims(
     return valid
 
 
-def _answer_policy(citations: list[str]) -> dict[str, Any]:
+def _answer_policy(citations: list[str], conflict_status: str) -> dict[str, Any]:
     empty = not citations
+    conflict_instruction = {
+        "present": (
+            "Visible open contradictions affect the selected claims. Acknowledge the conflict; "
+            "do not assert that the evidence is conflict-free or choose a winner without supporting evidence."
+        ),
+        "absent": (
+            "No visible open contradictions were found for the selected claims. "
+            "This check does not cover other memory or unrecorded contradictions."
+        ),
+        "unknown": (
+            "Conflict checking is incomplete or unavailable. Do not claim there are no contradictions; "
+            "qualify memory-based conclusions or ask for clarification when a conflict-free answer is required."
+        ),
+    }[conflict_status]
     return {
         "must_abstain_or_clarify": empty,
         "require_citations": not empty,
         "allowed_citations": citations,
+        "conflict_status": conflict_status,
         "instruction": (
             "No admissible memory evidence was returned. Abstain from memory-based claims or ask a clarifying question."
             if empty else
             "Use only the returned evidence for memory-based claims and cite only an allowed citation ID."
-        ),
+        ) + " " + conflict_instruction,
     }
 
 
@@ -850,6 +924,7 @@ def recall(
         "graph": "not_requested",
     }
     raw_claim_ids: dict[str, str] = {}
+    claim_check_failed = False
 
     event_scope = str(os.environ.get("MEMORY_WIKI_EVENT_SCOPE", "chat") or "chat").strip().lower()
     event_ready = False
@@ -888,6 +963,7 @@ def recall(
         except Exception:
             claim_rows = []
             source_status["claims"] = "unavailable"
+            claim_check_failed = True
         for rank, row in enumerate(claim_rows or [], 1):
             if not isinstance(row, dict):
                 try:
@@ -898,6 +974,7 @@ def recall(
                 if not provider._claim_visible(row):
                     continue
             except Exception:
+                claim_check_failed = True
                 continue
             raw_id = str(row.get("id") or "")
             content = _guard_text(
@@ -1257,6 +1334,14 @@ def recall(
         )
         guarded_queries.append(safe_query or "[query omitted by recall guard]")
 
+    conflict_status = _detect_conflicts(provider, selected_claim_ids)
+    if conflict_status == "absent" and (
+        claim_check_failed
+        or any(raw_id not in final_visible_claims for raw_id in raw_claim_ids.values())
+    ):
+        # Final revalidation fails closed without distinguishing errors from
+        # revoked/deleted claims. Do not turn that information loss into absence.
+        conflict_status = "unknown"
     return {
         "items": items,
         "intent_plan": {
@@ -1267,7 +1352,9 @@ def recall(
             "sources": source_status,
         },
         "evidence_count": len(items),
-        "conflicts": _detect_conflicts(provider, selected_claim_ids),
+        # Legacy boolean reports only confirmed presence. False is not absence.
+        "conflicts": conflict_status == "present",
+        "conflict_check": {"status": conflict_status, "scope": "selected_claims"},
         "chars_used": used_chars,
         "max_chars": max_chars,
         "recall_tracking": {
@@ -1279,5 +1366,5 @@ def recall(
                 "requires_answer_id_for_cross_retry_idempotency": True,
             },
         },
-        "answer_policy": _answer_policy(citations),
+        "answer_policy": _answer_policy(citations, conflict_status),
     }
