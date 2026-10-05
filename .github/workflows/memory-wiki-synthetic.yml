@@ -34,11 +34,16 @@ jobs:
         working-directory: source
     env:
       SOURCE_SHA: ${{ inputs.source_sha }}
-      CI_RUNROOT: ${{ runner.temp }}/memory-wiki-synthetic
-      UV_CACHE_DIR: ${{ runner.temp }}/memory-wiki-uv-cache
-      UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/memory-wiki-project-venv
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
+      - name: Bind owned runner paths for subsequent steps
+        working-directory: ${{ github.workspace }}
+        env:
+          CI_RUNROOT: ${{ runner.temp }}/memory-wiki-synthetic
+          UV_CACHE_DIR: ${{ runner.temp }}/memory-wiki-uv-cache
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/memory-wiki-project-venv
+        run: |
+          printf '%s\n' "CI_RUNROOT=$CI_RUNROOT" "UV_CACHE_DIR=$UV_CACHE_DIR" "UV_PROJECT_ENVIRONMENT=$UV_PROJECT_ENVIRONMENT" >> "$GITHUB_ENV"
       - name: Validate literal SHA and checkout byte policy
         working-directory: ${{ github.workspace }}
         run: |
@@ -108,6 +113,8 @@ jobs:
           --stage "${{ matrix.stage }}" --run-root "$CI_RUNROOT/gate"
       - name: Admit explicit public artifact bytes (not native proof)
         id: native_output_gate
+        env:
+          CI_RUNROOT: ${{ runner.temp }}/memory-wiki-synthetic
         if: always()
         run: >-
           python -B scripts/ci_owned/ci_output_admission.py native
