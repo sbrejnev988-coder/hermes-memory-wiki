@@ -17,6 +17,7 @@ jobs:
     env:
       HERMES_HOME: .hermes-release
       HERMES_SECURITY_STRICT: "0"
+      PYTHON_DOTENV_DISABLED: "1"
       MEMORY_WIKI_SEMANTIC: "0"
       MEMORY_WIKI_DOCUMENT_AUTO_SCAN_CACHE: "0"
     steps:

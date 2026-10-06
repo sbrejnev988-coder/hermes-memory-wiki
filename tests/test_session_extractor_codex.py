@@ -95,6 +95,52 @@ def test_profile_yaml_codex_uses_native_exact_model_and_schema_instructions(tmp_
     assert kwargs['max_tokens'] == 900
 
 
+def test_exact_requested_codex_yaml_block_is_admitted(tmp_path):
+    module = _extractor()
+    requested = dict(enabled=True, provider='openai-codex', model='gpt-6-luna',
+                     timeout=30, max_tokens=9000, reasoning_effort='medium')
+    home = _configure(tmp_path / 'own', **requested)
+    snapshot = module.read_extraction_settings(home)
+    assert snapshot.error == ''
+    assert {key: getattr(snapshot, key) for key in requested} == requested
+    assert type(snapshot.enabled) is bool
+    assert type(snapshot.timeout) is type(snapshot.max_tokens) is int
+    assert snapshot.home == home.resolve()
+
+
+@pytest.mark.parametrize('provider,model,max_tokens,accepted', [
+    pytest.param('openai-codex', 'gpt-6-luna', 256, True, id='codex-256-accepted'),
+    pytest.param('openai-codex', 'gpt-6-luna', 255, False, id='codex-255-rejected'),
+    pytest.param('openai-codex', 'gpt-6-luna', 9000, True, id='codex-9000-accepted'),
+    pytest.param('openai-codex', 'gpt-6-luna', 9001, False, id='codex-9001-rejected'),
+    pytest.param('openrouter', 'openai/gpt-4.1-mini', 256, True, id='openrouter-256-accepted'),
+    pytest.param('openrouter', 'openai/gpt-4.1-mini', 255, False, id='openrouter-255-rejected'),
+    pytest.param('openrouter', 'openai/gpt-4.1-mini', 3000, True, id='openrouter-3000-accepted'),
+    pytest.param('openrouter', 'openai/gpt-4.1-mini', 3001, False, id='openrouter-3001-rejected'),
+])
+def test_yaml_token_budget_provider_boundaries(tmp_path, provider, model, max_tokens, accepted):
+    module = _extractor()
+    home = _configure(tmp_path / 'own', provider=provider, model=model, max_tokens=max_tokens)
+    snapshot = module.read_extraction_settings(home)
+    if accepted:
+        assert snapshot.error == ''
+        assert snapshot.enabled is True
+        assert (snapshot.provider, snapshot.model, snapshot.max_tokens) == (provider, model, max_tokens)
+    else:
+        assert snapshot.enabled is False
+        assert snapshot.error == 'invalid extraction settings'
+
+
+@pytest.mark.parametrize('max_tokens', [3000, 3001, 9000, 9001])
+def test_legacy_environment_token_budget_still_clamps_to_3000(monkeypatch, max_tokens):
+    import os
+    module = _extractor()
+    monkeypatch.setenv('MW_EXTRACTION_MAX_TOKENS', str(max_tokens))
+    # Exercise the unchanged legacy environment reader, not YAML admission.
+    assert module._settings()['max_tokens'] == 3000
+    assert os.environ['MW_EXTRACTION_MAX_TOKENS'] == str(max_tokens)
+
+
 @pytest.mark.parametrize('changes', [
     {'enabled': 'false'}, {'enabled': 1}, {'enabled': None},
     {'provider': 'openrouter'}, {'model': ' gpt-6-luna'}, {'model': ''},

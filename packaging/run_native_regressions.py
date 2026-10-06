@@ -8,6 +8,10 @@ from __future__ import annotations
 import argparse
 import importlib
 import importlib.metadata
+import importlib.util
+import json
+import os
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -62,14 +66,58 @@ def main() -> int:
         if version != expected:
             raise RuntimeError(f"{package}: expected {expected}, found {version}")
     importlib.metadata.version("pytest")  # Missing test dependencies must fail, not skip.
+    # Proposed S2 caller repair: only the two declared legacy workflow homes.
+    # This producer is not a containment controller or a release receipt.
+    fixture_home = Path(os.environ["HERMES_HOME"]).absolute()
+    if fixture_home.parent != root or fixture_home.name not in {".hermes-ci", ".hermes-release"}:
+        raise RuntimeError("Legacy native receipt requires a declared isolated workflow home")
+    receipt_path = fixture_home.parent / "native-origins.json"
+    for path in [*reversed(fixture_home.parents), fixture_home, receipt_path]:
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0):
+            raise RuntimeError("Native receipt path must not follow links or reparse points")
+    if receipt_path.exists():
+        raise RuntimeError("Refuse to overwrite previous native origin evidence")
     sys.path.insert(0, str(root))
     sys.path.insert(0, str(core))
-    for name, exports in EXPORTS.items():
+    origins = {}
+    for name, exports in {**EXPORTS, "agent.memory_provider": ("MemoryProvider",)}.items():
         module = importlib.import_module(name)
-        if not Path(module.__file__).resolve().is_relative_to(core):
+        path = Path(module.__file__).resolve(strict=True)
+        if path != core / (name.replace(".", "/") + ".py"):
             raise RuntimeError(f"Native module did not load from pinned checkout: {name}")
         for export in exports:
             getattr(module, export)
+        origins[name] = str(path)
+    # Load the actual whole package before ordinary collection. Do not install
+    # a standalone SDK shim or replace an already-loaded foreign package.
+    plugin = sys.modules.get("memory_wiki")
+    if plugin is None:
+        spec = importlib.util.spec_from_file_location(
+            "memory_wiki", root / "__init__.py", submodule_search_locations=[str(root)],
+        )
+        if spec is None or spec.loader is None:
+            raise RuntimeError("Native plugin source loader unavailable")
+        plugin = importlib.util.module_from_spec(spec)
+        sys.modules["memory_wiki"] = plugin
+        spec.loader.exec_module(plugin)
+    native_base = importlib.import_module("agent.memory_provider").MemoryProvider
+    if (Path(plugin.__file__).resolve() != root / "__init__.py"
+            or plugin.MemoryProvider is not native_base
+            or plugin.MemoryWikiProvider.__mro__[1] is not native_base):
+        raise RuntimeError("Memory Wiki source or native MemoryProvider MRO mismatch")
+    raw = (json.dumps({"origins": origins}, indent=2) + "\n").encode("utf-8")
+    if len(raw) > 32768:
+        raise RuntimeError("Native origin receipt exceeds the bounded fixture contract")
+    # Exactly the existing ci_child.py:41 consumer schema, actual verified paths.
+    # Exclusive creation preserves prior failed receipts; no fake preload field.
+    with receipt_path.open("xb") as receipt:
+        receipt.write(raw)
+    if receipt_path.read_bytes() != raw:
+        raise RuntimeError("Native origin receipt readback mismatch")
     print(f"Native Hermes contract verified: NousResearch/hermes-agent@{sha}", flush=True)
     import pytest
     # Explicit plugin test directory prevents discovery of the core's own tests.

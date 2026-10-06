@@ -1,5 +1,5 @@
 name: memory-wiki
-version: 1.24.0
+version: 1.24.5
 description: "Hermes Memory Wiki - 121 synchronized tools; observable guard-safe automatic recall, expanded relevant candidate selection, profile-fleet read-only FTS5/Qdrant hybrid search, hardened document indexing, attachment-cache integration, and safe read-through secret-context discovery."
 provides_hooks:
   - pre_tool_call
