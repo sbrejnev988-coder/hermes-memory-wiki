@@ -1,24 +1,24 @@
-# Hermes Memory Wiki v1.24.5 — source-only кандидат релиза
+# Hermes Memory Wiki v1.24.5 — code-stage установлен; runtime-приёмка не завершена
 
 Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 121 MCP tools.
 
 The supported security properties and private reporting path are documented in [`SECURITY.md`](SECURITY.md).
 
-**Для Hermes-агентов:** [практический runbook безопасной установки и обновления](docs/HERMES-AGENT-DEPLOYMENT.md) — immutable pin, profile isolation, scanner/PM, Codex/OpenRouter, `voyageai/rerank-3`, проверки, owner activation и rollback. Документ отделяет проверенные примеры от неиспытанных путей и не является подтверждением развёртывания.
+**Текущий переносимый русский гайд:** [Memory Stack 1.24.5](docs/MEMORY_STACK_1_24_5_RU.md) — exact Wiki/LCM-X/PPLX PIN, 63 ENV + 8 YAML targets, native install/config, owner-run restart и отдельные saved/loaded/runtime readbacks. Это целевой режим, не утверждение, что все настройки применены или все индексы здоровы. [Deployment runbook](docs/HERMES-AGENT-DEPLOYMENT.md) сохранён с историческими CLI/source наблюдениями; его прежний source-only статус не является текущим статусом установленного code-stage.
 
 ## Статус релиза и границы проверки
 
-Число `1.24.5` в текущих manifest/project/runtime/SDK — версия нового source-кандидата, не доказательство публикации или runtime acceptance. Публикация и обновление пяти профилей принадлежат отдельной parent lane; свежие широкие тесты по решению владельца идут в самом конце. Позднейшие security-core/subagent-memory компоненты этим source-кандидатом не разрабатываются.
+Исходники 1.24.5 опубликованы; code-stage установлен штатным native installer в согласованных профилях после явного решения владельца о **code-only** обновлении. Exact installed PIN/payload и native enabled/selection прочитаны обратно. Это не загрузка новым owner process, не feature/full-recovery acceptance и не успешный CI/runtime всего релиза. Перезапуск оставлен владельцу; сохранение и проверка профильных настроек учитываются отдельно. Новые security-core/subagent-memory компоненты этим этапом не разрабатываются.
 
 Историческая проверка на срезе 4 октября 2026 года: последний опубликованный GitHub Release — **v1.22.3**; следующие два — v1.22.2 и v1.22.1, оба помечены superseded.[4] Эта запись не является новой проверкой GitHub.
 
-Историческая public-база прежней композиции — `438e0b57cb44470c2d47b9210941bea177d379f1`.[5] Проверенный при подготовке 1.24.5 public `main` — `4db712216143714671601b9e58b33ececc0c626d`: это CI-only commit, не публикация нового runtime Wiki. Финальный immutable SHA кандидата 1.24.5, tag и успешный CI этого SHA **не назначены**; непосредственно перед push требуется новое чтение remote ref. Исторический session-only PIN `2bda0efe7f1e5e90c1f0440a89e40f03314f9c21` не содержит новый Codex-маршрут графа. Для установки нужен отдельно принятый commit с требуемыми функциями, не плавающая branch/tag и не старый PIN с той же версией manifest.[2]
+Публичные immutable bindings установленного code-stage: основной Wiki source **E** — `42d2e943f887efda00d65ebf143adce28873103e`; secondary metadata-only **M** — `02eed6da5b5cdba02a4fb114534730067e2d21ea`. Для shared PM сохранены одна buildable и четыре virtual copies; M подготовлен до admission, installed TOML не патчится. Текущие bound GitHub URL/PIN закреплены штатным installer после разрешённого source replacement; прежние owner-файлы сохранены как исторические, не как proof новой runtime. Tag/GitHub Release 1.24.5 этим этапом не создавались, CI этого code-stage не принят. Прежние public SHA `438e0b57cb44470c2d47b9210941bea177d379f1` и `4db712216143714671601b9e58b33ececc0c626d`, а также session-only PIN `2bda0efe7f1e5e90c1f0440a89e40f03314f9c21` — история, не замена E/M. Перед новой установкой или push требуется чтение exact remote target.[2][5]
 
-[Текущие заметки 1.24.5](docs/RELEASE_NOTES_1_24_5_RU.md) описывают целую prefetch-упаковку, raw delta coverage, профильный delivery cap и фактические границы статической проверки. [Старые заметки 1.24.0](docs/RELEASE_NOTES_1_24_0_RU.md) сохранены без переписывания. Новые public-source guards и исправления extraction/SQL/CI перенесены из подготовленного source353, но полная композиция не получает native acceptance из старых receipts. Экранирование текста не означает универсальную семантическую защиту от prompt injection.
+[Текущие заметки 1.24.5](docs/RELEASE_NOTES_1_24_5_RU.md) разделяют опубликованный/установленный source и pending native/model/recovery gates. [Старые заметки 1.24.0](docs/RELEASE_NOTES_1_24_0_RU.md) сохранены без переписывания. Ранее подготовленные guards и extraction/SQL/CI слои не получают native acceptance из старых receipts. Экранирование текста не означает универсальную семантическую защиту от prompt injection.
 
-Memory Wiki выпускается самостоятельно: `memory.provider: memory-wiki` остаётся выбором долгосрочной памяти. LCM-X — отдельный слой; захват неподдержанных видов истории ещё не готов и не является условием релиза Wiki. Документ не подтверждает автоматическую доступность памяти основному агенту или детям `delegate_task`.
+`memory.provider: memory-wiki` остаётся долгосрочной памятью; официальный LCM-X 0.25.1 — отдельный context/history слой, PPLX 0.1.8 — независимый reviewer. Их роли, PIN и deliberately-off extensions описаны в новом гайде. Installation/registration не подтверждает capture, compaction, prompt-time recall или автоматическую доступность памяти детям `delegate_task`.
 
-Публикация исходников, установка, сохранение настроек, свежий CLI и реально загруженный gateway/Desktop — отдельные этапы. Ни этот README, ни сохранённый YAML не подтверждают последние этапы. Примеры ниже — только для отдельно разрешённого rollout принятого PIN; текущие модели и профили владельца не заменяются.
+Публикация, installed code, saved settings, fresh CLI, loaded gateway/Desktop и восстановление данных — отдельные этапы. Следующие примеры и старые presets сохраняют контракты своего среза; актуальные expanded targets и порядок активации находятся в новом гайде. Модели, credentials, data paths, ACL и профильные aliases владельца не экспортируются и не унифицируются.
 
 ## Ограничения extraction и calendar intent
 
