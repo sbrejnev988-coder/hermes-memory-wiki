@@ -44,6 +44,79 @@ from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+import marshal
+
+# Use the host's ContextVar resolver; a broken installed SDK is not standalone.
+try:
+    from hermes_constants import (
+        get_hermes_home as _native_home,
+        set_hermes_home_override as _set_native_home,
+        reset_hermes_home_override as _reset_native_home,
+    )
+except ModuleNotFoundError as exc:
+    if exc.name != "hermes_constants":
+        raise
+    _set_native_home = _reset_native_home = None
+    def _native_home():
+        return Path(os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes"))
+
+
+@contextmanager
+def _native_profile_scope(home):
+    token = _set_native_home(home) if _set_native_home is not None else None
+    try:
+        yield
+    finally:
+        if token is not None:
+            _reset_native_home(token)
+
+
+# Only this request owns its collector. Prefetch workers use detached copies.
+_REQUEST_HOME = contextvars.ContextVar("memory_wiki_request_home", default=None)
+_RECALL_REQUEST = contextvars.ContextVar("memory_wiki_recall_request", default=None)
+_SEARCH_RECEIPT = contextvars.ContextVar("memory_wiki_search_receipt", default=None)
+_LOADED_CODE_IDENTITY = ""
+
+
+def _stage_receipt(stage, status, reason="", **fields):
+    receipt = _SEARCH_RECEIPT.get()
+    if receipt is not None:
+        receipt[stage].update(status=status, reason=reason, **fields)
+
+
+def _profile_configuration_generation():
+    # Private cache invalidator, never serialized in status/receipts. Rotation
+    # invalidates one owner's generation, not other homes or their flights.
+    scope = _QDRANT_PROFILE_SCOPE.get() or {}
+    material = dict(scope)
+    material.update(embed_key=_embed_api_key(), rerank_key=_rerank_api_key(),
+                    qdrant_key=_qdrant_api_key())
+    return hashlib.sha256(json.dumps(material, sort_keys=True).encode()).hexdigest()
+
+
+def _new_recall_request(provider, entrypoint):
+    return {"version": 1, "trace_id": "rt_" + uuid.uuid4().hex[:20],
+            "entrypoint": entrypoint, "identity": provider._runtime_identity(),
+            "searches": [], "emitted_ids": [], "delivery_path": "canonical"}
+
+
+def _freeze_recall_receipt(request):
+    # Serialize to detach all mutable worker state. Only delivered safe IDs may
+    # carry per-item contributions; no query/hash/text/provider bodies here.
+    emitted = set(request.get("emitted_ids", []))
+    out = json.loads(json.dumps(request))
+    out.pop("emitted_ids", None)
+    for search in out["searches"]:
+        search["fusion"]["items"] = [item for item in search["fusion"].get("items", [])
+                                      if item["id"] in emitted]
+        if "ranks" in search["rerank"]:
+            search["rerank"]["ranks"] = [item for item in search["rerank"]["ranks"] if item["id"] in emitted]
+    out["final"] = {"emitted_claim_count": len(emitted),
+                    "guard": "enforced", "revalidation": "canonical"}
+    out["outer_fusion"] = {"kind": "orchestrator_rrf", "k": 60,
+                           "status": "executed" if request["entrypoint"] == "memory_wiki_recall" else "not_run",
+                           "distinct_from_inner": True}
+    return out
 
 
 class _RuntimeModuleProxy:
@@ -784,189 +857,217 @@ def _embedding_cache_configuration_signature() -> str:
     ).hexdigest()
 
 
+_EMBED_PROFILE_STATES: Dict[str, Dict[str, Any]] = {}
+
+
+def _embedding_cache_state():
+    home = str(_bound_profile_home().resolve())
+    return _EMBED_PROFILE_STATES.setdefault(home, {
+        "cache": _EMBED_CACHE if Path(home) == _IMPORT_HERMES_HOME else OrderedDict(),
+        "flights": _EMBED_CACHE_INFLIGHT if Path(home) == _IMPORT_HERMES_HOME else {},
+        "metrics": _EMBED_CACHE_METRICS if Path(home) == _IMPORT_HERMES_HOME else {key: 0 for key in _EMBED_CACHE_METRICS},
+        "signature": "", "generation": 0,
+        "generation_metrics": {key: 0 for key in _EMBED_CACHE_METRICS},
+    })
+
+
+def _embedding_metric(state, name, generation_metrics=None):
+    # Preserve legacy owner-cumulative counters and separately attribute the
+    # event to its captured configuration generation. Late waiters cannot
+    # overwrite the new generation's accounting.
+    state["metrics"][name] += 1
+    selected = state["generation_metrics"] if generation_metrics is None else generation_metrics
+    selected[name] += 1
+
+
 def _embedding_cache_sync_configuration_locked() -> str:
-    """Clear cached and in-flight vectors after any embedding config change."""
     global _EMBED_CACHE_CONFIG_SIGNATURE
-    current = _embedding_cache_configuration_signature()
-    previous = _EMBED_CACHE_CONFIG_SIGNATURE
+    state = _embedding_cache_state()
+    current = _embedding_cache_configuration_signature() + _profile_configuration_generation()
+    previous = state["signature"]
     if previous and previous != current:
-        _EMBED_CACHE.clear()
-        stale_flights = list(_EMBED_CACHE_INFLIGHT.values())
-        _EMBED_CACHE_INFLIGHT.clear()
-        for flight in stale_flights:
-            flight["result"] = None
-            flight["invalidated"] = True
+        state["cache"].clear()
+        for flight in state["flights"].values():
+            flight.update(result=None, invalidated=True)
             flight["event"].set()
-        _EMBED_CACHE_METRICS["config_resets"] += 1
-    _EMBED_CACHE_CONFIG_SIGNATURE = current
+        state["flights"].clear()
+        state["generation"] += 1
+        state["generation_metrics"] = {key: 0 for key in _EMBED_CACHE_METRICS}
+        _embedding_metric(state, "config_resets")
+    state["signature"] = current
+    if _bound_profile_home().resolve() == _IMPORT_HERMES_HOME:
+        _EMBED_CACHE_CONFIG_SIGNATURE = current
     return current
 
 
 def _embedding_cache_clear(*, reset_metrics: bool = False) -> None:
-    """Clear the process-local embedding cache; primarily for host reloads/tests."""
     global _EMBED_CACHE_CONFIG_SIGNATURE
     with _EMBED_CACHE_LOCK:
-        _EMBED_CACHE.clear()
-        flights = list(_EMBED_CACHE_INFLIGHT.values())
-        _EMBED_CACHE_INFLIGHT.clear()
-        for flight in flights:
-            flight["result"] = None
-            flight["invalidated"] = True
-            flight["event"].set()
+        states = list(_EMBED_PROFILE_STATES.values())
+        states.append({"cache": _EMBED_CACHE, "flights": _EMBED_CACHE_INFLIGHT,
+                       "metrics": _EMBED_CACHE_METRICS, "signature": "", "generation": 0})
+        for state in states:
+            state["cache"].clear()
+            for flight in state["flights"].values():
+                flight.update(result=None, invalidated=True)
+                flight["event"].set()
+            state["flights"].clear()
+            state["signature"] = ""
+            state["generation"] += 1
+            state["generation_metrics"] = {key: 0 for key in _EMBED_CACHE_METRICS}
+            if reset_metrics:
+                for key in state["metrics"]:
+                    state["metrics"][key] = 0
         _EMBED_CACHE_CONFIG_SIGNATURE = ""
-        if reset_metrics:
-            for key in _EMBED_CACHE_METRICS:
-                _EMBED_CACHE_METRICS[key] = 0
 
 
 def _embedding_cache_key_from_parts(canonical_text: str, input_type: str, signature: str) -> str:
-    return hashlib.sha256(
-        json.dumps(
-            {
-                "config_signature": signature,
-                "input_type": str(input_type),
-                "text": canonical_text,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-        ).encode("utf-8")
-    ).hexdigest()
+    return hashlib.sha256(json.dumps({
+        "owner": str(_bound_profile_home().resolve()), "config_signature": signature,
+        "input_type": str(input_type), "text": canonical_text,
+    }, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 
 
 def _embedding_cache_key(text: str, input_type: str) -> str:
-    canonical = _normalized_embedding_input(text, input_type)
     with _EMBED_CACHE_LOCK:
-        signature = _embedding_cache_sync_configuration_locked()
-        return _embedding_cache_key_from_parts(canonical, input_type, signature)
+        return _embedding_cache_key_from_parts(_normalized_embedding_input(text, input_type),
+                                              input_type, _embedding_cache_sync_configuration_locked())
 
 
 def _embedding_cache_lookup_locked(key: str, now_mono: float) -> Optional[List[float]]:
-    row = _EMBED_CACHE.get(key)
+    state = _embedding_cache_state()
+    row = state["cache"].get(key)
     if not row:
         return None
     expires_at, vector = row
     if expires_at <= now_mono:
-        _EMBED_CACHE.pop(key, None)
-        _EMBED_CACHE_METRICS["expired"] += 1
+        state["cache"].pop(key, None)
+        _embedding_metric(state, "expired")
         return None
-    _EMBED_CACHE.move_to_end(key)
+    state["cache"].move_to_end(key)
     return list(vector)
 
 
 def _embedding_cache_get(text: str, input_type: str) -> Optional[List[float]]:
     if EMBED_CACHE_MAX_ENTRIES <= 0:
         return None
-    canonical = _normalized_embedding_input(text, input_type)
     with _EMBED_CACHE_LOCK:
-        signature = _embedding_cache_sync_configuration_locked()
-        key = _embedding_cache_key_from_parts(canonical, input_type, signature)
+        key = _embedding_cache_key(text, input_type)
         vector = _embedding_cache_lookup_locked(key, time.monotonic())
-        if vector is None:
-            _EMBED_CACHE_METRICS["misses"] += 1
-            return None
-        _EMBED_CACHE_METRICS["hits"] += 1
+        _embedding_metric(_embedding_cache_state(), "hits" if vector is not None else "misses")
         return vector
 
 
-def _embedding_cache_put(text: str, input_type: str, vector: Optional[List[float]]) -> None:
-    if EMBED_CACHE_MAX_ENTRIES <= 0 or not vector:
-        return
+def _embedding_store_locked(state, key, input_type, vector):
     ttl = EMBED_QUERY_CACHE_TTL_SECONDS if input_type == "search_query" else EMBED_DOCUMENT_CACHE_TTL_SECONDS
-    if ttl <= 0:
+    if ttl <= 0 or EMBED_CACHE_MAX_ENTRIES <= 0 or not vector:
         return
-    canonical = _normalized_embedding_input(text, input_type)
+    state["cache"][key] = (time.monotonic() + ttl, list(vector))
+    state["cache"].move_to_end(key)
+    _embedding_metric(state, "stores")
+    while len(state["cache"]) > EMBED_CACHE_MAX_ENTRIES:
+        state["cache"].popitem(last=False)
+        _embedding_metric(state, "evictions")
+
+
+def _embedding_cache_put(text: str, input_type: str, vector: Optional[List[float]]) -> None:
     with _EMBED_CACHE_LOCK:
-        signature = _embedding_cache_sync_configuration_locked()
-        key = _embedding_cache_key_from_parts(canonical, input_type, signature)
-        _EMBED_CACHE[key] = (time.monotonic() + ttl, list(vector))
-        _EMBED_CACHE.move_to_end(key)
-        _EMBED_CACHE_METRICS["stores"] += 1
-        while len(_EMBED_CACHE) > EMBED_CACHE_MAX_ENTRIES:
-            _EMBED_CACHE.popitem(last=False)
-            _EMBED_CACHE_METRICS["evictions"] += 1
+        key = _embedding_cache_key(text, input_type)
+        _embedding_store_locked(_embedding_cache_state(), key, input_type, vector)
 
 
-def _embedding_cached_call(
-    text: str,
-    input_type: str,
-    producer: Any,
-) -> Optional[List[float]]:
-    """Return one cached embedding and coalesce concurrent identical calls."""
+def _embedding_cached_call(text: str, input_type: str, producer: Any) -> Optional[List[float]]:
     canonical = _normalized_embedding_input(text, input_type)
+    started = time.monotonic()
+    def produce():
+        # Capture this producer's outcome even without a request collector, so
+        # coalesced callers retain its timeout rather than a generic miss.
+        receipt = _SEARCH_RECEIPT.get()
+        stage = {}
+        token = _SEARCH_RECEIPT.set({**(receipt or {}), "embedding": stage})
+        try:
+            return producer(canonical), stage
+        finally:
+            _SEARCH_RECEIPT.reset(token)
+            if receipt is not None:
+                receipt["embedding"].update(stage)
     if not canonical:
+        _stage_receipt("embedding", "not_run", "empty_query")
         return None
     if EMBED_CACHE_MAX_ENTRIES <= 0:
-        return producer(canonical)
-
-    owner = False
+        vector, stage = produce()
+        _stage_receipt("embedding", "executed" if vector else "timeout" if stage.get("status") == "timeout" else "failed",
+                       "cache_disabled" if vector else stage.get("reason") or "embedding_unavailable",
+                       elapsed_ms=(time.monotonic()-started)*1000)
+        return vector
     with _EMBED_CACHE_LOCK:
         signature = _embedding_cache_sync_configuration_locked()
+        state = _embedding_cache_state()
+        generation = state["generation"]
+        generation_metrics = state["generation_metrics"]
         key = _embedding_cache_key_from_parts(canonical, input_type, signature)
-        cached = _embedding_cache_lookup_locked(key, time.monotonic())
+        cached = _embedding_cache_lookup_locked(key, started)
         if cached is not None:
-            _EMBED_CACHE_METRICS["hits"] += 1
+            _embedding_metric(state, "hits", generation_metrics)
+            _stage_receipt("embedding", "cache_hit", elapsed_ms=(time.monotonic()-started)*1000)
             return cached
-        flight = _EMBED_CACHE_INFLIGHT.get(key)
-        if flight is None:
-            flight = {
-                "event": threading.Event(), "result": None,
-                "invalidated": False, "signature": signature,
-            }
-            _EMBED_CACHE_INFLIGHT[key] = flight
-            _EMBED_CACHE_METRICS["misses"] += 1
-            owner = True
+        flight = state["flights"].get(key)
+        owner = flight is None
+        if owner:
+            flight = {"event": threading.Event(), "result": None, "invalidated": False}
+            state["flights"][key] = flight
+            _embedding_metric(state, "misses", generation_metrics)
         else:
-            _EMBED_CACHE_METRICS["coalesced"] += 1
-
+            _embedding_metric(state, "coalesced", generation_metrics)
     if not owner:
         wait_seconds = float(EMBED_CACHE_SINGLEFLIGHT_WAIT_SECONDS)
         if _prefetch_active():
-            wait_seconds = _prefetch_network_timeout(
-                wait_seconds, reserve=PREFETCH_FALLBACK_RESERVE_SECONDS,
-            )
-        if wait_seconds <= 0.0 or not flight["event"].wait(wait_seconds):
+            wait_seconds = _prefetch_network_timeout(wait_seconds, reserve=PREFETCH_FALLBACK_RESERVE_SECONDS)
+        if wait_seconds <= 0 or not flight["event"].wait(wait_seconds):
             with _EMBED_CACHE_LOCK:
-                _EMBED_CACHE_METRICS["wait_timeouts"] += 1
-            # Preserve the existing local FTS fallback rather than starting a
-            # duplicate billable request while the original is still running.
+                _embedding_metric(state, "wait_timeouts", generation_metrics)
+            _stage_receipt("embedding", "timeout", "singleflight_wait", elapsed_ms=(time.monotonic()-started)*1000)
             return None
         result = flight.get("result")
+        status, reason = ("failed", "generation_invalidated") if flight["invalidated"] else flight.get("outcome", ("failed", "embedding_unavailable"))
+        _stage_receipt("embedding", "coalesced" if result else status, "" if result else reason,
+                       elapsed_ms=(time.monotonic()-started)*1000)
         return list(result) if result else None
-
     try:
-        vector = producer(canonical)
-    except Exception:
+        vector, stage = produce()
+    except Exception as exc:
+        outcome = ("timeout" if isinstance(exc, TimeoutError) else "failed", _safe_exception_label(exc))
         with _EMBED_CACHE_LOCK:
-            current = _EMBED_CACHE_INFLIGHT.get(key)
-            if current is flight:
-                _EMBED_CACHE_INFLIGHT.pop(key, None)
-            flight["result"] = None
+            if state["flights"].get(key) is flight:
+                state["flights"].pop(key, None)
+            flight["outcome"] = outcome
             flight["event"].set()
+        _stage_receipt("embedding", *outcome, elapsed_ms=(time.monotonic()-started)*1000)
         raise
-
-    accepted: Optional[List[float]] = list(vector) if vector else None
+    accepted = list(vector) if vector else None
+    outcome = ("timeout" if stage.get("status") == "timeout" else "failed",
+               stage.get("reason") or "embedding_unavailable")
     with _EMBED_CACHE_LOCK:
-        current_signature = _embedding_cache_sync_configuration_locked()
-        if current_signature != signature or flight.get("invalidated"):
+        # Check the captured generation BEFORE synchronizing. A late producer
+        # still carries old profile settings; synchronizing first would revert
+        # the new generation and invalidate its healthy cache/flights.
+        if state["generation"] != generation or flight["invalidated"]:
             accepted = None
-        elif accepted:
-            ttl = (
-                EMBED_QUERY_CACHE_TTL_SECONDS
-                if input_type == "search_query"
-                else EMBED_DOCUMENT_CACHE_TTL_SECONDS
-            )
-            if ttl > 0:
-                _EMBED_CACHE[key] = (time.monotonic() + ttl, list(accepted))
-                _EMBED_CACHE.move_to_end(key)
-                _EMBED_CACHE_METRICS["stores"] += 1
-                while len(_EMBED_CACHE) > EMBED_CACHE_MAX_ENTRIES:
-                    _EMBED_CACHE.popitem(last=False)
-                    _EMBED_CACHE_METRICS["evictions"] += 1
-        current = _EMBED_CACHE_INFLIGHT.get(key)
-        if current is flight:
-            _EMBED_CACHE_INFLIGHT.pop(key, None)
-        flight["result"] = list(accepted) if accepted else None
+            outcome = ("failed", "generation_invalidated")
+        else:
+            current = _embedding_cache_sync_configuration_locked()
+            if current != signature:
+                accepted = None
+                outcome = ("failed", "generation_invalidated")
+        if accepted:
+            _embedding_store_locked(state, key, input_type, accepted)
+        if state["flights"].get(key) is flight:
+            state["flights"].pop(key, None)
+        flight["result"] = accepted
+        flight["outcome"] = outcome
         flight["event"].set()
+    _stage_receipt("embedding", "executed" if accepted else outcome[0], "" if accepted else outcome[1],
+                   elapsed_ms=(time.monotonic()-started)*1000)
     return list(accepted) if accepted else None
 
 # Fail closed when a remote model slug is accidentally routed to the local hash stub.
@@ -1060,9 +1161,7 @@ _QDRANT_PROFILE_DEFAULTS = {
     "MEMORY_WIKI_QDRANT_HISTORICAL_COLLECTIONS": "",
     "MEMORY_WIKI_QDRANT_HISTORICAL_ENDPOINTS": "",
 }
-_IMPORT_HERMES_HOME = Path(
-    os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
-).expanduser().resolve()
+_IMPORT_HERMES_HOME = Path(_native_home()).expanduser().resolve()
 _GLOBAL_SEARCH_PROFILE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 _GLOBAL_SEARCH_PUBLIC_ENV = {
     "MEMORY_WIKI_GLOBAL_SEARCH_ENABLED",
@@ -1200,6 +1299,7 @@ def _profile_qdrant_settings(home: Path) -> Dict[str, str]:
             selected["MEMORY_WIKI_QDRANT_ALIAS"] = _QDRANT_PROFILE_DEFAULTS[
                 "MEMORY_WIKI_QDRANT_ALIAS"
             ]
+        missing = []
         compatible = all(
             key not in selected or selected[key].rstrip("/") == value.rstrip("/")
             for key, value in _PROFILE_EMBED_CONTRACT.items()
@@ -1210,20 +1310,25 @@ def _profile_qdrant_settings(home: Path) -> Dict[str, str]:
                 "MEMORY_WIKI_EPISODIC_QDRANT_COLLECTION",
                 "MEMORY_WIKI_QDRANT_ALIAS",
             }
-            if any(not selected.get(key) for key in required_route):
+            missing = sorted(key for key in required_route if not selected.get(key))
+            if missing:
                 compatible = False
             if (EMBED_PROVIDER in {"openrouter", "nous"}
                     and not selected.get("MEMORY_WIKI_EMBED_API_KEY")):
+                missing.append("MEMORY_WIKI_EMBED_API_KEY")
                 compatible = False
         return {name: selected.get(name, default)
                 for name, default in _QDRANT_PROFILE_DEFAULTS.items()} | {
                     "__strict": "1", "__semantic_compatible": "1" if compatible else "0",
+                    "__semantic_reason": "ready" if compatible else ("missing_profile_settings" if missing else "embedding_contract_mismatch"),
+                    "__missing_keys": ",".join(sorted(missing)),
                 } | {key: selected[key] for key in _PROFILE_SECRET_KEYS if key in selected}
     if Path(home).expanduser().resolve() != _IMPORT_HERMES_HOME:
         # A foreign provider with no own configuration cannot borrow the
         # importer's collections or credentials. Local SQLite/FTS may continue.
         return dict(_QDRANT_PROFILE_DEFAULTS) | {
             "__strict": "1", "__semantic_compatible": "0",
+            "__semantic_reason": "profile_config_missing", "__missing_keys": "",
         }
     # Legacy single-profile installations may have no profile .env.
     return {
@@ -1287,7 +1392,7 @@ def _bound_profile_home() -> Path:
     scope = _QDRANT_PROFILE_SCOPE.get()
     return Path(
         scope["__home"] if scope is not None
-        else os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
+        else str(_native_home())
     ).expanduser()
 
 
@@ -1378,6 +1483,9 @@ def _episodic_collection_name(manifest: Optional[dict] = None) -> str:
     return candidate
 
 
+_QDRANT_ALIAS_CAPABILITIES: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+
+
 def _qdrant_alias_supported(*, refresh: bool = False) -> bool:
     """Return whether the configured Qdrant endpoint implements alias APIs.
 
@@ -1390,11 +1498,14 @@ def _qdrant_alias_supported(*, refresh: bool = False) -> bool:
         return False
     ts = time.monotonic()
     endpoint = _normalized_qdrant_endpoint()
-    cached = _QDRANT_ALIAS_CAPABILITY.get("supported")
-    checked = float(_QDRANT_ALIAS_CAPABILITY.get("checked_at") or 0.0)
+    key = (str(_bound_profile_home().resolve()), endpoint, _qdrant_alias_mode(),
+           _profile_configuration_generation())
+    capability = _QDRANT_ALIAS_CAPABILITIES.setdefault(key, {})
+    cached = capability.get("supported")
+    checked = float(capability.get("checked_at") or 0.0)
     if (
         not refresh and cached is not None
-        and _QDRANT_ALIAS_CAPABILITY.get("endpoint") == endpoint
+        and capability.get("endpoint") == endpoint
         and ts - checked < QDRANT_ALIAS_PROBE_TTL_SECONDS
     ):
         return bool(cached)
@@ -1404,7 +1515,7 @@ def _qdrant_alias_supported(*, refresh: bool = False) -> bool:
         and str(result.get("status") or "ok") == "ok"
         and isinstance(((result.get("result") or {}).get("aliases")), list)
     )
-    _QDRANT_ALIAS_CAPABILITY.update({
+    capability.update({
         "checked_at": ts,
         "supported": supported,
         "error": "" if supported else "alias_api_unavailable",
@@ -3310,17 +3421,19 @@ _RERANK_PROFILE_STATES: Dict[str, Dict[str, Any]] = {}
 
 
 def _rerank_scope_state() -> Dict[str, Any]:
-    """Keep a failed profile's circuit, cache and diagnostics out of its peers."""
     home = str(_bound_profile_home().resolve())
-    if home == str(_IMPORT_HERMES_HOME):
-        return _RERANK_DEFAULT_STATE
+    generation = _profile_configuration_generation()
     with _RERANK_LOCK:
-        return _RERANK_PROFILE_STATES.setdefault(home, {
-            "cache": {}, "stats": {key: ("" if key == "last_error" else 0)
-                                   for key in _RERANK_STATS},
-            "failure_count": 0, "circuit_until": 0.0,
-        })
-# --- P6: Fault injection hooks for automated testing (DEBUG only) ---
+        state = (_RERANK_DEFAULT_STATE if home == str(_IMPORT_HERMES_HOME)
+                 else _RERANK_PROFILE_STATES.setdefault(home, {
+                     "cache": {}, "stats": {key: ("" if key == "last_error" else 0) for key in _RERANK_STATS},
+                     "failure_count": 0, "circuit_until": 0.0,
+                 }))
+        if state.get("generation") not in {None, generation}:
+            state["cache"].clear()
+            state.update(failure_count=0, circuit_until=0.0)
+        state["generation"] = generation
+        return state# --- P6: Fault injection hooks for automated testing (DEBUG only) ---
 _FAULT_INJECT_FTS_CORRUPT = os.environ.get("MW_FAULT_INJECT_FTS_CORRUPT", "0") == "1"
 _FAULT_INJECT_STALE = os.environ.get("MW_FAULT_INJECT_STALE", "0") == "1"
 _FAULT_INJECT_BACKUP_CHECKSUM_MISMATCH = os.environ.get("MW_FAULT_INJECT_BACKUP_CHECKSUM_MISMATCH", "0") == "1"
@@ -3442,6 +3555,7 @@ def _embed_text(text: str, timeout: float = 8.0) -> Optional[List[float]]:
 def _qdrant_req(method: str, path: str, body: Optional[dict] = None, timeout: float = 10.0) -> Optional[dict]:
     """HTTP-запрос к Qdrant, ограниченный текущим prefetch budget."""
     if not _semantic_profile_ready():
+        _stage_receipt("qdrant", "not_run", "profile_fence")
         return None
     path_parts = urllib.parse.urlsplit(path).path.split("/")
     if (
@@ -3457,6 +3571,7 @@ def _qdrant_req(method: str, path: str, body: Optional[dict] = None, timeout: fl
         return None
     timeout = _prefetch_network_timeout(timeout)
     if timeout <= 0.0:
+        _stage_receipt("qdrant", "timeout", "deadline")
         _debug_log(f"qdrant_req {method} {path}: skipped because prefetch budget expired")
         return None
     try:
@@ -3475,6 +3590,7 @@ def _qdrant_req(method: str, path: str, body: Optional[dict] = None, timeout: fl
             return {}
         return json.loads(raw)
     except Exception as e:
+        _stage_receipt("qdrant", "timeout" if isinstance(e, TimeoutError) else "failed", _safe_exception_label(e))
         _debug_log(f"qdrant_req failed: {type(e).__name__}")
         return None
 
@@ -3522,8 +3638,10 @@ def _embed_document(text: str) -> Optional[List[float]]:
 def _embed_query(text: str) -> Optional[List[float]]:
     """Embedding для нормализованного запроса с TTL/LRU и single-flight reuse."""
     if not _semantic_profile_ready():
+        _stage_receipt("embedding", "not_run", "profile_fence")
         return None
     if not EMBED_CONTRACT_VALID:
+        _stage_receipt("embedding", "not_run", "embedding_contract_mismatch")
         return None
     raw = str(text or "")
     try:
@@ -3531,6 +3649,7 @@ def _embed_query(text: str) -> Optional[List[float]]:
             # Retrieval queries are user data. Never send credential-bearing
             # text to OpenRouter or any configured embedding HTTP endpoint;
             # callers retain their lexical/SQLite fallback.
+            _stage_receipt("embedding", "not_run", "secret_query")
             _debug_log("query embedding skipped by secret boundary")
             return None
     except Exception:
@@ -3787,6 +3906,7 @@ def _openrouter_embed(text: str, *, input_type: str, timeout: float = 30.0) -> O
         try:
             attempt_timeout = _prefetch_network_timeout(timeout)
             if attempt_timeout <= 0.0:
+                _stage_receipt("embedding", "timeout", "deadline")
                 _debug_log("OpenRouter embeddings skipped because prefetch budget expired")
                 return None
             with _urlopen_no_redirect(request, timeout=attempt_timeout) as response:
@@ -3794,6 +3914,7 @@ def _openrouter_embed(text: str, *, input_type: str, timeout: float = 30.0) -> O
                 break
         except urllib.error.HTTPError as exc:
             code = exc.code
+            _stage_receipt("embedding", "failed", _safe_exception_label(exc))
             # Provider error bodies can echo submitted text. Keep diagnostics
             # metadata-only so memory content cannot reappear in local logs.
             _debug_log(f"OpenRouter embeddings HTTP {code}")
@@ -3818,6 +3939,7 @@ def _openrouter_embed(text: str, *, input_type: str, timeout: float = 30.0) -> O
             else:
                 return None
         except Exception as exc:
+            _stage_receipt("embedding", "timeout" if isinstance(exc, TimeoutError) else "failed", _safe_exception_label(exc))
             if attempt + 1 >= attempts:
                 _debug_log(f"OpenRouter embeddings error after retries: {type(exc).__name__}")
                 return None
@@ -3838,7 +3960,10 @@ def _openrouter_embed(text: str, *, input_type: str, timeout: float = 30.0) -> O
         return None
 
     vector = data[0].get("embedding")
-    return _validate_embedding_vector(vector, "OpenRouter")
+    validated = _validate_embedding_vector(vector, "OpenRouter")
+    if validated is None:
+        _stage_receipt("embedding", "failed", "invalid_vector")
+    return validated
 
 
 QDRANT_CLAIM_PAYLOAD_VERSION = 2
@@ -4436,7 +4561,14 @@ def _qdrant_search(
     """Векторный поиск через настоящий Qdrant."""
     if len(vector) != QDRANT_VECTOR_SIZE:
         return []
-    coll = _active_collection_name()
+    receipt = _SEARCH_RECEIPT.get()
+    legacy_unbound = receipt is None and _QDRANT_PROFILE_SCOPE.get() is None
+    coll = (_active_collection_name() if legacy_unbound else
+            ((receipt or {}).get("route", {}).get("resolved_target") or _qdrant_resolved_active_collection()))
+    if not coll or (not legacy_unbound and not _is_managed_claim_collection(coll)):
+        _stage_receipt("qdrant", "not_run", "resolved_target_out_of_profile")
+        return []
+    started = time.monotonic()
     body: Dict[str, Any] = {
         "query": vector,
         "limit": max(1, int(limit)),
@@ -4450,14 +4582,31 @@ def _qdrant_search(
         f"/collections/{coll}/points/query",
         body,
     )
-    points = (result or {}).get("result", {}).get("points", [])
+    if (not isinstance(result, dict) or result.get("status", "ok") != "ok"
+            or not isinstance(result.get("result"), dict)
+            or not isinstance(result["result"].get("points"), list)):
+        prior = (receipt or {}).get("qdrant", {})
+        _stage_receipt("qdrant", prior.get("status") if prior.get("status") in {"failed", "timeout"} else "failed",
+                       prior.get("reason") or "invalid_search_envelope", target=coll,
+                       elapsed_ms=(time.monotonic()-started)*1000)
+        return []
+    points = result["result"]["points"]
     matches: List[Tuple[str, float]] = []
     for point in points:
         pl = point.get("payload") or {}
         cid = pl.get("claim_id")
         if cid is None:
             cid = str(point.get("id"))
-        matches.append((str(cid), float(point.get("score", 0.0))))
+        try:
+            score = float(point.get("score", 0.0))
+            if not math.isfinite(score):
+                raise ValueError("nonfinite score")
+            matches.append((str(cid), score))
+        except (TypeError, ValueError):
+            _stage_receipt("qdrant", "failed", "invalid_search_score", target=coll)
+            return []
+    _stage_receipt("qdrant", "executed", "no_hits" if not matches else "", target=coll,
+                   elapsed_ms=(time.monotonic()-started)*1000)
     return matches
 
 
@@ -4512,17 +4661,21 @@ _OPENROUTER_HEALTH_TTL_SECONDS = 300.0
 
 
 def _openrouter_health_cache() -> Dict[str, Any]:
-    """Return health state for the bound provider, preserving legacy importer state."""
-    scope = _QDRANT_PROFILE_SCOPE.get()
-    if scope is None or Path(scope.get("__home", "")).resolve() == _IMPORT_HERMES_HOME:
-        return _OPENROUTER_HEALTH_CACHE
-    return _OPENROUTER_HEALTH_BY_PROFILE.setdefault(
-        scope["__home"],
-        {"checked_at": 0.0, "available": None, "refreshing": False, "last_error": ""},
-    )
-
+    home = str(_bound_profile_home().resolve())
+    generation = _profile_configuration_generation()
+    cache = (_OPENROUTER_HEALTH_CACHE if home == str(_IMPORT_HERMES_HOME)
+             else _OPENROUTER_HEALTH_BY_PROFILE.setdefault(home, {
+                 "checked_at": 0.0, "available": None, "refreshing": False, "last_error": "",
+             }))
+    if cache.get("generation") not in {None, generation}:
+        cache.update(checked_at=0.0, available=None, refreshing=False, last_error="")
+    cache["generation"] = generation
+    return cache
 
 def _refresh_openrouter_health() -> None:
+    with _OPENROUTER_HEALTH_LOCK:
+        cache = _openrouter_health_cache()
+        generation = cache["generation"]
     try:
         available = bool(_openrouter_available())
         error = ""
@@ -4530,7 +4683,8 @@ def _refresh_openrouter_health() -> None:
         available = False
         error = _safe_exception_label(exc)
     with _OPENROUTER_HEALTH_LOCK:
-        cache = _openrouter_health_cache()
+        if cache.get("generation") != generation:
+            return
         cache["available"] = available
         cache["checked_at"] = time.time()
         cache["refreshing"] = False
@@ -4586,7 +4740,7 @@ def _qdrant_resolved_active_collection() -> str:
     if alias_supported:
         target = _qdrant_alias_target(_qdrant_alias())
         if target:
-            return target
+            return target if _is_managed_claim_collection(target) else ""
         if _qdrant_alias_mode() == "require":
             return ""
     elif _qdrant_alias_mode() == "require":
@@ -4828,9 +4982,15 @@ def _switch_alias(new_collection: str) -> bool:
 
 def _semantic_available(*, read_only: bool = False) -> bool:
     """Check embedding/Qdrant; diagnostic reads must not embed or create collections."""
-    if not SEMANTIC_ENABLED or not _semantic_profile_ready():
+    if not SEMANTIC_ENABLED:
+        _stage_receipt("qdrant", "not_run", "semantic_disabled")
+        return False
+    if not _semantic_profile_ready():
+        scope = _QDRANT_PROFILE_SCOPE.get() or {}
+        _stage_receipt("qdrant", "not_run", scope.get("__semantic_reason", "profile_fence"))
         return False
     if not EMBED_CONTRACT_VALID:
+        _stage_receipt("qdrant", "not_run", "embedding_contract_mismatch")
         for error in _EMBED_BOOT_ERRORS:
             _debug_log(f"semantic disabled: {error}")
         return False
@@ -4838,6 +4998,7 @@ def _semantic_available(*, read_only: bool = False) -> bool:
         available = (_openrouter_available(allow_probe=False) if read_only
                      else _openrouter_health_swr())
         if not available:
+            _stage_receipt("qdrant", "not_run", "embedding_health_unavailable")
             _debug_log("OpenRouter/Nous embeddings unavailable by model-list check")
             return False
     else:
@@ -4877,8 +5038,25 @@ def _semantic_available(*, read_only: bool = False) -> bool:
     if qdrant_status.get("status") != "ok":
         _debug_log(f"unexpected Qdrant response: {qdrant_status}")
         return False
-    return (_ensure_collection(create=False) if read_only
-            else _qdrant_ensure_collection())
+    if not read_only and _SEARCH_RECEIPT.get() is None:
+        return _qdrant_ensure_collection()
+    target = _qdrant_resolved_active_collection()
+    if not target:
+        _stage_receipt("qdrant", "not_run", "alias_or_collection_unavailable")
+        return False
+    if not _is_managed_claim_collection(target):
+        _stage_receipt("qdrant", "not_run", "resolved_target_out_of_profile")
+        return False
+    if _manifest_hash(_embedding_manifest()) not in target.split("_"):
+        _stage_receipt("qdrant", "not_run", "manifest_target_mismatch")
+        return False
+    valid = _ensure_collection(target, create=False)
+    receipt = _SEARCH_RECEIPT.get()
+    if receipt is not None:
+        receipt["route"].update(resolved_target=target, contract_valid=valid)
+    if not valid:
+        _stage_receipt("qdrant", "not_run", "collection_contract_mismatch")
+    return valid
 
 
 def _episodic_semantic_available() -> bool:
@@ -5944,7 +6122,7 @@ class MemoryWikiProvider(MemoryProvider):
     def name(self) -> str: return "memory-wiki"
 
     def __init__(self) -> None:
-        self.home = Path(os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")).expanduser()
+        self.home = Path(_native_home()).expanduser().resolve()
         self.root = self.home / "memory-wiki"
         self.pages_dir = self.root / "pages"
         self.dashboard_dir = self.root / "dashboards"
@@ -5980,6 +6158,48 @@ class MemoryWikiProvider(MemoryProvider):
         # --- F2/F3: Регистрируем глобальный инстанс для TF-IDF (доступ из статических функций) ---
         import __main__
         __main__._memory_wiki_instance = self
+
+    def _runtime_identity(self) -> Dict[str, Any]:
+        conn = getattr(self, "_conn", None)
+        conn_path = None
+        conn_matches = None
+        if conn is not None:
+            try:
+                main = next((row[2] for row in conn.execute("PRAGMA database_list")
+                             if row[1] == "main"), None)
+                if main:
+                    conn_path = str(Path(main).resolve())
+                    conn_matches = Path(main).resolve() == Path(self.db_path).resolve()
+            except (sqlite3.Error, OSError, AttributeError):
+                pass
+        scope = _QDRANT_PROFILE_SCOPE.get() or {}
+        return {
+            "importer_home": str(_IMPORT_HERMES_HOME),
+            "request_home": _REQUEST_HOME.get() or str(Path(_native_home()).expanduser().resolve()),
+            "provider_home": str(Path(self.home).expanduser().resolve()),
+            "db_path": str(Path(self.db_path).resolve()) if getattr(self, "db_path", None) else None,
+            "conn_path": conn_path, "conn_path_matches": conn_matches,
+            "module_name": __name__, "module_file": str(Path(__file__).resolve()),
+            "loaded_code_identity": _LOADED_CODE_IDENTITY,
+            "loaded_source_revision_known": False,
+            "profile_ready": scope.get("__semantic_compatible", "1") != "0",
+            "profile_reason": scope.get("__semantic_reason", "ready"),
+            "missing_key_names": scope.get("__missing_keys", "").split(",") if scope.get("__missing_keys") else [],
+        }
+
+    def _claim_visibility_sql(self, session_id="", *, include_all_projects=False, prefix=""):
+        if prefix not in {"", "claims."}:
+            raise ValueError("invalid SQL prefix")
+        p = prefix
+        sid = str(session_id or self.session_id or "default")
+        project = str(self.project_scope or "")
+        sql = (f"(LOWER({p}visibility_scope)='global'"
+               f" OR (LOWER({p}visibility_scope)='bot' AND {p}origin_bot_id=?)"
+               f" OR (LOWER({p}visibility_scope)='chat' AND {p}origin_bot_id=? AND {p}origin_chat_hash=?)"
+               f" OR (LOWER({p}visibility_scope)='private' AND {p}origin_bot_id=? AND {p}origin_session_id=?)"
+               f" OR (LOWER({p}visibility_scope)='project' AND (?=1 OR ({p}project_id=? AND ?!=''))))")
+        return sql, [self.bot_id, self.bot_id, self._chat_hash(sid), self.bot_id, sid,
+                     int(bool(include_all_projects)), project, project]
 
     # ----- lifecycle -----------------------------------------------------
     def is_available(self) -> bool:
@@ -6017,6 +6237,12 @@ class MemoryWikiProvider(MemoryProvider):
         )
 
     def initialize(self, session_id: str, **kwargs) -> None:
+        target_home = Path(kwargs.get("hermes_home") or self.home).expanduser().resolve()
+        if target_home != self.home.resolve() and (
+            self._conn is not None or self._background_worker is not None
+        ):
+            # Refuse BEFORE changing session, bot, home or any persistent path.
+            raise RuntimeError("provider_home_rebind_requires_new_instance")
         self.session_id = session_id or "default"
         self.platform = kwargs.get("platform") or ""
         self.agent_context = kwargs.get("agent_context") or "primary"
@@ -6822,6 +7048,8 @@ class MemoryWikiProvider(MemoryProvider):
             _debug_log(f"prefetch retrieval accounting failed: {_safe_exception_label(exc)}")
 
     def _finish_prefetch_diagnostics(self, diag: Dict[str, Any], *, status: str = "ok") -> None:
+        if _prefetch_cancelled():
+            return
         clean = {
             "status": str(status or "ok"),
             # A random trace ID supports one-run correlation without exposing a
@@ -6941,6 +7169,7 @@ class MemoryWikiProvider(MemoryProvider):
                 record_retrieval=False,
             )
             blocks = []
+            block_ids = {}
             for row in rows:
                 checked = self._inspect_recall_item(
                     row, audit=False, max_len=min(PREFETCH_CLAIM_MAX_CHARS, 900)
@@ -6950,6 +7179,7 @@ class MemoryWikiProvider(MemoryProvider):
                 blocks.append(
                     f"- `{_context_data(row.get('id',''))}` topic={_context_data(row.get('topic',''))}: {_context_data(checked.get('content',''))}"
                 )
+                block_ids[blocks[-1]] = str(row["id"])
                 if len(blocks) >= 8:
                     break
             shared = self._shared_prefetch_fragments(min(1200, prefetch_chars // 4))
@@ -6974,6 +7204,9 @@ class MemoryWikiProvider(MemoryProvider):
                     continue
                 lines.append(block); current_chars += len(block) + 1
                 rendered += 1
+                request = _RECALL_REQUEST.get()
+                if request is not None:
+                    request["emitted_ids"].append(block_ids[block])
             output = "\n".join(lines) if rendered or shared_count else ""
             self._audit("prefetch", "lexical_fallback", f"reason={reason}; rendered={rendered}")
             return output
@@ -7005,33 +7238,50 @@ class MemoryWikiProvider(MemoryProvider):
         error_box: Dict[str, Exception] = {}
         cancel_event = threading.Event()
         worker_budget = max(0.5, PREFETCH_DEADLINE_SECONDS - PREFETCH_FALLBACK_RESERVE_SECONDS)
+        request = _RECALL_REQUEST.get()
+        worker_request = json.loads(json.dumps(request)) if request is not None else None
+        worker_context = contextvars.copy_context()
 
         def _run_bounded() -> None:
+            token = _RECALL_REQUEST.set(worker_request)
             try:
                 with _prefetch_budget(worker_budget, cancel_event):
                     result_box["value"] = self._prefetch_impl(query, session_id=sid, delivery_budget=delivery_budget) or ""
             except Exception as exc:
                 error_box["value"] = exc
+            finally:
+                _RECALL_REQUEST.reset(token)
 
-        worker = threading.Thread(
-            target=_run_bounded, daemon=True, name="memory-wiki-bounded-prefetch"
-        )
         started = time.monotonic()
-        worker.start()
-        worker.join(worker_budget)
+        try:
+            worker = threading.Thread(target=worker_context.run, args=(_run_bounded,),
+                                      daemon=True, name="memory-wiki-bounded-prefetch")
+            worker.start()
+            worker.join(worker_budget)
+        except Exception:
+            cancel_event.set()
+            if request is not None:
+                request["delivery_path"] = "thread_start_fallback"
+            return self._lexical_prefetch_fallback(query, session_id=sid, reason="thread_start_failed", delivery_budget=delivery_budget)
         if worker.is_alive():
             cancel_event.set()
+            if request is not None:
+                request["delivery_path"] = "deadline_fallback"
             _debug_log(f"PREFETCH deadline reached after {worker_budget:.3f}s; returning local FTS fallback")
             result = self._lexical_prefetch_fallback(query, session_id=sid, reason="deadline", delivery_budget=delivery_budget)
             _online_metrics.record_path(self.db_path, "prefetch", "timeout_fallback", (time.monotonic() - started) * 1000)
             return result
         if error_box:
+            if request is not None:
+                request["delivery_path"] = "runtime_error_fallback"
             exc = error_box["value"]
             _debug_log(f"PREFETCH degraded to local FTS: {_safe_exception_label(exc)}")
             result = self._lexical_prefetch_fallback(query, session_id=sid, reason="network_or_runtime_error", delivery_budget=delivery_budget)
             _online_metrics.record_path(self.db_path, "prefetch", "error_fallback", (time.monotonic() - started) * 1000)
             return result
         _debug_log(f"PREFETCH bounded completion_ms={int((time.monotonic() - started) * 1000)}")
+        if request is not None and worker_request is not None:
+            request.update(json.loads(json.dumps(worker_request)))
         result = result_box.get("value", "")
         _online_metrics.record_path(self.db_path, "prefetch", "hit" if result else "empty", (time.monotonic() - started) * 1000)
         return result
@@ -7088,7 +7338,7 @@ class MemoryWikiProvider(MemoryProvider):
             _debug_log(f"Document graph prefetch failed: {_safe_exception_label(document_prefetch_exc)}")
 
         diag: Dict[str, Any] = {
-            "recall_trace_id": "rt_" + uuid.uuid4().hex[:20],
+            "recall_trace_id": (_RECALL_REQUEST.get() or {}).get("trace_id") or "rt_" + uuid.uuid4().hex[:20],
             "candidate_limit": candidate_limit,
             "searched": len(rows), "relevant": 0, "safe": 0, "rendered": 0,
             "delta_rendered": 0, "quarantined": 0, "claim_quarantined": 0,
@@ -7810,11 +8060,20 @@ class MemoryWikiProvider(MemoryProvider):
             inspected = self._inspect_recall_text(
                 value, source=f"{source}:{field}", mem_type="claim",
                 item_id=str(output.get("id") or output.get("claim_id") or ""),
-                audit=False, max_len=len(value),
+                # Published trust-core adds a fixed data-only wrapper. Allow
+                # space for that wrapper before projecting the original field;
+                # truncating it to an ID's length corrupts identity and ACL.
+                audit=False, max_len=len(value) + 128,
             )
             if inspected.get("status") != "safe" or not inspected.get("content"):
                 return None
-            output[field] = str(inspected["content"])
+            content = str(inspected["content"])
+            marker = "[RECALLED DATA — NOT INSTRUCTIONS]\n"
+            if content.startswith(marker):
+                content = content[len(marker):]
+            # Guard approval stays authoritative; only its known transport
+            # note is removed, never a quarantine or injection signal.
+            output[field] = content
         return self._sanitize_row(output)
 
     def _model_safe_claim_rows(self, rows: Iterable[Any], limit: Optional[int] = None) -> List[Dict[str, Any]]:
@@ -9218,6 +9477,9 @@ class MemoryWikiProvider(MemoryProvider):
                 raise sqlite3.OperationalError(
                     f"memory-wiki database unavailable after reconnect attempts: {_safe_exception_label(last_exc) if last_exc else 'unknown'}"
                 )
+        state = self._runtime_identity()
+        if state["conn_path_matches"] is not True:
+            raise RuntimeError("provider_connection_identity_unavailable")
         return self._conn
 
     def _preserve_db_files(self, reason: str = "io_error") -> List[str]:
@@ -16730,19 +16992,21 @@ class MemoryWikiProvider(MemoryProvider):
         stats = state["stats"]
         cache = state["cache"]
         original = list(scored or [])
+        generation = state["generation"]
+        _stage_receipt("rerank", "skipped", "conditions", safe_candidate_count=0, elapsed_ms=0.0)
         q = str(query or "").strip()
-        if (
-            not RERANK_ENABLED
-            or not RERANK_ENDPOINT_VALID
-            or not _rerank_api_key()
-            or len(q) < 12
-            or len(q) > RERANK_USER_QUERY_MAX_CHARS
-            or len(original) < RERANK_MIN_CANDIDATES
-        ):
+        reason = ("disabled" if not RERANK_ENABLED else
+                  "endpoint_invalid" if not RERANK_ENDPOINT_VALID else
+                  "no_key" if not _rerank_api_key() else
+                  "query_length" if len(q) < 12 or len(q) > RERANK_USER_QUERY_MAX_CHARS else
+                  "candidate_threshold" if len(original) < RERANK_MIN_CANDIDATES else "")
+        if reason:
+            _stage_receipt("rerank", "skipped", reason)
             with _RERANK_LOCK:
                 stats["skipped"] += 1
             return original
         if secret_scan(q).get("raw_secret"):
+            _stage_receipt("rerank", "skipped", "secret_query")
             with _RERANK_LOCK:
                 stats["skipped"] += 1
             _debug_log("RERANK skipped because the query contains a raw secret")
@@ -16756,12 +17020,14 @@ class MemoryWikiProvider(MemoryProvider):
         ):
             with _RERANK_LOCK:
                 stats["skipped"] += 1
+            _stage_receipt("rerank", "skipped", "exact_technical")
             _debug_log("RERANK skip exact-dominant technical query")
             return original
 
         now_mono = time.monotonic()
         with _RERANK_LOCK:
             if state["circuit_until"] > now_mono:
+                _stage_receipt("rerank", "skipped", "circuit_open")
                 stats["skipped"] += 1
                 return original
 
@@ -16776,7 +17042,13 @@ class MemoryWikiProvider(MemoryProvider):
             text = redact_secrets(str(row.get("claim") or "")).strip()
             if not text or is_ephemeral_fragment(text) or secret_scan(text).get("raw_secret"):
                 continue
+            if "visibility_scope" in row and not self._claim_visible(row):
+                continue
+            checked = self._inspect_recall_item(row, audit=False, max_len=RERANK_DOCUMENT_MAX_CHARS)
+            if checked.get("status") != "safe":
+                continue
             prefix.append(row)
+        _stage_receipt("rerank", "skipped", "safe_candidate_threshold", safe_candidate_count=len(prefix))
         if len(prefix) < RERANK_MIN_CANDIDATES:
             with _RERANK_LOCK:
                 stats["skipped"] += 1
@@ -16804,6 +17076,21 @@ class MemoryWikiProvider(MemoryProvider):
             _serialize_rerank_document(row, code_meta_by_id.get(str(row.get("id") or "")))
             for row in prefix
         ]
+        guarded_documents = []
+        guarded_prefix = []
+        for row, document in zip(prefix, documents):
+            checked = self._inspect_recall_text(document, source="rerank_document", mem_type="claim",
+                                                audit=False, max_len=len(document) + 100)
+            if checked.get("status") == "safe":
+                guarded_documents.append(str(checked["content"]))
+                guarded_prefix.append(row)
+        documents, prefix = guarded_documents, guarded_prefix
+        _stage_receipt("rerank", "skipped", "safe_document_threshold", safe_candidate_count=len(prefix))
+        if len(prefix) < RERANK_MIN_CANDIDATES:
+            return original
+        if _prefetch_network_timeout(RERANK_TIMEOUT) <= 0.0:
+            _stage_receipt("rerank", "skipped", "deadline")
+            return original
         rerank_query = _build_rerank_query(q, query_mode)
         # Cached rerank results are attached by stable row ID, so the cache key must
         # represent the candidate *set* rather than the incidental retrieval order.
@@ -16859,6 +17146,7 @@ class MemoryWikiProvider(MemoryProvider):
                 cached = cache.get(cache_key)
                 if cached and cached[0] > now_mono:
                     stats["cache_hits"] += 1
+                    _stage_receipt("rerank", "cache_hit", "", ranks=[{"id": cid, "rank": rank} for cid, _score, rank in cached[1]])
                     return fuse_current_order(cached[1])
                 for key in [k for k, value in cache.items() if value[0] <= now_mono]:
                     cache.pop(key, None)
@@ -16918,15 +17206,23 @@ class MemoryWikiProvider(MemoryProvider):
             if not obj:
                 raise RuntimeError(last_error or "empty rerank response")
 
-            api_results = obj.get("results") or []
+            api_results = obj.get("results")
+            if not isinstance(api_results, list):
+                raise ValueError("invalid_rerank_results")
             ranked: List[Tuple[str, float, int]] = []
             seen_indexes = set()
             for rank, result in enumerate(api_results, 1):
-                idx = int(result.get("index", -1))
-                if idx < 0 or idx >= len(prefix) or idx in seen_indexes:
-                    continue
+                if not isinstance(result, dict):
+                    raise ValueError("invalid_rerank_item")
+                idx = result.get("index", -1)
+                score = result.get("relevance_score")
+                if (isinstance(idx, bool) or not isinstance(idx, int) or idx < 0
+                        or idx >= len(prefix) or idx in seen_indexes
+                        or isinstance(score, bool) or not isinstance(score, (int, float))
+                        or not math.isfinite(float(score))):
+                    raise ValueError("invalid_rerank_rank_or_score")
                 seen_indexes.add(idx)
-                ranked.append((str(prefix[idx].get("id")), float(result.get("relevance_score", 0.0)), rank))
+                ranked.append((str(prefix[idx].get("id")), float(score), rank))
             if len(ranked) < RERANK_MIN_CANDIDATES:
                 raise ValueError(f"rerank returned only {len(ranked)} valid results")
 
@@ -16936,31 +17232,36 @@ class MemoryWikiProvider(MemoryProvider):
             latency_ms = int((time.monotonic() - started) * 1000)
             usage = obj.get("usage") or {}
             with _RERANK_LOCK:
-                state["failure_count"] = 0
-                state["circuit_until"] = 0.0
+                if state.get("generation") == generation:
+                    state["failure_count"] = 0
+                    state["circuit_until"] = 0.0
                 stats["requests"] += 1
                 stats["successes"] += 1
                 stats["search_units"] += int(usage.get("search_units") or 0)
                 stats["cost_usd"] += float(usage.get("cost") or 0.0)
                 stats["last_latency_ms"] = latency_ms
                 stats["last_error"] = ""
-                if RERANK_CACHE_TTL > 0:
+                if RERANK_CACHE_TTL > 0 and state.get("generation") == generation:
                     if len(cache) >= RERANK_CACHE_MAX:
                         oldest = min(cache, key=lambda k: cache[k][0])
                         cache.pop(oldest, None)
                     cache[cache_key] = (time.monotonic() + RERANK_CACHE_TTL, cached_meta)
+            _stage_receipt("rerank", "executed", "", elapsed_ms=latency_ms,
+                           ranks=[{"id": cid, "rank": rank} for cid, _score, rank in ranked])
             return ordered
         except Exception as exc:
             latency_ms = int((time.monotonic() - started) * 1000)
             with _RERANK_LOCK:
-                state["failure_count"] += 1
+                if state.get("generation") == generation:
+                    state["failure_count"] += 1
                 stats["requests"] += 1
                 stats["failures"] += 1
                 stats["last_latency_ms"] = latency_ms
                 stats["last_error"] = _safe_exception_label(exc)
-                if state["failure_count"] >= RERANK_CIRCUIT_FAILURES:
+                if state.get("generation") == generation and state["failure_count"] >= RERANK_CIRCUIT_FAILURES:
                     state["circuit_until"] = time.monotonic() + RERANK_CIRCUIT_SECONDS
                     state["failure_count"] = 0
+            _stage_receipt("rerank", "failed", "timeout" if isinstance(exc, TimeoutError) else _safe_exception_label(exc), elapsed_ms=latency_ms)
             return original
 
     def _search_fallback(
@@ -16979,12 +17280,19 @@ class MemoryWikiProvider(MemoryProvider):
         topic_slug = self._topic_alias(topic, "") if topic else ""
         pid = self.project_scope or current_project_id()
         strict = os.environ.get("MEMORY_WIKI_STRICT_RECALL", "1").lower() not in ("0", "false", "no")
-        where = ["status='active'"]
+        visibility, visibility_params = self._claim_visibility_sql(session_id, include_all_projects=include_all_projects)
+        params.extend(visibility_params)
+        where = ["status='active'", "risk!='secret' AND quarantined_at=0", visibility]
+        if not include_stale:
+            where.append("freshness_at>=?")
+            params.append(now() - STALE_DAYS * 86400)
+            if _FAULT_INJECT_STALE:
+                where.append("0")
         if not include_all_projects:
             where.append("(scope!='project' OR project_id=?)")
             params.append(pid)
         if strict:
-            where.append("risk!='secret' AND quarantined_at=0 AND trust_class NOT IN ('tool_log','raw_blob','secret') AND type!='source_artifact' AND quality>=0.20")
+            where.append("risk!='secret' AND quarantined_at=0 AND trust_class NOT IN ('tool_log','raw_blob','secret') AND type!='source_artifact' AND quality>=0.20 AND (pinned!=0 OR quality>=0.28)")
         if topic_slug:
             where.append("topic=?"); params.append(topic_slug)
         like_terms=[t for t in str(query or "").lower().split()
@@ -17031,7 +17339,7 @@ class MemoryWikiProvider(MemoryProvider):
         of truth. Without this hydration step, semantic IDs that were not also
         found by FTS/LIKE/recent-row fallbacks never reached the scorer.
         """
-        claim_ids = [str(cid) for cid in semantic_ids if str(cid)][:VECTOR_TOP_K]
+        claim_ids = [str(cid) for cid in semantic_ids if str(cid)]
         if not claim_ids:
             return 0
         hydrated = 0
@@ -17352,155 +17660,165 @@ class MemoryWikiProvider(MemoryProvider):
         }
 
     def _search(self, query: str, limit=10, include_stale=True, topic: Optional[str]=None, session_id: str="", retrieval_mode: str="hybrid", record_retrieval: bool=True, include_all_projects: bool=False, apply_rerank: bool=True, *, conn: Optional[sqlite3.Connection] = None) -> List[Dict[str, Any]]:
-        limit = max(1, min(int(limit or 10), 200)); q = query or ""; qt = tokens(q); c = conn or self._connect()
+        limit = max(1, min(int(limit or 10), 200))
+        q = query or ""; qt = tokens(q); c = conn or self._connect()
         retrieval_mode = str(retrieval_mode or "hybrid").strip().lower()
         if retrieval_mode not in {"hybrid", "fts", "vector"}:
             raise ValueError("retrieval_mode must be one of: hybrid, fts, vector")
-        semantic_enabled = bool(SEMANTIC_ENABLED and retrieval_mode != "fts")
-        if conn is None and retrieval_mode != "vector" and not c.in_transaction:
+        query_only = bool(c.execute("PRAGMA query_only").fetchone()[0])
+        can_repair = conn is None and not query_only and not c.in_transaction
+        fts_healthy = retrieval_mode != "vector"
+        fts_reason = ""
+        # Lexical health/repair is independent. Vector mode never touches FTS.
+        if fts_healthy:
             try:
-                marker = c.execute(
-                    "SELECT value FROM meta WHERE key='claims_fts_format'"
-                ).fetchone()
+                marker = c.execute("SELECT value FROM meta WHERE key='claims_fts_format'").fetchone()
                 if not marker or marker[0] != "v3":
+                    if not can_repair:
+                        raise sqlite3.DatabaseError("unsafe_fts_format")
                     self._ensure_fts_current()
-            except sqlite3.DatabaseError as exc:
-                _debug_log(f"FTS parity repair failed: {_safe_exception_label(exc)}")
-                return self._search_fallback(
-                    query, limit, include_stale, topic,
-                    session_id=session_id, include_all_projects=include_all_projects,
-                )
-        # --- v1.6: Auto-repair FTS on corruption ---
-        try:
-            c.execute("SELECT count(*) FROM claims_fts").fetchone()
-        except Exception as e:
-            estr = str(e).lower()
-            if any(kw in estr for kw in ("malformed","corrupt","disk image","no such table")):
-                if conn is not None:
-                    return self._search_fallback(
-                        query, limit, include_stale, topic,
-                        session_id=session_id, include_all_projects=include_all_projects,
-                        conn=c,
-                    )
-                try:
-                    self._rebuild_fts()
-                except Exception:
-                    return self._search_fallback(
-                        query,
-                        limit,
-                        include_stale,
-                        topic,
-                        session_id=session_id,
-                        include_all_projects=include_all_projects,
-                    )
+                c.execute("SELECT count(*) FROM claims_fts").fetchone()
+            except sqlite3.DatabaseError:
+                fts_healthy = False
+                fts_reason = "fts_unavailable_or_unsafe"
+                if can_repair:
+                    try:
+                        self._rebuild_fts()
+                        c.execute("SELECT count(*) FROM claims_fts").fetchone()
+                        fts_healthy = True
+                        fts_reason = "fts_repaired"
+                    except Exception:
+                        fts_reason = "fts_repair_failed"
         candidates: Dict[str, sqlite3.Row] = {}; bm25: Dict[str, float] = {}
-        topic_slug = self._topic_alias(topic, "") if topic else ""; pid=self.project_scope or current_project_id()
-        # --- Topic hierarchy: expand to parent topics for broader recall ---
+        topic_slug = self._topic_alias(topic, "") if topic else ""
+        pid = self.project_scope or current_project_id()
         strict = os.environ.get("MEMORY_WIKI_STRICT_RECALL", "1").lower() not in ("0", "false", "no")
-        # --- Semantic search: TF-IDF (local) + qdrant/embed (HTTP stubs) — оба активны ---
+        visibility, visibility_params = self._claim_visibility_sql(session_id, include_all_projects=include_all_projects, prefix="claims.")
+        base_where = "claims.status='active' AND claims.risk!='secret' AND claims.quarantined_at=0 AND " + visibility
+        base_params = list(visibility_params)
+        if not include_all_projects:
+            base_where += " AND (claims.scope!='project' OR claims.project_id=?)"
+            base_params.append(pid)
+        if strict:
+            base_where += " AND claims.trust_class NOT IN ('tool_log','raw_blob','secret') AND claims.type!='source_artifact' AND claims.quality>=0.20 AND (claims.pinned!=0 OR claims.quality>=0.28)"
+        if topic_slug:
+            base_where += " AND claims.topic=?"; base_params.append(topic_slug)
+        if not include_stale:
+            base_where += " AND claims.freshness_at>=?"
+            base_params.append(now() - STALE_DAYS * 86400)
+            if _FAULT_INJECT_STALE:
+                base_where += " AND 0"
         semantic_ids: Dict[str, float] = {}
-        rrf_fused: Dict[str, float] = {}
         query_mode = _detect_query_mode(q)
-        _debug_log(f"QUERY mode={query_mode} chars={len(q)}")
-        if q and semantic_enabled:
-            # Layer 2 (единственный): HTTP/OpenRouter embeddings → Qdrant
-            if _semantic_available():
+        semantic_hydrated = 0
+        if retrieval_mode != "fts":
+            if not q.strip():
+                _stage_receipt("qdrant", "not_run", "empty_query")
+            elif _semantic_available():
                 try:
+                    # Authoritative current ACL/status before remote top-K, even
+                    # when stale remote payload labels a hidden row as global.
+                    # Full ID set, deliberately no LIMIT/truncation.
+                    eligible_ids = [str(row[0]) for row in c.execute(
+                        "SELECT id FROM claims WHERE " + base_where, base_params)]
                     http_emb = _embed_query(q)
                     if http_emb:
                         effective_session = str(session_id or self.session_id or "default")
-                        http_matches = _qdrant_search(
-                            http_emb,
-                            VECTOR_TOP_K,
-                            query_filter=_qdrant_visibility_filter(
-                                bot_id=str(self.bot_id or ""),
-                                chat_hash=self._chat_hash(effective_session),
-                                session_id=effective_session,
-                                project_id=str(pid or ""),
-                                include_all_projects=bool(include_all_projects),
-                            ),
-                        )
-                        if http_matches:
-                            for sid, score in http_matches:
-                                semantic_ids[sid] = max(semantic_ids.get(sid, 0.0), score * 0.5)  # HTTP weight
-                            _debug_log(f"HTTP-qdrant top-{len(http_matches)}")
-                except Exception as e:
-                    _debug_log(f"HTTP-qdrant error: {_safe_exception_label(e)}")
-            _debug_log(f"SEMANTIC total-{len(semantic_ids)} ids")
-        base_where = "status='active'"
-        if not include_all_projects:
-            base_where += " AND (scope!='project' OR project_id=?)"
-        if strict:
-            base_where += " AND risk!='secret' AND quarantined_at=0 AND trust_class NOT IN ('tool_log','raw_blob','secret') AND type!='source_artifact' AND quality>=0.20"
-        if topic_slug:
-            base_where += " AND topic=?"
-        base_params = ([] if include_all_projects else [pid]) + ([topic_slug] if topic_slug else [])
-        semantic_hydrated = self._hydrate_semantic_candidates(
-            c, candidates, semantic_ids, base_where, base_params
-        )
-        def add_rows(sql: str, params: List[Any], cap: int = 80) -> None:
-            try:
-                for r in c.execute(sql + f" LIMIT {int(cap)}", params).fetchall(): candidates.setdefault(r["id"], r)
-            except Exception: pass
-        if q.strip() and retrieval_mode != "vector":
-            for ftsq in (safe_fts_query(q, mode="and"), safe_fts_query(q, mode="or")):
-                try:
-                    fts_sql = "SELECT claims.*, bm25(claims_fts) AS rank FROM claims_fts JOIN claims ON claims_fts.id=claims.id WHERE claims_fts MATCH ? AND claims.status='active'"
-                    fts_params: List[Any] = [ftsq]
-                    if strict:
-                        fts_sql += " AND claims.risk!='secret' AND claims.quarantined_at=0 AND claims.trust_class NOT IN ('tool_log','raw_blob','secret') AND claims.type!='source_artifact' AND claims.quality>=0.20"
-                    if topic_slug: fts_sql += " AND claims.topic=?"; fts_params.append(topic_slug)
-                    if not include_all_projects:
-                        fts_sql += " AND (claims.scope!='project' OR claims.project_id=?)"
-                        fts_params.append(pid)
-                    fts_sql += " ORDER BY rank"
-                    for r in c.execute(fts_sql + " LIMIT 100", fts_params).fetchall(): candidates.setdefault(r["id"], r); bm25[r["id"]] = max(bm25.get(r["id"], 0.0), bm25_norm(r["rank"]))
-                except (sqlite3.DatabaseError, sqlite3.OperationalError) as e:
-                    if conn is not None:
-                        # A graph reader is explicitly query-only.  It may not
-                        # repair FTS or write audit rows through the provider's
-                        # shared connection while another transaction is live.
-                        continue
-                    # --- P3: FTS5 runtime auto-repair on corruption ---
-                    self._audit('fts5', 'corruption_detected',
-                                f'FTS5 MATCH error: {_safe_exception_label(e)}; auto-rebuilding')
+                        query_filter = _qdrant_visibility_filter(
+                            bot_id=str(self.bot_id or ""), chat_hash=self._chat_hash(effective_session),
+                            session_id=effective_session, project_id=str(pid or ""),
+                            include_all_projects=bool(include_all_projects))
+                        query_filter.setdefault("must", []).append({"has_id": [_qdrant_point_id(cid) for cid in eligible_ids]})
+                        http_matches = _qdrant_search(http_emb, VECTOR_TOP_K, query_filter=query_filter)
+                        for cid, value in http_matches:
+                            if math.isfinite(float(value)):
+                                semantic_ids[cid] = max(semantic_ids.get(cid, 0.0), value * 0.5)
+                    else:
+                        _stage_receipt("qdrant", "not_run", "embedding_failed")
+                except Exception as exc:
+                    _stage_receipt("qdrant", "timeout" if isinstance(exc, TimeoutError) else "failed", _safe_exception_label(exc))
+            else:
+                receipt = _SEARCH_RECEIPT.get()
+                if receipt is not None and not receipt["qdrant"]["reason"]:
+                    _stage_receipt("qdrant", "not_run", "semantic_unavailable")
+                if receipt is not None:
+                    _stage_receipt("embedding", "not_run", receipt["qdrant"]["reason"])
+        semantic_hydrated = self._hydrate_semantic_candidates(c, candidates, semantic_ids, base_where, base_params)
+        like_ids = set()
+        def add_rows(sql, params, cap=80, *, lexical=False):
+            for row in c.execute(sql + " LIMIT ?", [*params, int(cap)]).fetchall():
+                candidates.setdefault(row["id"], row)
+                if lexical:
+                    like_ids.add(str(row["id"]))
+        if retrieval_mode != "vector":
+            started = time.monotonic()
+            if q.strip() and fts_healthy:
+                for ftsq in (safe_fts_query(q, mode="and"), safe_fts_query(q, mode="or")):
                     try:
-                        self._rebuild_fts()
-                        self._audit('fts5', 'auto_rebuild', 'FTS5 runtime rebuild completed')
-                        # Retry the search after rebuild
-                        c2 = self._connect()
-                        try:
-                            for r in c2.execute(fts_sql + " LIMIT 100", fts_params).fetchall():
-                                candidates.setdefault(r["id"], r)
-                                bm25[r["id"]] = max(bm25.get(r["id"], 0.0), bm25_norm(r["rank"]))
-                        finally:
-                            if c2 is not c: c2.close()
-                    except Exception as rebuild_err:
-                        self._audit('fts5', 'rebuild_failed', _safe_exception_label(rebuild_err))
-                except Exception: pass
-            like = f"%{self._escape_like(q.strip()[:180])}%"
-            add_rows(f"SELECT * FROM claims WHERE {base_where} AND (claim LIKE ? ESCAPE '\\' OR normalized_claim LIKE ? ESCAPE '\\' OR evidence LIKE ? ESCAPE '\\')", base_params + [like, like, like], 80)
+                        # The same predicate/params applies to FTS, LIKE, priors,
+                        # eligible-ID filter and authoritative hydration.
+                        fts_sql = "SELECT claims.*, bm25(claims_fts) AS rank FROM claims_fts JOIN claims ON claims_fts.id=claims.id WHERE claims_fts MATCH ? AND " + base_where
+                        for row in c.execute(fts_sql + " ORDER BY rank LIMIT 100", [ftsq, *base_params]).fetchall():
+                            candidates.setdefault(row["id"], row)
+                            bm25[row["id"]] = max(bm25.get(row["id"], 0.0), bm25_norm(row["rank"]))
+                    except sqlite3.DatabaseError:
+                        fts_healthy = False; fts_reason = "fts_match_failed"
+                        # No audit/write on a query-only caller. Repair next call
+                        # through the existing parity guard; vector results stay.
+                        break
+            if not fts_healthy:
+                for row in self._search_fallback(q, limit=500, include_stale=include_stale,
+                                                topic=topic, session_id=session_id,
+                                                include_all_projects=include_all_projects, conn=c):
+                    candidates.setdefault(row["id"], row); like_ids.add(row["id"])
+            elif q.strip():
+                like = f"%{self._escape_like(q.strip()[:180])}%"
+                add_rows(f"SELECT * FROM claims WHERE {base_where} AND (claim LIKE ? ESCAPE '\\' OR normalized_claim LIKE ? ESCAPE '\\' OR evidence LIKE ? ESCAPE '\\')", base_params + [like, like, like], 80, lexical=True)
+            _stage_receipt("lexical", "executed", fts_reason or ("no_hits" if not bm25 and not like_ids else ""),
+                           kind="fts5" if fts_healthy else "like", elapsed_ms=(time.monotonic()-started)*1000)
         if retrieval_mode == "hybrid":
             add_rows(f"SELECT * FROM claims WHERE {base_where} ORDER BY pinned DESC, salience DESC, usefulness DESC, trust_score DESC, updated_at DESC", base_params, 120)
             add_rows(f"SELECT * FROM claims WHERE {base_where} ORDER BY updated_at DESC", base_params, 160)
-            add_rows(f"SELECT * FROM claims WHERE {base_where} AND risk!='secret' ORDER BY recall_count ASC, freshness_at DESC", base_params, 80)
-        # --- RRF fusion: объединяем lexical (bm25) и semantic (cosine) ранги ---
-        # RRF must only rank rows that actually matched a lexical retriever.
-        # Hybrid mode also adds broad recent/salient candidates. Giving those
-        # rows a synthetic lexical weight turns candidate generation into a
-        # relevance signal and lets unrelated memories enter automatic prefetch.
-        lex_weights = {
-            claim_id: score for claim_id, score in bm25.items()
-            if claim_id in candidates and candidates[claim_id]["status"] == "active"
-        }
+            add_rows(f"SELECT * FROM claims WHERE {base_where} ORDER BY recall_count ASC, freshness_at DESC", base_params, 80)
+        # Eliminate absent/stale/hidden rows BEFORE rank denominators.
+        # Keep the private candidate-list API: canonical output and rerank
+        # independently enforce Injection Guard (old callers inspect refusals).
+        eligible = {}
+        for cid, row in candidates.items():
+            if not self._claim_visible(row, session_id) and not (include_all_projects and row["visibility_scope"] == "project"):
+                continue
+            if row["status"] != "active" or row["risk"] == "secret" or int(row["quarantined_at"] or 0):
+                continue
+            if strict and not int(row["pinned"] or 0) and is_ephemeral_fragment(row["claim"]):
+                continue
+            if not include_stale and self._is_stale(row["freshness_at"]):
+                continue
+            eligible[cid] = row
+        candidates = eligible
+        lex_weights = {cid: value for cid, value in bm25.items() if cid in candidates}
+        semantic_ids = {cid: value for cid, value in semantic_ids.items() if cid in candidates}
         if query_mode == "technical": lw, sw = 1.4, 0.6
         elif query_mode == "semantic": lw, sw = 0.6, 1.4
         else: lw, sw = 1.0, 1.0
         rrf_fused = _rrf_fusion(lex_weights, semantic_ids, RRF_K, lw, sw)
-        _debug_log(
-            f"RRF fused={len(rrf_fused)} candidates={len(candidates)} "
-            f"semantic={len(semantic_ids)} hydrated={semantic_hydrated} lw={lw} sw={sw}"
-        )
+        lexical_ranks = {cid: rank for rank, (cid, _) in enumerate(sorted(lex_weights.items(), key=lambda item: -item[1]), 1)}
+        vector_ranks = {cid: rank for rank, (cid, _) in enumerate(sorted(semantic_ids.items(), key=lambda item: -item[1]), 1)}
+        receipt = _SEARCH_RECEIPT.get()
+        if receipt is not None:
+            receipt["lexical"]["visible_count"] = len(set(lex_weights) | (like_ids & set(candidates)))
+            receipt["qdrant"]["visible_count"] = len(semantic_ids)
+            receipt["fusion"] = {"k": RRF_K, "lexical_weight": lw, "vector_weight": sw,
+                                 "lexical_count": len(lex_weights), "vector_count": len(semantic_ids),
+                                 "overlap_count": len(set(lex_weights) & set(semantic_ids)),
+                                 "union_count": len(set(lex_weights) | set(semantic_ids)),
+                                 "prior_count": len(set(candidates) - set(lex_weights) - set(semantic_ids) - like_ids),
+                                 "like_count": len(like_ids & set(candidates)), "items": []}
+            for cid in rrf_fused:
+                lr = lexical_ranks.get(cid); vr = vector_ranks.get(cid)
+                receipt["fusion"]["items"].append({"id": cid, "lexical_rank": lr, "vector_rank": vr,
+                    "lexical_contribution": lw/(RRF_K+lr) if lr else 0.0,
+                    "vector_contribution": sw/(RRF_K+vr) if vr else 0.0,
+                    "rrf_raw": rrf_fused[cid], "score_contribution": rrf_fused[cid]*0.55})
         scored=[]
         for r in candidates.values():
             if r["status"] != "active": continue
@@ -17533,9 +17851,11 @@ class MemoryWikiProvider(MemoryProvider):
         scored.sort(key=lambda x: x["score"], reverse=True)
         if retrieval_mode == "hybrid" and apply_rerank and not _prefetch_budget_expired(0.20):
             scored = self._rerank_rows(q, scored, query_mode)
+        else:
+            _stage_receipt("rerank", "skipped", "deadline" if _prefetch_budget_expired(0.20) else "mode_or_disabled")
         scored = self._apply_diversity(scored, query_mode)
         ids = [x["id"] for x in scored[:limit]]
-        if ids and record_retrieval and conn is None:
+        if ids and record_retrieval and conn is None and not query_only:
             with c:
                 ts=now(); c.executemany("UPDATE claims SET access_count=access_count+1, recall_count=recall_count+1, last_accessed=?, last_recalled=? WHERE id=?", [(ts, ts, i) for i in ids])
                 recall_rows = [
@@ -21279,17 +21599,30 @@ class MemoryWikiProvider(MemoryProvider):
     def _semantic_status(self) -> Dict[str,Any]:
         embed_ok = bool(_semantic_available(read_only=True))
         pts = 0
+        points_known = False
         alias_supported = _qdrant_alias_supported()
         alias_target = _qdrant_alias_target(_qdrant_alias()) if alias_supported else ""
         active_target = _qdrant_resolved_active_collection()
         try:
             online_collection = _qdrant_alias() if alias_supported and alias_target else active_target
             r = _qdrant_req("GET", f"/collections/{online_collection}") if online_collection else None
-            pts = r.get("result", {}).get("points_count", 0) if r else 0
+            count = r.get("result", {}).get("points_count") if isinstance(r, dict) else None
+            points_known = isinstance(count, int) and not isinstance(count, bool)
+            pts = count if points_known else 0
         except Exception:
             pass
         manifest = _embedding_manifest()
+        with _EMBED_CACHE_LOCK:
+            embed_state = _embedding_cache_state()
+            embed_metrics = dict(embed_state["metrics"])
+            embed_entries = len(embed_state["cache"])
+            embed_generation = embed_state["generation"]
+            embed_generation_metrics = dict(embed_state["generation_metrics"])
         return {
+            "runtime_identity": self._runtime_identity(),
+            "qdrant_points_known": points_known,
+            "qdrant_points_actual": pts if points_known else None,
+            "qdrant_points_status": "known" if points_known else "unknown",
             "embedding_ok": embed_ok,
             "semantic_enabled": SEMANTIC_ENABLED,
             "embedding_contract_valid": EMBED_CONTRACT_VALID,
@@ -21303,8 +21636,10 @@ class MemoryWikiProvider(MemoryProvider):
             "qdrant_vector_size": QDRANT_VECTOR_SIZE,
             "embedding_input_max_chars": EMBED_INPUT_MAX_CHARS,
             "embedding_cache": {
-                **dict(_EMBED_CACHE_METRICS),
-                "entries": len(_EMBED_CACHE),
+                **embed_metrics,
+                "entries": embed_entries,
+                "generation": embed_generation,
+                "generation_metrics": embed_generation_metrics,
                 "max_entries": EMBED_CACHE_MAX_ENTRIES,
                 "query_ttl_seconds": EMBED_QUERY_CACHE_TTL_SECONDS,
                 "document_ttl_seconds": EMBED_DOCUMENT_CACHE_TTL_SECONDS,
@@ -21839,21 +22174,109 @@ class MemoryWikiProvider(MemoryProvider):
 
 
 def _bind_memory_wiki_profile_methods() -> None:
-    """Keep each provider's calls on its own Qdrant namespace in shared hosts."""
-    for method_name, method in tuple(vars(MemoryWikiProvider).items()):
+    """Keep native home, route, document and request scopes exception-safe."""
+    global _LOADED_CODE_IDENTITY
+    methods = tuple(vars(MemoryWikiProvider).items())
+    codes = [(name, method.__code__) for name, method in methods if inspect.isfunction(method)]
+    codes.extend((name, value.__code__) for name, value in tuple(globals().items())
+                 if inspect.isfunction(value) and value.__module__ == __name__)
+    _LOADED_CODE_IDENTITY = hashlib.sha256(marshal.dumps(tuple(codes))).hexdigest()
+    for method_name, method in methods:
         if method_name.startswith("__") or not inspect.isfunction(method):
             continue
 
         def scoped(self, *args, __method=method, __name=method_name, **kwargs):
             base_home = getattr(self, "home", None) or _IMPORT_HERMES_HOME
-            home = base_home
-            if __name == "initialize":
-                home = kwargs.get("hermes_home") or base_home
-            with _profile_qdrant_scope(Path(home)), _document_profile_scope(Path(home)):
-                return __method(self, *args, **kwargs)
+            home = kwargs.get("hermes_home") or base_home if __name == "initialize" else base_home
+            if __name == "initialize" and Path(home).expanduser().resolve() != Path(base_home).resolve() and (
+                    getattr(self, "_conn", None) is not None or getattr(self, "_background_worker", None) is not None):
+                raise RuntimeError("provider_home_rebind_requires_new_instance")
+            caller_token = None
+            if _REQUEST_HOME.get() is None:
+                caller_token = _REQUEST_HOME.set(str(Path(_native_home()).expanduser().resolve()))
+            root_token = None
+            child_token = None
+            root = _RECALL_REQUEST.get()
+            tool_name = (args[0] if args else kwargs.get("tool_name")) if __name == "handle_tool_call" else None
+            entrypoint = (__name == "prefetch" or (__name == "handle_tool_call"
+                          and tool_name in {"memory_wiki_query", "memory_wiki_recall"}))
+            try:
+                with _native_profile_scope(home), _profile_qdrant_scope(Path(home)), _document_profile_scope(Path(home)):
+                    if entrypoint and root is None:
+                        root = _new_recall_request(self, tool_name if __name == "handle_tool_call" else "prefetch")
+                        root_token = _RECALL_REQUEST.set(root)
+                    child = None
+                    if __name == "_search":
+                        mode = str(kwargs.get("retrieval_mode", args[5] if len(args) > 5 else "hybrid") or "hybrid").lower()
+                        scope = _QDRANT_PROFILE_SCOPE.get() or {}
+                        def safe_name(value):
+                            return str(value) if re.fullmatch(r"[A-Za-z0-9_.-]{1,200}", str(value)) else "invalid"
+                        child = {"ordinal": len(root["searches"])+1 if root else 1,
+                                 "requested_mode": mode, "effective_mode": "none",
+                                 "route": {"profile_ready": _semantic_profile_ready(),
+                                           "reason": scope.get("__semantic_reason", "ready"),
+                                           "missing_key_names": scope.get("__missing_keys", "").split(",") if scope.get("__missing_keys") else [],
+                                           "endpoint": _validated_http_endpoint(_qdrant_url())[0] or "invalid",
+                                           "base": safe_name(_qdrant_collection()), "alias": safe_name(_qdrant_alias()),
+                                           "resolved_target": None, "contract_valid": None,
+                                           "model": EMBED_MODEL, "dimensions": QDRANT_VECTOR_SIZE,
+                                           "distance": "Cosine", "manifest_hash": _manifest_hash(_embedding_manifest())},
+                                 "lexical": {"kind": "none", "status": "not_run", "reason": "mode_selection", "visible_count": 0, "elapsed_ms": 0.0},
+                                 "embedding": {"status": "not_run", "reason": "mode_selection", "elapsed_ms": 0.0},
+                                 "qdrant": {"status": "not_run", "reason": "mode_selection", "visible_count": 0, "elapsed_ms": 0.0},
+                                 "fusion": {"items": []},
+                                 "rerank": {"status": "skipped", "reason": "not_reached", "safe_candidate_count": 0, "elapsed_ms": 0.0}}
+                        if root is not None:
+                            root["searches"].append(child)
+                        child_token = _SEARCH_RECEIPT.set(child)
+                    try:
+                        result = __method(self, *args, **kwargs)
+                    except Exception:
+                        if child is not None:
+                            child["effective_mode"] = "failed"
+                        raise
+                    if child is not None:
+                        lex = child["lexical"]; vec = child["qdrant"]
+                        child["effective_mode"] = (
+                            "hybrid" if lex["status"] == "executed" and lex["kind"] == "fts5" and vec["status"] == "executed" else
+                            "like_vector" if lex["status"] == "executed" and vec["status"] == "executed" else
+                            "vector_only" if vec["status"] == "executed" else
+                            "fts_only" if lex["status"] == "executed" and lex["kind"] == "fts5" else
+                            "like_only" if lex["status"] == "executed" else "unavailable")
+                    if __name == "_record_recall_rows" and root is not None and isinstance(result, dict):
+                        root["emitted_ids"] = list(dict.fromkeys([*root["emitted_ids"], *result]))
+                    if root_token is not None:
+                        if __name == "handle_tool_call":
+                            payload = json.loads(result)
+                            if root["entrypoint"] == "memory_wiki_query":
+                                root["emitted_ids"] = [str(row["id"]) for row in payload.get("claims", []) if row.get("id")]
+                            else:
+                                root["emitted_ids"] = [str(row["id"]) for row in payload.get("items", [])
+                                                       if row.get("kind") == "claim" and row.get("id")]
+                            # Identity is read back after the actual canonical call
+                            # (an initially closed connection remains unknown until used).
+                            root["identity"] = self._runtime_identity()
+                            payload["retrieval_receipt"] = _freeze_recall_receipt(root)
+                            result = json.dumps(payload, ensure_ascii=False)
+                        else:
+                            frozen = _freeze_recall_receipt(root)
+                            # The callback API stays str. Metadata in its delivered
+                            # text is request-local, not last-prefetch telemetry.
+                            if result:
+                                line = "\nRetrieval receipt: " + json.dumps(frozen, ensure_ascii=False, separators=(",", ":"))
+                                budget = self._prefetch_delivery_budget()
+                                if len(result) + len(line) <= budget:
+                                    result += line
+                    return result
+            finally:
+                if child_token is not None:
+                    _SEARCH_RECEIPT.reset(child_token)
+                if root_token is not None:
+                    _RECALL_REQUEST.reset(root_token)
+                if caller_token is not None:
+                    _REQUEST_HOME.reset(caller_token)
 
         setattr(MemoryWikiProvider, method_name, functools.wraps(method)(scoped))
-
 
 _bind_memory_wiki_profile_methods()
 
