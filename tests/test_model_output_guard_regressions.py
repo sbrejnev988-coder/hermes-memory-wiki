@@ -33,7 +33,7 @@ def _call(provider, name: str, **arguments):
 @pytest.fixture
 def wiki(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setenv("HERMES_SECURITY_STRICT", "0")
+    monkeypatch.setenv("HERMES_SECURITY_STRICT", "1")
     monkeypatch.setenv("MEMORY_WIKI_SEMANTIC", "0")
     monkeypatch.setenv("MEMORY_WIKI_BACKGROUND_JOBS_ENABLED", "0")
     monkeypatch.setenv("MEMORY_WIKI_LLM_PACK", "0")

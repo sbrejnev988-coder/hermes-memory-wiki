@@ -29,7 +29,7 @@ def _home(tmp_path: Path, name: str, historical: str = "") -> Path:
 
 def _module(monkeypatch, importer: Path, name: str):
     monkeypatch.setenv("HERMES_HOME", str(importer))
-    monkeypatch.setenv("HERMES_SECURITY_STRICT", "0")
+    monkeypatch.setenv("HERMES_SECURITY_STRICT", "1")
     monkeypatch.setenv("MEMORY_WIKI_DEBUG", "0")
     monkeypatch.setenv("MEMORY_WIKI_SEMANTIC", "0")
     monkeypatch.setenv("MEMORY_WIKI_EMBED_PROVIDER", "openrouter")
