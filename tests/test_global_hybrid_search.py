@@ -33,8 +33,10 @@ def _home(root: Path, name: str, *, global_search: bool = True) -> Path:
 
 def _load_module(home: Path, monkeypatch) -> object:
     monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setenv("HERMES_SECURITY_STRICT", "0")
-    monkeypatch.setenv("MEMORY_WIKI_SEMANTIC", "1")
+    monkeypatch.setenv("HERMES_SECURITY_STRICT", "1")
+    # Fixture initialization is offline; vector tests explicitly enable it
+    # after installing their HTTP/query transport. FTS controls need no probe.
+    monkeypatch.setenv("MEMORY_WIKI_SEMANTIC", "0")
     monkeypatch.setenv("MEMORY_WIKI_EMBED_PROVIDER", "stub")
     name = "memory_wiki_global_hybrid_search_test"
     spec = importlib.util.spec_from_file_location(
