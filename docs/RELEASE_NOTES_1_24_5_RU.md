@@ -28,3 +28,10 @@
 Текущий порядок: **опубликованный exact source → native installed code/readback → разрешённые YAML/ENV и saved readbacks → ручной restart владельцем → loaded/effective readbacks → отдельно разрешённые runtime/recovery проверки**. Parent readback этого среза подтверждает 15 установленных plugin targets и 355 saved-setting значений во всех пяти согласованных профилях. Это не доказательство loaded значений на другом ПК или в ещё не перезапущенном backend. Новые GUI/MCP/workers, hermes-security-core/subagent-memory и дополнительные LCM extensions не начинаются до отдельного допуска; существующая mandatory protection не откладывается. `code_stage_installed=true`, `release_accepted=false`, `native_proved=false`, `full_recovery_proved=false`.
 
 Текущий [переносимый русский Memory Stack guide](MEMORY_STACK_1_24_5_RU.md) содержит 63 ENV + 8 YAML targets и отделяет общий auto delivery cap 15000 от provider ceiling 48000 и большого ручного packing. Этот doc-only update не меняет runtime, metadata, schemas или tests E/M. Подробности prefetch: [исторический source-only срез](PREFETCH_PACKING_SOURCE_ONLY_RU.md). Исторические notes: [1.24.0](RELEASE_NOTES_1_24_0_RU.md).
+
+
+## Последующий patch: профильный hybrid recall
+
+Базовые E/M PIN выше описывают первоначальный code-stage; обновлённый routing/hybrid patch публикуется отдельными exact commits той же версии 1.24.5. Схемы и исходные metadata не изменены. Независимые FTS/vector ветви, ACL до выборочных лимитов, native owner contexts/cache и frozen canonical receipts описаны в [HYBRID_SEARCH_DIAGNOSTICS_RU.md](HYBRID_SEARCH_DIAGNOSTICS_RU.md).
+
+Сохранены 58 уникальных native synthetic cases в шести выбранных завершённых receipts (44 + 14), а не единый 58-case прогон. Первый нормальный запуск 53 cases / 7 setup failures и blocked socket receipt сохранены. Source review закрыл F1/F2/F3; новые live gateway/embedding/rerank/reindex и полный release пока не подтверждены. Strict policy, credentials и защитные отказы не ослаблялись.

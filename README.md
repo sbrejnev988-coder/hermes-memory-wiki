@@ -1086,3 +1086,8 @@ This source package includes the runtime modules required by the advertised code
 [3] https://hermes-agent.nousresearch.com/docs/reference/package-management
 [4] https://github.com/sbrejnev988-coder/hermes-memory-wiki/releases
 [5] https://api.github.com/repos/sbrejnev988-coder/hermes-memory-wiki/git/ref/heads/main
+
+
+## Профильный hybrid recall: исправление routing и диагностики
+
+Текущий source содержит независимые FTS/vector branches, ACL до LIMIT/top-K, профильные native ContextVars/cache и request-scoped `retrieval_receipt`. Исправлены topic JOIN, keyword-form calls и сохранение embedding timeout. [Русский контракт и границы доказательства](docs/HYBRID_SEARCH_DIAGNOSTICS_RU.md). Source/offline receipts не являются подтверждением loaded gateway или полной reindex/recovery readiness.
