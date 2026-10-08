@@ -1928,7 +1928,7 @@
   },
   {
     "name": "memory_wiki_reindex",
-    "description": "Re-index all active claims into Qdrant vector store.",
+    "description": "Re-index active claims into Qdrant. Opt in with current_scope_only=true for caller-visible, in-place updates of the existing owned target; dry_run=true performs read-only preflight (no embedding, creation or writes). Scope-only force is refused; default full-index behavior is unchanged.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -1937,6 +1937,14 @@
           "default": 0
         },
         "force": {
+          "type": "boolean",
+          "default": false
+        },
+        "current_scope_only": {
+          "type": "boolean",
+          "default": false
+        },
+        "dry_run": {
           "type": "boolean",
           "default": false
         }
