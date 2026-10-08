@@ -73,6 +73,7 @@ def _native_profile_scope(home):
 
 # Only this request owns its collector. Prefetch workers use detached copies.
 _REQUEST_HOME = contextvars.ContextVar("memory_wiki_request_home", default=None)
+_SCOPED_REINDEX_READ_ONLY = contextvars.ContextVar("memory_wiki_scoped_reindex_read_only", default=False)
 _RECALL_REQUEST = contextvars.ContextVar("memory_wiki_recall_request", default=None)
 _SEARCH_RECEIPT = contextvars.ContextVar("memory_wiki_search_receipt", default=None)
 _LOADED_CODE_IDENTITY = ""
@@ -3502,7 +3503,7 @@ def _detect_query_mode(q: str) -> str:
 
 def _debug_log(msg: str) -> None:
     """Запись в debug-лог если MEMORY_WIKI_DEBUG=1."""
-    if not DEBUG_MODE: return
+    if not DEBUG_MODE or _SCOPED_REINDEX_READ_ONLY.get(): return
     try:
         log_path = (
             _bound_profile_home() / "memory-wiki" / "debug.log"
@@ -4229,13 +4230,16 @@ def _qdrant_visibility_filter(
     return {"should": should}
 
 
-def _qdrant_upsert(claim_id: str, vector: List[float], payload: dict, collection: str = None) -> bool:
+def _qdrant_upsert(claim_id: str, vector: List[float], payload: dict, collection: str = None,
+                   *, create_collection: bool = True, before_write=None) -> bool:
     """Сохранить вектор в настоящем Qdrant."""
     if len(vector) != QDRANT_VECTOR_SIZE:
         _debug_log(f"qdrant vector size mismatch: expected={QDRANT_VECTOR_SIZE}, actual={len(vector)}")
         return False
     coll = collection or _active_collection_name()
-    if coll != _qdrant_alias() and not _ensure_collection(coll):
+    if coll != _qdrant_alias() and not (
+        _ensure_collection(coll) if create_collection else _ensure_collection(coll, create=False)
+    ):
         _debug_log(f"qdrant physical collection unavailable: {coll}")
         return False
     stored_payload = dict(payload or {})
@@ -4243,6 +4247,8 @@ def _qdrant_upsert(claim_id: str, vector: List[float], payload: dict, collection
         stored_payload["episode_id"] = str(claim_id)
     else:
         stored_payload["claim_id"] = str(claim_id)
+    if before_write is not None:
+        before_write()
     result = _qdrant_req(
         "PUT",
         f"/collections/{coll}/points?wait=true",
@@ -5005,7 +5011,7 @@ def _switch_alias(new_collection: str) -> bool:
     return result is not None and str(result.get("status") or "ok") == "ok"
 
 
-def _semantic_available(*, read_only: bool = False) -> bool:
+def _semantic_available(*, read_only: bool = False, read_only_target: Optional[str] = None) -> bool:
     """Check embedding/Qdrant; diagnostic reads must not embed or create collections."""
     if not SEMANTIC_ENABLED:
         _stage_receipt("qdrant", "not_run", "semantic_disabled")
@@ -5065,7 +5071,8 @@ def _semantic_available(*, read_only: bool = False) -> bool:
         return False
     if not read_only and _SEARCH_RECEIPT.get() is None:
         return _qdrant_ensure_collection()
-    target = _qdrant_resolved_active_collection()
+    # Only scoped read-only admission supplies a freshly proven physical target.
+    target = read_only_target if read_only and read_only_target is not None else _qdrant_resolved_active_collection()
     if not target:
         _stage_receipt("qdrant", "not_run", "alias_or_collection_unavailable")
         return False
@@ -8580,7 +8587,7 @@ class MemoryWikiProvider(MemoryProvider):
             {"name":"memory_wiki_journal_status","description":"Inspect append-only JSONL journal health, hash chain and recent events.","parameters":P({"verify":{"type":"boolean","default":True},"limit":{"type":"integer","default":5}}, [])},
             {"name":"memory_wiki_journal_checkpoint","description":"Write a logical JSON checkpoint of SQLite tables for journal-based recovery. Secret values are always excluded.","parameters":P({"name":{"type":"string","default":"manual"}}, [])},
             {"name":"memory_wiki_semantic_status","description":"Check embedding (:4000) and Qdrant (:6333) health and point count.","parameters":P({}, [])},
-            {"name":"memory_wiki_reindex","description":"Re-index all active claims into Qdrant vector store.","parameters":P({"limit":{"type":"integer","default":0},"force":{"type":"boolean","default":False}}, [])},
+            {"name":"memory_wiki_reindex","description":"Re-index active claims into Qdrant. Opt in with current_scope_only=true for caller-visible, in-place updates of the existing owned target; dry_run=true performs read-only preflight (no embedding, creation or writes). Scope-only force is refused; default full-index behavior is unchanged.","parameters":P({"limit":{"type":"integer","default":0},"force":{"type":"boolean","default":False},"current_scope_only":{"type":"boolean","default":False},"dry_run":{"type":"boolean","default":False}}, [])},
             {"name":"memory_wiki_debug_search","description":"Search with full breakdown: FTS rank, vector rank, RRF score per claim.","parameters":P({"query":{"type":"string"},"limit":{"type":"integer","default":10},"topic":{"type":"string","default":""}}, ["query"])},
             {"name":"memory_wiki_compare_search","description":"Compare FTS-only vs vector-only vs hybrid retrieval.","parameters":P({"query":{"type":"string"},"limit":{"type":"integer","default":10},"topic":{"type":"string","default":""}}, ["query"])},
             {"name":"memory_wiki_query_mode","description":"Detect query type (technical/semantic/mixed) without searching.","parameters":P({"query":{"type":"string"}}, ["query"])},
@@ -8659,6 +8666,22 @@ class MemoryWikiProvider(MemoryProvider):
                 ),
             )
         _journal_capture_id = str(a.pop("__journal_capture_id", "") or "")
+
+        if tool_name == "memory_wiki_reindex":
+            # New booleans are exact, not truthy/coerced authority. Dispatch the
+            # opt-in before lazy migration and full-corpus journal/checkpoints.
+            if any(type(a.get(key, False)) is not bool for key in ("current_scope_only", "dry_run")):
+                return tool_result(success=False, error="invalid_arguments")
+            if a.get("dry_run", False) and not a.get("current_scope_only", False):
+                return tool_result(success=False, error="dry_run_requires_current_scope_only")
+            if a.get("current_scope_only", False):
+                if (set(a) - {"limit", "force", "current_scope_only", "dry_run"}
+                        or type(a.get("force", False)) is not bool
+                        or type(a.get("limit", 0)) is not int or a.get("limit", 0) < 0):
+                    return tool_result(success=False, error="invalid_arguments")
+                outcome = self._reindex(a.get("limit", 0), a.get("force", False),
+                                        current_scope_only=True, dry_run=a.get("dry_run", False))
+                return tool_result(success=bool(outcome.get("ok")), **outcome)
 
         # Secret value writes, migrations and scrub passes are local-admin only.
         # Fail closed even if a caller bypasses tools/list and invokes a hidden
@@ -21761,8 +21784,26 @@ class MemoryWikiProvider(MemoryProvider):
             "last_prefetch": dict(getattr(self, "_last_prefetch_diagnostics", {}) or {}),
         }
 
-    def _reindex(self, limit: int = 0, force: bool = False) -> Dict[str,Any]:
+    def _reindex(self, limit: int = 0, force: bool = False, *,
+                 current_scope_only: bool = False, dry_run: bool = False) -> Dict[str,Any]:
         """Build an immutable collection, retry failed IDs, then atomically switch the alias."""
+        if type(current_scope_only) is not bool or type(dry_run) is not bool:
+            return {"ok": False, "error": "invalid_arguments"}
+        if dry_run and not current_scope_only:
+            return {"ok": False, "error": "dry_run_requires_current_scope_only"}
+        if current_scope_only:
+            if type(force) is not bool or type(limit) is not int or limit < 0:
+                return {"ok": False, "error": "invalid_arguments"}
+            if force:
+                return {"ok": False, "current_scope_only": True, "dry_run": dry_run,
+                        "status": "refused", "alias_switched": False,
+                        "error": "scope_force_would_replace_shared_coverage"}
+            from .current_scope_reindex import reindex
+            token = _SCOPED_REINDEX_READ_ONLY.set(dry_run)
+            try:
+                return reindex(self, sys.modules[__name__], limit, dry_run=dry_run)
+            finally:
+                _SCOPED_REINDEX_READ_ONLY.reset(token)
         if not SEMANTIC_ENABLED:
             return {"ok": False, "error": "semantic disabled"}
         if not EMBED_CONTRACT_VALID:
@@ -22374,7 +22415,23 @@ def _bind_memory_wiki_profile_methods() -> None:
                 if caller_token is not None:
                     _REQUEST_HOME.reset(caller_token)
 
-        setattr(MemoryWikiProvider, method_name, functools.wraps(method)(scoped))
+        bound = functools.wraps(method)(scoped)
+        if method_name == "handle_tool_call":
+            def bounded_scope_dispatch(self, tool_name, args, __dispatch=bound, **kwargs):
+                if (tool_name != "memory_wiki_reindex" or not isinstance(args, dict)
+                        or args.get("current_scope_only") is not True):
+                    return __dispatch(self, tool_name, args, **kwargs)
+                try:
+                    return __dispatch(self, tool_name, args, **kwargs)
+                except Exception:
+                    # Includes scoped imports, profile setup/cleanup and handler
+                    # prerequisites; no retry, replacement connection or journal.
+                    return tool_result(success=False, ok=False, status="refused",
+                                       current_scope_only=True, dry_run=args.get("dry_run") is True,
+                                       alias_switched=False, attempts=0, ok_count=0, failed=0,
+                                       error="scope_preflight_failed")
+            bound = functools.wraps(method)(bounded_scope_dispatch)
+        setattr(MemoryWikiProvider, method_name, bound)
 
 _bind_memory_wiki_profile_methods()
 
