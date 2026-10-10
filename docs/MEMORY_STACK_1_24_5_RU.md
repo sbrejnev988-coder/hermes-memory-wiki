@@ -6,6 +6,8 @@
 
 Точные primary E и metadata-only secondary M указываются последующим doc-only binding после создания настоящих commits; raw SHA256 source никогда не используется как Git PIN. Пока remote readback этих новых refs не выполнен, они не называются опубликованными или пригодными для remote install. Старые E42d2/M02eed и current-main 6a748/a503 — исторические checkpoints, не current feature PIN. Сканирование, install/PM/liveness, собственные rollout markers и owner reload проверяются координатором отдельно.
 
+SOURCE и offline wheel build фактически выполнены один раз на первоначальном локальном commit `b035eace1ba1726a6c8da661e6c5f0e66ede31ea`: **6/6 SOURCE-групп, 55 public handler calls, child exit 0**, build exit 0. Последующие изменения — документация и cold-partition metadata; на новых PIN эти прогоны **не повторялись**. Проверено byte correspondence: все 35 runtime-файлов и все 42 packaged source/support members совпадают с проверенным payload. Сохранённый wheel SHA256 `c9d5b3fabd85e985169c1722e9efec7509e60e2abd600a0fdaf87f0322aa34dc`; **48 уникальных ZIP members = 48 RECORD rows**, hashes/размеры/CRC проверены. Это перенос доказательства по точным bytes, не новое исполнение на текущем PIN и не native E2E/installed/loaded/services/billing/whole-release proof. Перед остальными профилями нужен отдельный настоящий default pilot на опубликованном code PIN через штатный public dispatch, без SDK stand-ins.
+
 Регрессионные границы и cold-process prerequisites: [TEST_CONTRACT.md](TEST_CONTRACT.md). SOURCE-only PASS, package readback, сохранённые settings, installed source и loaded/runtime/full-recovery — разные доказательства.
 
 > **Целевой режим, а не отчёт «всё уже работает».** Memory Wiki — долгосрочная память; LCM-X — история и сжатие контекста; PPLX — независимая оценка результатов. Ни версии, ни saved settings не доказывают загрузку работающим процессом, полноту индекса, native lifecycle или восстановление данных.
@@ -296,7 +298,7 @@ Wiki retrieval/rerank/cache/outbox constants частично captured при im
 |---|---|
 | Source и owner | Новый PID/start time, loaded module/source PIN и собственный chat/store/launch owner; manifest version без source не достаточно |
 | Selection | `plugins list --user --json`, `config get memory.provider`, `config get context.engine`; YAML/registration не feature proof |
-| Saved settings | Все 8 YAML/63 ENV через actual readers; effective process overrides и snapshot отдельно |
+| Saved settings | Все 8 YAML/65 ENV (73 readbacks на профиль) через actual readers; effective process overrides и snapshot отдельно |
 | LCM | Native `lcm_status`: version/engine identity, threshold 0.78 и source, privacy settings/active config; tools existence не capture/compaction/recovery proof |
 | Wiki budgets | Effective importer constants, owner host cap 15000, getter versus cached host spill snapshot; не private cache patch |
 | Prefetch | В рамках отдельно разрешённого наблюдения whole guarded rendered units и финальные counters, budget/deadline/withheld/cancellation, actual model-bound length ≤15000; below-cap пример не доказывает все будущие запросы |
