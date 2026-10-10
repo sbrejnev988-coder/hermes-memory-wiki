@@ -1,0 +1,20 @@
+Historical G4-only BEFORE oracle. Not a current-source or native trust receipt.
+original_test_sha256=ae3ec98617dfc3b990aa5e6a9c7939339aaecbccae88e4157dfc0c8310fa03ee
+
+def test_08_direct_boundary_preservation_and_network_denial(self):
+        global NETWORK_EXPECTED
+        baseline = Path(os.environ['G4_BASE'])
+        before = (baseline/'google_drive_source_adapter.py').read_bytes()
+        after = (SOURCE/'google_drive_source_adapter.py').read_bytes()
+        self.assertEqual(before[before.index(b'def _metadata('):], after[after.index(b'def _metadata('):])
+        self.assertEqual((baseline/'__init__.py').read_bytes(), (SOURCE/'__init__.py').read_bytes())
+        self.assertEqual(hashlib.sha256((FIX/'app/lib/hermes_trust_core.py').read_bytes()).hexdigest(),
+                         '9d9b3aac80bea5f1aba6ac289a3647b5b3a1fc9bf9d60e0fd920390b5544638b')
+        NETWORK_EXPECTED = True
+        try:
+            with self.assertRaises(NetworkDenied):
+                socket.socket()
+        finally:
+            NETWORK_EXPECTED = False
+        self.assertEqual(NETWORK_EVENTS,[{'event':'socket.__new__','expected':True}])
+        self.assertNotIn('agent.memory_provider',sys.modules)

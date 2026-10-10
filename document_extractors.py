@@ -908,9 +908,9 @@ def _extract_pdf_pypdf(path: Path, max_units: int, max_pages: int) -> Optional[E
     return ExtractedDocument("pypdf", "application/pdf", meta.get("Title") or path.stem, units, metadata=meta)
 
 
-def extract_image_ocr(path: Path, max_chars: int, language: str, timeout: int) -> ExtractedDocument:
-    exe = os.environ.get("MEMORY_WIKI_TESSERACT_BIN", "tesseract")
-    cmd = [exe, str(path), "stdout", "-l", language, "--psm", os.environ.get("MEMORY_WIKI_OCR_PSM", "3")]
+def extract_image_ocr(path: Path, max_chars: int, language: str, timeout: int,
+                      *, executable: str = "tesseract", psm: str = "3") -> ExtractedDocument:
+    cmd = [executable, str(path), "stdout", "-l", language, "--psm", psm]
     try:
         proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout, check=False)
     except FileNotFoundError:
@@ -935,6 +935,30 @@ def _is_loopback_http_url(value: str) -> bool:
         return False
 
 
+def _tika_request_identity(value: str) -> str:
+    """Opaque identity for the complete URL used by the loopback PUT.
+
+    Preserve query order, repeated keys, escapes and userinfo as sent, not a
+    lossy semantic projection. Existing loopback admission uses hostname even
+    with userinfo; this does not create an auth route. Never persist the URL,
+    query, credentials or the effective options dict; only this digest escapes.
+    """
+    if not value:
+        return ""
+    try:
+        if not isinstance(value, str) or len(value) > 8192:
+            raise ValueError
+        if any(ord(char) <= 32 or ord(char) == 127 for char in value):
+            raise ValueError
+        raw = value.encode("utf-8")
+        if len(raw) > 8192 or not _is_loopback_http_url(value):
+            raise ValueError
+        urllib.parse.urlsplit(value).port  # Validate the same endpoint before cache/dispatch.
+    except (TypeError, ValueError, UnicodeError):
+        raise ValueError("invalid loopback Tika request URL") from None
+    return sha256_bytes(raw)
+
+
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     """Reject redirects before urllib can resend untrusted document bytes."""
 
@@ -947,8 +971,7 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 def extract_tika(path: Path, *, tika_url: str, timeout: int, max_chars: int) -> ExtractedDocument:
     if not tika_url:
         return ExtractedDocument("none", _mime_for(path), path.stem, [], warnings=["no parser available and Tika disabled"], status="unsupported")
-    if not _is_loopback_http_url(tika_url):
-        raise ValueError("Tika URL must be loopback-only")
+    _tika_request_identity(tika_url)
     data = path.read_bytes()
     req = urllib.request.Request(tika_url, data=data, method="PUT", headers={"Accept": "text/plain", "Content-Type": _mime_for(path)})
     try:
@@ -972,8 +995,58 @@ def extract_tika(path: Path, *, tika_url: str, timeout: int, max_chars: int) -> 
                              metadata={"encoding": encoding, "truncated": truncated}, warnings=warnings)
 
 
+def effective_extraction_options(options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Normalize the values the parser actually consumes, not caller aliases."""
+    o = dict(options or {})
+    bounded = lambda key, default, lo, hi: max(lo, min(int(o.get(key, default)), hi))
+    max_bytes = int(o.get("max_bytes", 128 * 1024 * 1024))
+    return {
+        "max_bytes": max_bytes,
+        "max_units": bounded("max_units", 100_000, 1, 1_000_000),
+        "max_cells": bounded("max_cells", 500_000, 1, 5_000_000),
+        "max_pages": bounded("max_pages", 10_000, 1, 100_000),
+        "max_chars": bounded("max_chars", 100_000_000, 1000, 500_000_000),
+        "zip_max_entries": bounded("zip_max_entries", 50_000, 10, 1_000_000),
+        "zip_expansion_factor": bounded("zip_expansion_factor", 8, 1, 100),
+        "zip_max_ratio": bounded("zip_max_ratio", 200, 5, 10_000),
+        "zip_max_member": bounded("zip_max_member", 16 * 1024 * 1024, 1024 * 1024, max_bytes),
+        "ocr": bool(o.get("ocr", False)),
+        "ocr_language": str(o.get("ocr_language", "eng+rus")),
+        "ocr_min_native_chars": int(o.get("ocr_min_native_chars", 40)),
+        "tesseract_bin": str(o.get("tesseract_bin", os.environ.get("MEMORY_WIKI_TESSERACT_BIN", "tesseract"))),
+        "ocr_psm": str(o.get("ocr_psm", os.environ.get("MEMORY_WIKI_OCR_PSM", "3"))),
+        "external_timeout": int(o.get("external_timeout", 90)),
+        "tika_url": str(o.get("tika_url") or ""),
+    }
+
+
+def extraction_options_fingerprint(path: Path, options: Dict[str, Any]) -> str:
+    """Content-affecting parser axes; deadlines and embedding routes are absent."""
+    o = effective_extraction_options(options)
+    ext = path.suffix.lower()
+    keys = {"max_bytes", "max_units"}
+    if ext in OOXML_EXTENSIONS | ODF_EXTENSIONS | EBOOK_EXTENSIONS:
+        keys.update({"zip_max_entries", "zip_expansion_factor", "zip_max_ratio", "zip_max_member"})
+    if ext in {".xlsx", ".xlsm", ".xltx"}: keys.add("max_cells")
+    if ext in PDF_EXTENSIONS: keys.update({"max_pages", "max_chars", "ocr"})
+    if ext in IMAGE_EXTENSIONS: keys.update({"max_chars", "ocr"})
+    if ext in PDF_EXTENSIONS | IMAGE_EXTENSIONS and o["ocr"]:
+        keys.add("ocr_language")
+        if ext in PDF_EXTENSIONS: keys.add("ocr_min_native_chars")
+        else: keys.update({"tesseract_bin", "ocr_psm"})
+    material = {k: o[k] for k in sorted(keys)}
+    if ext in PDF_EXTENSIONS or ext not in SUPPORTED_EXTENSIONS - LEGACY_OFFICE_EXTENSIONS:
+        # Hash the whole bounded request URL, including query, only in memory.
+        # URI/query credentials must never be persisted as plaintext material.
+        material["tika_parser"] = _tika_request_identity(o["tika_url"])
+        material["max_chars"] = o["max_chars"]
+    material["extractor_version"] = EXTRACTOR_VERSION
+    material["secret_policy_version"] = SECRET_POLICY_VERSION
+    return sha256_bytes(json.dumps(material, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode())
+
+
 def extract_document(path: Path, options: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    options = dict(options or {})
+    options = effective_extraction_options(options)
     path = path.expanduser().resolve(strict=True)
     if path.is_symlink() or not path.is_file():
         raise ValueError("document path must be a regular non-symlink file")
@@ -1019,8 +1092,9 @@ def extract_document(path: Path, options: Optional[Dict[str, Any]] = None) -> Di
                                   timeout=int(options.get("external_timeout", 90)), max_chars=max_chars)
     elif ext in IMAGE_EXTENSIONS:
         if bool(options.get("ocr", False)):
-            result = extract_image_ocr(path, max_chars, str(options.get("ocr_language", "eng+rus")),
-                                       int(options.get("external_timeout", 90)))
+            result = extract_image_ocr(path, max_chars, options["ocr_language"],
+                                       options["external_timeout"], executable=options["tesseract_bin"],
+                                       psm=options["ocr_psm"])
         else:
             result = ExtractedDocument("none", _mime_for(path), path.stem, [],
                                        warnings=["image OCR disabled"], status="metadata_only")

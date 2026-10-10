@@ -30,7 +30,8 @@ _PATTERN_REMEMBER = re.compile(
     r"(?:\bзапомни(?:те)?\b|\bremember\b|\bnote this\b|\bstore this\b|\bkeep in mind\b)\s*[:,-]?\s*(.+?)(?:(?<=[.!?])\s|$)", re.I,
 )
 _PATTERN_PREFERENCE = re.compile(
-    r"(?:\bя\s+(?:всегда|никогда|предпочитаю|люблю|ненавижу)\b|\bI\s+(?:always|never|prefer|love|hate)\b)\s+(.+?)(?:(?<=[.!?])\s|$)", re.I,
+    # Retain the actor and stance, not just the object after never/hate.
+    r"((?:\bя\s+(?:всегда|никогда|предпочитаю|люблю|ненавижу)\b|\bI\s+(?:always|never|prefer|love|hate)\b)\s+.+?)(?:(?<=[.!?])\s|$)", re.I,
 )
 _PATTERN_DECISION = re.compile(
     r"(?:\bрешено\b|\bреш(?:ил|или|ила)\b|\bdecision\b|\bdecided\b)\s*[:,-]?\s*(.+?)(?:(?<=[.!?])\s|$)", re.I,
@@ -382,6 +383,10 @@ def _heuristic_extract(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if message["role"] != "user" or _INJECTION_RE.search(message["content"]):
             continue
         occupied: List[Tuple[int, int]] = []
+        quoted_spans = [row.span() for row in re.finditer(
+            r'"[^"]*(?:"|$)|«[^»]*(?:»|$)|“[^”]*(?:”|$)|(?<!\w)\'[^\']*(?:\'|$)|`[^`]*(?:`|$)',
+            message["content"], re.S,
+        )]
         for pattern, claim_type in (
             # Specific durable semantics win when they appear inside a broad
             # "remember this" span; overlapping matches are one candidate.
@@ -391,16 +396,54 @@ def _heuristic_extract(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             for match in pattern.finditer(message["content"]):
                 if any(match.start() < end and match.end() > start for start, end in occupied):
                     continue
+                # Reserve rejected specific spans too: a broad remember match
+                # must not resurrect quoted/ambiguous speech as an owner fact.
+                occupied.append(match.span())
                 raw_claim = " ".join(str(match.group(1)).split()).strip(" -:,.\t\r\n")
                 evidence_quote = match.group(0).strip()
-                if 10 < len(raw_claim) <= 2000 and not _TRIVIAL_RE.match(raw_claim):
-                    occupied.append(match.span())
-                    claims.append({
-                        "claim": _attribute_claim(raw_claim, "user", claim_type), "type": claim_type, "topic": "general",
-                        "evidence_quote": evidence_quote, "speaker": "user", "message_index": message["message_index"],
-                        "event_at": message["event_at"], "event_timezone": message["event_timezone"],
-                        "confidence": 0.78, "source": "extractor:heuristic",
-                    })
+                if (not (10 < len(raw_claim) <= 2000) or _TRIVIAL_RE.match(raw_claim)
+                        or any(start <= match.start(1) < end for start, end in quoted_spans)
+                        or not _claim_supported(raw_claim, evidence_quote)):
+                    continue
+                if claim_type == "preference" or _negation_spans(raw_claim):
+                    scope_start, scope_end = next(
+                        (start, end) for start, end in _lexical_sentence_spans(message["content"])
+                        if start <= match.start() < end
+                    )
+                    scope_start += len(message["content"][scope_start:scope_end]) - len(
+                        message["content"][scope_start:scope_end].lstrip())
+                    if claim_type == "preference":
+                        if message["content"][scope_start:scope_end].rstrip().endswith("?"):
+                            continue
+                        # Only direct first-person speech, optionally after a
+                        # literal memory directive. Names, quotes and reported
+                        # speech before I/я confer no owner attribution.
+                        directive = _PATTERN_REMEMBER.match(message["content"], scope_start, scope_end)
+                        if match.start() != scope_start and not (
+                                directive and directive.start(1) == match.start()):
+                            continue
+                        grounding_start = match.start()
+                        grounding_quote = evidence_quote
+                        assertions = _lexical_assertions(raw_claim, require_complete=True)
+                        if not assertions or any(
+                                row.get("actor") not in {("i",), ("я",)} for row in assertions):
+                            continue
+                    else:
+                        # Strip only this root directive for lexical comparison;
+                        # retain its full literal quote in durable evidence.
+                        if match.start() != scope_start:
+                            continue
+                        grounding_start = match.start(1)
+                        grounding_quote = match.group(1).strip()
+                    if not _quote_preserves_negation(
+                            raw_claim, grounding_quote, message["content"][grounding_start:scope_end]):
+                        continue
+                claims.append({
+                    "claim": _attribute_claim(raw_claim, "user", claim_type), "type": claim_type, "topic": "general",
+                    "evidence_quote": evidence_quote, "speaker": "user", "message_index": message["message_index"],
+                    "event_at": message["event_at"], "event_timezone": message["event_timezone"],
+                    "confidence": 0.78, "source": "extractor:heuristic",
+                })
     return claims
 
 
@@ -569,7 +612,12 @@ def _attribute_claim(claim: str, speaker: str, claim_type: str = "fact") -> str:
         # label, so use an explicit durable attribution that survives storage.
         russian = bool(re.search(r"[А-Яа-яЁё]", normalized))
         if claim_type == "preference":
-            prefix = "Пользователь предпочитает: " if russian else "User prefers: "
+            # A preference's type is not its stance. Never turn a literal
+            # dislike or constraint into a positive "prefers" relationship.
+            if _negation_spans(normalized) or re.search(r"\b(?:hates?|ненавижу|ненавидит)\b", lower):
+                prefix = "Предпочтение пользователя: " if russian else "User preference: "
+            else:
+                prefix = "Пользователь предпочитает: " if russian else "User prefers: "
         elif claim_type == "decision":
             prefix = "Пользователь решил: " if russian else "User decided: "
         elif claim_type == "procedure":
@@ -1201,12 +1249,21 @@ def _deduplicate(entries: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def _evidence_payload(entry: Dict[str, Any], session_id: str) -> str:
-    return json.dumps({
+    payload = json.dumps({
         "schema": "memory-wiki-extraction-evidence-v1", "session_id": str(session_id or "")[:300],
         "speaker": entry["speaker"], "message_index": int(entry["message_index"]),
         "evidence_quote": entry["evidence_quote"], "event_at": int(entry.get("event_at") or 0),
         "event_timezone": entry.get("event_timezone") or "UTC", "extractor": entry["source"],
     }, ensure_ascii=False, sort_keys=True)
+    # Preparation's prose shortener collapses whitespace even inside JSON
+    # strings. Escape significant literal whitespace without changing the schema
+    # or the decoded source quote; ordinary separator spaces remain unchanged.
+    payload = re.sub(r" {2,}|[^\S\x20]", lambda match: "".join(
+        f"\\u{ord(char):04x}" for char in match.group()), payload)
+    # Bound the final escaped JSON before preparation can shorten it.
+    if len(payload) > 2000:
+        raise ValueError("extraction evidence exceeds 2000 characters")
+    return payload
 
 
 def extract_session_claims(

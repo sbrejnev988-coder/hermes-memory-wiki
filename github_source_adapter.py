@@ -156,6 +156,42 @@ def _decode_file(response_body: bytes, *, requested_path: str) -> tuple[str, str
     return text, oid
 
 
+def _complete_cached_source(provider: Any, key: str, scope_id: str, repository_id: str,
+                            *, embed: bool) -> dict[str, Any]:
+    import hashlib
+    connectors.authorize_write(provider, key)
+    conn = provider._connect()
+    record = conn.execute("SELECT * FROM external_sources WHERE source_key=?", (key,)).fetchone()
+    if record is None or str(record["status"]) != "active":
+        raise ValueError("connector_cache_requires_download")
+    source_id = str(record["document_source_id"])
+    source = conn.execute("SELECT * FROM document_sources WHERE source_id=?", (source_id,)).fetchone()
+    revision = conn.execute("SELECT file_hash,status FROM document_revisions WHERE revision_id=? AND source_id=?",
+                            (source["revision_id"], source_id)).fetchone() if source is not None else None
+    if (source is None or not int(source["active"] or 0) or revision is None or revision["status"] != "active"
+            or str(record["scope_id"]) != scope_id or str(record["repository_id"]) != repository_id
+            or str(source["scope_id"]) != scope_id or str(source["repository_id"]) != repository_id
+            or source["file_hash"] != record["content_hash"] or revision["file_hash"] != source["file_hash"]):
+        raise ValueError("connector_cache_requires_download")
+    staged = connectors._record_snapshot_path(provider, key)
+    try:
+        checked = connectors.documents._allowed_path(staged)
+        if (Path(source["source_path"]).resolve() != checked.resolve()
+                or connectors.documents._source_id(checked) != source_id
+                or checked.stat().st_size > connectors.MAX_RECORD_BYTES + 1000
+                or hashlib.sha256(checked.read_bytes()).hexdigest() != record["content_hash"]):
+            raise ValueError("connector_cache_requires_download")
+    except (OSError, ValueError, PermissionError) as exc:
+        raise ValueError("connector_cache_requires_download") from exc
+    result = {"status": "unchanged", "source_key": key, "source_id": source_id,
+              "revision_id": str(source["revision_id"]), "scope_id": scope_id, "repository_id": repository_id}
+    if embed:
+        result["embedding"] = connectors.documents.embed_pending_documents(provider, {
+            "source_id": source_id, "scope_id": scope_id, "repository_id": repository_id, "limit": 200,
+        })
+    return result
+
+
 def sync_file(provider: Any, args: dict[str, Any]) -> dict[str, Any]:
     owner, repo, path, ref = _identity(args)
     scope_id, repository_id = connectors._scope(
@@ -208,10 +244,8 @@ def sync_file(provider: Any, args: dict[str, Any]) -> dict[str, Any]:
             if status == 304:
                 if not prior_etag:
                     raise ValueError("github_unexpected_not_modified")
-                return {"status": "unchanged", "source_key": key,
-                        "source_id": str(existing["document_source_id"]),
-                        "scope_id": scope_id, "repository_id": repository_id,
-                        "conditional_hit": True}
+                return {**_complete_cached_source(provider, key, scope_id, repository_id,
+                                               embed=bool(args.get("embed", False))), "conditional_hit": True}
             if status != 200:
                 raise ValueError(f"github_http_error:{status}")
             length = response_headers.get("Content-Length")
@@ -230,10 +264,8 @@ def sync_file(provider: Any, args: dict[str, Any]) -> dict[str, Any]:
                 provider._github_rate_limit_until = time.time() + _retry_after(response_headers)
     except urllib.error.HTTPError as exc:
         if exc.code == 304 and prior_etag:
-            return {"status": "unchanged", "source_key": key,
-                    "source_id": str(existing["document_source_id"]),
-                    "scope_id": scope_id, "repository_id": repository_id,
-                    "conditional_hit": True}
+            return {**_complete_cached_source(provider, key, scope_id, repository_id,
+                                           embed=bool(args.get("embed", False))), "conditional_hit": True}
         if exc.code in {403, 429}:
             retry = _retry_after(exc.headers)
             provider._github_rate_limit_until = time.time() + retry

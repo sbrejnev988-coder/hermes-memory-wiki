@@ -1,0 +1,28 @@
+def _metadata(provider: Any, file_id: str, token: str) -> dict[str, Any]:
+    fields = "id,name,mimeType,size,md5Checksum,version,trashed,capabilities(canDownload)"
+    url = (f"https://www.googleapis.com/drive/v3/files/{file_id}?"
+           + urllib.parse.urlencode({"fields": fields, "supportsAllDrives": "true"}))
+    raw = _request(provider, url, token, _MAX_META_BYTES)
+    try:
+        item = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, ValueError) as exc:
+        raise ValueError("drive_invalid_metadata") from exc
+    if (not isinstance(item, dict) or item.get("id") != file_id
+            or item.get("trashed") is not False
+            or not isinstance(item.get("capabilities"), dict)
+            or item["capabilities"].get("canDownload") is not True):
+        raise ValueError("drive_file_not_downloadable")
+    mime = str(item.get("mimeType") or "")
+    if mime not in _BLOB_MIME and mime != _DOC_MIME:
+        raise ValueError("drive_unsupported_text_type")
+    version = str(item.get("version") or "")
+    if not version.isdigit() or len(version) > 30:
+        raise ValueError("drive_invalid_revision")
+    if mime != _DOC_MIME:
+        try:
+            size = int(item.get("size"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("drive_invalid_size") from exc
+        if size < 0 or size > connectors.MAX_RECORD_BYTES:
+            raise ValueError("drive_file_too_large")
+    return item

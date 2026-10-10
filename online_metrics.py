@@ -111,6 +111,26 @@ def record_path(db_path: str | Path, operation: str, outcome: str, duration_ms: 
     """
     if not enabled():
         return False
+    # A recall's actual upper owner commits this exact sample only together
+    # with its admitted delivery. The callback still runs before final read.
+    try:
+        from .disclosure_fence import current_delivery
+    except ImportError:
+        from disclosure_fence import current_delivery
+    delivery = current_delivery()
+    if delivery is not None:
+        if Path(db_path).resolve() != Path(delivery.provider.db_path).resolve():
+            return False
+        if operation not in OPERATIONS or outcome not in OUTCOMES:
+            return False
+        conn = delivery.provider._conn
+        if conn is None or conn.execute("SELECT 1 FROM sqlite_master WHERE name='memory_online_metrics' AND type='table'").fetchone() is None:
+            return False  # ordinary unavailable telemetry is not permission
+        duration = _duration(duration_ms)
+        day = int(time.time()) // 86400
+        delivery.queue('metric', (day, operation, outcome, _bucket(duration), duration, duration))
+        delivery.queue('metric_expire', (day - retention_days() + 1,))
+        return True
     path = Path(db_path)
     if not path.is_file():
         return False

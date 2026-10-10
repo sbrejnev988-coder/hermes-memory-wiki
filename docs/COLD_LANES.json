@@ -1,0 +1,1334 @@
+{
+  "schema": "memory-stack.current-source-cold-lanes/v1",
+  "status": "SOURCE_CHECKPOINT_NOT_NATIVE_ADMISSION",
+  "frozen_provider_sha256": "6edf7c9bf9b8059f68495f221564a53a67801692fa5b8a4bb825ee2a820113bd",
+  "needs_final_rebind": false,
+  "input_inventory_sha256": null,
+  "cold_processes": {
+    "strict": {
+      "HERMES_SECURITY_STRICT": "1",
+      "targets": [
+        "tests/test_hybrid_runtime_receipts.py",
+        "tests/test_postinstall_admission_routes.py"
+      ],
+      "core": {
+        "selected_revision": null,
+        "origin": null,
+        "resolved_closure": null
+      },
+      "trust_core": {
+        "public_delivery_origin": null,
+        "sha256": null
+      }
+    },
+    "legacy": {
+      "HERMES_SECURITY_STRICT": "0",
+      "targets": [
+        "tests/audit_native_helpers_20261003.py",
+        "tests/ci_owned/binding_cases.py",
+        "tests/ci_owned/contract_cases.py",
+        "tests/ci_owned/entry_cases.py",
+        "tests/ci_owned/exit_cases.py",
+        "tests/ci_owned/recovery_cases.py",
+        "tests/ci_owned/test_output_admission.py",
+        "tests/conftest.py",
+        "tests/fixtures/primitive_guard_a9d5016e.py",
+        "tests/helpers/audit_native_helpers_20261003.py",
+        "tests/helpers/conftest.py",
+        "tests/helpers/legacy_recall_sqlite_helpers_20261003.py",
+        "tests/helpers/owned_fd_audit.py",
+        "tests/helpers/provider_lifecycle.py",
+        "tests/helpers/test_fixture_provider_ownership.py",
+        "tests/helpers/test_native_helper_singleton.py",
+        "tests/helpers/test_native_owner_boundaries.py",
+        "tests/helpers/test_native_owner_retry.py",
+        "tests/helpers/test_native_race_teardown.py",
+        "tests/repair_41aaaa6/test_manifest_repository_scope_regression.py",
+        "tests/repair_41aaaa6/test_pack_context_repository_guard.py",
+        "tests/repair_41aaaa6/test_repository_scoping_regression.py",
+        "tests/repair_41aaaa6/test_schema_parity_repository_scope.py",
+        "tests/test_acl_aware_reindex.py",
+        "tests/test_atomic_transaction.py",
+        "tests/test_attest_preference_cli.py",
+        "tests/test_audit_bundle_checker_20261003.py",
+        "tests/test_audit_conflicts_20261003.py",
+        "tests/test_audit_decay_20261003.py",
+        "tests/test_audit_guard_20261003.py",
+        "tests/test_audit_guard_security_diagnostics_20261003.py",
+        "tests/test_audit_native_integration_20261003.py",
+        "tests/test_audit_package_contracts_20261003.py",
+        "tests/test_audit_recall_hardening_20261003.py",
+        "tests/test_audit_release_error_20261003.py",
+        "tests/test_background_jobs.py",
+        "tests/test_benchmark_provenance.py",
+        "tests/test_claim_auxiliary_privacy.py",
+        "tests/test_claim_edit_partition_hash.py",
+        "tests/test_code_graph_idempotency_atomicity.py",
+        "tests/test_code_graph_no_implicit_drain.py",
+        "tests/test_code_graph_pem_redaction.py",
+        "tests/test_code_graph_prefetch_scope.py",
+        "tests/test_code_graph_scope_acl_regression.py",
+        "tests/test_code_graph_snapshot_lifecycle.py",
+        "tests/test_code_recovery_artifact_keyed_secret.py",
+        "tests/test_code_recovery_artifact_redaction.py",
+        "tests/test_code_shrinker_bridge.py",
+        "tests/test_code_shrinker_state_machine_fault_matrix.py",
+        "tests/test_continuation_code_boundary.py",
+        "tests/test_continuation_context_boundary.py",
+        "tests/test_d2_f1_rendering.py",
+        "tests/test_debug_log_path.py",
+        "tests/test_document_archival_acl_regression.py",
+        "tests/test_document_auto_embed_pending.py",
+        "tests/test_document_auto_journal_cooldown.py",
+        "tests/test_document_auto_scope_and_roots.py",
+        "tests/test_document_cross_scope_ingest.py",
+        "tests/test_document_embed_pending_safety.py",
+        "tests/test_document_embedding_evidence.py",
+        "tests/test_document_graph_local_audit_fixes.py",
+        "tests/test_document_inbox_bounds.py",
+        "tests/test_document_inbox_terminal_state.py",
+        "tests/test_document_index_temporal_isolation.py",
+        "tests/test_document_ingest_snapshot.py",
+        "tests/test_document_ooxml_member_limit.py",
+        "tests/test_document_profile_home_isolation.py",
+        "tests/test_document_query_source_artifacts.py",
+        "tests/test_document_recovery_g1_native.py",
+        "tests/test_document_scan_bounds.py",
+        "tests/test_document_scan_ingest_boundary_p1.py",
+        "tests/test_document_scope_access.py",
+        "tests/test_document_secret_redaction_quotes.py",
+        "tests/test_document_shared_claim_lifecycle.py",
+        "tests/test_document_snapshot_boundary.py",
+        "tests/test_document_stat_fast_path.py",
+        "tests/test_document_state_g1_native.py",
+        "tests/test_document_terminal_g1_native.py",
+        "tests/test_document_unit_budget.py",
+        "tests/test_document_unit_budget_extended.py",
+        "tests/test_document_windows_job_limits.py",
+        "tests/test_document_windows_short_path_alias.py",
+        "tests/test_document_worker_admission.py",
+        "tests/test_document_worker_admission_fail_closed.py",
+        "tests/test_document_worker_blocked_input.py",
+        "tests/test_document_worker_env_limits.py",
+        "tests/test_document_worker_exited_root.py",
+        "tests/test_document_worker_flush_cap.py",
+        "tests/test_document_worker_lifecycle.py",
+        "tests/test_document_worker_linux_session.py",
+        "tests/test_document_worker_no_preexec.py",
+        "tests/test_document_worker_output_bound.py",
+        "tests/test_document_worker_rereview_cleanup_failure.py",
+        "tests/test_document_worker_resource_setup.py",
+        "tests/test_document_worker_utf8.py",
+        "tests/test_document_xml_safety.py",
+        "tests/test_document_zip_member_limit.py",
+        "tests/test_document_zip_option.py",
+        "tests/test_document_zip_path_member_limit.py",
+        "tests/test_embed_stub_log_path.py",
+        "tests/test_embedding_query_cache.py",
+        "tests/test_entity_graph_extraction.py",
+        "tests/test_entity_graph_query.py",
+        "tests/test_episodic_fallback_probe.py",
+        "tests/test_episodic_fts_docids.py",
+        "tests/test_episodic_memory.py",
+        "tests/test_episodic_pair_context.py",
+        "tests/test_episodic_prefetch.py",
+        "tests/test_episodic_semantic.py",
+        "tests/test_episodic_source_erasure.py",
+        "tests/test_event_scale_retention.py",
+        "tests/test_exception_diagnostics.py",
+        "tests/test_extraction_review_l1_l2.py",
+        "tests/test_extraction_review_security.py",
+        "tests/test_final_calendar_intent.py",
+        "tests/test_final_extraction_contract.py",
+        "tests/test_fts_security_parity_regression.py",
+        "tests/test_full_oracle_episode_probe.py",
+        "tests/test_github_source_adapter.py",
+        "tests/test_global_hybrid_search.py",
+        "tests/test_global_vector_acl_prefilter.py",
+        "tests/test_google_drive_source_adapter.py",
+        "tests/test_graph_extractor_codex.py",
+        "tests/test_guard_dan_false_positive.py",
+        "tests/test_host_memory_remove_privacy.py",
+        "tests/test_http_redirect_safety.py",
+        "tests/test_invalidate_revision_acl_regression.py",
+        "tests/test_journal_checkpoint_document_fk_order.py",
+        "tests/test_journal_checkpoint_graph_coverage.py",
+        "tests/test_journal_checkpoint_manifest_fail_closed.py",
+        "tests/test_journal_checkpoint_meta_values.py",
+        "tests/test_journal_checkpoint_pending_semantic_upsert.py",
+        "tests/test_journal_checkpoint_race_fail_closed.py",
+        "tests/test_journal_corrupt_checkpoint_fail_closed.py",
+        "tests/test_journal_document_mutation_checkpoint.py",
+        "tests/test_journal_file_identity_full_rebuild.py",
+        "tests/test_journal_incomplete_fail_closed.py",
+        "tests/test_journal_internal_controls.py",
+        "tests/test_journal_operation_checkpoint_atomicity.py",
+        "tests/test_journal_orphan_after_fail_closed.py",
+        "tests/test_journal_rebuild_post_swap_rollback.py",
+        "tests/test_journal_recovery_outbox_swap.py",
+        "tests/test_journal_recovery_reference_error_redaction.py",
+        "tests/test_journal_replay_auto_document_cache.py",
+        "tests/test_journal_replay_code_artifact_tamper.py",
+        "tests/test_journal_replay_code_claim.py",
+        "tests/test_journal_replay_code_claim_artifact.py",
+        "tests/test_journal_replay_code_graph_embed.py",
+        "tests/test_journal_replay_code_graph_inbox.py",
+        "tests/test_journal_replay_direct_code_mutations.py",
+        "tests/test_journal_replay_document_changed_fail_closed.py",
+        "tests/test_journal_replay_document_embed.py",
+        "tests/test_journal_replay_document_inbox.py",
+        "tests/test_journal_replay_document_inline_embed.py",
+        "tests/test_journal_replay_document_scan_all_sources.py",
+        "tests/test_journal_replay_document_scan_delete.py",
+        "tests/test_journal_replay_document_scan_prune.py",
+        "tests/test_journal_replay_document_source.py",
+        "tests/test_journal_replay_empty_code_inbox.py",
+        "tests/test_journal_replay_fail_closed.py",
+        "tests/test_journal_replay_hash_tamper_fail_closed.py",
+        "tests/test_journal_replay_patch_artifact.py",
+        "tests/test_journal_replay_reindex_deferred.py",
+        "tests/test_journal_sensitive_error_redaction.py",
+        "tests/test_journal_sensitive_tool_error_fail_closed.py",
+        "tests/test_journal_unreplayable_fail_closed.py",
+        "tests/test_journal_windows_interprocess_lock.py",
+        "tests/test_llm_pack_privacy.py",
+        "tests/test_local_guard_required_gaps.py",
+        "tests/test_locomo_adapter.py",
+        "tests/test_locomo_episode_probe.py",
+        "tests/test_longmemeval_adapter.py",
+        "tests/test_longmemeval_ingestion_probe.py",
+        "tests/test_longmemeval_v2_adapter.py",
+        "tests/test_maintenance_contract.py",
+        "tests/test_mcp_compatibility_contract.py",
+        "tests/test_mcp_error_redaction.py",
+        "tests/test_mcp_invalid_request_shape.py",
+        "tests/test_mcp_jsonrpc_errors.py",
+        "tests/test_mcp_notifications_and_redaction.py",
+        "tests/test_mcp_profile_paths.py",
+        "tests/test_mcp_release_metadata.py",
+        "tests/test_mcp_runtime_cache_location.py",
+        "tests/test_mcp_schema_cache_format.py",
+        "tests/test_mcp_schema_cache_resilience.py",
+        "tests/test_memory_events.py",
+        "tests/test_memory_observations.py",
+        "tests/test_model_facing_visibility_acl.py",
+        "tests/test_model_mutation_provenance.py",
+        "tests/test_model_output_followup_regressions.py",
+        "tests/test_model_output_guard_regressions.py",
+        "tests/test_observation_bulk_expiry.py",
+        "tests/test_observation_evidence_reguard.py",
+        "tests/test_observation_finite_work.py",
+        "tests/test_observation_repair01.py",
+        "tests/test_online_metrics.py",
+        "tests/test_p2_g3_native.py",
+        "tests/test_p2_g3_repair01_pure.py",
+        "tests/test_p2_g4_identity_errors.py",
+        "tests/test_p2_g4_repair01.py",
+        "tests/test_preference_provenance_and_aux_secrets.py",
+        "tests/test_prefetch_auxiliary_guard.py",
+        "tests/test_prefetch_delivery_packing_regression.py",
+        "tests/test_prefetch_runtime.py",
+        "tests/test_prefetch_secret_context_regression.py",
+        "tests/test_prefetch_trace_privacy.py",
+        "tests/test_privacy_erasure_replay.py",
+        "tests/test_profile_health_endpoint_fence.py",
+        "tests/test_profile_qdrant_isolation.py",
+        "tests/test_public_code_project_acl.py",
+        "tests/test_python_sdk_identity.py",
+        "tests/test_qa_budget_and_judge.py",
+        "tests/test_qdrant_claim_integrity_regression.py",
+        "tests/test_qdrant_payload_acl.py",
+        "tests/test_quality_benchmark.py",
+        "tests/test_r02_null_pagination_20261004.py",
+        "tests/test_r03_conservative.py",
+        "tests/test_recall_feedback_lifecycle.py",
+        "tests/test_recall_planner.py",
+        "tests/test_recovery_artifact_registry.py",
+        "tests/test_recovery_artifact_symlink_boundary.py",
+        "tests/test_release_contract.py",
+        "tests/test_release_document_security_regressions.py",
+        "tests/test_release_metadata.py",
+        "tests/test_rerank_cache_fusion_regression.py",
+        "tests/test_scale_event_ledger.py",
+        "tests/test_schema_compatibility.py",
+        "tests/test_scope_derivation_regressions.py",
+        "tests/test_scoped_auxiliary_rows.py",
+        "tests/test_scoped_entity_graph.py",
+        "tests/test_scoped_recovery.py",
+        "tests/test_scoped_session_and_audit.py",
+        "tests/test_search_fallback_visibility.py",
+        "tests/test_secret_context_metadata_sanitization.py",
+        "tests/test_secret_context_profile_isolation.py",
+        "tests/test_secret_registry_profile_override.py",
+        "tests/test_secret_registry_without_legacy_core.py",
+        "tests/test_security_boundary_regressions.py",
+        "tests/test_semantic_diagnostics_safety.py",
+        "tests/test_session_extractor_codex.py",
+        "tests/test_session_extractor_grounding.py",
+        "tests/test_session_extractor_openrouter.py",
+        "tests/test_session_graph_auto_enrichment.py",
+        "tests/test_shared_blocks.py",
+        "tests/test_source_connectors.py",
+        "tests/test_source_review_findings.py",
+        "tests/test_startup_fts_and_diagnostics.py",
+        "tests/test_temporal_supersession_partition.py",
+        "tests/test_unified_recall.py",
+        "tests/test_visual_evidence.py",
+        "tests/test_wheel_contents.py"
+      ],
+      "core": {
+        "selected_revision": null,
+        "origin": null,
+        "resolved_closure": null
+      },
+      "trust_core": {
+        "genuine_absence_required": true
+      }
+    },
+    "legacy-recovery": {
+      "HERMES_SECURITY_STRICT": "0",
+      "targets": [
+        "tests/ci_owned/recovery_cases.py"
+      ],
+      "core": {
+        "selected_revision": null,
+        "origin": null,
+        "resolved_closure": null
+      }
+    }
+  },
+  "partition": [
+    {
+      "path": "tests/audit_native_helpers_20261003.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/ci_owned/binding_cases.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/ci_owned/contract_cases.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/ci_owned/entry_cases.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/ci_owned/exit_cases.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/ci_owned/recovery_cases.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/ci_owned/test_output_admission.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/conftest.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/fixtures/primitive_guard_a9d5016e.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/helpers/audit_native_helpers_20261003.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/helpers/conftest.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/helpers/legacy_recall_sqlite_helpers_20261003.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/helpers/owned_fd_audit.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/helpers/provider_lifecycle.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/helpers/test_fixture_provider_ownership.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/helpers/test_native_helper_singleton.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/helpers/test_native_owner_boundaries.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/helpers/test_native_owner_retry.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/helpers/test_native_race_teardown.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/repair_41aaaa6/test_manifest_repository_scope_regression.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/repair_41aaaa6/test_pack_context_repository_guard.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/repair_41aaaa6/test_repository_scoping_regression.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/repair_41aaaa6/test_schema_parity_repository_scope.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_acl_aware_reindex.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_atomic_transaction.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_attest_preference_cli.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_audit_bundle_checker_20261003.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_audit_conflicts_20261003.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_audit_decay_20261003.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_audit_guard_20261003.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_audit_guard_security_diagnostics_20261003.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_audit_native_integration_20261003.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_audit_package_contracts_20261003.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_audit_recall_hardening_20261003.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_audit_release_error_20261003.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_background_jobs.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_benchmark_provenance.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_claim_auxiliary_privacy.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_claim_edit_partition_hash.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_code_graph_idempotency_atomicity.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_code_graph_no_implicit_drain.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_code_graph_pem_redaction.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_code_graph_prefetch_scope.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_code_graph_scope_acl_regression.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_code_graph_snapshot_lifecycle.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_code_recovery_artifact_keyed_secret.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_code_recovery_artifact_redaction.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_code_shrinker_bridge.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_code_shrinker_state_machine_fault_matrix.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_continuation_code_boundary.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_continuation_context_boundary.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_d2_f1_rendering.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_debug_log_path.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_archival_acl_regression.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_auto_embed_pending.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_auto_journal_cooldown.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_auto_scope_and_roots.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_cross_scope_ingest.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_embed_pending_safety.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_embedding_evidence.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_graph_local_audit_fixes.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_inbox_bounds.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_inbox_terminal_state.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_index_temporal_isolation.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_ingest_snapshot.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_ooxml_member_limit.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_profile_home_isolation.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_query_source_artifacts.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_recovery_g1_native.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_scan_bounds.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_scan_ingest_boundary_p1.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_scope_access.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_secret_redaction_quotes.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_shared_claim_lifecycle.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_snapshot_boundary.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_stat_fast_path.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_state_g1_native.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_terminal_g1_native.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_unit_budget.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_unit_budget_extended.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_windows_job_limits.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_windows_short_path_alias.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_worker_admission.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_worker_admission_fail_closed.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_worker_blocked_input.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_worker_env_limits.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_worker_exited_root.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_worker_flush_cap.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_worker_lifecycle.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_worker_linux_session.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_worker_no_preexec.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_worker_output_bound.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_worker_rereview_cleanup_failure.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_worker_resource_setup.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_worker_utf8.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_xml_safety.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_zip_member_limit.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_zip_option.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_document_zip_path_member_limit.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_embed_stub_log_path.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_embedding_query_cache.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_entity_graph_extraction.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_entity_graph_query.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_episodic_fallback_probe.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_episodic_fts_docids.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_episodic_memory.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_episodic_pair_context.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_episodic_prefetch.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_episodic_semantic.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_episodic_source_erasure.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_event_scale_retention.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_exception_diagnostics.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_extraction_review_l1_l2.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_extraction_review_security.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_final_calendar_intent.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_final_extraction_contract.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_fts_security_parity_regression.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_full_oracle_episode_probe.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_github_source_adapter.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_global_hybrid_search.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_global_vector_acl_prefilter.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_google_drive_source_adapter.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_graph_extractor_codex.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_guard_dan_false_positive.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_host_memory_remove_privacy.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_http_redirect_safety.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_hybrid_runtime_receipts.py",
+      "lane": "strict"
+    },
+    {
+      "path": "tests/test_invalidate_revision_acl_regression.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_checkpoint_document_fk_order.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_checkpoint_graph_coverage.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_checkpoint_manifest_fail_closed.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_checkpoint_meta_values.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_checkpoint_pending_semantic_upsert.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_checkpoint_race_fail_closed.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_corrupt_checkpoint_fail_closed.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_document_mutation_checkpoint.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_file_identity_full_rebuild.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_incomplete_fail_closed.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_internal_controls.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_operation_checkpoint_atomicity.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_orphan_after_fail_closed.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_rebuild_post_swap_rollback.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_recovery_outbox_swap.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_recovery_reference_error_redaction.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_replay_auto_document_cache.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_replay_code_artifact_tamper.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_replay_code_claim.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_replay_code_claim_artifact.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_replay_code_graph_embed.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_replay_code_graph_inbox.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_replay_direct_code_mutations.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_replay_document_changed_fail_closed.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_replay_document_embed.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_replay_document_inbox.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_replay_document_inline_embed.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_replay_document_scan_all_sources.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_replay_document_scan_delete.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_replay_document_scan_prune.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_replay_document_source.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_replay_empty_code_inbox.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_replay_fail_closed.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_replay_hash_tamper_fail_closed.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_replay_patch_artifact.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_replay_reindex_deferred.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_sensitive_error_redaction.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_sensitive_tool_error_fail_closed.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_unreplayable_fail_closed.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_journal_windows_interprocess_lock.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_llm_pack_privacy.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_local_guard_required_gaps.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_locomo_adapter.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_locomo_episode_probe.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_longmemeval_adapter.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_longmemeval_ingestion_probe.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_longmemeval_v2_adapter.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_maintenance_contract.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_mcp_compatibility_contract.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_mcp_error_redaction.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_mcp_invalid_request_shape.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_mcp_jsonrpc_errors.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_mcp_notifications_and_redaction.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_mcp_profile_paths.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_mcp_release_metadata.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_mcp_runtime_cache_location.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_mcp_schema_cache_format.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_mcp_schema_cache_resilience.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_memory_events.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_memory_observations.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_model_facing_visibility_acl.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_model_mutation_provenance.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_model_output_followup_regressions.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_model_output_guard_regressions.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_observation_bulk_expiry.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_observation_evidence_reguard.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_observation_finite_work.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_observation_repair01.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_online_metrics.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_p2_g3_native.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_p2_g3_repair01_pure.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_p2_g4_identity_errors.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_p2_g4_repair01.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_postinstall_admission_routes.py",
+      "lane": "strict"
+    },
+    {
+      "path": "tests/test_preference_provenance_and_aux_secrets.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_prefetch_auxiliary_guard.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_prefetch_delivery_packing_regression.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_prefetch_runtime.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_prefetch_secret_context_regression.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_prefetch_trace_privacy.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_privacy_erasure_replay.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_profile_health_endpoint_fence.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_profile_qdrant_isolation.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_public_code_project_acl.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_python_sdk_identity.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_qa_budget_and_judge.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_qdrant_claim_integrity_regression.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_qdrant_payload_acl.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_quality_benchmark.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_r02_null_pagination_20261004.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_r03_conservative.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_recall_feedback_lifecycle.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_recall_planner.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_recovery_artifact_registry.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_recovery_artifact_symlink_boundary.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_release_contract.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_release_document_security_regressions.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_release_metadata.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_rerank_cache_fusion_regression.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_scale_event_ledger.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_schema_compatibility.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_scope_derivation_regressions.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_scoped_auxiliary_rows.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_scoped_entity_graph.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_scoped_recovery.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_scoped_session_and_audit.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_search_fallback_visibility.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_secret_context_metadata_sanitization.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_secret_context_profile_isolation.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_secret_registry_profile_override.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_secret_registry_without_legacy_core.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_security_boundary_regressions.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_semantic_diagnostics_safety.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_session_extractor_codex.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_session_extractor_grounding.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_session_extractor_openrouter.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_session_graph_auto_enrichment.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_shared_blocks.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_source_connectors.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_source_review_findings.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_startup_fts_and_diagnostics.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_temporal_supersession_partition.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_unified_recall.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_visual_evidence.py",
+      "lane": "legacy"
+    },
+    {
+      "path": "tests/test_wheel_contents.py",
+      "lane": "legacy"
+    }
+  ],
+  "source_explicit_targets": [
+    "tests/test_p2_g3_repair01_pure.py",
+    "tests/test_p2_g4_identity_errors.py",
+    "tests/test_p2_g4_repair01.py"
+  ],
+  "source_entry": "tests/ci_owned/doc_code_carrier_cases.py",
+  "source_fixture_inputs": [
+    "tests/helpers/cases_disclosure.py",
+    "tests/helpers/cases_shared_closed.py",
+    "tests/helpers/cases_terminal.py"
+  ],
+  "no_selection_filters": true,
+  "native_sdk_execution_admitted": false,
+  "prerequisites": [
+    "independently admitted native bootstrap/recorder and genuine SDK origins/MRO for native lanes",
+    "exact source hashes and owned scratch under the permanent SOURCE controller for source_entry",
+    "G4 source lanes need their own declared G4_FIXTURE/G4_REPAIR_FIXTURE app/user roots; not one universal pytest process"
+  ],
+  "before_oracle": "Historical G4 provider/trust equality kept in tests/fixtures/g4_original_boundary_gold.txt; current _metadata scope is separately bound.",
+  "gold_security_assertions": "preserved; source/legacy/strict union rather than skip/xfail/deselect"
+}

@@ -159,7 +159,10 @@ def test_02_actual_public_tool_failure_decoded_secrecy(provider):
     observed.update(producer='MemoryWikiProvider.handle_tool_call -> ingest_document/_allowed_path -> native tool_error',
                     native_tool_success=parsed.get('success'), parser_launches=0)
     save('public-tool-error-decoded', observed)
-    assert parsed['success'] is False
+    # Native tools.registry.tool_error(message) has error only; no implicit success/ok.
+    assert type(parsed) is dict and set(parsed) == {'error'}
+    assert parsed['error'] == 'ValueError'
+    assert all(MARKER not in s and WINDOWS_PATH not in s for s in scalar_strings(parsed))
     assert observed['phases'] == ['before', 'error']
     assert observed['marker_leaks'] == 0
     assert observed['summary_scalar_allowlist'] and observed['request_pair_scalar_allowlist']

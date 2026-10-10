@@ -1,5 +1,14 @@
-# Memory Wiki 1.24.5 — опубликованный source, установленный code-stage
+# Memory Wiki 1.24.5 — локальный RI-R01 / hybrid SOURCE checkpoint
 
+## Новый RI-R01 / hybrid SOURCE checkpoint
+
+Подготовлен **локальный публикационный кандидат поверх current main**, не новый tag/GitHub Release и не выполненная установка. Приняты cumulative runtime SOURCE bytes; текущий пакет отдельно проверяет переносимые carrier regressions и offline wheel correspondence. Схемы 121, DDL/migrations и версия 1.24.5 не повышены. Исходный owner, raw source images, private reader lifetime, serialization/cleanup ordering и primary UNKNOWN не превращаются в разрешение на live/native execution.
+
+Точные primary E и metadata-only secondary M указываются последующим doc-only binding после создания настоящих commits; raw SHA256 source никогда не используется как Git PIN. Пока remote readback этих новых refs не выполнен, они не называются опубликованными или пригодными для remote install. Старые E42d2/M02eed и current-main 6a748/a503 — исторические checkpoints, не current feature PIN. Сканирование, install/PM/liveness, собственные rollout markers и owner reload проверяются координатором отдельно.
+
+Регрессионные границы и cold-process prerequisites: [TEST_CONTRACT.md](TEST_CONTRACT.md). SOURCE-only PASS, package readback, сохранённые settings, installed source и loaded/runtime/full-recovery — разные доказательства.
+
+## Исторический опубликованный/установленный code-stage
 **Исходники опубликованы, code-stage установлен; runtime готовность не подтверждена.** Версия выбрана владельцем: **1.24.5**. Основной public PIN E — `42d2e943f887efda00d65ebf143adce28873103e`; secondary metadata-only PIN M — `02eed6da5b5cdba02a4fb114534730067e2d21ea`. Native installation/readback выполнены после явного решения владельца о code-only обновлении. Это не tag/GitHub Release, native feature/full-recovery acceptance или успешный CI/runtime всей композиции. Профильные настройки и owner restart — отдельные этапы.
 
 ## Изменения

@@ -1,5 +1,13 @@
 # Memory Stack 1.24.5: переносимый гайд для Hermes
 
+## Новый RI-R01 / hybrid SOURCE checkpoint
+
+Подготовлен **локальный публикационный кандидат поверх current main**, не новый tag/GitHub Release и не выполненная установка. Приняты cumulative runtime SOURCE bytes; текущий пакет отдельно проверяет переносимые carrier regressions и offline wheel correspondence. Схемы 121, DDL/migrations и версия 1.24.5 не повышены. Исходный owner, raw source images, private reader lifetime, serialization/cleanup ordering и primary UNKNOWN не превращаются в разрешение на live/native execution.
+
+Точные primary E и metadata-only secondary M указываются последующим doc-only binding после создания настоящих commits; raw SHA256 source никогда не используется как Git PIN. Пока remote readback этих новых refs не выполнен, они не называются опубликованными или пригодными для remote install. Старые E42d2/M02eed и current-main 6a748/a503 — исторические checkpoints, не current feature PIN. Сканирование, install/PM/liveness, собственные rollout markers и owner reload проверяются координатором отдельно.
+
+Регрессионные границы и cold-process prerequisites: [TEST_CONTRACT.md](TEST_CONTRACT.md). SOURCE-only PASS, package readback, сохранённые settings, installed source и loaded/runtime/full-recovery — разные доказательства.
+
 > **Целевой режим, а не отчёт «всё уже работает».** Memory Wiki — долгосрочная память; LCM-X — история и сжатие контекста; PPLX — независимая оценка результатов. Ни версии, ни saved settings не доказывают загрузку работающим процессом, полноту индекса, native lifecycle или восстановление данных.
 
 ## 1. Статус и точные исходники
@@ -8,8 +16,8 @@
 
 | Компонент | Публичный источник и immutable PIN | Назначение |
 |---|---|---|
-| Wiki 1.24.5, основной buildable source **E** | [репозиторий](https://github.com/sbrejnev988-coder/hermes-memory-wiki), [`42d2e943f887efda00d65ebf143adce28873103e`](https://github.com/sbrejnev988-coder/hermes-memory-wiki/commit/42d2e943f887efda00d65ebf143adce28873103e) | Native plugin/provider `memory-wiki` |
-| Wiki 1.24.5, secondary metadata-only source **M** | [тот же репозиторий](https://github.com/sbrejnev988-coder/hermes-memory-wiki), [`02eed6da5b5cdba02a4fb114534730067e2d21ea`](https://github.com/sbrejnev988-coder/hermes-memory-wiki/commit/02eed6da5b5cdba02a4fb114534730067e2d21ea) | Подготовленный до admission virtual PM member; runtime payload сохранён |
+| Wiki 1.24.5, исторический buildable source **E** | [репозиторий](https://github.com/sbrejnev988-coder/hermes-memory-wiki), [`42d2e943f887efda00d65ebf143adce28873103e`](https://github.com/sbrejnev988-coder/hermes-memory-wiki/commit/42d2e943f887efda00d65ebf143adce28873103e) | Native plugin/provider `memory-wiki` |
+| Wiki 1.24.5, исторический secondary metadata-only source **M** | [тот же репозиторий](https://github.com/sbrejnev988-coder/hermes-memory-wiki), [`02eed6da5b5cdba02a4fb114534730067e2d21ea`](https://github.com/sbrejnev988-coder/hermes-memory-wiki/commit/02eed6da5b5cdba02a4fb114534730067e2d21ea) | Подготовленный до admission virtual PM member; runtime payload сохранён |
 | LCM-X 0.25.1 | [официальный v0.25.1](https://github.com/electricsheephq/lcm-x/releases/tag/v0.25.1), [`f47b55e031b507b424ff5f480d8f2a80d358f1f0`](https://github.com/electricsheephq/lcm-x/commit/f47b55e031b507b424ff5f480d8f2a80d358f1f0) | Plugin `hermes-lcm-x`, `context.engine: lcm-x`; YAML-раздел остаётся `lcm`, tools — `lcm_*` |
 | PPLX reviewer 0.1.8 | [репозиторий](https://github.com/sbrejnev988-coder/pplx-decider-review), [`4b61c8631031dfee30b9240adfb16d27ea6d80c2`](https://github.com/sbrejnev988-coder/pplx-decider-review/commit/4b61c8631031dfee30b9240adfb16d27ea6d80c2) | Plugin `pplx-decider-review`; не поиск и не разрешение на действия |
 
@@ -119,7 +127,7 @@ h config set context.engine lcm-x
 | `hooks.output_spill.max_chars` | integer | `15000` |
 | `plugins.entries.memory-wiki.settings.extraction.enabled` | bool | `true` |
 | `plugins.entries.memory-wiki.settings.extraction.timeout` | integer | `45` |
-| `plugins.entries.memory-wiki.settings.extraction.max_tokens` | integer | `1800` |
+| `plugins.entries.memory-wiki.settings.extraction.max_tokens` | integer | `3000` |
 
 ```bash
 h config set compression.enabled true
@@ -129,16 +137,16 @@ h config set hooks.output_spill.enabled true
 h config set hooks.output_spill.max_chars 15000
 h config set plugins.entries.memory-wiki.settings.extraction.enabled true
 h config set plugins.entries.memory-wiki.settings.extraction.timeout 45
-h config set plugins.entries.memory-wiki.settings.extraction.max_tokens 1800
+h config set plugins.entries.memory-wiki.settings.extraction.max_tokens 3000
 ```
 
 Сразу после **каждого** set выполнить `h config get <тот-же-dotted-key> --json`, сверить тип и значение, а весь parsed config — с его собственным baseline плюс только разрешённая дельта. `--force` у config writer не доказывает reader support и не является scanner consent.
 
-Перед `lcm.context_threshold=0.78` проверить effective overrides: `LCM_CONTEXT_THRESHOLD` отсутствует либо ровно `0.78`; `LCM_ABSOLUTE_THRESHOLD_TOKENS` отсутствует/0; model-threshold maps/presets не заменяют выбранный ratio. Конкурирующий override нельзя молча удалить. Приёмка требует loaded LCM threshold и его source, а не одного YAML readback. `compression.enabled` остаётся global compaction gate; выбор LCM-X не отключает обычное сохранение истории.
+Для нового явно выбранного ratio preset перед `lcm.context_threshold=0.78` проверить effective overrides: `LCM_CONTEXT_THRESHOLD` отсутствует либо ровно `0.78`; `LCM_ABSOLUTE_THRESHOLD_TOKENS` отсутствует/0; model-threshold maps/presets не заменяют выбранный ratio. Существующие owner overrides, включая absolute threshold `700000`, сохранить: portable ratio/absolute0 не навязывается нынешнему владельцу. Конкурирующий override нельзя молча удалить. Приёмка требует loaded LCM threshold и его source, а не одного YAML readback. `compression.enabled` остаётся global compaction gate; выбор LCM-X не отключает обычное сохранение истории.
 
-Extraction — выборочная работа на поддерживаемых lifecycle boundaries, не LLM на каждом сообщении и не автоматическое подтверждение истины. Timeout 45 — acceptance budget, не гарантия мгновенной отмены OS/remote I/O. Для Codex `max_tokens=1800` — hint, **не server-enforced spending cap**; для OpenRouter действуют собственные валидатор и transport. Не менять transport или добавлять paid fallback.
+Extraction — выборочная работа на поддерживаемых lifecycle boundaries, не LLM на каждом сообщении и не автоматическое подтверждение истины. Timeout 45 — acceptance budget, не гарантия мгновенной отмены OS/remote I/O. Для Codex `max_tokens=3000` — hint, **не server-enforced spending cap**; для OpenRouter действуют собственные валидатор и transport. Не менять transport или добавлять paid fallback.
 
-## 5. Ровно 63 ENV targets
+## 5. Ровно 65 ENV targets
 
 В этом PIN эти параметры читаются через ENV, поэтому их не переводят в придуманные dotted YAML keys. Ниже только non-secret common targets; string literals сохранены точно. Сохранить **каждую** строку через supported profile-local writer:
 
@@ -151,6 +159,8 @@ h config set "$KEY" "$VALUE"
 Не `source`/`eval` блока, не user-wide `setx`, не whole-file copy `.env`. Bare UPPER_SNAKE маршрутизируется native writer в owner ENV surface в проверенном CLI; на другом core сначала подтвердить это help/reader. Для readback использовать **настоящий профильный ENV reader**, а не YAML-копию: native `config get` считать ENV readback лишь если его текущая реализация действительно возвращает этот surface. Иначе approved read-only native dotenv reader проецирует только этот allowlist. Credential checks — presence-only. Saved readback не заменяет effective importer/engine readback после restart.
 
 ```env
+LCM_RECALL_SCAN_MAX_ROWS=100000
+LCM_RECALL_SCAN_BUDGET_S=2.0
 MEMORY_WIKI_SEMANTIC=1
 MEMORY_WIKI_RRF_K=10
 MEMORY_WIKI_VECTOR_TOP_K=200
@@ -310,3 +320,7 @@ Wiki retrieval/rerank/cache/outbox constants частично captured при im
 - [Wiki README exact E](https://github.com/sbrejnev988-coder/hermes-memory-wiki/blob/42d2e943f887efda00d65ebf143adce28873103e/README.md), [security policy](../SECURITY.md), [1.24.5 release-stage notes](RELEASE_NOTES_1_24_5_RU.md).
 - [LCM-X README exact PIN](https://github.com/electricsheephq/lcm-x/blob/f47b55e031b507b424ff5f480d8f2a80d358f1f0/README.md).
 - [PPLX README exact PIN](https://github.com/sbrejnev988-coder/pplx-decider-review/blob/4b61c8631031dfee30b9240adfb16d27ea6d80c2/README.md).
+
+### Saved-only срез лимитов
+
+Target/current saved snapshot: `extraction.max_tokens=3000` (integer), `LCM_RECALL_SCAN_MAX_ROWS=100000` и `LCM_RECALL_SCAN_BUDGET_S=2.0` (ENV strings). Этот срез не доказывает loaded значения. Собственные host spill `15000`, absolute threshold `700000`, модели/маршруты/данные/ACL сохраняются; другой ПК применяет только свой согласованный preset. Scanner/liveness и exact PIN readback обязательны до install; собственный untracked rollout marker сохраняет future native same-source carry, не публикуется в payload.

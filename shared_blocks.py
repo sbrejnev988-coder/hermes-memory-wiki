@@ -97,17 +97,61 @@ def _digest(row: sqlite3.Row) -> str:
     return hashlib.sha256(str(row["claim"] or "").encode("utf-8")).hexdigest()[:20]
 
 
+def _source_claim_allowed(row: Any) -> bool:
+    # The existing sharing policy, not the recipient's ordinary creator ACL.
+    return (str(row["status"] or "") == "active"
+            and str(row["risk"] or "").lower() != "secret"
+            and str(row["secrecy_level"] or "").lower() == "public"
+            and not int(row["quarantined_at"] or 0))
+
+
 def _source_claim(provider: Any, claim_id: str, *, require_owner_visible: bool) -> sqlite3.Row | None:
     conn = provider._connect()
     row = conn.execute("SELECT * FROM claims WHERE id=?", (claim_id,)).fetchone()
     if row is None or (require_owner_visible and not provider._claim_visible(row)):
         return None
-    if (str(row["status"] or "") != "active"
-            or str(row["risk"] or "").lower() == "secret"
-            or str(row["secrecy_level"] or "").lower() != "public"
-            or int(row["quarantined_at"] or 0)):
-        return None
-    return row
+    return row if _source_claim_allowed(row) else None
+
+
+def _block_refs(block: Any) -> list[dict[str, Any]]:
+    try:
+        refs = json.loads(block["claim_refs_json"])
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(refs, list) or len(refs) > MAX_BLOCK_CLAIMS:
+        return []
+    return [ref for ref in refs if isinstance(ref, dict) and ref.get("claim_id")]
+
+
+def _attached_claims(provider: Any, blocks, grants, attachments, claims) -> dict[str, list[Any]]:
+    """Recheck existing sharing rows without connect, guards or new authority.
+
+    Call only with the fence's raw SQLite images. JSON references/digests select
+    source claims; only a real active grant AND attachment admit a recipient.
+    """
+    if not provider.database_instance_id:
+        raise ValueError("shared_block_actor_unavailable")
+    bot_id, _, project_id = _actor(provider)
+    principals = {("bot", bot_id)}
+    if project_id:
+        principals.add(("project", project_id))
+    granted = {(r["block_id"], r["principal_type"], r["principal_id"])
+               for r in grants if not int(r["revoked_at"] or 0)}
+    attached = {(r["block_id"], r["principal_type"], r["principal_id"])
+                for r in attachments if not int(r["detached_at"] or 0)}
+    by_id = {r["id"]: r for r in claims}
+    output = {}
+    for block in blocks:
+        bid = block["id"]
+        if block["status"] != "active" or not any(
+                (bid, ptype, pid) in granted & attached for ptype, pid in principals):
+            continue
+        output[bid] = []
+        for ref in _block_refs(block):
+            row = by_id.get(str(ref["claim_id"]))
+            if row is not None and _source_claim_allowed(row) and _digest(row) == ref.get("digest80"):
+                output[bid].append(row)
+    return output
 
 
 def _event(conn: sqlite3.Connection, provider: Any, block_id: str,
@@ -346,45 +390,58 @@ def list_blocks(provider: Any) -> dict[str, Any]:
     return {"owned": [dict(row) for row in owned], "received": received[:50]}
 
 
-def render_attached(provider: Any, *, max_chars: int = MAX_BLOCK_CHARS) -> list[dict[str, Any]]:
-    bot_id, _, project_id = _actor(provider)
+def render_attached(provider: Any, *, max_chars: int = MAX_BLOCK_CHARS,
+                    _disclosure=None) -> list[dict[str, Any]]:
+    # The caller may retain this fence through its later guards/worker join.
+    # Direct render callers still validate after the renderer's last callback.
+    try:
+        from .disclosure_fence import DisclosureFence
+    except ImportError:
+        from disclosure_fence import DisclosureFence
     conn = provider._connect()
-    rows = conn.execute("""SELECT b.id,b.title,b.claim_refs_json
-        FROM shared_block_attachments a
-        JOIN shared_block_grants g USING(block_id,principal_type,principal_id)
-        JOIN shared_blocks b ON b.id=a.block_id
-        WHERE a.detached_at=0 AND g.revoked_at=0 AND b.status='active'
-          AND ((a.principal_type='bot' AND a.principal_id=?)
-            OR (a.principal_type='project' AND a.principal_id=? AND ?!=''))
-        ORDER BY a.attached_at DESC LIMIT ?""",
-        (bot_id, project_id, project_id, MAX_ATTACHED_BLOCKS)).fetchall()
-    remaining = max(0, min(int(max_chars), MAX_BLOCK_CHARS))
-    rendered = []
-    seen_blocks: set[str] = set()
-    for block in rows:
-        if remaining < 40:
-            break
-        if block["id"] in seen_blocks:
-            continue
-        seen_blocks.add(block["id"])
-        try:
-            refs = json.loads(block["claim_refs_json"])
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(refs, list) or len(refs) > MAX_BLOCK_CLAIMS:
-            continue
-        claims = []
-        for ref in refs:
-            if not isinstance(ref, dict):
+    fence = _disclosure if _disclosure is not None else DisclosureFence(provider, conn)
+    if fence.provider is not provider or fence.conn is not conn or not fence.ok:
+        return []
+    try:
+        bot_id, _, project_id = _actor(provider)
+        rows = conn.execute("""SELECT b.id
+            FROM shared_block_attachments a
+            JOIN shared_block_grants g USING(block_id,principal_type,principal_id)
+            JOIN shared_blocks b ON b.id=a.block_id
+            WHERE a.detached_at=0 AND g.revoked_at=0 AND b.status='active'
+              AND ((a.principal_type='bot' AND a.principal_id=?)
+                OR (a.principal_type='project' AND a.principal_id=? AND ?!=''))
+            ORDER BY a.attached_at DESC LIMIT ?""",
+            (bot_id, project_id, project_id, MAX_ATTACHED_BLOCKS)).fetchall()
+        # Capture EVERY selected raw block/ref/grant/attachment/source claim
+        # before the first guard; later claims cannot adopt a callback's edits.
+        blocks, eligible = fence.shared([r['id'] for r in rows])
+        if not fence.ok:
+            return []
+        by_id = {r['id']: r for r in blocks}
+        remaining = max(0, min(int(max_chars), MAX_BLOCK_CHARS))
+        rendered = []
+        seen_blocks: set[str] = set()
+        for selected in rows:
+            if remaining < 40:
+                break
+            bid = selected['id']
+            if bid in seen_blocks:
                 continue
-            claim_id = str(ref.get("claim_id") or "")
-            row = _source_claim(provider, claim_id, require_owner_visible=False)
-            if row is None or _digest(row) != ref.get("digest80"):
-                continue
-            content = _safe_claim_text(provider, row)
-            if content and len(content) + 4 <= remaining:
-                claims.append({"claim_id": claim_id, "text": content})
-                remaining -= len(content) + 4
-        if claims:
-            rendered.append({"block_id": block["id"], "title": block["title"], "claims": claims})
-    return rendered
+            seen_blocks.add(bid)
+            block = by_id[bid]
+            claims = []
+            for row in eligible.get(bid, []):
+                content = _safe_claim_text(provider, row)
+                if content and len(content) + 4 <= remaining:
+                    claims.append({"claim_id": str(row['id']), "text": content})
+                    remaining -= len(content) + 4
+            if claims:
+                rendered.append({"block_id": bid, "title": block["title"], "claims": claims})
+        if _disclosure is None and not fence.finish():
+            return []
+        return rendered
+    except Exception:
+        fence.ok = False
+        return []
+

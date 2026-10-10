@@ -7,7 +7,7 @@ source cannot be reconstructed from this queue or retried from old text.
 from __future__ import annotations
 
 import copy
-from contextlib import closing
+from contextlib import closing, nullcontext
 import hashlib
 import json
 import os
@@ -282,7 +282,8 @@ class JobStore:
         with closing(self._connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             current = conn.execute("SELECT * FROM memory_jobs WHERE job_id=?", (job["job_id"],)).fetchone()
-            if not current or current["status"] != "leased" \
+            if not current or current["profile_key"] != self.profile or current["owner_key"] != self.owner \
+                    or current["status"] != "leased" or int(current["lease_expires_at"]) <= stamp \
                     or current["lease_owner"] != job["lease_owner"] \
                     or not str(current["lease_owner"]).startswith(worker + ":") \
                     or int(current["lease_generation"]) != int(job["lease_generation"]):
@@ -320,10 +321,12 @@ class JobStore:
         with closing(self._connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             row = conn.execute(
-                "SELECT lease_owner,lease_generation,generation,status FROM memory_jobs WHERE job_id=?",
-                (job["job_id"],),
+                "SELECT lease_owner,lease_generation,generation,status,lease_expires_at FROM memory_jobs "
+                "WHERE job_id=? AND profile_key=? AND owner_key=?",
+                (job["job_id"], self.profile, self.owner),
             ).fetchone()
-            if not row or row["status"] != "leased" or row["lease_owner"] != job["lease_owner"] \
+            if not row or row["status"] != "leased" or int(row["lease_expires_at"]) <= stamp \
+                    or row["lease_owner"] != job["lease_owner"] \
                     or not str(row["lease_owner"]).startswith(worker + ":") \
                     or int(row["lease_generation"]) != int(job["lease_generation"]):
                 return False
@@ -337,9 +340,16 @@ class JobStore:
             )
             return True
 
-    def owns(self, job: Mapping[str, Any], worker: str, *, now: int | None = None) -> bool:
+    def owns(
+        self, job: Mapping[str, Any], worker: str, *, now: int | None = None,
+        connection: sqlite3.Connection | None = None,
+    ) -> bool:
         stamp = int(time.time() if now is None else now)
-        with closing(self._connect()) as conn:
+        # A consolidation writer transaction already fences token/generation
+        # changes in this same database. Read its real lease locally rather
+        # than opening thousands of extra SQLite handles while re-guarding
+        # support; expiry and every existing ownership predicate still apply.
+        with (closing(self._connect()) if connection is None else nullcontext(connection)) as conn:
             row = conn.execute(
                 "SELECT lease_owner,lease_expires_at,lease_generation,status "
                 "FROM memory_jobs WHERE job_id=? AND profile_key=? AND owner_key=?",
@@ -549,6 +559,8 @@ def _worker_provider(provider: Any, source: Mapping[str, Any]) -> Any:
 
 
 def _event_source(provider: Any, job: Mapping[str, Any], payload: Mapping[str, Any]) -> Any:
+    if job["profile_key"] != profile_key(provider) or job["owner_key"] != owner_key(provider):
+        return None
     with provider._lock:
         row = provider._connect().execute(
             """SELECT e.*,d.docid AS event_sequence
@@ -557,24 +569,37 @@ def _event_source(provider: Any, job: Mapping[str, Any], payload: Mapping[str, A
                WHERE e.event_id=? AND e.expires_at>?""",
             (payload["event_id"], int(time.time())),
         ).fetchone()
-    if row is None and _OWNER_HASH.fullmatch(str(job["owner_chat_hash"])) \
+    if row is None and job["job_type"] == "consolidate_observations" \
+            and _OWNER_HASH.fullmatch(str(job["owner_chat_hash"])) \
             and _OWNER_HASH.fullmatch(str(job["owner_session_hash"])):
         # The newest coalesced pointer may have been deleted, while older
-        # retained events still need consolidation. Search this exact session
-        # and verify the full partition digest before using a replacement.
+        # retained events still need consolidation. This fallback does not
+        # authorize historical extraction without a retained consent pointer.
+        # Partition eligibility must
+        # precede LIMIT: newer foreign projects/scopes must not hide this work.
         with provider._lock:
-            candidates = provider._connect().execute(
+            conn = provider._connect()
+            # Use exactly partition_key's str semantics, including None/0;
+            # neither COALESCE nor reconstructed payload supplies authority.
+            conn.create_function(
+                "memory_wiki_job_partition", 5,
+                lambda *parts: _digest(*(str(part) for part in parts)),
+                deterministic=True,
+            )
+            row = conn.execute(
                 """SELECT e.*,d.docid AS event_sequence
                    FROM memory_events e JOIN memory_event_fts_docids d
                      ON d.event_id=e.event_id
                    WHERE e.owner_bot_id=? AND e.owner_chat_hash=?
                      AND e.owner_session_hash=? AND e.expires_at>?
-                     AND d.docid<=? ORDER BY d.docid DESC LIMIT 128""",
+                     AND d.docid<=?
+                     AND memory_wiki_job_partition(e.owner_bot_id,e.owner_chat_hash,
+                         e.owner_session_hash,e.visibility_scope,e.project_id)=?
+                   ORDER BY d.docid DESC LIMIT 1""",
                 (provider.bot_id, job["owner_chat_hash"], job["owner_session_hash"],
-                 int(time.time()), payload.get("high_watermark", 2**63-1)),
-            ).fetchall()
-        row = next((candidate for candidate in candidates
-                    if partition_key(candidate) == job["partition_key"]), None)
+                 int(time.time()), payload.get("high_watermark", 2**63-1),
+                 job["partition_key"]),
+            ).fetchone()
     if row is None:
         return None
     if (partition_key(row) != job["partition_key"]
@@ -589,6 +614,7 @@ def _event_source(provider: Any, job: Mapping[str, Any], payload: Mapping[str, A
 def _run_job(
     provider: Any, module: Any, job: Mapping[str, Any],
     lease_valid: Callable[[], bool] | None = None,
+    lease_valid_in_transaction: Callable[[sqlite3.Connection], bool] | None = None,
 ) -> str | tuple[str, int]:
     try:
         payload = json.loads(str(job["payload_json"]))
@@ -624,7 +650,9 @@ def _run_job(
 
     source = _event_source(provider, job, payload)
     if source is None:
-        return ""  # Deleted or expired source wins over an old job.
+        # A missing pointer/bounded miss is not authoritative empty work. Keep
+        # the existing job pending, without reconstructing deleted evidence.
+        return ("defer", int(time.time()) + 60)
     worker = _worker_provider(provider, source)
     try:
         if kind == "consolidate_observations":
@@ -632,14 +660,25 @@ def _run_job(
             if scope not in {"chat", "bot", "project"}:
                 return "invalid_source"
             if not module._memory_observations.enabled():
-                return ""
+                # Runtime policy blocks execution, not completion of retained
+                # work. The existing queue/poll loop retries after re-enable.
+                return ("defer", int(time.time()) + 60)
             result = module._memory_observations.consolidate_events(
                 worker, module, scope=scope, session_id=worker.session_id,
                 project_id=str(source["project_id"] or ""),
                 limit=_limit("MEMORY_WIKI_OBSERVATION_BACKGROUND_BATCH", 64, 1, 1000),
+                lease_valid=(lambda: lease_valid_in_transaction(worker._connect()))
+                if lease_valid_in_transaction is not None else lease_valid,
             )
-            if int(result.get("events_deferred") or 0) > 0:
-                return ("defer", int(result.get("next_retry_at") or (time.time() + 60)))
+            if result.get("ready_work_remaining"):
+                # Yield between bounded passes. Every lease still consumes the
+                # existing daily budget; successful progress is not a failure
+                # attempt and must not turn a 1000-event backlog into dead work.
+                return ("defer", int(time.time()) + 1)
+            if int(result.get("next_retry_at") or 0) > 0:
+                return ("defer", int(result["next_retry_at"]))
+            if int(result.get("events_deferred") or 0) > 0 or result.get("budget_exhausted"):
+                return ("defer", int(time.time()) + 1)
             return ""
         if kind != "extract_session_events":
             return "invalid_source"
@@ -710,6 +749,9 @@ def _run_job(
         if not messages:
             return ""
 
+        class _EventClaimLeaseLost(Exception):
+            """Roll back this claim transaction on lost ownership."""
+
         def persist_if_current(*args: Any, **kwargs: Any) -> str:
             # Guard after the remote response and immediately before every
             # claim write. A deleted/edited event invalidates this extraction.
@@ -737,6 +779,7 @@ def _run_job(
                 visibility_scope=source_scope, project_id=source_project,
                 event_at=kwargs.get("event_at", 0),
                 event_timezone=kwargs.get("event_timezone", "UTC"),
+                _no_side_effects=True,
             )
             if not isinstance(prepared, dict):
                 return ""
@@ -747,34 +790,47 @@ def _run_job(
             # SQLite's RESERVED writer lock fences event deletion against
             # validation and the claim write. The callback cannot resurrect
             # an event erased while the remote extractor was running.
-            with conn:
-                conn.execute("BEGIN IMMEDIATE")
-                live = conn.execute(
-                    f"""SELECT event_id,content_hash,owner_bot_id,owner_chat_hash,
+            try:
+                with conn:
+                    conn.execute("BEGIN IMMEDIATE")
+                    live = conn.execute(
+                        f"""SELECT event_id,content_hash,owner_bot_id,owner_chat_hash,
                                owner_session_hash,visibility_scope,project_id,event_type,role
                         FROM memory_events WHERE event_id IN ({marks})
                           AND owner_bot_id=? AND owner_chat_hash=? AND owner_session_hash=?
                           AND visibility_scope=? AND project_id=? AND expires_at>?""",
-                    (*ids, source["owner_bot_id"], source["owner_chat_hash"],
-                     source["owner_session_hash"], source_scope,
-                     source_project, int(time.time())),
-                ).fetchall()
-                if {str(row["event_id"]): source_identity(row) for row in live} != originals:
-                    return ""
-                for original in messages:
-                    if module.secret_scan(original["content"]).get("raw_secret"):
+                        (*ids, source["owner_bot_id"], source["owner_chat_hash"],
+                         source["owner_session_hash"], source_scope,
+                         source_project, int(time.time())),
+                    ).fetchall()
+                    if {str(row["event_id"]): source_identity(row) for row in live} != originals:
                         return ""
-                    inspected = worker._inspect_recall_text(
-                        original["content"], source="host:background_event",
-                        mem_type="event", audit=False,
-                        max_len=max(4000, len(original["content"])),
+                    for original in messages:
+                        if module.secret_scan(original["content"]).get("raw_secret"):
+                            return ""
+                        inspected = worker._inspect_recall_text(
+                            original["content"], source="host:background_event",
+                            mem_type="event", audit=False,
+                            max_len=max(4000, len(original["content"])),
+                        )
+                        if inspected.get("status") != "safe" or inspected.get("content") != original["content"]:
+                            return ""
+                    if (lease_valid_in_transaction is not None
+                            and not lease_valid_in_transaction(conn)) or (
+                            lease_valid_in_transaction is None
+                            and lease_valid is not None and not lease_valid()):
+                        raise _EventClaimLeaseLost
+                    claim_id = worker._add_claim_tx(
+                        conn, prepared, float(kwargs.get("confidence", .72)),
+                        float(kwargs.get("salience", .70)),
                     )
-                    if inspected.get("status") != "safe" or inspected.get("content") != original["content"]:
-                        return ""
-                claim_id = worker._add_claim_tx(
-                    conn, prepared, float(kwargs.get("confidence", .72)),
-                    float(kwargs.get("salience", .70)),
-                )
+                    if (lease_valid_in_transaction is not None
+                            and not lease_valid_in_transaction(conn)) or (
+                            lease_valid_in_transaction is None
+                            and lease_valid is not None and not lease_valid()):
+                        raise _EventClaimLeaseLost
+            except _EventClaimLeaseLost:
+                return ""
             if claim_id and not prepared.get("_no_op"):
                 worker._after_claim_commit(claim_id, prepared["topic"], prepared["claim"])
             return str(claim_id or "")
@@ -788,10 +844,7 @@ def _run_job(
         )
         # Graph jobs only refer to new, still active claims; execution repeats
         # full graph eligibility checks against authoritative current rows.
-        graph_allowed = os.environ.get("MEMORY_WIKI_GRAPH_AUTO_EXTRACT", "0").strip().lower() \
-            in {"1", "true", "yes", "on"}
-        graph_available = os.environ.get("MEMORY_WIKI_GRAPH_EXTRACT_ENABLED", "0").strip().lower() \
-            in {"1", "true", "yes", "on"}
+        graph_allowed, graph_available = worker.relevant_graph_extraction_settings()
         if source_scope == "chat" and graph_allowed and graph_available:
             for claim_id in result.get("persisted_ids", [])[:4]:
                 if isinstance(claim_id, str) and claim_id not in preexisting \
@@ -833,11 +886,14 @@ def run_once(provider: Any, module: Any, *, worker_id: str | None = None) -> boo
         outcome = _run_job(
             provider, module, job,
             lease_valid=lambda: store.owns(job, worker_id),
+            lease_valid_in_transaction=lambda conn: store.owns(job, worker_id, connection=conn),
         )
         error_code = outcome if isinstance(outcome, str) else ""
     except sqlite3.Error:
         error_code = "database"
-    except (TimeoutError, ConnectionError):
+    except TimeoutError:
+        error_code = "timeout"
+    except ConnectionError:
         error_code = "network"
     except Exception:
         # Deliberately never log or persist str(exc); providers sometimes

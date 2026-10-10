@@ -155,19 +155,23 @@ def _clean_text(value: Any, limit: int = 12000) -> str:
 
 
 def _redact_graph_text(value: Any, limit: int, redactor: Optional[Callable[[str], str]] = None) -> str:
-    """Bounded graph text with the provider's complete secret redactor applied.
+    """Bound graph text; a supplied complete redactor must succeed.
 
-    ``code_knowledge_graph`` remains usable by tiny standalone test providers,
-    so the local PEM/assignment guard is retained as a fail-closed fallback.
-    The installed provider passes ``redact_secrets`` through a method, avoiding
-    a circular import while covering all of Memory Wiki's credential patterns.
+    None retains the legacy standalone PEM/assignment guard only. It is not
+    equivalent to the provider's complete policy. Failure or non-text output
+    from a supplied redactor rejects the operation, never a partial safe copy.
     """
     text = _clean_text(str(value or "").replace("\x00", ""), max(0, limit))
-    if callable(redactor):
+    if redactor is not None:
+        if not callable(redactor):
+            raise RuntimeError("code graph redaction failed")
         try:
-            text = str(redactor(text)).replace("\x00", "")
+            redacted = redactor(text)
+            if not isinstance(redacted, str):
+                raise TypeError
+            text = redacted.replace("\x00", "")
         except Exception:
-            pass
+            raise RuntimeError("code graph redaction failed") from None
     return _clean_text(text, limit)
 
 
@@ -221,8 +225,23 @@ def _is_graph_integrity_digest(key: str, value: Any) -> bool:
 
 
 def _provider_graph_redactor(provider: Any) -> Optional[Callable[[str], str]]:
-    candidate = getattr(provider, "_redact_code_graph_text", None)
-    return candidate if callable(candidate) else None
+    # Class declarations can only require a stricter policy, never grant access.
+    # A subclass/instance cannot waive an inherited literal True requirement.
+    try:
+        required = False
+        for owner in type(provider).__mro__:
+            requirement = vars(owner).get("_requires_full_code_graph_redactor", False)
+            if type(requirement) is not bool:
+                raise TypeError
+            required = required or requirement
+        candidate = getattr(provider, "_redact_code_graph_text", None)
+    except Exception:
+        raise RuntimeError("code graph redaction failed") from None
+    if callable(candidate):
+        return candidate
+    if required:
+        raise RuntimeError("code graph redaction failed")
+    return None
 
 
 def _opaque_graph_id_provenance_version(
@@ -523,6 +542,7 @@ def _safe_graph_output(
 def _graph_read_output(
     provider: Any, value: Dict[str, Any], *,
     _conn: Optional[sqlite3.Connection] = None,
+    _disclosure=None,
 ) -> Dict[str, Any]:
     """Represent redacted navigation data without raw prompt delimiters.
 
@@ -562,6 +582,11 @@ def _graph_read_output(
         "source_hashes": "unchanged provenance, not hashes of represented strings",
         "exact_source": "Code Shrinker file.lines or symbol.source",
     }
+    if _disclosure is not None and not _disclosure.finish():
+        return {"output_boundary": result["output_boundary"], "results": [], "lines": [], "symbols": [],
+                "nodes": [], "edges": [], "repositories": [], "totals": {},
+                "retrieval": {"fts_symbols": 0, "fts_chunks": 0, "fts_lines": 0,
+                              "semantic_chunks": 0, "reranked": False}, "disclosure": "withheld"}
     return result
 
 
@@ -1178,21 +1203,292 @@ def install_code_graph_schema(conn: sqlite3.Connection) -> None:
         pass
 
 
+class _GraphWriterConnection(sqlite3.Connection):
+    def _admit(self):
+        owner = getattr(self, "_graph_owner", None)
+        if owner is None:
+            raise RuntimeError("graph_writer_not_issued")
+        with _provider_claim_lock(owner):
+            # Admission/idle observation is outside native execution, never in
+            # an authorizer callback. Reentrant user operations cannot borrow it.
+            if getattr(self, "_graph_inflight", None) is not None:
+                raise RuntimeError("graph_writer_operation_in_flight")
+            state = getattr(self, "_graph_state", "opening")
+            if state not in {"opening", "issued"}:
+                raise RuntimeError("graph_writer_lifetime_expired")
+            if (getattr(owner, "_lifecycle_state", "") in {"failed", "quarantined", "stopping"}
+                    or getattr(owner, "_transaction_quarantine", None) is not None):
+                raise RuntimeError("provider_lifecycle_not_ready")
+            if not _graph_writer_identity(owner, self, states=("opening", "issued")):
+                raise RuntimeError("graph_writer_not_issued")
+            if state == "issued" and self._graph_tx_started and not self.in_transaction:
+                self._graph_state = "expired"
+                raise RuntimeError("graph_writer_lifetime_expired")
+
+    def _graph_authorize(self, action, a, b, database, source):
+        # Pure exact identity + the particular currently executing admitted
+        # call. SQLite can set in_transaction=False BEFORE COMMIT returns and
+        # issue internal non-TX callbacks in that interval. Neither that idle
+        # bit nor a boolean committing flag retires or grants a capability.
+        owner = self._graph_owner
+        flight = self._graph_inflight
+        cleanup = self._graph_cleanup and action == sqlite3.SQLITE_TRANSACTION and a == "ROLLBACK"
+        states = ("opening", "issued", "expired") if cleanup else ("opening", "issued")
+        if (not _graph_writer_identity(owner, self, states=states)
+                or type(flight) is not tuple or len(flight) != 5
+                or flight[0] is not self or flight[1] is not owner
+                or flight[2] is not self._graph_lifetime
+                or flight[3] != threading.get_ident()):
+            return sqlite3.SQLITE_DENY
+        if self._graph_state == "issued":
+            if action == sqlite3.SQLITE_SAVEPOINT:
+                return sqlite3.SQLITE_DENY
+            if action == sqlite3.SQLITE_TRANSACTION:
+                if (self._graph_context is not None and a in {"COMMIT", "ROLLBACK"}
+                        and not (self._graph_committing or self._graph_cleanup)):
+                    return sqlite3.SQLITE_DENY
+                if a == "BEGIN" and self._graph_tx_started:
+                    return sqlite3.SQLITE_DENY
+                if a in {"COMMIT", "ROLLBACK"}:
+                    self._graph_end_attempt = a
+                elif a == "BEGIN":
+                    self._graph_begin_attempt = True
+        callback = self._graph_user_authorizer
+        return sqlite3.SQLITE_OK if callback is None else callback(action, a, b, database, source)
+
+    def _graph_call(self, operation, *args, _cleanup=False, _commit=False, **kwargs):
+        owner = self._graph_owner
+        with _provider_claim_lock(owner):
+            if not _cleanup:
+                self._admit()
+            elif (self._graph_inflight is not None
+                    or not _graph_writer_identity(owner, self, states=("opening", "issued", "expired"))):
+                raise RuntimeError("graph_writer_cleanup_UNKNOWN")
+            before = self.in_transaction
+            self._graph_end_attempt = None
+            self._graph_begin_attempt = False
+            self._graph_cleanup = _cleanup
+            self._graph_committing = _commit
+            # Strong call-local references: exact object, owner and issuance
+            # token; the fresh token distinguishes this invocation, not a path.
+            flight = (self, owner, self._graph_lifetime, threading.get_ident(), object())
+            self._graph_inflight = flight
+            try:
+                try:
+                    result = operation(*args, **kwargs)
+                finally:
+                    # Native return/raise has happened. A subsequent cleanup
+                    # call gets its OWN admission, never this operation's lease.
+                    if self._graph_inflight is flight:
+                        self._graph_inflight = None
+                    self._graph_cleanup = False
+                    self._graph_committing = False
+            except BaseException as primary:
+                ended = (before or self._graph_begin_attempt) and not self.in_transaction
+                attempted = _commit or self._graph_end_attempt == "COMMIT"
+                if self._graph_state == "issued" and ended:
+                    self._graph_state = "expired"
+                if attempted:
+                    _rollback_graph_writer_connection(self, primary, commit_attempted=True)
+                elif not _cleanup and self._graph_end_attempt == "ROLLBACK":
+                    _rollback_graph_writer_connection(self, primary)
+                raise
+            after = self.in_transaction
+            if self._graph_state == "issued":
+                if after:
+                    self._graph_tx_started = True
+                if (before and not after) or _commit or _cleanup:
+                    self._graph_state = "expired"
+            return result
+
+    def cursor(self, factory=None):
+        with _provider_claim_lock(self._graph_owner):
+            self._admit()
+            if factory is not None and factory is not _GraphWriterCursor:
+                raise RuntimeError("graph_writer_cursor_factory_unsupported")
+            return super().cursor(factory=_GraphWriterCursor)
+
+    def execute(self, *args, **kwargs):
+        return self.cursor().execute(*args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        return self.cursor().executemany(*args, **kwargs)
+
+    def _admit_script(self):
+        self._admit()
+        if self._graph_state != "opening":
+            # CPython executescript commits BEFORE parsing its first statement.
+            # Graph schema installation is the only supported script lifetime.
+            raise RuntimeError("graph_writer_script_unsupported")
+
+    def executescript(self, *args, **kwargs):
+        self._admit_script()
+        return self.cursor().executescript(*args, **kwargs)
+
+    def set_authorizer(self, callback):
+        # A user callback can restrict the real fence, never replace it or
+        # reconfigure it from within an admitted native operation.
+        with _provider_claim_lock(self._graph_owner):
+            self._admit()
+            if callback is not None and not callable(callback):
+                raise TypeError("authorizer_must_be_callable")
+            self._graph_user_authorizer = callback
+            return sqlite3.Connection.set_authorizer(self, self._graph_authorize)
+
+    def __setattr__(self, name, value):
+        if name in {"autocommit", "isolation_level"} and getattr(self, "_graph_state", "opening") != "opening":
+            raise RuntimeError("graph_writer_transaction_mode_unsupported")
+        return super().__setattr__(name, value)
+
+    def blobopen(self, *args, **kwargs):
+        raise RuntimeError("graph_writer_blob_unsupported")
+
+    def deserialize(self, *args, **kwargs):
+        raise RuntimeError("graph_writer_deserialize_unsupported")
+
+    def commit(self):
+        return self._graph_call(super().commit, _commit=True)
+
+    def rollback(self):
+        try:
+            return self._graph_call(super().rollback, _cleanup=True)
+        except BaseException as cleanup:
+            self._graph_state = "quarantined"
+            self._graph_owner._quarantine_claim_connection(self, "graph_rollback_" + type(cleanup).__name__)
+            raise
+
+    def __enter__(self):
+        self._admit()
+        if self._graph_context is not None:
+            raise RuntimeError("graph_writer_nested_context_unsupported")
+        transaction = getattr(self._graph_owner, "_claim_transaction", None)
+        if not callable(transaction):
+            raise RuntimeError("graph_writer_context_unsupported")
+        context = transaction(self, adopt=True)
+        context.__enter__()
+        self._graph_context = context
+        return self
+
+    def __exit__(self, exc_type, primary, tb):
+        context = self._graph_context
+        if context is None:
+            raise RuntimeError("graph_writer_context_not_entered")
+        try:
+            return context.__exit__(exc_type, primary, tb)
+        finally:
+            if self._graph_state != "quarantined":
+                self._graph_context = None
+
+    def close(self):
+        owner = self._graph_owner
+        with _provider_claim_lock(owner):
+            # Reentrant native callbacks must not close or retire this owner.
+            if self._graph_inflight is not None:
+                raise RuntimeError("graph_writer_operation_in_flight")
+            if self._graph_state == "closed":
+                return
+            if self._graph_state == "quarantined":
+                raise RuntimeError("graph_writer_cleanup_UNKNOWN")
+            try:
+                if self.in_transaction:
+                    self.rollback()
+                if self.in_transaction:
+                    raise RuntimeError("graph_writer_transaction_still_active")
+                super().close()
+            except BaseException as cleanup:
+                self._graph_state = "quarantined"
+                owner._quarantine_claim_connection(self, "graph_close_" + type(cleanup).__name__)
+                raise
+            owners = getattr(owner, "_graph_writer_connections", {})
+            if owners.get(self) is self._graph_lifetime:
+                del owners[self]
+            self._graph_state = "closed"
+            self._graph_primary = None
+
+
+
+
+def _graph_writer_identity(provider, conn, *, states=("issued",)) -> bool:
+    """Pure factory/owner/registry predicate; never observe/alter TX lifetime."""
+    return (type(conn) is _GraphWriterConnection
+            and getattr(conn, "_graph_owner", None) is provider
+            and getattr(conn, "_graph_state", "") in states
+            and getattr(provider, "_lifecycle_state", "") not in {"failed", "quarantined", "stopping"}
+            and getattr(provider, "_transaction_quarantine", None) is None
+            and getattr(provider, "_graph_writer_connections", {}).get(conn) is conn._graph_lifetime
+            and conn._graph_shared is getattr(provider, "_conn", None)
+            and conn._graph_shared is getattr(provider, "_owned_conn", None))
+
+
+def _owns_graph_writer(provider, conn) -> bool:
+    # Outside a callback, an ended/native-bypassed TX is not a usable writer.
+    # This query is PURE: only next locked admission retires an observed idle
+    # writer. Authorizer eligibility uses exact pre-call admission instead.
+    return (_graph_writer_identity(provider, conn)
+            and (not conn._graph_tx_started or conn.in_transaction))
+
+
+def _remember_graph_writer_error(conn, primary):
+    if type(conn) is _GraphWriterConnection and conn._graph_primary is None:
+        conn._graph_primary = primary
+
+
+def _rollback_graph_writer_connection(conn, primary, *, commit_attempted=False):
+    _remember_graph_writer_error(conn, primary)
+    owner = getattr(conn, "_graph_owner", None)
+    if type(conn) is _GraphWriterConnection and hasattr(owner, "_rollback_claim_transaction"):
+        completed = owner._rollback_claim_transaction(conn, primary, commit_attempted=commit_attempted)
+        conn._graph_state = "expired" if completed and conn._graph_state != "quarantined" else "quarantined"
+        return completed
+    try:
+        conn.rollback()
+        if conn.in_transaction:
+            raise RuntimeError("graph_writer_transaction_still_active")
+    except BaseException as cleanup:
+        primary.add_note("graph_writer_rollback_cleanup:" + type(cleanup).__name__ + "; outcome=UNKNOWN")
+        return False
+    return True
+
+
+class _GraphWriterCursor(sqlite3.Cursor):
+    """Every issued cursor uses the same connection lifetime, including fetch."""
+    def execute(self, *args, **kwargs):
+        return self.connection._graph_call(super().execute, *args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        return self.connection._graph_call(super().executemany, *args, **kwargs)
+
+    def executescript(self, *args, **kwargs):
+        self.connection._admit_script()
+        return self.connection._graph_call(super().executescript, *args, **kwargs)
+
+    def fetchone(self):
+        return self.connection._graph_call(super().fetchone)
+
+    def fetchmany(self, *args, **kwargs):
+        return self.connection._graph_call(super().fetchmany, *args, **kwargs)
+
+    def fetchall(self):
+        return self.connection._graph_call(super().fetchall)
+
+    def __iter__(self):
+        self.connection._admit()
+        return self
+
+    def __next__(self):
+        return self.connection._graph_call(super().__next__)
+
+
 def _open_graph_writer_connection(provider: Any) -> Tuple[sqlite3.Connection, bool]:
-    """Open a private SQLite writer for graph lifecycle operations.
+    """Issue an exact private owner, from actual open to one writer TX/close.
 
-    ``MemoryWikiProvider._connect()`` is deliberately shared by worker threads.
-    A top-level transaction on that connection can be committed accidentally by
-    an unrelated provider method which calls ``commit()`` (for example audit
-    logging).  Graph ingestion therefore never owns its atomic lifecycle on
-    that shared handle when the database is file-backed.  SQLite's write lock
-    on this private connection serializes other providers/processes as well.
-
-    Tiny standalone test providers may use ``:memory:`` databases.  Such a
-    database cannot be reopened as an equivalent connection, so retain the
-    legacy handle only for that non-persistent fallback.
+    Registration is private process-local bookkeeping from this factory. It
+    authenticates neither host intent nor file contents and grants no reader ACL.
+    File-backed writers are never replaced by the shared provider connection.
     """
     shared = provider._connect()
+    if shared.in_transaction:
+        raise RuntimeError("graph_writer_shared_transaction_pending")
     raw_path = getattr(provider, "db_path", "")
     path = str(raw_path or "")
     if not path:
@@ -1204,31 +1500,74 @@ def _open_graph_writer_connection(provider: Any) -> Tuple[sqlite3.Connection, bo
         except sqlite3.Error:
             path = ""
     if not path or path == ":memory:" or path.startswith("file::memory:"):
-        return shared, False
+        raise RuntimeError("graph_writer_file_backed_required")
 
-    writer = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
-    writer.row_factory = sqlite3.Row
+    with _provider_claim_lock(provider):
+        writer = sqlite3.connect(path, check_same_thread=False, timeout=30.0, factory=_GraphWriterConnection, cached_statements=0)
+        # Publish exact ownership immediately, including schema/start failures.
+        writer._graph_owner = provider
+        writer._graph_shared = shared
+        writer._graph_lifetime = object()
+        writer._graph_state = "opening"
+        writer._graph_primary = None
+        writer._graph_tx_started = False
+        writer._graph_end_attempt = None
+        writer._graph_begin_attempt = False
+        writer._graph_cleanup = False
+        writer._graph_committing = False
+        writer._graph_inflight = None
+        writer._graph_user_authorizer = None
+        writer._graph_context = None
+        sqlite3.Connection.set_authorizer(writer, writer._graph_authorize)
+        owners = getattr(provider, "_graph_writer_connections", None)
+        if owners is None:
+            owners = provider._graph_writer_connections = {}
+        owners[writer] = writer._graph_lifetime
     try:
+        writer.row_factory = sqlite3.Row
         writer.execute("PRAGMA busy_timeout=30000")
         writer.execute("PRAGMA foreign_keys=ON")
         writer.execute("PRAGMA temp_store=MEMORY")
         writer.execute("PRAGMA synchronous=FULL")
-        # Journal mode belongs to the database, so this read verifies the
-        # private connection joins the provider's WAL/DELETE mode without
-        # attempting a mode-changing PRAGMA while another writer is active.
         writer.execute("PRAGMA journal_mode").fetchone()
-        # Migrations are intentionally completed before BEGIN IMMEDIATE.
-        # They never share the lifecycle transaction being protected below.
         install_code_graph_schema(writer)
         if writer.in_transaction:
             writer.commit()
-    except Exception:
-        writer.close()
+        writer._graph_tx_started = False
+        writer._graph_state = "issued"
+    except BaseException as primary:
+        _rollback_graph_writer_connection(writer, primary)
+        _close_graph_writer_connection(writer, True)
         raise
     return writer, True
 
 
-def _open_graph_reader_connection(provider: Any) -> Tuple[sqlite3.Connection, bool]:
+
+
+class _GraphReaderConnection(sqlite3.Connection):
+    """Private query-only factory lifetime; never a claim writer grant."""
+    def close(self):
+        owner = self._graph_read_owner
+        with _provider_claim_lock(owner):
+            if not _owns_graph_reader(owner, self):
+                raise RuntimeError('graph_reader_owner_unproven')
+            if self.in_transaction:
+                raise RuntimeError('graph_reader_transaction_pending')
+            sqlite3.Connection.close(self)
+            self._graph_read_state = 'closed'
+            del owner._graph_reader_connections[self]
+
+
+def _owns_graph_reader(provider, conn):
+    return (type(conn) is _GraphReaderConnection
+            and conn._graph_read_owner is provider
+            and conn._graph_read_shared is provider._conn is provider._owned_conn
+            and conn._graph_read_thread == threading.get_ident()
+            and conn._graph_read_state in {'opening', 'issued'}
+            and getattr(provider, '_graph_reader_connections', {}).get(conn) is conn._graph_read_lifetime)
+
+
+def _open_graph_reader_connection(provider: Any, *, disclosure=False) -> Tuple[sqlite3.Connection, bool]:
     """Open a private read handle without running DDL on a request path.
 
     Provider initialization and graph ingestion install the schema.  Read
@@ -1238,6 +1577,9 @@ def _open_graph_reader_connection(provider: Any) -> Tuple[sqlite3.Connection, bo
     the last committed WAL snapshot while a graph writer is in progress.
     """
     shared = provider._connect()
+    if shared is not provider._owned_conn:
+        raise RuntimeError('graph_reader_parent_owner_unproven')
+    anchor = provider._retain_read_fence(shared) if disclosure else None
     raw_path = getattr(provider, "db_path", "")
     path = str(raw_path or "")
     if not path:
@@ -1250,7 +1592,18 @@ def _open_graph_reader_connection(provider: Any) -> Tuple[sqlite3.Connection, bo
             path = ""
     if not path or path == ":memory:" or path.startswith("file::memory:"):
         return shared, False
-    reader = sqlite3.connect(path, check_same_thread=False, timeout=30.0)
+    reader = sqlite3.connect(path, check_same_thread=False, timeout=30.0, factory=_GraphReaderConnection)
+    reader._graph_read_owner = provider
+    reader._graph_read_shared = shared
+    reader._graph_read_fence = anchor
+    reader._graph_read_lifetime = object()
+    reader._graph_read_thread = threading.get_ident()
+    reader._graph_read_state = 'opening'
+    reader._graph_read_primary = None
+    owners = getattr(provider, '_graph_reader_connections', None)
+    if owners is None:
+        owners = provider._graph_reader_connections = {}
+    owners[reader] = reader._graph_read_lifetime
     reader.row_factory = sqlite3.Row
     try:
         reader.execute("PRAGMA busy_timeout=30000")
@@ -1258,8 +1611,12 @@ def _open_graph_reader_connection(provider: Any) -> Tuple[sqlite3.Connection, bo
         reader.execute("PRAGMA temp_store=MEMORY")
         reader.execute("PRAGMA query_only=ON")
         reader.execute("SELECT 1").fetchone()
-    except Exception:
-        reader.close()
+        reader._graph_read_state = 'issued'
+        if anchor is not None:
+            anchor.bind_reader(reader)
+    except BaseException as primary:
+        reader._graph_read_primary = primary
+        _close_graph_writer_connection(reader, True)
         raise
     return reader, True
 
@@ -1267,11 +1624,31 @@ def _open_graph_reader_connection(provider: Any) -> Tuple[sqlite3.Connection, bo
 def _close_graph_writer_connection(conn: sqlite3.Connection, owned: bool) -> None:
     if not owned:
         return
+    reader = type(conn) is _GraphReaderConnection
+    primary = conn._graph_read_primary if reader else (getattr(conn, "_graph_primary", None) if type(conn) is _GraphWriterConnection else None)
     try:
-        if conn.in_transaction:
+        if type(conn) is not _GraphWriterConnection and conn.in_transaction:
             conn.rollback()
-    finally:
         conn.close()
+    except BaseException as cleanup:
+        if reader:
+            conn._graph_read_state = 'quarantined'
+            conn._graph_read_owner._quarantine_claim_connection(conn, 'graph_reader_close_' + type(cleanup).__name__, primary if primary is not None else cleanup)
+        if type(conn) is _GraphWriterConnection:
+            conn._graph_state = "quarantined"
+            conn._graph_owner._quarantine_claim_connection(conn, "graph_close_" + type(cleanup).__name__, primary if primary is not None else cleanup)
+        if primary is None:
+            raise
+        note = "graph_writer_close_cleanup:" + type(cleanup).__name__ + "; outcome=UNKNOWN"
+        if note not in getattr(primary, "__notes__", ()):
+            primary.add_note(note)
+        # Never suppress cleanup against a primary which a caller may swallow.
+        # The exact primary must actually reach the caller, including telemetry.
+        raise primary from cleanup
+
+
+
+
 
 
 def _delete_fts_for_files(conn: sqlite3.Connection, repository_id: str, files: Sequence[str]) -> None:
@@ -1513,6 +1890,9 @@ def _embed_graph_chunks(
             " ORDER BY CASE WHEN symbol_id<>'' THEN 0 ELSE 1 END, token_estimate DESC LIMIT ?",
             [*params, limit],
         ).fetchall()
+    except BaseException as primary:
+        _remember_graph_writer_error(conn, primary)
+        raise
     finally:
         _close_graph_writer_connection(conn, owns_conn)
 
@@ -1661,16 +2041,17 @@ def _embed_graph_chunks(
                     conn.commit()
                     post_commit_callbacks.extend(callbacks)
                     stats["created"] += 1
-                except Exception:
-                    if conn.in_transaction:
-                        conn.rollback()
+                except BaseException as primary:
+                    _rollback_graph_writer_connection(conn, primary)
                     raise
                 finally:
                     _close_graph_writer_connection(conn, owns_conn)
                     conn = None
         except Exception as exc:  # one malformed unit must not abort the snapshot
-            if conn is not None and conn.in_transaction:
-                conn.rollback()
+            if conn is not None and getattr(conn, "_graph_state", "") != "closed":
+                _rollback_graph_writer_connection(conn, exc)
+            if getattr(provider, "_lifecycle_state", "") == "quarantined":
+                raise
             stats["failed"] += 1
             if len(stats["errors"]) < 12:
                 stats["errors"].append(f"chunk failure: {type(exc).__name__}")
@@ -1682,6 +2063,8 @@ def _embed_graph_chunks(
         try:
             provider._after_claim_commit(claim_id, topic, claim)
         except Exception as exc:
+            if getattr(provider, "_transaction_quarantine", None) is not None:
+                raise
             if len(stats["errors"]) < 12:
                 stats["errors"].append(f"post_commit failure: {type(exc).__name__}")
     return stats
@@ -1789,6 +2172,7 @@ def ingest_code_graph_event(
     # embedding calls outside it avoids holding the writer transaction across
     # model/network work, while the event record makes the graph mutation
     # exactly-once before deferred embeddings begin.
+    snapshot_committed = False
     with _GRAPH_INGEST_LOCK:
         conn, owns_conn = _open_graph_writer_connection(provider)
         try:
@@ -1969,12 +2353,16 @@ def ingest_code_graph_event(
             if finalized.rowcount != 1:
                 raise RuntimeError("code graph event reservation was not finalized")
             conn.commit()
-        except Exception:
-            if conn.in_transaction:
-                conn.rollback()
+            snapshot_committed = True
+        except BaseException as primary:
+            _rollback_graph_writer_connection(conn, primary)
             raise
         finally:
-            _close_graph_writer_connection(conn, owns_conn)
+            try:
+                _close_graph_writer_connection(conn, owns_conn)
+            except BaseException as primary:
+                primary.add_note("code_graph_ingest:snapshot=" + ("committed" if snapshot_committed else "not_confirmed") + "; cleanup=UNKNOWN")
+                raise
 
     try:
         embed_stats = _embed_graph_chunks(
@@ -1983,10 +2371,13 @@ def ingest_code_graph_event(
             expected_event_id=event_id, expected_payload_hash=payload_hash,
         )
     except Exception as exc:
+        if getattr(provider, "_transaction_quarantine", None) is not None:
+            exc.add_note("code_graph_ingest:snapshot=committed; embedding=UNKNOWN; cleanup=UNKNOWN")
+            raise
         # Graph state is already durable and can be retried through
         # embed_pending_chunks.  Preserve that success rather than making a
         # network/model issue appear to roll back a committed snapshot.
-        embed_stats = {"enabled": True, "processed": 0, "created": 0, "reused": 0, "failed": 1,
+        embed_stats = {"status": "deferred", "enabled": True, "processed": 0, "created": 0, "reused": 0, "failed": 1,
                        "errors": [f"deferred embedding: {type(exc).__name__}"]}
 
     result = {**durable_result, "embedding": embed_stats}
@@ -2003,11 +2394,18 @@ def ingest_code_graph_event(
                     (_json(result), event_id, payload_hash, payload_hash_version),
                 )
                 conn.commit()
-        except Exception:
-            if conn.in_transaction:
-                conn.rollback()
+        except BaseException as primary:
+            _rollback_graph_writer_connection(conn, primary)
+            if getattr(provider, "_transaction_quarantine", None) is not None or not isinstance(primary, Exception):
+                primary.add_note("code_graph_ingest:snapshot=committed; telemetry=UNKNOWN; cleanup=UNKNOWN")
+                raise
+            result["telemetry"] = {"status": "deferred", "error": type(primary).__name__}
         finally:
-            _close_graph_writer_connection(conn, owns_conn)
+            try:
+                _close_graph_writer_connection(conn, owns_conn)
+            except BaseException as primary:
+                primary.add_note("code_graph_ingest:snapshot=committed; telemetry=UNKNOWN; cleanup=UNKNOWN")
+                raise
     return {"status": "completed", "deduplicated": False, **result}
 
 
@@ -2036,6 +2434,9 @@ def embed_pending_chunks(
             "SELECT COUNT(*) FROM code_graph_chunks WHERE repository_id=? AND embedding_claim_id=''",
             (repository_id,),
         ).fetchone()
+    except BaseException as primary:
+        _remember_graph_writer_error(conn, primary)
+        raise
     finally:
         _close_graph_writer_connection(conn, owns_conn)
     stats = _embed_graph_chunks(
@@ -2049,6 +2450,9 @@ def embed_pending_chunks(
             "SELECT COUNT(*) FROM code_graph_chunks WHERE repository_id=? AND embedding_claim_id=''",
             (repository_id,),
         ).fetchone()
+    except BaseException as primary:
+        _remember_graph_writer_error(conn, primary)
+        raise
     finally:
         _close_graph_writer_connection(conn, owns_conn)
     return {
@@ -2168,11 +2572,26 @@ def _active_code_graph_repository(
 
 def query_code_graph(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     """Query through a private connection so read-time schema checks cannot commit a writer."""
-    conn, owns_conn = _open_graph_reader_connection(provider)
+    conn, owns_conn = _open_graph_reader_connection(provider, disclosure=True)
     try:
         return _query_code_graph_on_connection(provider, args, conn)
+    except BaseException as primary:
+        if type(conn) is _GraphReaderConnection:
+            conn._graph_read_primary = primary
+        raise
     finally:
         _close_graph_writer_connection(conn, owns_conn)
+
+
+def _code_disclosure(provider, conn):
+    if type(conn) is _GraphReaderConnection:
+        if (not _owns_graph_reader(provider, conn) or conn._graph_read_fence is None
+                or conn._graph_read_fence.source_conn is not conn):
+            raise RuntimeError('graph_reader_original_carrier_missing')
+        return conn._graph_read_fence
+    if conn is not provider._conn or conn is not provider._owned_conn:
+        raise RuntimeError('graph_reader_parent_owner_unproven')
+    return provider._retain_read_fence(conn)
 
 
 def _query_code_graph_on_connection(
@@ -2181,6 +2600,7 @@ def _query_code_graph_on_connection(
     query = str(args.get("query") or "").strip()
     if not query:
         raise ValueError("query is required")
+    disclosure = _code_disclosure(provider, conn)
     repository_id = _active_code_graph_repository(provider, args.get("repository_id"), conn)
     limit = max(1, min(int(args.get("limit") or 12), 50))
     lexical_limit = max(20, min(int(args.get("candidate_limit") or limit * 8), 300))
@@ -2201,15 +2621,26 @@ def _query_code_graph_on_connection(
     _rrf_add(scores, score_parts, symbol_keys, "fts_symbol", 1.15)
     _rrf_add(scores, score_parts, chunk_keys, "fts_chunk", 1.0)
     _rrf_add(scores, score_parts, line_keys, "fts_line", 0.75)
+    for table, column, ids in (
+        ("code_graph_symbols", ("repository_id", "symbol_id"), [(repository_id, r['symbol_id']) for r in symbol_rows]),
+        ("code_graph_chunks", ("repository_id", "chunk_id"), [(repository_id, r['chunk_id']) for r in chunk_rows]),
+        ("code_graph_lines", ("repository_id", "file_path", "line_no"), [(repository_id,r['file_path'],r['line_no']) for r in line_rows]),
+    ):
+        disclosure.code(disclosure.watch(table, column, ids))
 
     semantic_count = 0
     try:
-        # Search the dedicated code-intelligence topic so unrelated personal
-        # memories cannot consume Memory Wiki's bounded semantic top-K.
+        # Repository authority was checked above. Narrow Wiki's ordinary ACL/
+        # metadata domain before both vector and claim cutoffs, not after them.
+        eligible_claim_ids = [str(r[0]) for r in conn.execute(
+            "SELECT DISTINCT embedding_claim_id FROM code_graph_chunks "
+            "WHERE repository_id=? AND embedding_claim_id<>''", (repository_id,),
+        )]
         semantic_rows = provider._search(query, limit=min(50, lexical_limit), include_stale=False,
                                          topic="code-intelligence",
                                          session_id=str(args.get("session_id") or ""),
-                                         record_retrieval=False, conn=conn)
+                                         record_retrieval=False, conn=conn, apply_rerank=False,
+                                         _eligible_claim_ids=eligible_claim_ids)
         claim_ids = [str(r.get("id") or "") for r in semantic_rows if str(r.get("id") or "")]
         if claim_ids:
             placeholders = ",".join("?" for _ in claim_ids)
@@ -2276,6 +2707,10 @@ def _query_code_graph_on_connection(
         item = _load_candidate(conn, key)
         if not item:
             continue
+        table, columns = {"symbol": ("code_graph_symbols", ("repository_id", "symbol_id")),
+                          "chunk": ("code_graph_chunks", ("repository_id", "chunk_id")),
+                          "line": ("code_graph_lines", ("repository_id", "file_path", "line_no"))}[item['candidate_type']]
+        disclosure.code(disclosure.watch(table, columns, [tuple(item[c] for c in columns)]))
         item["score"] = round(scores[key], 8)
         item["score_parts"] = score_parts[key]
         item["excerpt"] = _clean_text(item.get("excerpt"), int(args.get("max_chars_per_hit") or 2400))
@@ -2283,11 +2718,13 @@ def _query_code_graph_on_connection(
         sid = str(item.get("symbol_id") or (item.get("id") if item.get("candidate_type") == "symbol" else ""))
         if sid:
             item["relations"] = [dict(r) for r in conn.execute(
-                "SELECT predicate,source_id,target_id,source_file,source_line,target_file,confidence "
+                "SELECT edge_id,predicate,source_id,target_id,source_file,source_line,target_file,confidence "
                 "FROM code_graph_edges WHERE repository_id=? AND (source_id=? OR target_id=?) "
                 "ORDER BY confidence DESC LIMIT 12",
                 (item["repository_id"], sid, sid),
             ).fetchall()]
+            disclosure.watch("code_graph_edges", ("repository_id","edge_id"),
+                             [(repository_id,r['edge_id']) for r in item['relations']])
         candidates.append(item)
 
     # Reuse the installed Voyage/Cohere reranker without making it mandatory.
@@ -2337,13 +2774,17 @@ def _query_code_graph_on_connection(
             "semantic_chunks": semantic_count, "semantic_error": semantic_error,
             "fusion": "weighted_rrf_k60", "reranked": reranked, "rerank_error": rerank_error,
         },
-    }, _conn=conn)
+    }, _conn=conn, _disclosure=disclosure)
 
 
 def code_line_context(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
-    conn, owns_conn = _open_graph_reader_connection(provider)
+    conn, owns_conn = _open_graph_reader_connection(provider, disclosure=True)
     try:
         return _code_line_context_on_connection(provider, args, conn)
+    except BaseException as primary:
+        if type(conn) is _GraphReaderConnection:
+            conn._graph_read_primary = primary
+        raise
     finally:
         _close_graph_writer_connection(conn, owns_conn)
 
@@ -2351,6 +2792,7 @@ def code_line_context(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
 def _code_line_context_on_connection(
     provider: Any, args: Dict[str, Any], conn: sqlite3.Connection
 ) -> Dict[str, Any]:
+    disclosure = _code_disclosure(provider, conn)
     repository_id = _active_code_graph_repository(
         provider, args.get("repository_id"), conn, bind_omitted=False,
     )
@@ -2381,6 +2823,11 @@ def _code_line_context_on_connection(
         (repository_id, file_path, max(1, line_no - radius), line_no + radius),
     ).fetchall()]
     symbol_ids = sorted({str(r.get("symbol_id") or "") for r in rows if str(r.get("symbol_id") or "")})
+    disclosure.code(disclosure.watch("code_graph_lines", ("repository_id","file_path","line_no"),
+                                     [(repository_id,file_path,r['line_no']) for r in rows]))
+    disclosure.code(disclosure.watch("code_graph_chunks", ("repository_id","chunk_id"),
+                                     [(repository_id,r['chunk_id']) for r in rows if r.get('chunk_id')]))
+    disclosure.watch("code_graph_symbols", ("repository_id","symbol_id"), [(repository_id,sid) for sid in symbol_ids])
     symbols = []
     if symbol_ids:
         placeholders = ",".join("?" for _ in symbol_ids)
@@ -2392,13 +2839,17 @@ def _code_line_context_on_connection(
             "range": [max(1, line_no - radius), line_no + radius],
             "lines": rows, "symbols": symbols,
             "line_id": line_id or next((str(r.get("line_id") or "") for r in rows if int(r.get("line_no") or 0) == line_no), ""),
-            "note": "Stored lines are redacted navigation copies; use Code Shrinker file.lines or symbol.source for exact source."}, _conn=conn)
+            "note": "Stored lines are redacted navigation copies; use Code Shrinker file.lines or symbol.source for exact source."}, _conn=conn, _disclosure=disclosure)
 
 
 def code_graph_neighbors(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
-    conn, owns_conn = _open_graph_reader_connection(provider)
+    conn, owns_conn = _open_graph_reader_connection(provider, disclosure=True)
     try:
         return _code_graph_neighbors_on_connection(provider, args, conn)
+    except BaseException as primary:
+        if type(conn) is _GraphReaderConnection:
+            conn._graph_read_primary = primary
+        raise
     finally:
         _close_graph_writer_connection(conn, owns_conn)
 
@@ -2406,6 +2857,7 @@ def code_graph_neighbors(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
 def _code_graph_neighbors_on_connection(
     provider: Any, args: Dict[str, Any], conn: sqlite3.Connection
 ) -> Dict[str, Any]:
+    disclosure = _code_disclosure(provider, conn)
     repository_id = _active_code_graph_repository(
         provider, args.get("repository_id"), conn, bind_omitted=False,
     )
@@ -2441,14 +2893,20 @@ def _code_graph_neighbors_on_connection(
             f"SELECT symbol_id,file_path,qualified_name,kind,signature,start_line,end_line FROM code_graph_symbols WHERE repository_id=? AND symbol_id IN ({placeholders})",
             [repository_id, *symbol_nodes],
         ).fetchall()]
+    disclosure.code(disclosure.watch("code_graph_symbols", ("repository_id","symbol_id"), [(repository_id,n['symbol_id']) for n in nodes]))
+    disclosure.watch("code_graph_edges", ("repository_id","edge_id"), [(repository_id,e['edge_id']) for e in edges])
     return _graph_read_output(provider, {"repository_id": repository_id, "node_id": node_id, "hops": hops,
-            "nodes": nodes, "edges": edges[:limit]}, _conn=conn)
+            "nodes": nodes, "edges": edges[:limit]}, _conn=conn, _disclosure=disclosure)
 
 
 def code_graph_status(provider: Any, args: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    conn, owns_conn = _open_graph_reader_connection(provider)
+    conn, owns_conn = _open_graph_reader_connection(provider, disclosure=True)
     try:
         return _code_graph_status_on_connection(provider, args, conn)
+    except BaseException as primary:
+        if type(conn) is _GraphReaderConnection:
+            conn._graph_read_primary = primary
+        raise
     finally:
         _close_graph_writer_connection(conn, owns_conn)
 
@@ -2457,12 +2915,14 @@ def _code_graph_status_on_connection(
     provider: Any, args: Optional[Dict[str, Any]], conn: sqlite3.Connection
 ) -> Dict[str, Any]:
     args = args or {}
+    disclosure = _code_disclosure(provider, conn)
     repository_id = _active_code_graph_repository(provider, args.get("repository_id"), conn)
     repos = [dict(r) for r in conn.execute(
         "SELECT * FROM code_graph_repositories WHERE repository_id=? ORDER BY updated_at DESC",
         (repository_id,),
     ).fetchall()]
     totals = {}
+    disclosure.watch("code_graph_repositories", "repository_id", [repository_id])
     for table, label in (("code_graph_files", "files"), ("code_graph_symbols", "symbols"),
                          ("code_graph_chunks", "chunks"), ("code_graph_lines", "lines"),
                          ("code_graph_edges", "edges")):
@@ -2488,7 +2948,7 @@ def _code_graph_status_on_connection(
         "totals": totals,
         "embedding_enabled": _env_bool("MEMORY_WIKI_CODE_GRAPH_EMBED", True),
         "rerank_enabled": _env_bool("MEMORY_WIKI_CODE_GRAPH_RERANK", True),
-    }, _conn=conn)
+    }, _conn=conn, _disclosure=disclosure)
 
 
 def _scrub_graph_identity_columns(
@@ -2744,7 +3204,7 @@ def scrub_code_graph_storage(
 def maybe_prefetch_code_context(provider: Any, query: str, max_chars: int = 8000) -> str:
     if not _env_bool("MEMORY_WIKI_CODE_GRAPH_PREFETCH", True) or not _CODE_HINT.search(str(query or "")):
         return ""
-    conn, owns_conn = _open_graph_reader_connection(provider)
+    conn, owns_conn = _open_graph_reader_connection(provider, disclosure=True)
     try:
         # Prefetch is model-facing: repository names in a prompt or the graph
         # table are not authority to read outside the active project.
@@ -2757,6 +3217,10 @@ def maybe_prefetch_code_context(provider: Any, query: str, max_chars: int = 8000
             "SELECT repository_id FROM code_graph_repositories WHERE repository_id=? "
             "ORDER BY updated_at DESC LIMIT 20", (project_scope,),
         ).fetchall()]
+    except BaseException as primary:
+        if type(conn) is _GraphReaderConnection:
+            conn._graph_read_primary = primary
+        raise
     finally:
         _close_graph_writer_connection(conn, owns_conn)
     if not repos:

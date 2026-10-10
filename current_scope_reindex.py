@@ -7,7 +7,8 @@ from typing import Any
 
 _FIELDS = ("id", "topic", "memory_revision", "updated_at", "visibility_scope",
            "origin_bot_id", "origin_session_id", "origin_chat_hash", "project_id",
-           "event_at", "created_at")
+           "event_at", "created_at", "status", "risk", "quarantined_at",
+           "trust_class", "type", "expires_at")
 
 _REFUSAL_REASONS = frozenset({
     "scope_erasure_authority_changed", "scope_erasure_replay_required",
@@ -113,10 +114,13 @@ def reindex(provider: Any, module: Any, limit: int, *, dry_run: bool) -> dict[st
 
         entries = erasures()
         visibility, params = provider._claim_visibility_sql()
-        where = ("status='active' AND normalized_claim IS NOT NULL "
+        eligibility = provider._claim_metadata_eligibility_sql("scoped_reindex")
+        where = (eligibility + " AND normalized_claim IS NOT NULL "
                  "AND normalized_claim!='' AND " + visibility)
-        # ACL is in SQL BEFORE ordering/limit. Metadata only; tombstones also
-        # precede the work budget. Nothing from the invisible corpus is counted.
+        # Metadata policy and ACL precede ordering/work limit; tombstones also
+        # precede the budget. No claim/evidence text is transported by preflight.
+        # Fingerprint the actual privacy labels (including retained expires_at),
+        # even if a label changes without bumping memory_revision/updated_at.
         rows = conn.execute("SELECT " + ",".join(_FIELDS) + " FROM claims WHERE "
                             + where + " ORDER BY id", params).fetchall()
         eligible = [row for row in rows if provider._claim_visible(row)

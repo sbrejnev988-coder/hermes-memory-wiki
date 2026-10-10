@@ -1,5 +1,15 @@
-# Hermes Memory Wiki v1.24.5 — code-stage установлен; runtime-приёмка не завершена
+# Hermes Memory Wiki v1.24.5
 
+## Новый RI-R01 / hybrid SOURCE checkpoint
+
+Подготовлен **локальный публикационный кандидат поверх current main**, не новый tag/GitHub Release и не выполненная установка. Приняты cumulative runtime SOURCE bytes; текущий пакет отдельно проверяет переносимые carrier regressions и offline wheel correspondence. Схемы 121, DDL/migrations и версия 1.24.5 не повышены. Исходный owner, raw source images, private reader lifetime, serialization/cleanup ordering и primary UNKNOWN не превращаются в разрешение на live/native execution.
+
+Точные primary E и metadata-only secondary M указываются последующим doc-only binding после создания настоящих commits; raw SHA256 source никогда не используется как Git PIN. Пока remote readback этих новых refs не выполнен, они не называются опубликованными или пригодными для remote install. Старые E42d2/M02eed и current-main 6a748/a503 — исторические checkpoints, не current feature PIN. Сканирование, install/PM/liveness, собственные rollout markers и owner reload проверяются координатором отдельно.
+
+Регрессионные границы и cold-process prerequisites: [TEST_CONTRACT.md](docs/TEST_CONTRACT.md). SOURCE-only PASS, package readback, сохранённые settings, installed source и loaded/runtime/full-recovery — разные доказательства.
+
+
+### Исторический code-stage и сохранённая документация
 Native structured long-term memory provider for Hermes Agent. SQLite claims are the source of truth; FTS5 and Qdrant are rebuildable retrieval indexes. 121 MCP tools.
 
 The supported security properties and private reporting path are documented in [`SECURITY.md`](SECURITY.md).

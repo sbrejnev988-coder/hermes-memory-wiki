@@ -15,7 +15,7 @@ import re
 import sqlite3
 import time
 import unicodedata
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 try:
     from . import memory_events as _events
@@ -857,8 +857,44 @@ def consolidate_events(
     project_id: str = "",
     session_id: str = "",
     limit: int | None = None,
+    lease_valid: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
-    """Incrementally cluster unlinked events and append immutable versions."""
+    """One bounded pass; decisions/retries are the durable progress cursor.
+
+    A background pass holds the existing SQLite writer fence through source
+    reads, guard callbacks, and the final lease check. Neither a stale lease
+    nor a deleted source can authorize a later materialization write.
+    """
+    conn = provider._connect()
+    with conn:
+        if lease_valid is not None:
+            conn.execute("BEGIN IMMEDIATE")
+            if not lease_valid():
+                raise TimeoutError("memory observation lease lost")
+        return _consolidate_events(
+            provider, module, scope=scope, project_id=project_id,
+            session_id=session_id, limit=limit, lease_valid=lease_valid,
+        )
+
+
+def _consolidate_events(
+    provider: Any,
+    module: Any,
+    *,
+    scope: str,
+    project_id: str,
+    session_id: str,
+    limit: int | None,
+    lease_valid: Callable[[], bool] | None,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + _bounded_float(
+        "MEMORY_WIKI_OBSERVATION_BACKGROUND_SECONDS", 5.0, 0.05, 60.0,
+    ) if lease_valid is not None else float("inf")
+
+    def check_lease() -> None:
+        if lease_valid is not None and not lease_valid():
+            raise TimeoutError("memory observation lease lost")
+
     principal, selected_scope, selected_project = _events._resolve_scope(
         provider, session_id=session_id, scope=scope, project_id=project_id,
     )
@@ -883,6 +919,13 @@ def consolidate_events(
     observation_owner_sql, observation_owner_params = _events._event_owner_sql(
         "o", principal, selected_scope, selected_project,
     )
+    if getattr(provider, "_background_job_owner", None) is not None and selected_scope == "chat":
+        # Chat ACL hashes alone do not distinguish two project contexts of the
+        # same session. A queued pass must stay in its authoritative partition.
+        event_owner_sql += " AND e.project_id=?"
+        event_owner_params += (selected_project,)
+        observation_owner_sql += " AND o.project_id=?"
+        observation_owner_params += (selected_project,)
     stamp = int(time.time())
     rows = conn.execute(
         f"""SELECT e.* FROM memory_events e
@@ -907,13 +950,21 @@ def consolidate_events(
     affected: set[str] = set()
     accepted = 0
     rejected = 0
-    deferred = 0
+    deferred_ids: set[str] = set()
+    support_deferred_ids: set[str] = set()
+    scanned = 0
+    budget_exhausted = False
     next_retry_at = 0
     created = 0
     invalidated = 0
     partition = _partition_identity(principal, selected_scope, selected_project)
     with conn:
         for raw in rows:
+            if time.monotonic() >= deadline:
+                budget_exhausted = True
+                break
+            check_lease()
+            scanned += 1
             raw_event_id = str(raw["event_id"])
             existing_link = conn.execute(
                 f"""SELECT oe.observation_id
@@ -923,15 +974,29 @@ def consolidate_events(
                     WHERE oe.event_id=? AND {observation_owner_sql} LIMIT 1""",
                 (raw_event_id, *observation_owner_params),
             ).fetchone()
+            if existing_link is not None and conn.execute(
+                """SELECT 1 FROM memory_observation_event_decisions d
+                   JOIN memory_observation_event_retries r ON r.event_id=d.event_id
+                   WHERE d.event_id=? AND d.outcome='linked'
+                     AND d.observation_id=? AND r.retry_after<=?""",
+                (raw_event_id, str(existing_link["observation_id"]), stamp),
+            ).fetchone() is not None:
+                # This is support work, not a new event admission. Keep its
+                # retry until the fresh support guard below consumes it in this
+                # same writer transaction; no approval crosses a transaction.
+                affected.add(str(existing_link["observation_id"]))
+                continue
             try:
                 event = _safe_event(provider, module, raw)
             except _RetryableEventGuard as exc:
-                deferred += 1
+                check_lease()
+                deferred_ids.add(raw_event_id)
                 due = _defer_event(
                     conn, str(raw["event_id"]), stamp=stamp, reason=exc.reason,
                 )
                 next_retry_at = due if not next_retry_at else min(next_retry_at, due)
                 continue
+            check_lease()
             if event is None:
                 rejected += 1
                 invalidated_observation_id = ""
@@ -1039,6 +1104,7 @@ def consolidate_events(
         versions_created = 0
         deleted_empty = 0
         for observation_id in sorted(affected):
+            check_lease()
             observation = conn.execute(
                 "SELECT * FROM memory_observations WHERE observation_id=?",
                 (observation_id,),
@@ -1051,19 +1117,86 @@ def consolidate_events(
             safe_support: list[dict[str, Any]] = []
             support_deferred = False
             for support_row in raw_support:
+                support_event_id = str(support_row["event_id"])
+                previous_retry = conn.execute(
+                    "SELECT retry_after FROM memory_observation_event_retries WHERE event_id=?",
+                    (support_event_id,),
+                ).fetchone()
+                if previous_retry is not None and int(previous_retry[0]) > stamp:
+                    # Do not retry support early merely because a new sibling
+                    # touched the observation, or increment its backoff twice.
+                    support_deferred = True
+                    due = int(previous_retry[0])
+                    next_retry_at = due if not next_retry_at else min(next_retry_at, due)
+                    continue
+                if time.monotonic() >= deadline:
+                    budget_exhausted = True
+                    support_deferred = True
+                    deferred_ids.add(support_event_id)
+                    support_deferred_ids.add(support_event_id)
+                    due = _defer_event(
+                        conn, support_event_id, stamp=stamp, reason="budget_deferred",
+                    )
+                    next_retry_at = due if not next_retry_at else min(next_retry_at, due)
+                    # One durable linked-event retry re-enters this observation
+                    # on the next pass, without a second queue or new message.
+                    break
                 try:
                     safe = _safe_event(provider, module, support_row)
                 except _RetryableEventGuard as exc:
+                    check_lease()
                     support_deferred = True
+                    deferred_ids.add(support_event_id)
+                    support_deferred_ids.add(support_event_id)
                     due = _defer_event(
                         conn, str(support_row["event_id"]), stamp=stamp,
                         reason=exc.reason,
                     )
                     next_retry_at = due if not next_retry_at else min(next_retry_at, due)
                     continue
+                check_lease()
                 if safe is not None:
                     safe_support.append(safe)
+                    conn.execute(
+                        "DELETE FROM memory_observation_event_retries WHERE event_id=?",
+                        (support_event_id,),
+                    )
+                else:
+                    # A due linked retry no longer takes the event-phase guard.
+                    # Preserve that phase's permanent-rejection invalidation.
+                    _invalidate_linked_observation(conn, observation_id)
+                    invalidated += 1
+                    rejected += 1
+                    conn.execute(
+                        """INSERT OR IGNORE INTO memory_observation_event_decisions(
+                            event_id,outcome,observation_id,decided_at
+                        ) VALUES(?,'rejected','',?)""",
+                        (support_event_id, stamp),
+                    )
+                    conn.execute(
+                        "DELETE FROM memory_observation_event_retries WHERE event_id=?",
+                        (support_event_id,),
+                    )
+                    support_deferred = True
+                    break
             if support_deferred:
+                continue
+            # Callbacks are untrusted to retain the source/policy snapshot.
+            # Re-read after all guards, without adopting changed rows or using
+            # a durable approval. Other writers remain fenced by BEGIN IMMEDIATE.
+            live_support = _support_rows(
+                conn, observation_id, event_owner_sql, event_owner_params,
+                int(time.time()),
+            )
+            if not enabled() or [dict(r) for r in live_support] != [dict(r) for r in raw_support]:
+                if live_support:
+                    event_id = str(live_support[0]["event_id"])
+                    deferred_ids.add(event_id)
+                    support_deferred_ids.add(event_id)
+                    due = _defer_event(
+                        conn, event_id, stamp=stamp, reason="source_or_policy_changed",
+                    )
+                    next_retry_at = due if not next_retry_at else min(next_retry_at, due)
                 continue
             if not safe_support:
                 conn.execute(
@@ -1072,21 +1205,48 @@ def consolidate_events(
                 )
                 deleted_empty += 1
                 continue
+            check_lease()
             versions_created += int(_write_version(
                 conn, observation, safe_support, stamp=stamp,
             ))
+        check_lease()
         pruned = pre_pruned + prune_observations(
             provider, conn=conn, scope=selected_scope,
             project_id=selected_project, session_id=session_id,
         )
+        check_lease()
+    # Read authoritative remaining work, not len(rows)==batch or the initial
+    # number of events. Future retries (including support-only retries) are
+    # unfinished but not READY; foreign/expired rows never consume this LIMIT.
+    remaining_stamp = int(time.time())
+    ready = conn.execute(
+        f"""SELECT e.event_id FROM memory_events e
+            LEFT JOIN memory_observation_event_decisions d ON d.event_id=e.event_id
+            LEFT JOIN memory_observation_event_retries r ON r.event_id=e.event_id
+            WHERE {event_owner_sql} AND e.expires_at>?
+              AND (d.event_id IS NULL OR r.event_id IS NOT NULL)
+              AND (r.event_id IS NULL OR r.retry_after<=?)
+            ORDER BY e.created_at,e.observed_at,e.event_id LIMIT 1""",
+        (*event_owner_params, remaining_stamp, remaining_stamp),
+    ).fetchone()
+    future = conn.execute(
+        f"""SELECT MIN(r.retry_after) FROM memory_observation_event_retries r
+            JOIN memory_events e ON e.event_id=r.event_id
+            WHERE {event_owner_sql} AND e.expires_at>? AND r.retry_after>?""",
+        (*event_owner_params, remaining_stamp, remaining_stamp),
+    ).fetchone()[0]
     return {
         "scope": selected_scope,
         "project_id": selected_project if selected_scope == "project" else "",
-        "events_scanned": len(rows),
+        "events_scanned": scanned,
         "events_linked": accepted,
         "events_rejected": rejected,
-        "events_deferred": deferred,
-        "next_retry_at": next_retry_at,
+        "events_deferred": len(deferred_ids),
+        "support_events_deferred": len(support_deferred_ids),
+        "ready_work_remaining": int(ready is not None),
+        "next_cursor": str(ready["event_id"]) if ready is not None else "",
+        "next_retry_at": int(future or 0),
+        "budget_exhausted": budget_exhausted,
         "observations_created": created,
         "observations_invalidated": invalidated,
         "versions_created": versions_created,
@@ -1516,6 +1676,9 @@ def prune_observations(
         "", principal, selected_scope, selected_project,
     )
     database = conn or provider._connect()
+    if getattr(provider, "_background_job_owner", None) is not None and selected_scope == "chat":
+        owner_sql += " AND project_id=?"
+        owner_params += (selected_project,)
     _require_schema(database)
     before = int(database.execute(
         f"SELECT COUNT(*) FROM memory_observations WHERE {owner_sql}", owner_params,

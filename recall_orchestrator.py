@@ -19,6 +19,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 try:
+    from .disclosure_fence import DisclosureFence, TerminalDelivery, DELIVERY, current_delivery, withheld_payload
+except ImportError:
+    from disclosure_fence import DisclosureFence, TerminalDelivery, DELIVERY, current_delivery, withheld_payload
+
+try:
     from .recall_planner import classify_memory_intent, expand_memory_queries
 except ImportError:  # pragma: no cover - standalone plugin loading
     try:
@@ -60,6 +65,8 @@ _CLAIM_SNAPSHOT_FIELDS = (
     "memory_class", "expires_at", "origin_bot_id", "origin_session_id",
     "origin_chat_hash", "source_kind", "visibility_scope", "scope",
     "project_id", "memory_revision", "event_at", "event_timezone", "visible",
+    "risk", "quarantined_at", "quality", "pinned", "normalized_claim",
+    "custody", "freshness_at", "last_verified_at", "decay_policy",
 )
 _EVENT_SCOPES = frozenset({"chat", "bot", "project"})
 _CONFLICT_PAGE_SIZE = 40
@@ -379,14 +386,16 @@ def _final_visible_claims(provider: Any, claim_ids: Iterable[str]) -> dict[str, 
         rows = conn.execute(
             f"SELECT * FROM claims WHERE id IN ({placeholders})", tuple(unique),
         ).fetchall()
+        disclosure = DisclosureFence(provider, conn)
+        disclosure.claims(rows)
         visible: dict[str, str] = {}
         for row in rows:
             try:
                 if provider._claim_visible(row):
-                    visible[str(row["id"])] = _claim_snapshot_fingerprint(row)
+                    visible[str(row["id"])] = _claim_snapshot_fingerprint(provider._sanitize_row(row))
             except Exception:
                 continue
-        return visible
+        return visible if disclosure.finish() else {}
     except Exception:
         return {}
 
@@ -893,7 +902,7 @@ def _answer_policy(citations: list[str], conflict_status: str) -> dict[str, Any]
     }
 
 
-def recall(
+def _recall_prepared(
     provider: Any,
     query: str,
     mode: str = "auto",
@@ -913,6 +922,13 @@ def recall(
     limit = max(1, min(int(limit or 10), 20))
     max_chars = max(128, min(int(max_chars or 6000), 24000))
     queries = list(query_expander(str(query or ""), mode=mode) or [])[:8]
+    # Capture original owner, physical namespace and existing revision epochs
+    # before any source backend or guard callback can wait or change context.
+    provider._connect()
+    disclosure = DisclosureFence(provider)
+    delivery = current_delivery(provider)
+    if delivery is not None:
+        delivery.retain(disclosure)
     intent = classify_memory_intent(str(query or ""))
     retrieval_mode = "fts" if mode == "fast" else "hybrid"
     candidates: dict[tuple[str, str], dict[str, Any]] = {}
@@ -924,6 +940,7 @@ def recall(
         "graph": "not_requested",
     }
     raw_claim_ids: dict[str, str] = {}
+    original_claim_rows = {}
     claim_check_failed = False
 
     event_scope = str(os.environ.get("MEMORY_WIKI_EVENT_SCOPE", "chat") or "chat").strip().lower()
@@ -964,6 +981,7 @@ def recall(
             claim_rows = []
             source_status["claims"] = "unavailable"
             claim_check_failed = True
+        disclosure.claims(claim_rows or [])
         for rank, row in enumerate(claim_rows or [], 1):
             if not isinstance(row, dict):
                 try:
@@ -986,6 +1004,7 @@ def recall(
                 continue
             safe_id = _stable_id(raw_id, "c")
             raw_claim_ids[safe_id] = raw_id
+            original_claim_rows[raw_id] = dict(row)
             item = {
                 "kind": "claim",
                 "citation": f"[M:C:{safe_id}]",
@@ -1229,6 +1248,24 @@ def recall(
             }
             _rrf_add(candidates, kind="graph", source_id=raw_id, rank=rank, item=item)
 
+    guarded_queries = []
+    for index, expanded_query in enumerate(queries):
+        safe_query = _guard_text(
+            provider, expanded_query, source="unified_recall:query_plan",
+            mem_type="query", item_id=f"query_{index}", max_len=500,
+        )
+        guarded_queries.append(safe_query or "[query omitted by recall guard]")
+    conflict_status = _detect_conflicts(provider, list(raw_claim_ids.values()))
+    for kind, table, column in (("event", "memory_events", "event_id"),
+                                ("episode", "episodic_turns", "id"),
+                                ("observation", "memory_observations", "observation_id")):
+        disclosure.watch(table, column, [item["_source_id"] for item in candidates.values()
+                                        if item["kind"] == kind], optional=True)
+    for graph_kind, table in (("entity", "entities"), ("relation", "relations")):
+        graph_rows = disclosure.watch(table, "id", [item["_source_id"] for item in candidates.values()
+                                  if item["kind"] == "graph" and item["graph_kind"] == graph_kind], optional=True)
+        linked = disclosure.watch("claims", "id", [r.get("source_claim_id", "") for r in graph_rows])
+        disclosure.claims(linked)
     final_visible_claims = _final_visible_claims(provider, raw_claim_ids.values())
     final_visible_nonclaims = _final_visible_nonclaims(
         provider,
@@ -1239,6 +1276,12 @@ def recall(
         event_scope=event_scope,
         runtime_module=runtime_module,
     )
+    # All source revalidators and all guards have now returned. This final
+    # bounded raw read also covers metadata and dependent source images.
+    if not disclosure.finish():
+        final_visible_claims = {}
+        final_visible_nonclaims = set()
+        conflict_status = "unknown"
     final_candidates = [
         item for item in candidates.values()
         if (
@@ -1290,6 +1333,7 @@ def recall(
     if selected_claim_ids and callable(recorder):
         tracking_rows = [
             {
+                **original_claim_rows[raw_claim_ids[str(item["id"])]],
                 "id": raw_claim_ids[str(item["id"])],
                 "score": float(item.get("rrf_score") or 0.0),
             }
@@ -1308,7 +1352,8 @@ def recall(
                     and _SAFE_ID_RE.fullmatch(str(event_id) or "")
                 }
                 tracking_status = (
-                    "ok" if len(recall_event_ids) == len(selected_claim_ids) else "partial"
+                    "ok" if len(recall_event_ids) == len(selected_claim_ids)
+                    else "partial" if recall_event_ids else "unavailable"
                 )
             else:
                 tracking_status = "unavailable"
@@ -1326,15 +1371,7 @@ def recall(
                 "claim_id": str(raw_claim_id),
                 "recall_event_id": recall_event_id,
             })
-    guarded_queries = []
-    for index, expanded_query in enumerate(queries):
-        safe_query = _guard_text(
-            provider, expanded_query, source="unified_recall:query_plan",
-            mem_type="query", item_id=f"query_{index}", max_len=500,
-        )
-        guarded_queries.append(safe_query or "[query omitted by recall guard]")
 
-    conflict_status = _detect_conflicts(provider, selected_claim_ids)
     if conflict_status == "absent" and (
         claim_check_failed
         or any(raw_id not in final_visible_claims for raw_id in raw_claim_ids.values())
@@ -1368,3 +1405,32 @@ def recall(
         },
         "answer_policy": _answer_policy(citations, conflict_status),
     }
+
+
+def recall(
+    provider: Any, query: str, mode: str = "auto", limit: int = 10,
+    max_chars: int = 6000, *, episodic_backend: Any = None,
+    event_backend: Any = None, observation_backend: Any = None,
+    runtime_module: Any = None,
+    query_expander: Callable[..., list[str]] = expand_memory_queries,
+) -> dict[str, Any]:
+    """Use the same terminal owner for standalone and public-handler calls."""
+    delivery = current_delivery(provider)
+    token = None
+    if delivery is None:
+        delivery = TerminalDelivery(provider)
+        token = DELIVERY.set(delivery)
+    try:
+        result = _recall_prepared(
+            provider, query, mode, limit, max_chars, episodic_backend=episodic_backend,
+            event_backend=event_backend, observation_backend=observation_backend,
+            runtime_module=runtime_module, query_expander=query_expander,
+        )
+        if token is None:
+            return result
+        refused = withheld_payload('memory_wiki_recall')
+        refused.pop('success', None)
+        return result if delivery.commit() else refused
+    finally:
+        if token is not None:
+            DELIVERY.reset(token)

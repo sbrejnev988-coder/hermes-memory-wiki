@@ -107,11 +107,39 @@ def _owner(provider: Any) -> str:
     return owner
 
 
-def authorize_write(provider: Any, source_key: str) -> None:
-    row = provider._connect().execute(
+def authorize_write(provider: Any, source_key: str, *, _conn=None) -> None:
+    conn = provider._connect() if _conn is None else _conn
+    row = conn.execute(
         "SELECT owner_bot_id FROM external_sources WHERE source_key=?", (source_key,)
     ).fetchone()
     if row is not None and str(row["owner_bot_id"] or "") != _owner(provider):
+        raise PermissionError("connector_source_not_owned")
+
+
+def _put_source_in_transaction(provider: Any, conn: sqlite3.Connection, *, source_key: str, source_type: str,
+                display_uri: str, scope_id: str, repository_id: str,
+                document_source_id: str, revision_key: str,
+                content_hash: str, _expected_owner=None) -> None:
+    if _expected_owner is not None:
+        if provider._connect() is not conn or not conn.in_transaction:
+            raise RuntimeError('connector_transaction_ownership_refused')
+        if _owner(provider) != _expected_owner:
+            raise PermissionError('connector_transaction_identity_changed')
+    authorize_write(provider, source_key, _conn=conn)
+    stamp = int(time.time())
+    cursor = conn.execute("""INSERT INTO external_sources
+        (source_key,owner_bot_id,source_type,display_uri,scope_id,repository_id,
+         document_source_id,revision_key,content_hash,status,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,'active',?,?)
+        ON CONFLICT(source_key) DO UPDATE SET
+          source_type=excluded.source_type, display_uri=excluded.display_uri,
+          document_source_id=excluded.document_source_id,
+          revision_key=excluded.revision_key, content_hash=excluded.content_hash,
+          status='active',updated_at=excluded.updated_at
+        WHERE external_sources.owner_bot_id=excluded.owner_bot_id""",
+        (source_key, _owner(provider), source_type, display_uri, scope_id, repository_id,
+         document_source_id, revision_key, content_hash, stamp, stamp))
+    if cursor.rowcount != 1:
         raise PermissionError("connector_source_not_owned")
 
 
@@ -121,22 +149,121 @@ def _put_source(provider: Any, *, source_key: str, source_type: str,
                 content_hash: str) -> None:
     conn = provider._connect()
     authorize_write(provider, source_key)
-    stamp = int(time.time())
     with conn:
-        cursor = conn.execute("""INSERT INTO external_sources
-            (source_key,owner_bot_id,source_type,display_uri,scope_id,repository_id,
-             document_source_id,revision_key,content_hash,status,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?,'active',?,?)
-            ON CONFLICT(source_key) DO UPDATE SET
-              source_type=excluded.source_type, display_uri=excluded.display_uri,
-              document_source_id=excluded.document_source_id,
-              revision_key=excluded.revision_key, content_hash=excluded.content_hash,
-              status='active',updated_at=excluded.updated_at
-            WHERE external_sources.owner_bot_id=excluded.owner_bot_id""",
-            (source_key, _owner(provider), source_type, display_uri, scope_id, repository_id,
-             document_source_id, revision_key, content_hash, stamp, stamp))
-        if cursor.rowcount != 1:
-            raise PermissionError("connector_source_not_owned")
+        _put_source_in_transaction(provider, conn, source_key=source_key,
+            source_type=source_type, display_uri=display_uri, scope_id=scope_id,
+            repository_id=repository_id, document_source_id=document_source_id,
+            revision_key=revision_key, content_hash=content_hash)
+
+
+class _RecordCommitHook:
+    """Private source-layer binding, not native identity/capability attestation.
+
+    Only the selected record entry constructs this hook. No JSON field or
+    registered argument accepts it. Its writer never opens/commits a connection.
+    """
+    def __init__(self, provider, conn, *, source_key, uri, namespace, source_id,
+                 source_type, display_uri, scope_id, repository_id, revision_key,
+                 content_hash):
+        self.provider, self.conn = provider, conn
+        self.owner = _owner(provider)
+        self.key, self.uri, self.namespace = source_key, uri, namespace
+        self.source_id = source_id
+        self.fields = dict(source_key=source_key, source_type=source_type,
+                           display_uri=display_uri, scope_id=scope_id,
+                           repository_id=repository_id,
+                           document_source_id=source_id,
+                           revision_key=revision_key, content_hash=content_hash)
+        self.expected = None
+        self.started = self.commit_attempted = self.commit_returned = False
+        self.rollback_completed = False
+        self.validate(provider, conn, transaction=False)
+        schema = conn.execute("SELECT value FROM document_graph_meta WHERE key='schema_version'").fetchone()
+        required = {'document_graph_meta', 'document_sources', 'document_revisions',
+                    'document_units', 'document_chunks', 'document_edges',
+                    'document_events', 'document_units_fts', 'document_chunks_fts',
+                    'external_sources'}
+        tables = {str(r[0]) for r in conn.execute('SELECT name FROM sqlite_master')}
+        if (not schema or int(schema[0]) < documents.SCHEMA_VERSION
+                or not required.issubset(tables)
+                or int(conn.execute('PRAGMA foreign_keys').fetchone()[0]) != 1):
+            raise RuntimeError('connector_transaction_schema_not_ready')
+        self.before = self._state()
+
+    def _state(self):
+        source = self.conn.execute(
+            'SELECT source_id,revision_id,file_hash,scope_id,repository_id,active '
+            'FROM document_sources WHERE source_id=?', (self.source_id,)).fetchone()
+        external = self.conn.execute(
+            'SELECT * FROM external_sources WHERE source_key=?', (self.key,)).fetchone()
+        return (tuple(source) if source is not None else None,
+                tuple(external) if external is not None else None)
+
+    def validate(self, provider, conn, *, transaction, before=False):
+        if provider is not self.provider or conn is not self.conn or provider._connect() is not conn:
+            raise RuntimeError('connector_transaction_connection_changed')
+        if conn.in_transaction != transaction:
+            raise RuntimeError('connector_transaction_ownership_refused')
+        if (_owner(provider) != self.owner
+                or _source_key(provider, self.uri, self.fields['scope_id'],
+                               self.fields['repository_id'], self.namespace) != self.key
+                or _scope(provider, self.fields['scope_id'], self.fields['repository_id'])
+                   != (self.fields['scope_id'], self.fields['repository_id'])):
+            raise PermissionError('connector_transaction_identity_changed')
+        authorize_write(provider, self.key, _conn=conn)
+        external = conn.execute('SELECT * FROM external_sources WHERE source_key=?', (self.key,)).fetchone()
+        if external is not None and any(str(external[k] or '') != str(self.fields[k])
+                for k in ('scope_id', 'repository_id', 'document_source_id')):
+            raise PermissionError('connector_transaction_source_binding_changed')
+        documents._assert_connector_owner(provider, self.source_id, _conn=conn)
+        if before and self._state() != self.before:
+            raise RuntimeError('connector_transaction_baseline_changed')
+
+    def _tuple(self):
+        row = self.conn.execute(
+            "SELECT s.source_id,s.revision_id,s.file_hash,e.revision_key,e.content_hash "
+            "FROM document_sources s JOIN document_revisions r "
+            "ON r.revision_id=s.revision_id AND r.source_id=s.source_id "
+            "AND r.file_hash=s.file_hash AND r.status='active' "
+            "JOIN external_sources e ON e.document_source_id=s.source_id "
+            "WHERE s.source_id=? AND e.source_key=? AND s.active=1 AND e.status='active' "
+            "AND e.owner_bot_id=? AND s.scope_id=? AND s.repository_id=? "
+            "AND e.scope_id=s.scope_id AND e.repository_id=s.repository_id",
+            (self.source_id, self.key, self.owner, self.fields['scope_id'],
+             self.fields['repository_id'])).fetchone()
+        return tuple(row) if row is not None else None
+
+    def apply(self, provider, conn):
+        self.validate(provider, conn, transaction=True)
+        row = conn.execute(
+            "SELECT s.source_id,s.revision_id,s.file_hash FROM document_sources s "
+            "JOIN document_revisions r ON r.revision_id=s.revision_id "
+            "AND r.source_id=s.source_id AND r.file_hash=s.file_hash "
+            "WHERE s.source_id=? AND s.active=1 AND r.status='active' "
+            "AND s.scope_id=? AND s.repository_id=?",
+            (self.source_id, self.fields['scope_id'], self.fields['repository_id'])).fetchone()
+        if row is None or str(row['file_hash']) != self.fields['content_hash']:
+            raise RuntimeError('connector_document_ingest_incomplete')
+        _put_source_in_transaction(provider, conn, _expected_owner=self.owner, **self.fields)
+        expected = (str(row['source_id']), str(row['revision_id']), str(row['file_hash']),
+                    self.fields['revision_key'], self.fields['content_hash'])
+        if self._tuple() != expected:
+            raise RuntimeError('connector_transaction_tuple_mismatch')
+        self.expected = expected
+
+    def outcome(self):
+        """Post-transaction exact SQL proof; execution of apply is not a commit."""
+        try:
+            self.validate(self.provider, self.conn, transaction=False)
+            state = self._state()
+            if (self.expected is not None and self._tuple() == self.expected
+                    and (self.commit_returned or (self.commit_attempted and state != self.before))):
+                return 'committed'
+            if state == self.before and (self.rollback_completed or not self.started):
+                return 'rolled_back'
+        except Exception:
+            pass
+        return 'unknown'
 
 
 def sync_local_file(provider: Any, args: dict[str, Any]) -> dict[str, Any]:
@@ -202,8 +329,7 @@ def upsert_record(provider: Any, record: SourceRecord) -> dict[str, Any]:
     text = str(record.text or "")
     if not text.strip() or len(text.encode("utf-8")) > MAX_RECORD_BYTES:
         raise ValueError("source_record_size_invalid")
-    # Redact before persistent staging; the document worker applies its own
-    # secret guard again before indexing derived chunks.
+    # Redact before staging; ingestion retains its own independent secret guard.
     safe_text = provider._connector_redact(text)
     if provider._shared_block_secret_scan(safe_text):
         raise ValueError("source_record_contains_secret")
@@ -213,14 +339,21 @@ def upsert_record(provider: Any, record: SourceRecord) -> dict[str, Any]:
     revision_key = _sha(revision)[:20]
     namespace = "github" if record.source_type.startswith("github_") else record.source_type
     key = _source_key(provider, uri, scope_id, repository_id, namespace)
-    authorize_write(provider, key)
     conn = provider._connect()
+    if conn.in_transaction or provider._connect() is not conn:
+        raise RuntimeError('connector_transaction_ownership_refused')
+    authorize_write(provider, key, _conn=conn)
+    path = _record_snapshot_path(provider, key)
+    hook = _RecordCommitHook(provider, conn, source_key=key, uri=uri,
+        namespace=namespace, source_id=documents._source_id(path),
+        source_type=record.source_type, display_uri=display_uri,
+        scope_id=scope_id, repository_id=repository_id,
+        revision_key=revision_key, content_hash=content_hash)
     existing = conn.execute("SELECT * FROM external_sources WHERE source_key=?", (key,)).fetchone()
     if existing is not None and str(existing["revision_key"]) == revision_key:
         if str(existing["content_hash"]) != content_hash:
             raise ValueError("source_revision_conflict")
         if existing["status"] == "active":
-            path = _record_snapshot_path(provider, key)
             source = conn.execute(
                 "SELECT active FROM document_sources WHERE source_id=?",
                 (existing["document_source_id"],),
@@ -229,6 +362,7 @@ def upsert_record(provider: Any, record: SourceRecord) -> dict[str, Any]:
                 try:
                     checked = documents._allowed_path(path)
                     if _sha(checked.read_text(encoding="utf-8")) == content_hash:
+                        hook.validate(provider, conn, transaction=False, before=True)
                         if record.embed:
                             documents.embed_pending_documents(provider, {
                                 "source_id": str(existing["document_source_id"]),
@@ -241,10 +375,11 @@ def upsert_record(provider: Any, record: SourceRecord) -> dict[str, Any]:
                                 "scope_id": scope_id, "repository_id": repository_id}
                 except (OSError, ValueError, UnicodeError):
                     pass
-    path = _record_snapshot_path(provider, key)
     temporary = path.with_name(f".{key}.{uuid.uuid4().hex[:12]}.tmp")
     backup = path.with_name(f".{key}.{uuid.uuid4().hex[:12]}.bak")
     had_previous = path.exists()
+    replaced = retain = False
+    primary = None
     try:
         if had_previous:
             documents._allowed_path(path)
@@ -255,49 +390,69 @@ def upsert_record(provider: Any, record: SourceRecord) -> dict[str, Any]:
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
-        try:
-            result = documents.ingest_document(provider, {
-                "path": str(path), "scope_id": scope_id,
-                "repository_id": repository_id, "embed": False,
-            })
-        except Exception:
-            if had_previous and backup.exists():
-                os.replace(backup, path)
-            elif not had_previous:
-                path.unlink(missing_ok=True)
-            raise
+        replaced = True
+        result = documents.ingest_document(provider, {
+            "path": str(path), "scope_id": scope_id,
+            "repository_id": repository_id, "embed": False,
+        }, _commit_hook=hook)
+        if hook.outcome() != 'committed' or hook.expected is None:
+            raise RuntimeError('connector_transaction_commit_outcome_unknown')
+    except BaseException as exc:
+        primary = exc
+        if replaced:
+            outcome = hook.outcome()
+            if outcome == 'rolled_back':
+                try:
+                    if had_previous:
+                        if not backup.exists():
+                            raise RuntimeError('connector_rollback_backup_unavailable')
+                        os.replace(backup, path)
+                    else:
+                        path.unlink(missing_ok=True)
+                except BaseException:
+                    retain = True
+                    primary.add_note('connector file rollback outcome UNKNOWN; candidate/backup retained')
+            elif outcome == 'unknown':
+                retain = True
+                primary.add_note('connector SQL outcome UNKNOWN; current candidate/backup retained; no automatic restore')
+            else:
+                primary.add_note('connector SQL tuple committed; current candidate kept; no old-file restore')
+        raise
     finally:
-        temporary.unlink(missing_ok=True)
-        backup.unlink(missing_ok=True)
-    source_id = str(result.get("source_id") or "")
-    source = conn.execute(
-        "SELECT revision_id,active FROM document_sources WHERE source_id=?", (source_id,)
-    ).fetchone()
-    if source is None or not int(source["active"] or 0):
-        raise RuntimeError("connector_document_ingest_incomplete")
-    _put_source(provider, source_key=key, source_type=record.source_type,
-                display_uri=display_uri, scope_id=scope_id,
-                repository_id=repository_id, document_source_id=source_id,
-                revision_key=revision_key, content_hash=content_hash)
+        if not retain:
+            for artifact in (temporary, backup):
+                try:
+                    artifact.unlink(missing_ok=True)
+                except OSError:
+                    if primary is None:
+                        raise
+                    primary.add_note('connector owned staging cleanup failed; primary exception preserved')
+    # Identity/revision comes from actual same-connection SQL, not result JSON.
+    source_id, document_revision, _, _, _ = hook.expected
     if record.embed:
         documents.embed_pending_documents(provider, {
             "source_id": source_id, "scope_id": scope_id,
             "repository_id": repository_id, "limit": 200,
         })
     return {"status": str(result.get("status") or "indexed"), "source_key": key,
-            "source_id": source_id, "revision_id": str(source["revision_id"] or ""),
+            "source_id": source_id, "revision_id": document_revision,
             "scope_id": scope_id, "repository_id": repository_id}
 
 
 def list_sources(provider: Any, limit: int = 50) -> dict[str, Any]:
+    conn = provider._connect()
+    disclosure = documents._document_disclosure(provider, conn)
     scope_id, repository_id = _scope(provider, "", "")
     count = max(1, min(int(limit), 100))
-    rows = provider._connect().execute("""SELECT source_key,source_type,display_uri,
+    rows = conn.execute("""SELECT source_key,source_type,display_uri,
         scope_id,repository_id,document_source_id,revision_key,status,updated_at
         FROM external_sources WHERE scope_id=? AND repository_id=? AND owner_bot_id=?
         ORDER BY updated_at DESC LIMIT ?""", (scope_id, repository_id,
                                                 _owner(provider), count)).fetchall()
-    return {"sources": [dict(row) for row in rows]}
+    originals = disclosure.watch('external_sources', 'source_key', [r['source_key'] for r in rows])
+    sources = disclosure.watch('document_sources', 'source_id', [r['document_source_id'] for r in originals], optional=True)
+    disclosure.watch('document_revisions', 'revision_id', [r['revision_id'] for r in sources], optional=True)
+    return documents._disclosed_document_output(provider, {"sources": [dict(row) for row in rows]}, disclosure)
 
 
 def authorize_delete(provider: Any, source_key: Any) -> sqlite3.Row:

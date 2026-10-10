@@ -9,6 +9,8 @@ content retrieval before marking the record as Drive-sourced.
 from __future__ import annotations
 
 import hashlib
+import http.client
+import io
 import json
 import os
 import re
@@ -59,6 +61,190 @@ def _open(request: urllib.request.Request, timeout: float):
     return urllib.request.build_opener(_NoRedirect).open(request, timeout=timeout)
 
 
+class _ChunkCompletionReader:
+    """Observe one native decoder's framing I/O, without parsing chunks.
+
+    CPython accepts EOF in trailers and discards chunk delimiters unchecked.
+    Require CRLF at those native read sites and bound total wire overhead.
+    No class/parser hook is replaced; the owning response keeps its file.
+    """
+
+    def __init__(self, response: http.client.HTTPResponse, cap: int):
+        self.response = response
+        self.fp = response.fp
+        self.remaining = cap + 65_536
+        self.terminal_line = False
+
+    def _charge(self, data: bytes) -> None:
+        if not isinstance(data, bytes) or len(data) > self.remaining:
+            raise ValueError("drive_http_error")
+        self.remaining -= len(data)
+
+    def read(self, amount: int) -> bytes:
+        if amount < 0 or amount > self.remaining:
+            raise ValueError("drive_http_error")
+        data = self.fp.read(amount)
+        self._charge(data)
+        if self.response.chunk_left == 0 and amount == 2 and data != b"\r\n":
+            raise ValueError("drive_http_error")
+        return data
+
+    def readline(self, limit: int) -> bytes:
+        if limit <= 0:
+            raise ValueError("drive_http_error")
+        line = self.fp.readline(min(limit, self.remaining + 1))
+        self._charge(line)
+        if not line.endswith(b"\r\n"):
+            raise ValueError("drive_http_error")
+        self.terminal_line = line == b"\r\n"
+        return line
+
+    def close(self) -> None:
+        self.fp.close()
+
+
+def _bounded_complete_body(response: Any, cap: int) -> bytes:
+    """Return only a complete bounded body; never infer EOF from short JSON.
+
+    Content-Length must match both returned bytes and native remaining length.
+    Native chunk completion additionally requires the terminal trailer CRLF;
+    chunk syntax is still decoded by HTTPResponse, not by a second parser.
+    Legal native EOF and in-memory BytesIO EOF remain supported. Unknown
+    stream/framing contracts fail closed. Ownership/close stays with _request.
+    """
+    headers = getattr(response, "headers", None)
+    length = headers.get("Content-Length") if headers is not None else None
+    if headers is not None and hasattr(headers, "get_all"):
+        if len(headers.get_all("Content-Length", [])) > 1:
+            raise ValueError("drive_invalid_content_length")
+        if len(headers.get_all("Transfer-Encoding", [])) > 1:
+            raise ValueError("drive_http_error")
+    declared = None
+    if length is not None:
+        try:
+            if not isinstance(length, str) or len(length) > 20:
+                raise ValueError
+            length = length.strip()
+            if not length.isascii() or not length.isdecimal():
+                raise ValueError
+            declared = int(length)
+        except (TypeError, ValueError):
+            raise ValueError("drive_invalid_content_length") from None
+        if declared < 0 or declared > cap:
+            raise ValueError("drive_response_too_large")
+    stream = response if isinstance(response, http.client.HTTPResponse) else getattr(response, "fp", None)
+    native = isinstance(stream, http.client.HTTPResponse)
+    if not native and not isinstance(stream, io.BytesIO):
+        raise ValueError("drive_http_error")
+    transfer = headers.get("Transfer-Encoding", "") if headers is not None else ""
+    tap = None
+    if native:
+        if stream.fp is None or stream.isclosed():
+            raise ValueError("drive_http_error")
+        if stream.chunked:
+            if declared is not None or transfer.strip().lower() != "chunked":
+                raise ValueError("drive_http_error")
+            tap = _ChunkCompletionReader(stream, cap)
+        elif transfer or stream.length != declared:
+            raise ValueError("drive_http_error")
+    elif transfer or stream.tell() != 0:
+        raise ValueError("drive_http_error")
+    if tap is not None:
+        stream.fp = tap
+    parts = []
+    total = 0
+    eof = False
+    try:
+        try:
+            while total <= cap:
+                part = response.read(cap + 1 - total)
+                if not isinstance(part, bytes):
+                    raise ValueError("drive_http_error")
+                if not part:
+                    eof = True
+                    break
+                parts.append(part)
+                total += len(part)
+                if native and stream.isclosed():
+                    break
+        except Exception:
+            # Native exceptions can carry private partial bodies. Never expose
+            # them, and never turn a read/framing failure into quota evidence.
+            raise ValueError("drive_http_error") from None
+        if total > cap:
+            raise ValueError("drive_response_too_large")
+        if declared is not None and total != declared:
+            raise ValueError("drive_http_error")
+        if native:
+            if not stream.isclosed() or (declared is not None and stream.length != 0):
+                raise ValueError("drive_http_error")
+            if tap is not None and (stream.chunk_left is not None or not tap.terminal_line):
+                raise ValueError("drive_http_error")
+        elif not eof:
+            raise ValueError("drive_http_error")
+        return b"".join(parts)
+    finally:
+        # Restore only our own still-open adapter, never resurrect a file the
+        # native response closed. HTTPError.close remains the sole owner close.
+        if tap is not None and stream.fp is tap:
+            stream.fp = tap.fp
+
+
+def _http_error_kind(exc: urllib.error.HTTPError) -> str:
+    """Classify bounded Google error codes; ownership stays with _request."""
+    if exc.code == 429:
+        # An actual HTTP 429 status is sufficient; no body-derived assertion.
+        return "rate"
+    if exc.code == 401:
+        return "auth"
+    if exc.code != 403:
+        return "http"
+    try:
+        raw = _bounded_complete_body(exc, 8192)
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        # Native HTTPResponse framing failures (e.g. IncompleteRead) can carry
+        # partial private bodies. Keep all ordinary read/parse failures coded.
+        return "http"
+    if not isinstance(payload, dict):
+        return "http"
+    error = payload.get("error")
+    # OAuth revoked grants are failures, never a reason to refresh/borrow a token.
+    if isinstance(error, str):
+        return "auth" if error == "invalid_grant" else "http"
+    if not isinstance(error, dict):
+        return "http"
+    if "code" in error and (type(error["code"]) is not int or error["code"] != exc.code):
+        return "http"
+    status = error.get("status")
+    reasons = error.get("errors", [])
+    if not isinstance(reasons, list) or len(reasons) > 16:
+        return "http"
+    codes = set()
+    for reason in reasons:
+        if not isinstance(reason, dict):
+            return "http"
+        code = reason.get("reason")
+        if not isinstance(code, str) or not re.fullmatch(r"[A-Za-z_]{1,64}", code):
+            return "http"
+        codes.add(code)
+    if status == "UNAUTHENTICATED" or codes.intersection({
+        "authError", "invalidCredentials", "invalidGrant", "invalid_grant",
+    }):
+        return "auth"
+    if status == "RESOURCE_EXHAUSTED" or codes.intersection({
+        "rateLimitExceeded", "userRateLimitExceeded", "sharingRateLimitExceeded",
+        "dailyLimitExceeded", "storageQuotaExceeded",
+    }):
+        return "rate"
+    if status == "PERMISSION_DENIED" or codes.intersection({
+        "insufficientPermissions", "insufficientFilePermissions", "appNotAuthorizedToFile",
+        "domainPolicy", "downloadRestrictedForRevision", "teamDriveMembershipRequired", "forbidden",
+    }):
+        return "permission"
+    return "http"
+
+
 def _request(provider: Any, url: str, token: str, cap: int) -> bytes:
     cooldown = float(getattr(provider, "_drive_rate_limit_until", 0) or 0)
     if cooldown > time.time():
@@ -75,31 +261,36 @@ def _request(provider: Any, url: str, token: str, cap: int) -> bytes:
         with _open(request, timeout) as response:
             if int(getattr(response, "status", None) or response.getcode()) != 200:
                 raise ValueError("drive_http_error")
-            length = response.headers.get("Content-Length")
-            if length is not None:
-                try:
-                    declared = int(length)
-                except (TypeError, ValueError) as exc:
-                    raise ValueError("drive_invalid_content_length") from exc
-                if declared < 0 or declared > cap:
-                    raise ValueError("drive_response_too_large")
-            body = response.read(cap + 1)
-            if len(body) > cap:
-                raise ValueError("drive_response_too_large")
-            return body
+            return _bounded_complete_body(response, cap)
     except urllib.error.HTTPError as exc:
-        if exc.code in {429, 403}:
-            try:
-                delay = max(1, min(int(exc.headers.get("Retry-After") or 60), 86400))
-            except (TypeError, ValueError):
+        cleanup_failed = False
+        try:
+            kind = _http_error_kind(exc)
+            if kind == "rate":
+                retry = exc.headers.get("Retry-After") if exc.headers is not None else None
                 delay = 60
-            provider._drive_rate_limit_until = time.time() + delay
-            raise ValueError(f"drive_rate_limited:retry_after_seconds={delay}") from None
-        if exc.code == 401:
-            raise ValueError("drive_auth_failed") from None
-        if exc.code == 404:
-            raise ValueError("drive_source_unavailable") from None
-        raise ValueError(f"drive_http_error:{exc.code}") from None
+                if isinstance(retry, str) and len(retry) <= 32:
+                    retry = retry.strip()
+                    if re.fullmatch(r"[+-]?[0-9]{1,20}", retry):
+                        delay = max(1, min(int(retry), 86400))
+                provider._drive_rate_limit_until = time.time() + delay
+                error = ValueError(f"drive_rate_limited:retry_after_seconds={delay}")
+            elif kind == "auth":
+                error = ValueError("drive_auth_failed")
+            elif kind == "permission":
+                error = ValueError("drive_permission_denied")
+            elif exc.code == 404:
+                error = ValueError("drive_source_unavailable")
+            else:
+                error = ValueError(f"drive_http_error:{exc.code}")
+        finally:
+            try:
+                exc.close()
+            except Exception:
+                cleanup_failed = True
+        if cleanup_failed:
+            error.add_note("drive_http_error_body_close_failed")
+        raise error from None
 
 
 def _metadata(provider: Any, file_id: str, token: str) -> dict[str, Any]:
@@ -155,15 +346,15 @@ def sync_file(provider: Any, args: dict[str, Any]) -> dict[str, Any]:
     if (existing is not None and existing["status"] == "active"
             and existing["source_type"] == "google_drive"
             and existing["revision_key"] == connectors._sha(version)[:20]):
-        staged = connectors._record_snapshot_path(provider, key)
-        source = provider._connect().execute(
-            "SELECT active FROM document_sources WHERE source_id=?",
-            (existing["document_source_id"],),
-        ).fetchone()
-        if staged.is_file() and source is not None and int(source["active"] or 0):
-            return {"status": "unchanged", "source_key": key,
-                    "source_id": str(existing["document_source_id"]),
-                    "scope_id": scope_id, "repository_id": repository_id}
+        try:
+            from .github_source_adapter import _complete_cached_source
+        except ImportError:
+            from github_source_adapter import _complete_cached_source
+        return _complete_cached_source(provider, key, scope_id, repository_id,
+                                       embed=bool(args.get("embed", False)))
+    if (existing is not None and existing["status"] != "active"
+            and existing["revision_key"] == connectors._sha(version)[:20]):
+        raise ValueError("connector_cache_requires_download")
     if before["mimeType"] == _DOC_MIME:
         url = (f"https://www.googleapis.com/drive/v3/files/{file_id}/export?"
                + urllib.parse.urlencode({"mimeType": "text/plain"}))
