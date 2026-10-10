@@ -14,7 +14,7 @@ Native structured long-term memory provider for Hermes Agent. SQLite claims are 
 
 The supported security properties and private reporting path are documented in [`SECURITY.md`](SECURITY.md).
 
-**Текущий переносимый русский гайд:** [Memory Stack 1.24.5](docs/MEMORY_STACK_1_24_5_RU.md) — exact Wiki/LCM-X/PPLX PIN, 63 ENV + 8 YAML targets, native install/config, owner-run restart и отдельные saved/loaded/runtime readbacks. Это целевой режим, не утверждение, что все настройки применены или все индексы здоровы. [Deployment runbook](docs/HERMES-AGENT-DEPLOYMENT.md) сохранён с историческими CLI/source наблюдениями; его прежний source-only статус не является текущим статусом установленного code-stage.
+**Текущий переносимый русский гайд:** [Memory Stack 1.24.5](docs/MEMORY_STACK_1_24_5_RU.md) — exact Wiki/LCM-X/PPLX PIN, 65 ENV + 8 YAML targets, native install/config, owner-run restart и отдельные saved/loaded/runtime readbacks. Это целевой режим, не утверждение, что все настройки применены или все индексы здоровы. [Deployment runbook](docs/HERMES-AGENT-DEPLOYMENT.md) сохранён с историческими CLI/source наблюдениями; его прежний source-only статус не является текущим статусом установленного code-stage.
 
 ## Статус релиза и границы проверки
 

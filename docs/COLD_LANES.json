@@ -221,9 +221,6 @@
         "tests/test_observation_repair01.py",
         "tests/test_online_metrics.py",
         "tests/test_p2_g3_native.py",
-        "tests/test_p2_g3_repair01_pure.py",
-        "tests/test_p2_g4_identity_errors.py",
-        "tests/test_p2_g4_repair01.py",
         "tests/test_preference_provenance_and_aux_secrets.py",
         "tests/test_prefetch_auxiliary_guard.py",
         "tests/test_prefetch_delivery_packing_regression.py",
@@ -1092,15 +1089,15 @@
     },
     {
       "path": "tests/test_p2_g3_repair01_pure.py",
-      "lane": "legacy"
+      "lane": "source-explicit"
     },
     {
       "path": "tests/test_p2_g4_identity_errors.py",
-      "lane": "legacy"
+      "lane": "source-explicit"
     },
     {
       "path": "tests/test_p2_g4_repair01.py",
-      "lane": "legacy"
+      "lane": "source-explicit"
     },
     {
       "path": "tests/test_postinstall_admission_routes.py",
@@ -1330,5 +1327,11 @@
     "G4 source lanes need their own declared G4_FIXTURE/G4_REPAIR_FIXTURE app/user roots; not one universal pytest process"
   ],
   "before_oracle": "Historical G4 provider/trust equality kept in tests/fixtures/g4_original_boundary_gold.txt; current _metadata scope is separately bound.",
-  "gold_security_assertions": "preserved; source/legacy/strict union rather than skip/xfail/deselect"
+  "gold_security_assertions": "preserved; source/legacy/strict union rather than skip/xfail/deselect",
+  "source_partition_contract": {
+    "lane": "source-explicit",
+    "native_cold_process_excluded": true,
+    "requires_SDK_absent": true,
+    "execution": "Existing separate direct/AST source fixtures with declared G4_FIXTURE/G4_REPAIR_FIXTURE roots; never cold_lane_entry nativepreload. No cases/assertions skipped orremoved."
+  }
 }

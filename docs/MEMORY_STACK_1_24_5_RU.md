@@ -226,7 +226,7 @@ LCM_SENSITIVE_PATTERNS_ENABLED=true
 LCM_EMBEDDING_PRIVACY_ENABLED=true
 ```
 
-Для каждого разрешённого профиля сверить exact strings всех 63 ENV targets и 8 YAML targets программно. Число readbacks равно `число обнаруженных разрешённых профилей × 71`; missing/invalid/duplicates не считать PASS. Это матрица saved settings, **не** доказательство loaded runtime. Остальные строки, models/auth/paths/aliases и профильные различия должны остаться прежними.
+Для каждого разрешённого профиля сверить exact strings всех 65 ENV targets и 8 YAML targets программно. Число readbacks равно `число обнаруженных разрешённых профилей × 73`; missing/invalid/duplicates не считать PASS. Это матрица saved settings, **не** доказательство loaded runtime. Остальные строки, models/auth/paths/aliases и профильные различия должны остаться прежними.
 
 ### Почему это не «поставить все флаги в 1»
 
