@@ -1,0 +1,707 @@
+{
+  "schema": "memory-stack.current-sdk-component/v1",
+  "reference_base": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011",
+  "preflight_refusal": {
+    "phase": "controller_preflight_before_child",
+    "controller_exit_code": 1,
+    "subprocess_invocations": 0,
+    "tests_started": false,
+    "error": "current_block_is_once_only: parent registered an empty evidence directory",
+    "failed_carrier_sha256": "651f06eb436cf677e6b7b600235260ed70212c87e01a450ec3be17bfcdab7930",
+    "console_ref": "preflight-console.txt",
+    "console_sha256": "7b176e3983e2f83729da8fdb5c93792df37fa4fe7c50296e77b0d6a011a3a79b",
+    "console_provenance": "verbatim terminal tool-returned text, UTF-8 normalized LF; NOT original binary stderr",
+    "corrective_delta": "only existing RESULT/logs/scratch blocks a run; empty owner-registered evidence directory does not",
+    "earlier_elapsed_seconds": null
+  },
+  "status": "SOURCE_BOUND_BLOCKED_BOOTSTRAP_EFFECTS",
+  "current_metadata_derivative": {
+    "kind": "current_source_metadata_only_UNIT",
+    "checkpoint_commit": "be4eba518da4717ed9305d3b3e05fc6eb7df907d",
+    "branch": "lead/integration-20261011",
+    "evidence_root": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\evidence",
+    "historical_descriptor": {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\docs\\CURRENT_SDK_COMPONENT_CONTRACT.json",
+      "sha256": "47bd8ec1a444781582afff50f7890505f916e90823cc19aa8a3b8c133a805c53"
+    },
+    "historical_executed_contract": {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\evidence\\executed-contract.json",
+      "sha256": "fe821d142b5750e70fe3d0614730309ad75dbb1624b83ccf88ea97e6169afa38"
+    },
+    "historical_execution_unchanged": true,
+    "new_component_or_native_admission": false,
+    "unit_only": true,
+    "scope_ru": "38 local source bindings re-read from reviewed combined A/B tree; 56 external historical bindings unchanged. Only UNIT descriptor/current-origin metadata, no new SDK/bootstrap grant.",
+    "remaining_gate": "BLOCKED: once-only component не повторяется; historical child2, functional6, unit9 и 26 bootstrap denials не становятся текущим UNIT или native PASS.",
+    "own_source_evidence_scratch_cap_bytes": 30000000,
+    "owner_total_accounting": null,
+    "previous_UNIT_descriptor": {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\docs\\CURRENT_SDK_COMPONENT_CONTRACT.json",
+      "sha256": "5e5eea9bf80e0813cda8f8f734265a65ef4bb918bfb9cb4d453009711fe54dbd",
+      "commit": "2539dc84618609f1227d48f293b1c125eefd2b90"
+    }
+  },
+  "qualifier_contract": {
+    "finding": "B-CARRIER-QUALIFY-SUPERVISOR-ERRORS",
+    "healthy_supervisor": {
+      "errors": [],
+      "primary_error": null,
+      "both_fields_required": true
+    },
+    "missing_or_non_list_errors_or_missing_primary": "unknown/capture",
+    "nonempty_errors_or_any_nonnull_primary": "failed/harness",
+    "complete_child_flags_do_not_override_supervisor_errors": true,
+    "input_errors_and_primary_preserved": true,
+    "proof_scope_ru": "Авторские UNIT states проверяют qualifier; настоящий supervisor cleanup error-path здесь не воспроизводится."
+  },
+  "captured_contract": {
+    "evidence_reference_base": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\evidence",
+    "status": "SOURCE_BOUND_BLOCKED_BOOTSTRAP_EFFECTS",
+    "actual_current_refusal_groups": [
+      {
+        "event": "socket.gethostname",
+        "phase": "setup/ordinary_public_registration/bootstrap.config_import",
+        "count": 1,
+        "first_caller": {
+          "file": "python/Lib/platform.py",
+          "name": "_node",
+          "line": 715
+        },
+        "chain_source_ref": "logs/current-sdk-component.stdout#/audit/refusals"
+      },
+      {
+        "event": "open",
+        "phase": "setup/ordinary_public_registration/bootstrap.config_import/bootstrap.config_load/bootstrap.container_probe",
+        "count": 24,
+        "first_caller": {
+          "file": "core/hermes_platform/host/runtime.py",
+          "name": "_read_proc",
+          "line": 42
+        },
+        "chain_source_ref": "logs/current-sdk-component.stdout#/audit/refusals"
+      },
+      {
+        "event": "subprocess.Popen",
+        "phase": "setup/ordinary_public_registration/bootstrap.config_import/bootstrap.version_metadata",
+        "count": 1,
+        "first_caller": {
+          "file": "python/Lib/subprocess.py",
+          "name": "_execute_child",
+          "line": 1549
+        },
+        "chain_source_ref": "logs/current-sdk-component.stdout#/audit/refusals"
+      }
+    ],
+    "cause": "All 26 are registration-time config/bootstrap effects, not provider.initialize: platform.system -> platform.uname -> _node (1); home permission/container detection (24); Fireworks import-time User-Agent get_version_info -> git-stamp comparison (1).",
+    "proc_split": {
+      "/proc/1/cgroup_source_branch": 12,
+      "/proc/self/mountinfo_source_branch": 12,
+      "directory_policy_open_events": 22,
+      "SOUL_md_file_policy_open_events": 2
+    },
+    "swallowed_refusals": "platform._node, runtime._read_proc, version_info._run_git catch OSError, including PermissionError. Behavior can complete, but ledger forbids acceptance.",
+    "retained_bootstrap_denials": true,
+    "new_permission_from_necessity_or_SHA": false,
+    "exact_worker_argv_ref": "RESULT.json#/execution/argv",
+    "closed_process_shape": {
+      "mode": "prepare_readback_only; DENIED at subprocess.Popen",
+      "python_argv_source_bound": [
+        "git",
+        "rev-parse",
+        "HEAD"
+      ],
+      "windows_commandline_source_bound": "git rev-parse HEAD",
+      "cwd_source_bound": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent",
+      "source_call": {
+        "file": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\hermes_cli\\version_info.py",
+        "sha256_ref": "raw loaded_origins hermes_cli.version_info",
+        "line": 167,
+        "name": "_stamp_version_info"
+      },
+      "constructor_source": {
+        "file": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\tools\\python-3.14.7+20260901-win32-x64\\Lib\\subprocess.py",
+        "audit_line": 1549,
+        "native_creation_line": 1553
+      },
+      "audit_arguments_captured": false,
+      "actual_audit_payload_fields": null,
+      "actual_winapi_payload": null,
+      "_winapi_CreateProcess_events": 0,
+      "process_creation_allowance": 0,
+      "native_admission": false
+    },
+    "observed_component_registration_applied": true,
+    "functional_cases_passed": 6,
+    "carrier_unit_cases_passed": 9,
+    "actual_child_exit_code": 2,
+    "captured_raw_ref": "logs/current-sdk-component.stdout",
+    "captured_raw_sha256": "c010e2e14da537c047932f1ed517180c5698a382cc00a15a6262dd284bf96714",
+    "complete_loaded_origin_count": 200,
+    "historical_evidence_rule": "matching 26-count reproduction on current selected SDK; archived 22-case run is unchanged. Its missing original caller identities remain UNKNOWN.",
+    "frozen_frame_identity_rule": "<frozen ...> co_filename strings in raw sidecar are pseudo-file lexical IDs, not physical fixture files or independently SHA-bound module origins.",
+    "no_new_runtime_execution_from_this_projection": true
+  },
+  "source_root": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source",
+  "source_base_commit": "d61268f5da18e11824a5285e4e4096fdd65672e6",
+  "source_layout": "Exact merged worktree metadata derivative; unchanged historical component capture is not new native execution",
+  "selected_python": {
+    "executable": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\tools\\python-3.14.7+20260901-win32-x64\\python.exe",
+    "facts": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\tools\\facts.json",
+    "catalog_version": "3.14.7+20260901",
+    "runtime_version_ref": "evidence/RESULT.json#/actual_component/facts/actual_python"
+  },
+  "selected_sdk": {
+    "revision": "79b45d1647f6b5680768d851c4c406e8cc550a1e",
+    "origin": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent",
+    "binding_paths": [
+      "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\agent\\memory_provider.py",
+      "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\agent\\memory_manager.py",
+      "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\hermes_constants.py",
+      "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\tools\\registry.py",
+      "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\tools\\hook_output_spill.py",
+      "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\tools\\tool_output_limits.py",
+      "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\hermes_cli\\config.py",
+      "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\hermes_cli\\config_defaults.py",
+      "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\hermes_yaml.py",
+      "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\utils.py",
+      "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\hermes_cli\\managed_scope.py",
+      "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\hermes_cli\\version_info.py",
+      "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\hermes_cli\\auth_constants.py",
+      "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\hermes_platform\\host\\runtime.py",
+      "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\pm\\paths.py"
+    ],
+    "resolved_closure_ref": "evidence/logs/current-sdk-component.stdout#/loaded_origins",
+    "source_review_only_until_actual_capture": true
+  },
+  "trust_core": {
+    "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\lib\\hermes_trust_core.py",
+    "identity_ref": "evidence/RESULT.json#/actual_component/facts/trust_callable_identity"
+  },
+  "dependencies": {
+    "ordinary_readonly_environment": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env",
+    "site_packages": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages",
+    "site_processing": false,
+    "foreign_or_global_site_packages": false,
+    "selection": "-I -B -S selected base interpreter; explicit existing ordinary dependency path after audit, no .pth/editable/sitecustomize",
+    "ruamel_yaml": {
+      "distribution": "ruamel.yaml",
+      "version": "0.18.16",
+      "origin": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\__init__.py",
+      "metadata": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel.yaml-0.18.16.dist-info\\METADATA"
+    }
+  },
+  "public_shapes": [
+    {
+      "class": "MemoryWikiProvider",
+      "method": "__init__",
+      "origin": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\__init__.py",
+      "line": 6854,
+      "signature": "self",
+      "ast_sha256": "8bbd878960d93fcb1fc9c2ae1354194c91b47d5d6d27537f2ed1a672939bec12"
+    },
+    {
+      "class": "MemoryManager",
+      "method": "__init__",
+      "origin": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\agent\\memory_manager.py",
+      "line": 398,
+      "signature": "self, *, external_prefetch_timeout: Optional[float]=None",
+      "ast_sha256": "412028cd9cd2322794ffd190da5bf8518f28533e953a0ccdc0236bebaf1e3086"
+    },
+    {
+      "class": "MemoryManager",
+      "method": "add_provider",
+      "origin": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\agent\\memory_manager.py",
+      "line": 434,
+      "signature": "self, provider: MemoryProvider",
+      "ast_sha256": "56b18ffc463373fa02278ae0bddbd6011690b7d30f13b4b6a57248b8f71faafd"
+    }
+  ],
+  "bootstrap_policy": {
+    "process_creation_allowance": 0,
+    "socket_operations": "deny all including gethostname",
+    "proc_external_reads": "deny, including attempts that would normally FileNotFound on Windows",
+    "refusal_handling": "retain_and_block_even_if_caught",
+    "preload_Core_before_audit": false,
+    "Core_SDK_PM_monkeypatch": false,
+    "audit_boundary": "Python audit envelope, not OS sandbox",
+    "sidecar": "event + bound phase + up to 8 primitive caller file/name/line, first 32 refused rows; all counters retained; no args/repr/exceptions/frames/providers/credentials stored",
+    "phase_binding": "explicit lexical component scopes + actual exact-source config/spill/version/proc call/return boundaries; never last NODE label"
+  },
+  "bootstrap_effect_source_candidates": [
+    {
+      "event": "socket.gethostname",
+      "source": "selected stdlib platform.uname called by config platform.system, actual caller required",
+      "permission": "DENIED"
+    },
+    {
+      "event": "open",
+      "source": "hermes_constants._container_or_chmod_skipped -> hermes_platform.host.runtime._detect_container -> _read_proc",
+      "paths": [
+        "/proc/1/cgroup",
+        "/proc/self/mountinfo"
+      ],
+      "permission": "DENIED"
+    },
+    {
+      "event": "subprocess.Popen",
+      "source": "version/metadata import closure; exact originating source/shape must come from captured caller, not previous NODE",
+      "permission": "DENIED",
+      "native_creation_attempts_allowed": 0
+    }
+  ],
+  "historical_refusal": {
+    "RESULT": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\validation\\full-memory-wiki-20261011\\terminal-output\\runtime-update-complete-fixture\\RESULT.json",
+    "RESULT_sha256": "99797b3bc7acf0e9ecc638f5932315a1145dd795ae281308479cf633d2d42f89",
+    "stdout": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\validation\\full-memory-wiki-20261011\\terminal-output\\runtime-update-complete-fixture\\logs\\current-SDK-own-deps.stdout",
+    "stdout_sha256": "ffadc7b89c5672090a3fdc8fcdb933502853cca08bf5658b3e40127e35a1013e",
+    "stderr": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\validation\\full-memory-wiki-20261011\\terminal-output\\runtime-update-complete-fixture\\logs\\current-SDK-own-deps.stderr",
+    "stderr_sha256": "cec6f53c0fe19cb323f87b00591f9abe1dd4ce3b23612832cf06bc51d53c0acc",
+    "counts": {
+      "socket.gethostname": 1,
+      "open": 24,
+      "subprocess.Popen": 1
+    },
+    "refused_total": 26,
+    "functional_passed": 22,
+    "exit_code": 1,
+    "first_caller_of_historical_events": "UNKNOWN: previous sidecar retained no caller identity, only 8 event rows; do not backfill reconstructed evidence",
+    "original_source_root": "validation/full-memory-wiki-20261011/terminal-source",
+    "old_90a_acceptance_not_relabelled": true
+  },
+  "metadata_rebind": {
+    "current_provider_origin": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\__init__.py",
+    "provider_sha256": "a5bc4202860693b14067ce88ca3e9fc5f5738f87fec341853fe75192fd99eee9",
+    "historical_COLD": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\docs\\COLD_LANES.json",
+    "historical_COLD_unchanged": true,
+    "self_document_excluded_only_from_source_bindings": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\docs\\CURRENT_SDK_COMPONENT_CONTRACT.json",
+    "native_authority_from_JSON": false
+  },
+  "permission": {
+    "ordinary_component_from_owner_request": true,
+    "native_admission": false,
+    "full_bootstrap": null,
+    "registered_provider_applied_ref": "evidence/RESULT.json#/actual_component/registration_applied",
+    "native_B4_R3_once_allowance": 0,
+    "loaded_fleet": null,
+    "CI_API_models_install_publication_restart": false
+  },
+  "fixture_environment": {
+    "PYTHON_DOTENV_DISABLED": "1",
+    "HERMES_SECURITY_STRICT": "1",
+    "MEMORY_WIKI_EVENT_LEDGER_ENABLED": "1",
+    "MEMORY_WIKI_SEMANTIC": "0",
+    "MEMORY_WIKI_RERANK_ENABLED": "0",
+    "MEMORY_WIKI_BACKGROUND_JOBS_ENABLED": "0",
+    "MEMORY_WIKI_GRAPH_AUTO_EXTRACT": "0",
+    "MW_EXTRACTION_ENABLED": "0",
+    "MEMORY_WIKI_EPISODIC_SEMANTIC": "0",
+    "MEMORY_WIKI_DOCUMENT_RERANK": "0",
+    "MEMORY_WIKI_CODE_GRAPH_RERANK": "0",
+    "MEMORY_WIKI_ONLINE_METRICS_ENABLED": "0"
+  },
+  "fixture_yaml": "memory:\n  provider: memory-wiki\n  prefetch_spill_enabled: false\nhooks:\n  output_spill:\n    enabled: false\nterminal:\n  backend: local\n",
+  "scratch_root": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\team-lead-20261011\\merged",
+  "budget": {
+    "lane_plus_scratch_cap": 30000000,
+    "reserve_bytes": 10000000,
+    "C_floor": 3000000000,
+    "owner_7GB_compliance": null,
+    "parent_combined_cap_unchanged": 550000000
+  },
+  "source_bindings": [
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel.yaml-0.18.16.dist-info\\METADATA",
+      "sha256": "39376f3b128778b05ed27fcf27958feef9436df63422463865b293c1b212c978"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\__init__.py",
+      "sha256": "3119652033a15c24d69c2f2707260f811f3e446cdbad6c8f97d603ede8ac499a"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\anchor.py",
+      "sha256": "bbaa5622e0df29f199523520c3a6997b11e27ec1fd9eb8048d84b3247dda1728"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\comments.py",
+      "sha256": "fccdf4d964c7cac3bb236be9cdd098452df8c43f3e499c31713ae0c52fdee101"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\compat.py",
+      "sha256": "ca05082fbfde00843a12bf4d815b4c08198d0418ae9b9033985dd03cbb2f9f47"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\composer.py",
+      "sha256": "995207cbd7f356028312ac8e031814740e5f4e20cf477f0e1cd7e96f517a0096"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\configobjwalker.py",
+      "sha256": "d20bd45cdc8862f4dd96245389b5036fb216e42eafe23b2499d85004a5973160"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\constructor.py",
+      "sha256": "bdaace288852001493bff213299314bb5ff1d9d6aeca217c0c4f91fa61145298"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\cyaml.py",
+      "sha256": "cfb986e4a3740a862ed96c5a4a9379341f62c88cb6c26bc9d0bf992ded96aa31"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\docinfo.py",
+      "sha256": "e0d3ef3bffa6e9ce1f4219be67ddfc9d42a4564a0bd8e050127ffa7e367e265f"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\dumper.py",
+      "sha256": "65d9d9c305b44bdc061e741ebac97940106a0fe23220801802a74cd1030e9dc5"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\emitter.py",
+      "sha256": "9a5bd5e7281cf80d897780208c62452eb6601f641d0c6edc442e51ec2a5013d7"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\error.py",
+      "sha256": "9f3a2e022b3d4d3a6c717f1f9d3197aa36fd5e2926ce881fe249f63aafac4f86"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\events.py",
+      "sha256": "cf0de91a87e7b498f354119c508c4a943c02b35df23d5d9433a212bf1f11d691"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\loader.py",
+      "sha256": "d5d59b07c79be84549344b625f1fe4dfd3806122f0369704f8c940fa10bc3604"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\main.py",
+      "sha256": "b26c1fff79e3f7e681a33684db921bdf6d920a83ca462427c23fe25ca3ea1fde"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\mergevalue.py",
+      "sha256": "38bb322fd2f906453a2d9117106c3519934f7d047b5678d65811076afaf83988"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\nodes.py",
+      "sha256": "107801e641e2554ca8a0d23bd231d65c56f4c79022dc42567caf16df4621ed64"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\parser.py",
+      "sha256": "44b2d0b372807d08fa2175841ed3d1c974320a5858d238a1b8ba50cd77d78f9a"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\reader.py",
+      "sha256": "27dee9bdccaf2f1956c20b98cdc10a2e97e919a727338f3e5dfd423e0142a07b"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\representer.py",
+      "sha256": "3412f1b0c1b3a794599df37b5bdbcb01a28e29dc4248b9b18696ea45844cd1c1"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\resolver.py",
+      "sha256": "aad8c7f2a4ffbff69a9aac646bc87440e7f6227f2cc6b2a914eeaa3b10d50171"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\scalarbool.py",
+      "sha256": "9af7b7435b033b5c586acb42e7f6c9d59477b0bef20c704824f44363e51b3767"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\scalarfloat.py",
+      "sha256": "4a36b81924af3b799c3f877da85b12d540d08364a0d6fe6e405f2cf2be4b02cd"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\scalarint.py",
+      "sha256": "ab400bdb6b1762ee9d274a350b778426f3d1c1faf0b9d7e77ac98e8c0c8a6c6e"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\scalarstring.py",
+      "sha256": "2ac30fbc108b5f5286a471e440aacd234c4a21dc88776e55abf22a2c57125ef4"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\scanner.py",
+      "sha256": "b716df08841b725be09153e1a093a1359a16044a395bc892a975f9b1509cc8ce"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\serializer.py",
+      "sha256": "96cfd7ccd8241e850a608a7054d99e921f84c9c5490eeae3b1523048d3d3f626"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\tag.py",
+      "sha256": "31452644fc34c569b596bfda0e0645a49ba468f9fa573651b2699289f1cddf2d"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\timestamp.py",
+      "sha256": "980e052c95c85172a4a66a2e0193b46ed1bb4fee7349c04b898563360594d15d"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\tokens.py",
+      "sha256": "bf97cc67d7b557a6978051d55377dff5bc6a78914da87cac80749b1156ea1571"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\Lib\\site-packages\\ruamel\\yaml\\util.py",
+      "sha256": "a5b49c11e319149d919e9767d63a60d63a26fbe51e83bf4149d8e05fd777f308"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\full-memory-wiki-suite-20261011\\env\\pyvenv.cfg",
+      "sha256": "27914c7aa830b3333b49214df1156b8371cec590a9e09da86f7d6bdd83ca335e"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\agent\\memory_manager.py",
+      "sha256": "1df39a53f534a21695ae22fc767245d354b0266da99c28d94fd2b65a5d826ad7"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\agent\\memory_provider.py",
+      "sha256": "2d62ab1c2b0de88dd7b4dd4ef87068adc8717800833930782785974edf3ff616"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\hermes_cli\\auth_constants.py",
+      "sha256": "90c81574397cd7b1bd33c38a57c4831bfe92be69dce3eb1d586d271921403eb5"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\hermes_cli\\config.py",
+      "sha256": "a469923872fc1e4d905089bb4cc4af5c8cc4104f9f72a159656205c07cdb80ef"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\hermes_cli\\config_defaults.py",
+      "sha256": "cc2cbc1b608e33f242c1a80723fbdfcaaf7bbb175e8eab6bafa863ab88fe4e1a"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\hermes_cli\\managed_scope.py",
+      "sha256": "d048bb14fae4517d9c0dc90255c9b495fdba3bbf5311a50aa5108b43c724874d"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\hermes_cli\\version_info.py",
+      "sha256": "2a422bbd2b32691d871b4fe550cd687be0bbb49989a76fedda8c00432d4944a9"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\hermes_constants.py",
+      "sha256": "93ce6412ce69ce1dda0607d98b339d5e622f135ec79ecaa2e6352a26783a3daf"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\hermes_platform\\host\\runtime.py",
+      "sha256": "fd760a3f044d6201aa5b543d0166de11f27e2da6a700839623ebd67ce1037d6a"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\hermes_yaml.py",
+      "sha256": "f97f0f08b6474c52434d0cffaa7ba0ecaa5b9279c4abcbb35c11d15f9c89db76"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\pm\\paths.py",
+      "sha256": "8f15860b82f443a424186317dc361ea6063e0e7c3113af9b56a76f6b89e97737"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\tools\\hook_output_spill.py",
+      "sha256": "8728e1223d12a86fc14014ee5b8749a2eb8bd8681ae3637a64874c8eece6e0a6"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\tools\\registry.py",
+      "sha256": "4a05aae5b4dd40bf9a104d23582d4363326ad7ce3fdac1ac249e0af04334d909"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\tools\\tool_output_limits.py",
+      "sha256": "e7e101de344c8e8effb887d5f2235fde0b58e12654a593c022d931a3762f812a"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\hermes-agent\\utils.py",
+      "sha256": "394b44230f13ba608c6ce9b2d143563b2554a73a219567b03884637776a4859a"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\lib\\hermes_trust_core.py",
+      "sha256": "9d9b3aac80bea5f1aba6ac289a3647b5b3a1fc9bf9d60e0fd920390b5544638b"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\devtools\\RESULT_CONTRACT.json",
+      "sha256": "76f4fb612f4f2402704e70f592a072561942d8c856b5caf7144b1086be2743cd"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\devtools\\harness.py",
+      "sha256": "4c399da0a77cf2b8067c70513f7217a51011916ac20571d1b2131d91dcc61a34"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\REGISTRATION.json",
+      "sha256": "738f0b0a53c658db9fe8a04537f4d6c71957db12067e39f060473d49021fc047"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\__init__.py",
+      "sha256": "a5bc4202860693b14067ce88ca3e9fc5f5738f87fec341853fe75192fd99eee9"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\background_jobs.py",
+      "sha256": "3ad75ace9a56d9fa00c7b260dd371a2e3a6ceadbac12b0099db43e30f99d04c1"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\code_knowledge_graph.py",
+      "sha256": "f8aa8838fc30ab199be71b253d70bbb89b0ef56cd86015c2d4a5800121bd1a0f"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\collapse.py",
+      "sha256": "9e5e77c3070fa58767b75230a9a7f99c53b4da23b7509a35e4caefaafdcf978c"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\current_scope_reindex.py",
+      "sha256": "d81979d49946c0e45fa6eac5c24e4001a1d3fdcd145e5ee3cacacad9c0cd627a"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\decay.py",
+      "sha256": "7fc1ed579319a3bdf46de4b06f1579c4ccafc1ac547dde3ed2b0186533bd0aab"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\disclosure_fence.py",
+      "sha256": "9893d25f343fda69bcb0e5db05a4b9941b88ec3b1039c9af8621015a86ce54a7"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\docs\\COLD_LANES.json",
+      "sha256": "df73211e54770d2eced223aa55fb0948b8b541e052523744c970e72bfb17f1bd"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\document_extractors.py",
+      "sha256": "c317b17582755d9a63f03ba64c60748701ea38b09c10f2608dce8b881a049a2e"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\document_knowledge_graph.py",
+      "sha256": "599ebc349307642448efd1981cb29912b6b0664e84b148f66c6b6a9a6aecb320"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\document_worker.py",
+      "sha256": "2fe998b2d7175e8caedfe806891bfe3130e60b85bdef12f13f4913cfa250606d"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\entity_relation_extractor.py",
+      "sha256": "cd884c7c343556cae8a6949d8e3d2fe4afab78ffa7f30fa4694e115812fcb123"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\episodic_memory.py",
+      "sha256": "1a0895e860bc25f3e042fb1ac7335b341cdd0481567d50255a0d0b3d41c83b5e"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\extractor.py",
+      "sha256": "015c64ae0671d329f3a8a1ca0fbbdc5c79234657c95c11e4d88d2f3c2b4e3222"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\github_source_adapter.py",
+      "sha256": "12e3b35219cc8ac23a02e7ab8ef24ee66bd398f3dd999298d1cd40c0a98c5d0b"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\google_drive_source_adapter.py",
+      "sha256": "fce9f21830b3788053b3e1f6372e6d8aa4124380b3a9377fe411652a27bde517"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\guard.py",
+      "sha256": "a41dd58b8be0b3d6742a961740fb412d4053afc4d16b01d58c95b0215117a4fc"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\http_safety.py",
+      "sha256": "bbbbda1a1b0d7febcc0f895a40c150060db409b6ff7c5b3b1f8b615d0f145e19"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\memory_events.py",
+      "sha256": "3c4334fa021012c7ed79d9763c1fcb2c79b14e13beede2de405aea184405c231"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\memory_observations.py",
+      "sha256": "33d8c5d9b6eab8bad2bdd6a3987548f6d94f70cf12501c73e03a5b2212b25e7a"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\migrations.py",
+      "sha256": "fb6fe91c8964be591004ebf9378b6dd7bb8084a6e84ae02a4515fc6b7bfa3310"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\online_metrics.py",
+      "sha256": "8a8dfb53b5c166a45102edeef545798532daa7f582835755214c3c880a03e762"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\patch_secret_context_plugin.py",
+      "sha256": "60fa2032a6b82c49db685452687315654ed8c873463b583962dc9a52c29ec1f6"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\privacy_erasure.py",
+      "sha256": "0a201b3f4fdefa001946a6ce9caa877a28652503574ee27bdf15485a51f08be0"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\recall_orchestrator.py",
+      "sha256": "2c6e808e929a1e290e40c521aebc981819bccec659d6d6f88e884229ebff3dd3"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\recall_planner.py",
+      "sha256": "2ed888c78c8a8bb5ba1663f46d62fa551c8f16033db29d3f5f0fc062f445f9e3"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\scripts\\ci_owned\\current_sdk_bootstrap.py",
+      "sha256": "c3446731fe913e5b459bd8d7d8161576bd9876fd1d4e8fe4041bed7d785c067c"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\sdk.py",
+      "sha256": "52fc5b6f930d1b628b8d0731ad0fd540996e5d36d7cc23c16a3ca1dd6ad73bc4"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\secret_context_bridge.py",
+      "sha256": "4a3f16a110dda04168636b3e6631d042855b668a97488ef5677a8a17b08de051"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\semantic_io.py",
+      "sha256": "53d2afabffdd360058bf50807ac63fff5ab0c3715fbbec3d1844f27d726086f7"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\setup.py",
+      "sha256": "cb184df928263e32fd4015c38d41dd71345979d6cb4ecad1c4d44b9090f19780"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\shared_blocks.py",
+      "sha256": "88bafd15a37abed67ef0beb55130da06b8291aec26018a66ddbc46435f93f832"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\source_connectors.py",
+      "sha256": "c36884925be21a322da899eb7307ccf69ef6b273f0cc7f2d71d874cef9e44910"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\tests\\ci_owned\\test_current_sdk_bootstrap.py",
+      "sha256": "447dd6c56fd91617800b7d50acba8be2defaf3df00483c01140eafbe4a799010"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\vault.py",
+      "sha256": "a0ae470a3f15597fcd0693df0c83af9f844d348d8f6fdaeb058c89c75434a203"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\vault_aead.py",
+      "sha256": "1417e29b788e8f466d0497a31b62cc3a3674c40256910f1d73c14b88d073936e"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\vault_registry_adapter.py",
+      "sha256": "702816f1efe3dd1c9c706a63c1090bb09e2d2180246ab1d2466e2ee4d6f5a16f"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\source\\visual_evidence.py",
+      "sha256": "256e5e8bdabb2b35d0e01dea9144e1cf4950897b295daf6d81ede0ac82146042"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\tools\\facts.json",
+      "sha256": "19918c9452768f5b284182d0eabc8d2d4ff185d81328be58d35db12b1558761b"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\tools\\python-3.14.7+20260901-win32-x64\\Lib\\platform.py",
+      "sha256": "240eba74565cd0dc4f99f182f7afc32bbea0593016ddb34165b529b5bcb6be0a"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\tools\\python-3.14.7+20260901-win32-x64\\Lib\\subprocess.py",
+      "sha256": "6628ffdd65c093a6c08cae01ffe82877d3ced515aac9e7be0cff16512c30a7d9"
+    },
+    {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\tools\\python-3.14.7+20260901-win32-x64\\python.exe",
+      "sha256": "703536cd5d48b90407300079f490247e81244057652895d5a60df1e7d2991962"
+    }
+  ],
+  "controller": {
+    "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\devtools\\harness.py",
+    "reuse": "unchanged permanent supervise/clean_env/strict_json/save_result; evidence output root locally bound; SOURCE launcher unchanged and not a component grant",
+    "selected_worker_flags": [
+      "-I",
+      "-B",
+      "-S",
+      "-X",
+      "utf8"
+    ],
+    "focused_package": "tests/ci_owned/test_current_sdk_bootstrap.py explicit stdlib unittest loading + actual guarded SDK component, no pytest/root conftest/JUnit hostname",
+    "raw_capture_limit": {
+      "stdout": 96000,
+      "stderr": 48000,
+      "timeout_seconds": 120
+    },
+    "no_task_close": true
+  }
+}

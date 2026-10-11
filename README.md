@@ -1,8 +1,16 @@
 # Hermes Memory Wiki v1.24.5
 
-## Recovery atomic/error checkpoint — source, не новый релиз
+## Document authority / host-erasure / SDK qualifier — source-checkpoint
 
-Current source correction PIN: [`d6fa8b37406f767045183e12c538e1f85bc6e702`](https://github.com/sbrejnev988-coder/hermes-memory-wiki/commit/d6fa8b37406f767045183e12c538e1f85bc6e702). Она сохраняет предыдущий FTS fix и закрывает native error-only journaling, отказ history overflow до эффекта, public joined TX boundary и atomic ingest replay identity UNION. Версия/schema не повышались.
+Новая принятая source-дельта: [`5d8a8b57319a8fa27ef8edd15f97bfb0a1f06ed1`](https://github.com/sbrejnev988-coder/hermes-memory-wiki/commit/5d8a8b57319a8fa27ef8edd15f97bfb0a1f06ed1). Она сохраняет предыдущие FTS/recovery исправления, удерживает original ingest admissions у actual outer owner до COMMIT, исправляет private document writer и host-erasure lifetime, а tooling qualifier отказывает при supervisor error/missing health fields.
+
+Проверено отдельно: **87/87 direct component**, exit0/audit0; **18/18 tooling UNIT**, exit0/audit0. Runtime execution PIN `3f33a9dc48385273749f8d2633903c63458bf0eb`; final source PIN выше отличается только descriptor metadata, runtime/test correspondence сверено. Это не единый105-case native/full-suite PASS. Старый independent FAIL сохранился; содержательная A-owner коррекция прошла независимое PASS review. [Граница доказательств и оставшиеся gates](docs/DOCUMENT_SDK_CHECKPOINT_20261011_RU.md).
+
+Версия остаётся **1.24.5**. Новый tag/GitHub Release/wheel/secondary PIN, install/reload/restart не выполнены. Native parser/full bootstrap, other Python/OS, live/loaded fleet и release регрессии остаются BLOCKED/UNKNOWN; once allowances0 и resource limits не повышены. Source-only CI не запускается и не называется PASS.
+
+## Предыдущий recovery atomic/error checkpoint — source, не новый релиз
+
+Previous recovery source correction PIN: [`d6fa8b37406f767045183e12c538e1f85bc6e702`](https://github.com/sbrejnev988-coder/hermes-memory-wiki/commit/d6fa8b37406f767045183e12c538e1f85bc6e702). Она сохраняет предыдущий FTS fix и закрывает native error-only journaling, отказ history overflow до эффекта, public joined TX boundary и atomic ingest replay identity UNION. Версия/schema не повышались.
 
 Координатор подтвердил **32/32**, actual child exit **0**, audit **0** для exact direct-provider/SQLite component и scoped read-only собственных файлов. Первый independent review старой дельты остался **FAIL**; corrective closeout не объявлен новым independent PASS. [Точные границы, evidence и оставшиеся blockers](docs/RECOVERY_ATOMIC_CHECKPOINT_20261011_RU.md).
 

@@ -2079,17 +2079,24 @@ def _record_commit_hook_type():
 def _validate_ingest_commit_hook(provider, conn, hook):
     if type(hook) is not _record_commit_hook_type():
         raise TypeError('document_private_commit_hook_invalid')
+    if hook.started or hook.commit_attempted or hook.commit_returned or hook.rollback_completed:
+        raise RuntimeError('document_private_commit_hook_reused')
     hook.validate(provider, conn, transaction=False, before=True)
 
 
 @contextmanager
-def _document_write_transaction(provider, conn):
+def _document_write_transaction(provider, conn, *, _commit_hook=None, _document_ingest=None):
     """Keep admission and effects in one real SQLite writer/owner lifetime."""
     owner = getattr(provider, "_claim_transaction", None)
     if callable(owner):
         # Shared/private provider handles are checked by the existing owner.
-        # A joined operation must not commit or clear its caller's transaction.
-        with owner(conn, join=True):
+        # Ordinary joins never commit the caller; a record owns its idle stage.
+        options = {"join": True} if _commit_hook is None else {"_document_hook": _commit_hook}
+        if _document_ingest is not None:
+            # The actual owner retains this ORIGINAL admission, including for
+            # legal joins, and fences it again after its late commit callbacks.
+            options["_document_ingest"] = _document_ingest
+        with owner(conn, **options):
             yield
         return
     # Standalone document API: never adopt an unproven pending transaction.
@@ -2098,18 +2105,57 @@ def _document_write_transaction(provider, conn):
     commit_attempted = False
     try:
         conn.execute("BEGIN IMMEDIATE")
+        if _commit_hook is not None:
+            _commit_hook.started = True
         yield
         commit_attempted = True
+        if _commit_hook is not None:
+            _commit_hook.commit_attempted = True
         conn.commit()
+        if conn.in_transaction:
+            raise RuntimeError("document_commit_transaction_still_active")
+        if _commit_hook is not None:
+            _commit_hook.commit_returned = True
     except BaseException as primary:
         try:
             pending = conn.in_transaction
             conn.rollback()
             if conn.in_transaction or (commit_attempted and not pending):
                 primary.add_note("document transaction cleanup outcome UNKNOWN")
+            elif _commit_hook is not None and _commit_hook.started:
+                _commit_hook.rollback_completed = True
         except BaseException:
             primary.add_note("document transaction rollback outcome UNKNOWN")
         raise
+
+
+def _assert_ingest_authority(provider, conn, source_id, admission, *, before):
+    """Re-read authority under the writer, never adopt a post-parser owner.
+
+    The admission tuple is private input from this ingest's original preflight,
+    not a tool argument or a capability. SQLite excludes competing writers;
+    a second check catches same-transaction trigger/callback changes.
+    """
+    _assert_connector_owner(provider, source_id, _conn=conn)
+    current = conn.execute("SELECT * FROM document_sources WHERE source_id=?", (source_id,)).fetchone()
+    if admission is None:
+        if current is not None:
+            _assert_source_access(provider, current)
+        return
+    path, scope_id, repository_id, actor, original_source, file_identity = admission
+    if (str(getattr(provider, "bot_id", "") or ""),
+            str(getattr(provider, "project_scope", "") or "")) != actor:
+        raise PermissionError("document_ingest_actor_changed")
+    if _document_access_scope(provider, scope_id, repository_id) != (scope_id, repository_id):
+        raise PermissionError("document_ingest_scope_changed")
+    _assert_ingest_source_scope(provider, current, scope_id, repository_id)
+    if before and (tuple(current) if current is not None else None) != original_source:
+        raise RuntimeError("document_ingest_source_changed")
+    if not before and (current is None or str(current["scope_id"] or "") != scope_id
+                       or str(current["repository_id"] or "") != repository_id):
+        raise RuntimeError("document_ingest_source_binding_changed")
+    _assert_ingest_path_alias_owner(provider, conn, path, source_id, scope_id, repository_id,
+                                    opened_identity=file_identity)
 
 
 def _verify_document_ingest_replay(conn, source_id, reference):
@@ -2145,52 +2191,42 @@ def _verify_document_ingest_replay(conn, source_id, reference):
 
 
 @contextmanager
-def _ingest_transaction(provider, conn, hook, *, source_id, _replay_reference=None):
-    if hook is None:
-        with _document_write_transaction(provider, conn):
-            yield
-            if _replay_reference is not None:
-                _verify_document_ingest_replay(conn, source_id, _replay_reference)
-                identities = [tuple(item) for item in _replay_reference.get("file_identities", [])]
-                # Validate the complete UNION, including the physical identity
-                # already admitted by this ingest, before adding historical IDs.
-                history = _file_identity_history(conn, source_id) | set(identities)
-                if len(history) > 500:
-                    raise _DocumentRecoveryHistoryOverflow(
-                        "document recovery reference file identity history exceeds journal limit"
-                    )
-                if len(_json([list(item) for item in sorted(history)])) > _MAX_FILE_IDENTITY_HISTORY_CHARS:
-                    raise RuntimeError("document file identity history exceeds checkpoint-safe limit")
-                for identity in identities:
-                    _remember_file_identity(conn, source_id, identity)
-            _document_recovery_file_identities(conn, source_id)
-        return
-    _validate_ingest_commit_hook(provider, conn, hook)
-    try:
-        conn.execute('BEGIN IMMEDIATE')
-        hook.started = True
-        hook.validate(provider, conn, transaction=True, before=True)
+def _ingest_transaction(provider, conn, hook, *, source_id, _replay_reference=None, _admission=None):
+    if hook is not None:
+        _validate_ingest_commit_hook(provider, conn, hook)
+    stage = (source_id, _admission) if _admission is not None else None
+    with _document_write_transaction(provider, conn, _commit_hook=hook, _document_ingest=stage):
+        _assert_ingest_authority(provider, conn, source_id, _admission, before=True)
+        if hook is not None:
+            hook.validate(provider, conn, transaction=True, before=True)
         yield
-        hook.validate(provider, conn, transaction=True)
-        if hook.expected is None:
-            raise RuntimeError('document_private_commit_hook_not_applied')
+        if hook is not None:
+            hook.validate(provider, conn, transaction=True)
+            if hook.expected is None:
+                raise RuntimeError('document_private_commit_hook_not_applied')
+        if _replay_reference is not None:
+            _verify_document_ingest_replay(conn, source_id, _replay_reference)
+            identities = [tuple(item) for item in _replay_reference.get("file_identities", [])]
+            # Validate the complete UNION, including the physical identity
+            # already admitted by this ingest, before adding historical IDs.
+            history = _file_identity_history(conn, source_id) | set(identities)
+            if len(history) > 500:
+                raise _DocumentRecoveryHistoryOverflow(
+                    "document recovery reference file identity history exceeds journal limit"
+                )
+            if len(_json([list(item) for item in sorted(history)])) > _MAX_FILE_IDENTITY_HISTORY_CHARS:
+                raise RuntimeError("document file identity history exceeds checkpoint-safe limit")
+            for identity in identities:
+                _remember_file_identity(conn, source_id, identity)
+        _assert_ingest_authority(provider, conn, source_id, _admission, before=False)
         _document_recovery_file_identities(conn, source_id)
-        hook.commit_attempted = True
-        conn.commit()
-        hook.commit_returned = True
-    except BaseException as primary:
-        if hook.started and conn.in_transaction:
-            try:
-                conn.rollback()
-                hook.rollback_completed = True
-            except BaseException:
-                primary.add_note('connector SQL rollback outcome UNKNOWN; candidate retained')
-        raise
 
 
 def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _replay_reference=None) -> Dict[str, Any]:
     if _commit_hook is not None and _replay_reference is not None:
         raise ValueError("document replay cannot use a connector commit hook")
+    original_actor = (str(getattr(provider, "bot_id", "") or ""),
+                      str(getattr(provider, "project_scope", "") or ""))
     path = _allowed_path(args.get("path"))
     scope_id, repository_id = _document_access_scope(
         provider,
@@ -2206,6 +2242,7 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
         _validate_ingest_commit_hook(provider, conn, _commit_hook)
     _assert_connector_owner(provider, source_id, _conn=conn if _commit_hook is not None else None)
     existing = conn.execute("SELECT * FROM document_sources WHERE source_id=?", (source_id,)).fetchone()
+    original_source = tuple(existing) if existing is not None else None
     _assert_ingest_source_scope(provider, existing, scope_id, repository_id)
     _assert_ingest_path_alias_owner(provider, conn, path, source_id, scope_id, repository_id)
     options = _worker_options(args)
@@ -2260,6 +2297,7 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
     payload["file_size"] = int(snapshot_meta["size_bytes"])
     extraction_payload = _sanitize_extracted_json(payload, max_items=1_000_000, max_string=2_000_000, max_depth=16)
     file_identity = snapshot_meta["file_identity"]
+    admission = (path, scope_id, repository_id, original_actor, original_source, file_identity)
     _assert_connector_owner(provider, source_id, _conn=conn if _commit_hook is not None else None)
     file_hash = str(payload.get("file_hash") or "")
     parser = str(payload.get("parser") or "")
@@ -2275,7 +2313,7 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
             and str(existing["parser"] or "") == parser
             and str(existing["parser_version"] or "") == parser_version
             and int(existing["active"] or 0) == 1):
-        with _ingest_transaction(provider, conn, _commit_hook, source_id=source_id, _replay_reference=_replay_reference):
+        with _ingest_transaction(provider, conn, _commit_hook, source_id=source_id, _replay_reference=_replay_reference, _admission=admission):
             identity_updated = _remember_file_identity(conn, source_id, file_identity)
             if _commit_hook is not None:
                 _commit_hook.apply(provider, conn)
@@ -2295,9 +2333,9 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
             and str(existing["parser"] or "") == parser
             and str(existing["parser_version"] or "") == parser_version
             and int(existing["active"] or 0) == 1):
-        old_links = _linked_document_chunks(conn, source_id)
         ts = _now()
-        with _ingest_transaction(provider, conn, _commit_hook, source_id=source_id, _replay_reference=_replay_reference):
+        with _ingest_transaction(provider, conn, _commit_hook, source_id=source_id, _replay_reference=_replay_reference, _admission=admission):
+            old_links = _linked_document_chunks(conn, source_id)
             conn.execute(
                 "UPDATE document_sources SET scope_id=?,repository_id=?,updated_at=? WHERE source_id=?",
                 (scope_id, repository_id, ts, source_id),
@@ -2330,9 +2368,6 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
     units = list(payload.get("units") or [])
     chunks = _make_chunks(payload, units, material_options)
     ts = _now()
-    old_links: List[sqlite3.Row] = []
-    if existing:
-        old_links = _linked_document_chunks(conn, source_id)
 
     def _record_result():
         event_id = "docevt_" + _sha(f"ingest\0{source_id}\0{revision_id}")[:28]
@@ -2358,7 +2393,8 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
             )
         return result
 
-    with _ingest_transaction(provider, conn, _commit_hook, source_id=source_id, _replay_reference=_replay_reference):
+    with _ingest_transaction(provider, conn, _commit_hook, source_id=source_id, _replay_reference=_replay_reference, _admission=admission):
+        old_links = _linked_document_chunks(conn, source_id) if existing else []
         conn.execute("UPDATE document_units SET active=0,updated_at=? WHERE source_id=? AND active=1", (ts, source_id))
         conn.execute("UPDATE document_chunks SET active=0,updated_at=? WHERE source_id=? AND active=1", (ts, source_id))
         conn.execute("UPDATE document_edges SET active=0,updated_at=? WHERE source_id=? AND active=1", (ts, source_id))
