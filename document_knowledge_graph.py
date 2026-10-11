@@ -2093,6 +2093,8 @@ def _document_write_transaction(provider, conn, *, _commit_hook=None, _document_
         # Ordinary joins never commit the caller; a record owns its idle stage.
         options = {"join": True} if _commit_hook is None else {"_document_hook": _commit_hook}
         if _document_ingest is not None:
+            # The actual owner retains this ORIGINAL admission, including for
+            # legal joins, and fences it again after its late commit callbacks.
             options["_document_ingest"] = _document_ingest
         with owner(conn, **options):
             yield

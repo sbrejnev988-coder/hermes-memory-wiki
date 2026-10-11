@@ -990,3 +990,326 @@ def test_host_erasure_enabled_intent_survives_real_cached_ingest_and_restart(pri
     finally:
         restarted.shutdown()
 
+
+def test_H2_joined_ingest_rechecks_callback_authority_after_return(store):
+    provider, conn, sid, path, _, _ = cached(store, physical=False)
+    key = external(provider, conn, sid, path)
+    before = image(conn)
+    observer = sqlite3.connect(str(provider.db_path), timeout=0)
+    target = wiki.MemoryWikiProvider._claim_journal_pending_commit.__wrapped__.__code__
+    returned, observed = [], []
+    def profile(frame, event, arg):
+        if event == "return" and frame.f_code is target and not observed:
+            assert returned == ["unchanged"]
+            assert conn.in_transaction and provider._claim_tx_connection is conn
+            observed.append("outer-journal-return-after-ingest")
+            conn.execute("UPDATE external_sources SET owner_bot_id='foreign-callback' WHERE source_key=?", (key,))
+    previous = sys.getprofile()
+    try:
+        sys.setprofile(profile)
+        with pytest.raises(PermissionError, match="connector_source_not_owned"):
+            with provider._claim_transaction(conn):
+                result = graph.ingest_document(provider, {"path": str(path), "embed": False})
+                returned.append(result["status"])
+                assert result["file_identity_updated"] and conn.in_transaction
+                assert observer.execute("SELECT COUNT(*) FROM document_graph_meta WHERE key LIKE 'file_identity_owner:%'").fetchone()[0] < conn.execute("SELECT COUNT(*) FROM document_graph_meta WHERE key LIKE 'file_identity_owner:%'").fetchone()[0]
+    finally:
+        sys.setprofile(previous)
+        observer.close()
+    assert observed == ["outer-journal-return-after-ingest"] and returned == ["unchanged"]
+    assert image(conn) == before and not conn.in_transaction
+    assert provider._claim_tx_connection is None and provider._transaction_quarantine is None
+
+
+def late_document_drift(provider, conn, sid, field, key=None):
+    # Mutate real owner-local authority, never replace a product callable.
+    if field == "actor":
+        provider.bot_id = "changed-joined-actor"
+    elif field == "source":
+        conn.execute("UPDATE document_sources SET scope_id='foreign',repository_id='foreign' WHERE source_id=?", (sid,))
+    else:
+        assert field == "connector" and key is not None
+        conn.execute("UPDATE external_sources SET owner_bot_id='foreign-joined-owner' WHERE source_key=?", (key,))
+
+
+@pytest.mark.parametrize("field", ["actor", "source", "connector"])
+def test_H2_joined_ingest_rechecks_authority_changed_in_outer_body(store, field):
+    provider, conn, sid, path, _, _ = cached(store, physical=False)
+    key = external(provider, conn, sid, path) if field == "connector" else None
+    before = image(conn)
+    original_actor = (provider.bot_id, provider.project_scope)
+    expected = {"actor": "actor_changed", "source": "different scope", "connector": "connector_source_not_owned"}[field]
+    with pytest.raises(PermissionError, match=expected):
+        with provider._claim_transaction(conn):
+            result = graph.ingest_document(provider, {"path": str(path), "embed": False})
+            assert result["status"] == "unchanged" and result["file_identity_updated"]
+            stage = provider._claim_tx_document_stage
+            assert stage[0] is conn and stage[1] == threading.get_ident() and len(stage[2]) == 1
+            admission = stage[2][0][1]
+            assert admission[3] == original_actor
+            late_document_drift(provider, conn, sid, field, key)
+            assert stage[2][0][1] is admission and admission[3] == original_actor
+    assert image(conn) == before and not conn.in_transaction
+    assert provider._claim_tx_document_stage is None and stage[2] == []
+    assert provider._claim_tx_connection is None and provider._transaction_quarantine is None
+
+
+@pytest.mark.parametrize("field", ["actor", "source"])
+def test_H2_joined_ingest_rechecks_journal_return_actor_and_source(store, field):
+    provider, conn, sid, path, _, _ = cached(store, physical=False)
+    before = image(conn)
+    target = wiki.MemoryWikiProvider._claim_journal_pending_commit.__wrapped__.__code__
+    returned, observed = [], []
+    expected = "actor_changed" if field == "actor" else "different scope"
+    def profile(frame, event, arg):
+        if event == "return" and frame.f_code is target and not observed:
+            assert returned == ["unchanged"] and provider._lock._is_owned()
+            assert conn.in_transaction and provider._claim_tx_connection is conn
+            observed.append("outer-journal-return")
+            late_document_drift(provider, conn, sid, field)
+    previous = sys.getprofile()
+    try:
+        sys.setprofile(profile)
+        with pytest.raises(PermissionError, match=expected):
+            with provider._claim_transaction(conn):
+                result = graph.ingest_document(provider, {"path": str(path), "embed": False})
+                returned.append(result["status"])
+                stage = provider._claim_tx_document_stage
+                assert len(stage[2]) == 1 and stage[2][0][0] == sid
+    finally:
+        sys.setprofile(previous)
+    assert observed == ["outer-journal-return"] and image(conn) == before
+    assert not conn.in_transaction and provider._claim_tx_document_stage is None and stage[2] == []
+    assert provider._transaction_quarantine is None
+
+
+@pytest.mark.parametrize("route", ["direct", "joined"])
+def test_H2_healthy_document_admission_retires_only_after_actual_commit(store, route):
+    provider, conn, sid, path, _, _ = cached(store, physical=False)
+    observer = sqlite3.connect(str(provider.db_path), timeout=0)
+    target = wiki.MemoryWikiProvider._claim_journal_pending_commit.__wrapped__.__code__
+    observed = []
+    def profile(frame, event, arg):
+        if event == "return" and frame.f_code is target:
+            stage = provider._claim_tx_document_stage
+            assert provider._lock._is_owned() and conn.in_transaction
+            assert stage[0] is provider._claim_tx_connection is conn
+            assert stage[1] == provider._claim_tx_thread == threading.get_ident()
+            assert [row[0] for row in stage[2]] == [sid]
+            assert observer.execute("SELECT COUNT(*) FROM document_graph_meta WHERE key LIKE 'file_identity_owner:%'").fetchone()[0] < conn.execute("SELECT COUNT(*) FROM document_graph_meta WHERE key LIKE 'file_identity_owner:%'").fetchone()[0]
+            observed.append(stage)
+    previous = sys.getprofile()
+    try:
+        sys.setprofile(profile)
+        if route == "joined":
+            with provider._claim_transaction(conn):
+                result = graph.ingest_document(provider, {"path": str(path), "embed": False})
+                assert conn.in_transaction and not observed
+        else:
+            result = graph.ingest_document(provider, {"path": str(path), "embed": False})
+        assert result["status"] == "unchanged" and result["file_identity_updated"]
+        assert len(observed) == 1 and observed[0][2] == []
+        assert observer.execute("SELECT COUNT(*) FROM document_graph_meta WHERE key LIKE 'file_identity_owner:%'").fetchone()[0] == conn.execute("SELECT COUNT(*) FROM document_graph_meta WHERE key LIKE 'file_identity_owner:%'").fetchone()[0]
+    finally:
+        sys.setprofile(previous)
+        observer.close()
+    assert not conn.in_transaction and provider._claim_tx_document_stage is None
+    assert provider._claim_tx_connection is None and provider._transaction_quarantine is None
+
+
+@pytest.mark.parametrize("drift", ["none", "first", "second"])
+def test_H2_multiple_joined_admissions_keep_first_and_last_obligations(store, drift):
+    provider, conn, first, first_path, _, _ = cached(store, "joined-first", physical=False)
+    _, _, second, second_path, _, _ = cached(store, "joined-second", physical=False)
+    before = image(conn)
+    stages = []
+    def run():
+        with provider._claim_transaction(conn):
+            stage = provider._claim_tx_document_stage
+            stages.append(stage)
+            for sid, path in [(first, first_path), (second, second_path)]:
+                result = graph.ingest_document(provider, {"path": str(path), "embed": False})
+                assert result["source_id"] == sid and result["file_identity_updated"]
+                assert provider._claim_tx_document_stage is stage and conn.in_transaction
+            assert [row[0] for row in stage[2]] == [first, second]
+            assert stage[2][0][1] is not stage[2][1][1]
+            if drift != "none":
+                late_document_drift(provider, conn, first if drift == "first" else second, "source")
+    if drift == "none":
+        run()
+        assert image(conn) != before
+    else:
+        with pytest.raises(PermissionError, match="different scope"):
+            run()
+        assert image(conn) == before
+    assert len(stages) == 1 and stages[0][2] == []
+    assert not conn.in_transaction and provider._claim_tx_document_stage is None
+    assert provider._transaction_quarantine is None
+
+
+def test_H2_repeated_source_join_cannot_replace_original_actor_admission(store):
+    provider, conn, sid, path, _, _ = cached(store, physical=False)
+    before = image(conn)
+    actor = provider.bot_id
+    with pytest.raises(PermissionError, match="actor_changed"):
+        with provider._claim_transaction(conn):
+            assert graph.ingest_document(provider, {"path": str(path), "embed": False})["file_identity_updated"]
+            stage = provider._claim_tx_document_stage
+            first = stage[2][0][1]
+            provider.bot_id = "new-second-admission-actor"
+            assert graph.ingest_document(provider, {"path": str(path), "embed": False})["status"] == "unchanged"
+            assert [row[0] for row in stage[2]] == [sid, sid]
+            assert stage[2][0][1] is first and first[3][0] == actor
+            assert stage[2][1][1][3][0] == provider.bot_id
+    assert image(conn) == before and not conn.in_transaction
+    assert provider._claim_tx_document_stage is None and stage[2] == []
+    assert provider._transaction_quarantine is None
+
+
+def test_H2_rollback_retires_admissions_without_polluting_new_owning_stage(store):
+    provider, conn, old_sid, old_path, _, _ = cached(store, "rolled-stage", physical=False)
+    _, _, new_sid, new_path, _, _ = cached(store, "next-stage", physical=False)
+    before = image(conn)
+    primary = ValueError("joined-rollback-primary")
+    with pytest.raises(ValueError) as caught:
+        with provider._claim_transaction(conn):
+            old_stage = provider._claim_tx_document_stage
+            assert graph.ingest_document(provider, {"path": str(old_path), "embed": False})["file_identity_updated"]
+            assert [row[0] for row in old_stage[2]] == [old_sid]
+            raise primary
+    assert caught.value is primary and image(conn) == before
+    assert provider._claim_tx_document_stage is None and old_stage[2] == []
+    with provider._claim_transaction(conn):
+        new_stage = provider._claim_tx_document_stage
+        assert new_stage is not old_stage and new_stage[2] == []
+        # The old source is deliberately no longer eligible; its retired
+        # obligations must not be resurrected by an unrelated new transaction.
+        late_document_drift(provider, conn, old_sid, "source")
+        result = graph.ingest_document(provider, {"path": str(new_path), "embed": False})
+        assert result["file_identity_updated"] and [row[0] for row in new_stage[2]] == [new_sid]
+    assert new_stage[2] == [] and provider._claim_tx_document_stage is None
+    assert conn.execute("SELECT scope_id FROM document_sources WHERE source_id=?", (old_sid,)).fetchone()[0] == "foreign"
+    assert conn.execute("SELECT scope_id FROM document_sources WHERE source_id=?", (new_sid,)).fetchone()[0] == "diagnostic"
+    assert not conn.in_transaction and provider._transaction_quarantine is None
+
+
+def test_H2_joined_rollback_unknown_retains_exact_stage_primary_and_all_admissions(store):
+    provider, conn, first, first_path, _, _ = cached(store, "unknown-first", physical=False)
+    _, _, second, second_path, _, _ = cached(store, "unknown-second", physical=False)
+    primary = ValueError("joined-retained-primary")
+    denied = []
+    def authorizer(action, a, b, database, trigger):
+        if action == sqlite3.SQLITE_TRANSACTION and a == "ROLLBACK":
+            denied.append("ROLLBACK")
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+    conn.set_authorizer(authorizer)
+    try:
+        with pytest.raises(ValueError) as caught:
+            with provider._claim_transaction(conn):
+                for path in [first_path, second_path]:
+                    assert graph.ingest_document(provider, {"path": str(path), "embed": False})["file_identity_updated"]
+                stage = provider._claim_tx_document_stage
+                obligations = tuple(stage[2])
+                raise primary
+        assert caught.value is primary and denied == ["ROLLBACK"]
+        assert provider._transaction_primary is primary and conn.in_transaction
+        assert provider._conn is provider._owned_conn is provider._claim_tx_connection is provider._transaction_quarantine is conn
+        assert provider._claim_tx_document_stage is stage and stage[0] is conn
+        assert stage[1] == provider._claim_tx_thread == threading.get_ident()
+        assert [row[0] for row in stage[2]] == [first, second]
+        assert all(actual is original for actual, original in zip(stage[2], obligations))
+        assert any("UNKNOWN" in note for note in primary.__notes__)
+        with pytest.raises(RuntimeError, match="provider_lifecycle_not_ready"):
+            provider._connect()
+        assert not provider._release_connection_for_retry(primary)
+        with pytest.raises(RuntimeError, match="provider_lifecycle_not_ready"):
+            with provider._claim_transaction(conn, join=True, _document_ingest=obligations[0]):
+                pytest.fail("quarantined stage was readmitted")
+        assert provider._claim_tx_document_stage is stage and tuple(stage[2]) == obligations
+        assert provider._transaction_primary is primary and provider._lifecycle_state == "quarantined"
+    finally:
+        conn.set_authorizer(None)  # Only fixture teardown may close retained SQL.
+
+
+@pytest.mark.parametrize("fault", ["commit_denied", "postcommit"])
+def test_H2_joined_admissions_retirement_distinguishes_rollback_from_postcommit_unknown(store, fault):
+    provider, conn, sid, path, _, _ = cached(store, physical=False)
+    before = image(conn)
+    target = wiki.MemoryWikiProvider._claim_journal_committed.__wrapped__.__code__
+    primary = ValueError("joined-postcommit-primary")
+    observed = []
+    def profile(frame, event, arg):
+        if fault == "postcommit" and event == "call" and frame.f_code is target:
+            assert not conn.in_transaction and provider._claim_tx_document_stage is stage
+            observed.append("after-native-commit")
+            raise primary
+    def authorizer(action, a, b, database, trigger):
+        if fault == "commit_denied" and action == sqlite3.SQLITE_TRANSACTION and a == "COMMIT":
+            observed.append("native-commit-denied")
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+    conn.set_authorizer(authorizer)
+    previous = sys.getprofile()
+    try:
+        sys.setprofile(profile)
+        with pytest.raises(sqlite3.DatabaseError if fault == "commit_denied" else ValueError) as caught:
+            with provider._claim_transaction(conn):
+                result = graph.ingest_document(provider, {"path": str(path), "embed": False})
+                assert result["file_identity_updated"]
+                stage = provider._claim_tx_document_stage
+                obligation = stage[2][0]
+    finally:
+        sys.setprofile(previous)
+        conn.set_authorizer(None)
+    assert not conn.in_transaction
+    if fault == "commit_denied":
+        assert observed == ["native-commit-denied"] and image(conn) == before
+        assert stage[2] == [] and provider._claim_tx_document_stage is None
+        assert provider._transaction_quarantine is None and provider._claim_tx_connection is None
+    else:
+        assert observed == ["after-native-commit"] and caught.value is primary
+        assert provider._transaction_primary is primary and provider._transaction_quarantine is conn
+        assert provider._claim_tx_connection is conn and provider._claim_tx_document_stage is stage
+        assert stage[2][0] is obligation and image(conn) != before
+        assert any("UNKNOWN" in note for note in primary.__notes__)
+        observer = sqlite3.connect(str(provider.db_path), timeout=0)
+        try:
+            assert observer.execute("SELECT COUNT(*) FROM document_graph_meta WHERE key LIKE 'file_identity_owner:%'").fetchone()[0] == conn.execute("SELECT COUNT(*) FROM document_graph_meta WHERE key LIKE 'file_identity_owner:%'").fetchone()[0]
+        finally:
+            observer.close()
+        assert not provider._release_connection_for_retry(primary)
+        assert provider._claim_tx_document_stage is stage and stage[2][0] is obligation
+
+
+def test_H2_original_admission_does_not_register_a_foreign_connection(store):
+    provider, conn, sid, path, _, _ = cached(store, physical=False)
+    foreign = sqlite3.connect(str(provider.db_path), timeout=0)
+    try:
+        with provider._claim_transaction(conn):
+            assert graph.ingest_document(provider, {"path": str(path), "embed": False})["file_identity_updated"]
+            stage = provider._claim_tx_document_stage
+            admission = stage[2][0]
+            with pytest.raises(RuntimeError, match="claim_mutation_transaction_not_owned"):
+                with graph._document_write_transaction(provider, foreign, _document_ingest=admission):
+                    pytest.fail("original admission became a foreign writer capability")
+            assert not foreign.in_transaction and foreign.total_changes == 0
+            assert provider._claim_tx_document_stage is stage and stage[2] == [admission]
+    finally:
+        foreign.close()
+    assert stage[2] == [] and provider._claim_tx_document_stage is None
+    assert not conn.in_transaction and provider._transaction_quarantine is None
+
+
+def test_H2_raw_unregistered_owner_is_refused_before_document_effect(store):
+    provider, conn, sid, path, _, _ = cached(store, physical=False)
+    before = image(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    with pytest.raises(RuntimeError, match="provider_transaction_owner_pending"):
+        graph.ingest_document(provider, {"path": str(path), "embed": False})
+    assert image(conn) == before and conn.in_transaction
+    assert provider._claim_tx_document_stage is None and provider._claim_tx_connection is None
+    assert provider._transaction_quarantine is provider._conn is provider._owned_conn is conn
+    with pytest.raises(RuntimeError, match="provider_lifecycle_not_ready"):
+        provider._connect()
+    assert provider._claim_tx_document_stage is None and provider._lifecycle_state == "quarantined"

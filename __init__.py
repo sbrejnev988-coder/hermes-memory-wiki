@@ -6892,6 +6892,10 @@ class MemoryWikiProvider(MemoryProvider):
         # constructor defaults, never recovery resets on initialize/reconnect.
         self._claim_tx_connection = None
         self._claim_tx_thread = None
+        # A fresh exact owning-stage record: (connection, thread, admissions).
+        # Joined documents retain their original authority here until native
+        # completion is proved; UNKNOWN must not reset this constructor state.
+        self._claim_tx_document_stage = None
         self._transaction_quarantine = None
         self._transaction_primary = None
         self._transaction_cleanup_notes = ()
@@ -14089,6 +14093,7 @@ class MemoryWikiProvider(MemoryProvider):
                 raise RuntimeError("claim_transaction_requires_idle_owner")
             previous = getattr(self, "_claim_tx_connection", None)
             previous_thread = getattr(self, "_claim_tx_thread", None)
+            previous_document_stage = self._claim_tx_document_stage
             if active and join and c is self._conn and previous is not c:
                 self._quarantine_claim_connection(c, "unowned_pending_transaction")
                 raise RuntimeError("claim_transaction_owner_pending")
@@ -14112,11 +14117,28 @@ class MemoryWikiProvider(MemoryProvider):
                     raise _DeliveryWithheld("terminal_active_journal_postcommit_required_BLOCKED")
             if not owns:
                 # Exact caller-owned TX: its outer scope owns cleanup/commit.
+                if _document_ingest is not None:
+                    # An admission tuple is not a writer capability. Register
+                    # only in the stage created by the actual provider owner,
+                    # never an unregistered/private raw BEGIN or another thread.
+                    if (previous is not c or previous_thread != threading.get_ident()
+                            or type(previous_document_stage) is not tuple
+                            or len(previous_document_stage) != 3
+                            or previous_document_stage[0] is not c
+                            or previous_document_stage[1] != previous_thread
+                            or type(previous_document_stage[2]) is not list):
+                        raise RuntimeError("document_ingest_owner_stage_unproven")
+                    previous_document_stage[2].append(_document_ingest)
                 yield c
                 return
             self._claim_tx_connection = c
             self._claim_tx_thread = threading.get_ident()
+            document_stage = (c, self._claim_tx_thread, [])
+            self._claim_tx_document_stage = document_stage
+            if _document_ingest is not None:
+                document_stage[2].append(_document_ingest)
             commit_attempted = False
+            completed = False
             try:
                 if not active:
                     c.execute("BEGIN" + (" " + begin if begin else ""))
@@ -14132,18 +14154,26 @@ class MemoryWikiProvider(MemoryProvider):
                     if (_document_hook.expected is None
                             or _document_hook._tuple() != _document_hook.expected):
                         raise RuntimeError("connector_transaction_tuple_mismatch")
-                if _document_ingest is not None:
-                    # Pending journal preparation is also a callback boundary;
-                    # ordinary document authority must still precede COMMIT.
-                    from .document_knowledge_graph import _assert_ingest_authority
-                    source_id, admission = _document_ingest
-                    _assert_ingest_authority(self, c, source_id, admission, before=False)
                 if _terminal is not None and (self._claim_tx_connection is not c
                         or self._claim_tx_thread != threading.get_ident()
                         or self._transaction_quarantine is not None
                         or _terminal.phase != 'verify' or _terminal.measurement is None
                         or c.total_changes != _terminal.measurement['after_changes']):
                     raise _DeliveryWithheld("terminal_commit_provenance_unproven")
+                if document_stage[2]:
+                    # Journal/hook preparation and the outer caller body may
+                    # run after a joined ingest returns. Check EVERY original
+                    # admission at this exact owner's final native boundary.
+                    if (self._claim_tx_connection is not c
+                            or self._claim_tx_thread != document_stage[1]
+                            or document_stage[1] != threading.get_ident()
+                            or self._claim_tx_document_stage is not document_stage):
+                        self._quarantine_claim_connection(c, "document_ingest_owner_stage_changed")
+                        raise RuntimeError("document_ingest_owner_stage_unproven")
+                    self._require_claim_writer(c, transaction=True)
+                    from .document_knowledge_graph import _assert_ingest_authority
+                    for source_id, admission in document_stage[2]:
+                        _assert_ingest_authority(self, c, source_id, admission, before=False)
                 commit_attempted = True  # Only immediately before actual commit.
                 if _document_hook is not None:
                     _document_hook.commit_attempted = True
@@ -14151,6 +14181,7 @@ class MemoryWikiProvider(MemoryProvider):
                 if c.in_transaction:
                     self._quarantine_claim_connection(c, "commit_transaction_still_active")
                     raise RuntimeError("claim_commit_transaction_still_active")
+                completed = True
                 if _document_hook is not None:
                     _document_hook.commit_returned = True
                 if _terminal is None:
@@ -14164,12 +14195,18 @@ class MemoryWikiProvider(MemoryProvider):
                     _terminal.measurement['native_idle'] = True
             except BaseException as primary:
                 rolled_back = self._rollback_claim_transaction(c, primary, commit_attempted=commit_attempted)
+                completed = rolled_back
                 if (_document_hook is not None and _document_hook.started
                         and not _document_hook.commit_returned):
                     _document_hook.rollback_completed = rolled_back
                 raise
             finally:
-                if getattr(self, "_transaction_quarantine", None) is not c:
+                if completed and getattr(self, "_transaction_quarantine", None) is not c:
+                    # Retire only our own exact stage after proved completion.
+                    # Failed rollback/postcommit keeps owner+primary+admissions.
+                    if self._claim_tx_document_stage is document_stage:
+                        document_stage[2].clear()
+                        self._claim_tx_document_stage = previous_document_stage
                     self._claim_tx_connection = previous
                     self._claim_tx_thread = previous_thread
 
