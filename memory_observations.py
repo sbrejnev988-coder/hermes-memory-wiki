@@ -866,9 +866,8 @@ def consolidate_events(
     nor a deleted source can authorize a later materialization write.
     """
     conn = provider._connect()
-    with conn:
+    with provider._claim_transaction(conn):
         if lease_valid is not None:
-            conn.execute("BEGIN IMMEDIATE")
             if not lease_valid():
                 raise TimeoutError("memory observation lease lost")
         return _consolidate_events(
@@ -958,7 +957,9 @@ def _consolidate_events(
     created = 0
     invalidated = 0
     partition = _partition_identity(principal, selected_scope, selected_project)
-    with conn:
+    # The outer public pass owns commit/rollback; never let a nested SQLite
+    # context commit its transaction before that owner finishes.
+    with provider._claim_transaction(conn, join=True):
         for raw in rows:
             if time.monotonic() >= deadline:
                 budget_exhausted = True

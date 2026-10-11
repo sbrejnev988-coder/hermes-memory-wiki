@@ -1204,6 +1204,10 @@
       "lane": "legacy"
     },
     {
+      "path": "tests/test_runtime_lifecycle_handoff.py",
+      "lane": "native-explicit-packet"
+    },
+    {
       "path": "tests/test_scale_event_ledger.py",
       "lane": "legacy"
     },
@@ -1333,5 +1337,13 @@
     "native_cold_process_excluded": true,
     "requires_SDK_absent": true,
     "execution": "Existing separate direct/AST source fixtures with declared G4_FIXTURE/G4_REPAIR_FIXTURE roots; never cold_lane_entry nativepreload. No cases/assertions skipped orremoved."
-  }
+  },
+  "native_explicit_packets": [
+    {
+      "path": "tests/test_runtime_lifecycle_handoff.py",
+      "entry": "run_lifecycle_packet(provider, root)",
+      "prerequisites": "Genuine public SDK, owned initialized provider/session with authored claims, credential-free SQLite, network/model calls disabled. Not a standalone pytest function.",
+      "executed_evidence": "7-case isolated packet at runtime source SHA 7ebb63ce54ea1c0fb2f56fddc2cb7a7b4aeabae3ae271fa8262c56fcc0aa51f3; not full cold native suite/fleet."
+    }
+  ]
 }

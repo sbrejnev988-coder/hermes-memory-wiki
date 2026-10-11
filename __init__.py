@@ -6884,6 +6884,13 @@ class MemoryWikiProvider(MemoryProvider):
         self._lifecycle_lock = threading.Lock()
         self._lifecycle_state = "idle"
         self._owned_conn = None
+        # One owner record for every native writer/terminal path. These are
+        # constructor defaults, never recovery resets on initialize/reconnect.
+        self._claim_tx_connection = None
+        self._claim_tx_thread = None
+        self._transaction_quarantine = None
+        self._transaction_primary = None
+        self._transaction_cleanup_notes = ()
         self._graph_reader_connections = {}
         self._privacy_erasure = None
         # --- F2/F3: Регистрируем глобальный инстанс для TF-IDF (доступ из статических функций) ---
@@ -7389,7 +7396,7 @@ class MemoryWikiProvider(MemoryProvider):
                 journal_mode, now(),
             ))
             return consumer_id
-        with c:
+        with self._claim_transaction(c):
             c.execute(
                 """INSERT INTO memory_consumers(
                        consumer_id,bot_id,session_id,chat_hash,project_id,last_seen_revision,
@@ -9709,14 +9716,18 @@ class MemoryWikiProvider(MemoryProvider):
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         # Inbox mutation is available only through memory_wiki_code_graph_ingest_inbox,
         # so every completed event has an explicit journal boundary.
-        if (self._lifecycle_state in {"failed", "quarantined", "stopping"}
-                or getattr(self, "_transaction_quarantine", None) is not None):
-            return tool_error("provider_lifecycle_not_ready; transaction outcome UNKNOWN")
-        if (self._conn is not None and self._conn.in_transaction
-                and (getattr(self, "_claim_tx_connection", None) is not self._conn
-                     or getattr(self, "_claim_tx_thread", None) != threading.get_ident())):
-            self._quarantine_claim_connection(self._conn, "tool_pending_transaction")
-            return tool_error("provider_transaction_owner_pending; transaction outcome UNKNOWN")
+        # A registered native writer holds this same lock through its return.
+        # Wait for that ordinary handoff before sampling TX state; an actually
+        # unregistered/foreign pending transaction is still refused unchanged.
+        with self._lock:
+            if (self._lifecycle_state in {"failed", "quarantined", "stopping"}
+                    or getattr(self, "_transaction_quarantine", None) is not None):
+                return tool_error("provider_lifecycle_not_ready; transaction outcome UNKNOWN")
+            if (self._conn is not None and self._conn.in_transaction
+                    and (getattr(self, "_claim_tx_connection", None) is not self._conn
+                         or getattr(self, "_claim_tx_thread", None) != threading.get_ident())):
+                self._quarantine_claim_connection(self._conn, "tool_pending_transaction")
+                return tool_error("provider_transaction_owner_pending; transaction outcome UNKNOWN")
         a = dict(args or {})
         _internal_journal_call = (
             kwargs.pop(_INTERNAL_JOURNAL_SENTINEL_KWARG, None)

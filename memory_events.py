@@ -876,7 +876,9 @@ def capture_event(
     event_id = "evt_" + uuid.uuid4().hex
     digest = hashlib.sha256(safe_content.encode("utf-8", "ignore")).hexdigest()
     conn = provider._connect()
-    with conn:
+    # Pruning resolves the database-bound principal again. Register the real
+    # owner before INSERT so its metadata reads join this same native lifetime.
+    with provider._claim_transaction(conn):
         conn.execute(
             """INSERT INTO memory_events(
                 event_id,owner_bot_id,owner_chat_hash,owner_session_hash,

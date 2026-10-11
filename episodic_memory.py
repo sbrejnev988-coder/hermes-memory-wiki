@@ -512,7 +512,7 @@ def capture_turn(provider: Any, module: Any, role: str, text: str, *, session_id
     conn = provider._connect()
     semantic = _semantic_enabled(module)
     queued = False
-    with conn:
+    with provider._claim_transaction(conn):
         conn.execute("""INSERT INTO episodic_turns
             (id,content,role,turn_id,owner_bot_id,owner_chat_hash,visibility_scope,
              created_at,expires_at,truncated,source_chars)
@@ -771,7 +771,7 @@ def query_episodes(provider: Any, module: Any, query: str, limit: int = 2,
     # them transactionally and enqueue the matching point deletes. A stale
     # vector can still never pass the authoritative hydration query below.
     queued_delete = False
-    with conn:
+    with provider._claim_transaction(conn):
         expired_ids = [str(row[0]) for row in conn.execute(
             "SELECT id FROM episodic_turns WHERE owner_bot_id=? AND expires_at<=?",
             (bot, stamp),

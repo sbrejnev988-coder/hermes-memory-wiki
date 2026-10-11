@@ -1,6 +1,19 @@
 # Hermes Memory Wiki v1.24.5
 
-## Новый RI-R01 / hybrid SOURCE checkpoint
+## Lifecycle/TX bug fix после RI-R01 checkpoint
+
+Исправлена отсутствующая constructor-инициализация `_transaction_quarantine`, из-за которой terminal-tail мог получить `AttributeError` и withheld вместо штатного результата. Начальное `None` задаётся **один раз в `MemoryWikiProvider.__init__`**, вместе с owner/thread/primary/cleanup defaults; на retry/initialize/reconnect карантин не сбрасывается. Genuine UNKNOWN и foreign-thread owner остаются fail-closed.
+
+Связанный lifecycle writer также исправлен: event/episode/consumer/observation записи используют существующий `_claim_transaction`; вложенная consolidation присоединяется к владельцу. Это предотвращает ложный `unowned_pending_transaction` на собственном потоке; tool admission согласован с зарегистрированным writer под прежним lock. Live retained state не очищается этим исходным изменением.
+
+Кандидат с runtime `__init__.py` SHA256 `7ebb63ce54ea1c0fb2f56fddc2cb7a7b4aeabae3ae271fa8262c56fcc0aa51f3` проверен на собственной синтетической SQLite с настоящими публичными SDK-классами: **7/7, exit 0**, обычные sync/save/query/nonempty prefetch/session-end/restart и genuine rollback/foreign-owner отказы. Независимое read-only ревью этого причинного изменения прошло; тесты при публикации не повторялись. Это component native proof, не работа live gateway, всех профилей, FULL, jiter/Job/HTTP/recovery или новые model calls. Регрессия — `tests/test_runtime_lifecycle_handoff.py::run_lifecycle_packet`, отдельный explicit native packet, не standalone pytest suite.
+
+Версия 1.24.5 и schema/DDL/migrations не меняются. Старый wheel `c9d5b3fa…`, собранный до runtime-исправления, **не содержит этот фикс** и не используется для его установки. Штатная установка производится из exact Git PIN после scanner/liveness/rollback admission; owner-run restart и public readback остаются отдельными шагами. Core, credentials, модели и пользовательские данные не редактируются.
+
+## Исторический RI-R01 / hybrid SOURCE checkpoint до lifecycle-фикса
+
+Следующая секция сохраняет provenance прежнего checkpoint. Её PIN и wheel не являются новыми install targets и не подтверждают исполнение lifecycle-фикса.
+
 
 Подготовлен **локальный публикационный кандидат поверх current main**, не новый tag/GitHub Release и не выполненная установка. Приняты cumulative runtime SOURCE bytes; текущий пакет отдельно проверяет переносимые carrier regressions и offline wheel correspondence. Схемы 121, DDL/migrations и версия 1.24.5 не повышены. Исходный owner, raw source images, private reader lifetime, serialization/cleanup ordering и primary UNKNOWN не превращаются в разрешение на live/native execution.
 
