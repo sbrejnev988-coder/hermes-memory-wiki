@@ -16,7 +16,7 @@
   },
   "status": "SOURCE_BOUND_BLOCKED_BOOTSTRAP_EFFECTS",
   "current_metadata_derivative": {
-    "kind": "merged_source_metadata_only_UNIT",
+    "kind": "current_source_metadata_only_UNIT",
     "checkpoint_commit": "be4eba518da4717ed9305d3b3e05fc6eb7df907d",
     "branch": "lead/integration-20261011",
     "evidence_root": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\merged\\evidence",
