@@ -1515,6 +1515,21 @@ def _document_recovery_relative_path(value: Any) -> Path:
     return relative
 
 
+class _DocumentRecoveryHistoryOverflow(RuntimeError):
+    """A content-free admission refusal, distinct from post-commit capture failure."""
+
+
+def _document_recovery_file_identities(conn: sqlite3.Connection, source_id: str):
+    identities = sorted(_file_identity_history(conn, str(source_id)))
+    if len(identities) > 500:
+        # Keep both the writer's separate 12000-char limit and the journal's
+        # 500-entry limit. Never truncate retirement/physical-owner history.
+        raise _DocumentRecoveryHistoryOverflow(
+            "document recovery reference file identity history exceeds journal limit"
+        )
+    return identities
+
+
 def _document_source_recovery_reference(
     provider: Any,
     source_id: str,
@@ -1543,11 +1558,7 @@ def _document_source_recovery_reference(
     edge_count = int(conn.execute(
         "SELECT COUNT(*) FROM document_edges WHERE source_id=? AND active=1", (source_id,)
     ).fetchone()[0])
-    file_identities = sorted(_file_identity_history(conn, str(source_id)))
-    if len(file_identities) > 500:
-        # Journal JSON serialization caps lists at 500; silently dropping a
-        # historical file ID would make an old hardlink ownerless on replay.
-        raise RuntimeError("document recovery file identity history exceeds journal limit")
+    file_identities = _document_recovery_file_identities(conn, str(source_id))
     return {
         "schema": _DOCUMENT_RECOVERY_SCHEMA,
         "kind": "document_source",
@@ -2072,11 +2083,87 @@ def _validate_ingest_commit_hook(provider, conn, hook):
 
 
 @contextmanager
-def _ingest_transaction(provider, conn, hook):
-    if hook is None:
-        # Preserve the direct document API's pre-existing transaction semantics.
-        with conn:
+def _document_write_transaction(provider, conn):
+    """Keep admission and effects in one real SQLite writer/owner lifetime."""
+    owner = getattr(provider, "_claim_transaction", None)
+    if callable(owner):
+        # Shared/private provider handles are checked by the existing owner.
+        # A joined operation must not commit or clear its caller's transaction.
+        with owner(conn, join=True):
             yield
+        return
+    # Standalone document API: never adopt an unproven pending transaction.
+    if conn.in_transaction:
+        raise RuntimeError("document_transaction_requires_idle_owner")
+    commit_attempted = False
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        yield
+        commit_attempted = True
+        conn.commit()
+    except BaseException as primary:
+        try:
+            pending = conn.in_transaction
+            conn.rollback()
+            if conn.in_transaction or (commit_attempted and not pending):
+                primary.add_note("document transaction cleanup outcome UNKNOWN")
+        except BaseException:
+            primary.add_note("document transaction rollback outcome UNKNOWN")
+        raise
+
+
+def _verify_document_ingest_replay(conn, source_id, reference):
+    """Validate the actual source rows before their owning ingest can commit."""
+    if source_id != str(reference.get("source_id") or "").strip():
+        raise RuntimeError("document recovery source identity changed")
+    expected_revision = str(reference.get("revision_id") or "").strip()
+    row = conn.execute(
+        "SELECT file_hash,revision_id,parser,parser_version,active FROM document_sources WHERE source_id=?", (source_id,)
+    ).fetchone()
+    if not row or not int(row["active"] or 0):
+        raise RuntimeError("document recovery did not restore an active source")
+    if str(row["file_hash"] or "").lower() != str(reference.get("file_hash") or "").lower():
+        raise RuntimeError("document recovery source hash changed")
+    # An unchanged-content ingest may only update the durable file-ID ledger;
+    # its result need not repeat parser metadata. The verified SQLite row is
+    # authoritative for both the unchanged and newly parsed paths.
+    if str(row["parser"] or "") != str(reference.get("parser") or ""):
+        raise RuntimeError("document recovery parser changed")
+    if expected_revision and str(row["revision_id"] or "") != expected_revision:
+        raise RuntimeError("document recovery revision changed")
+    if str(row["parser_version"] or "") != str(reference.get("parser_version") or ""):
+        raise RuntimeError("document recovery parser version changed")
+    actual_counts = {
+        "unit_count": int(conn.execute("SELECT COUNT(*) FROM document_units WHERE source_id=? AND active=1", (source_id,)).fetchone()[0]),
+        "chunk_count": int(conn.execute("SELECT COUNT(*) FROM document_chunks WHERE source_id=? AND active=1", (source_id,)).fetchone()[0]),
+        "edge_count": int(conn.execute("SELECT COUNT(*) FROM document_edges WHERE source_id=? AND active=1", (source_id,)).fetchone()[0]),
+    }
+    expected_counts = {key: int(reference.get(key) or 0) for key in actual_counts}
+    if actual_counts != expected_counts:
+        raise RuntimeError("document recovery structural counts changed")
+    return actual_counts
+
+
+@contextmanager
+def _ingest_transaction(provider, conn, hook, *, source_id, _replay_reference=None):
+    if hook is None:
+        with _document_write_transaction(provider, conn):
+            yield
+            if _replay_reference is not None:
+                _verify_document_ingest_replay(conn, source_id, _replay_reference)
+                identities = [tuple(item) for item in _replay_reference.get("file_identities", [])]
+                # Validate the complete UNION, including the physical identity
+                # already admitted by this ingest, before adding historical IDs.
+                history = _file_identity_history(conn, source_id) | set(identities)
+                if len(history) > 500:
+                    raise _DocumentRecoveryHistoryOverflow(
+                        "document recovery reference file identity history exceeds journal limit"
+                    )
+                if len(_json([list(item) for item in sorted(history)])) > _MAX_FILE_IDENTITY_HISTORY_CHARS:
+                    raise RuntimeError("document file identity history exceeds checkpoint-safe limit")
+                for identity in identities:
+                    _remember_file_identity(conn, source_id, identity)
+            _document_recovery_file_identities(conn, source_id)
         return
     _validate_ingest_commit_hook(provider, conn, hook)
     try:
@@ -2087,6 +2174,7 @@ def _ingest_transaction(provider, conn, hook):
         hook.validate(provider, conn, transaction=True)
         if hook.expected is None:
             raise RuntimeError('document_private_commit_hook_not_applied')
+        _document_recovery_file_identities(conn, source_id)
         hook.commit_attempted = True
         conn.commit()
         hook.commit_returned = True
@@ -2100,7 +2188,9 @@ def _ingest_transaction(provider, conn, hook):
         raise
 
 
-def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None) -> Dict[str, Any]:
+def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _replay_reference=None) -> Dict[str, Any]:
+    if _commit_hook is not None and _replay_reference is not None:
+        raise ValueError("document replay cannot use a connector commit hook")
     path = _allowed_path(args.get("path"))
     scope_id, repository_id = _document_access_scope(
         provider,
@@ -2185,7 +2275,7 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None) -
             and str(existing["parser"] or "") == parser
             and str(existing["parser_version"] or "") == parser_version
             and int(existing["active"] or 0) == 1):
-        with _ingest_transaction(provider, conn, _commit_hook):
+        with _ingest_transaction(provider, conn, _commit_hook, source_id=source_id, _replay_reference=_replay_reference):
             identity_updated = _remember_file_identity(conn, source_id, file_identity)
             if _commit_hook is not None:
                 _commit_hook.apply(provider, conn)
@@ -2207,7 +2297,7 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None) -
             and int(existing["active"] or 0) == 1):
         old_links = _linked_document_chunks(conn, source_id)
         ts = _now()
-        with _ingest_transaction(provider, conn, _commit_hook):
+        with _ingest_transaction(provider, conn, _commit_hook, source_id=source_id, _replay_reference=_replay_reference):
             conn.execute(
                 "UPDATE document_sources SET scope_id=?,repository_id=?,updated_at=? WHERE source_id=?",
                 (scope_id, repository_id, ts, source_id),
@@ -2268,7 +2358,7 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None) -
             )
         return result
 
-    with _ingest_transaction(provider, conn, _commit_hook):
+    with _ingest_transaction(provider, conn, _commit_hook, source_id=source_id, _replay_reference=_replay_reference):
         conn.execute("UPDATE document_units SET active=0,updated_at=? WHERE source_id=? AND active=1", (ts, source_id))
         conn.execute("UPDATE document_chunks SET active=0,updated_at=? WHERE source_id=? AND active=1", (ts, source_id))
         conn.execute("UPDATE document_edges SET active=0,updated_at=? WHERE source_id=? AND active=1", (ts, source_id))
@@ -2387,12 +2477,9 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None) -
         )
         if written.rowcount != 1:
             raise sqlite3.IntegrityError("document revision identity conflict")
+        result = _record_result()
         if _commit_hook is not None:
-            result = _record_result()
             _commit_hook.apply(provider, conn)
-    if _commit_hook is None:
-        with conn:
-            result = _record_result()
     if bool(args.get("embed", _env_bool("MEMORY_WIKI_DOCUMENT_EMBED_ON_INGEST", False))):
         result["embedding"] = embed_pending_documents(provider, {"source_id": source_id, "limit": int(args.get("embed_limit") or 200)})
     return _guard_document_output(result, provider=provider)
@@ -3442,19 +3529,28 @@ def delete_document(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     source_id = str(args.get("source_id") or "").strip()
     if not source_id: raise ValueError("source_id is required")
     conn = provider._connect(); install_document_graph_schema(conn)
+    with _document_write_transaction(provider, conn):
+        return _delete_document_locked(provider, conn, source_id)
+
+
+def _delete_document_locked(provider, conn, source_id):
+    """Called only inside the admitted writer transaction, including replay."""
     source = conn.execute("SELECT scope_id,repository_id FROM document_sources WHERE source_id=? AND active=1", (source_id,)).fetchone()
     if not source: raise ValueError("document source not found")
     _assert_source_access(provider, source)
-    _assert_connector_owner(provider, source_id)
+    _assert_connector_owner(provider, source_id, _conn=conn)
+    # BEGIN IMMEDIATE (or a joined, proven owner) precedes every source/ACL/
+    # history read. Competing SQLite writers cannot change this admission
+    # snapshot between the check and the source/index retirement commit.
+    _document_recovery_file_identities(conn, source_id)
     old_links = _linked_document_chunks(conn, source_id)
-    with conn:
-        conn.execute("UPDATE document_sources SET active=0,status='deleted',updated_at=? WHERE source_id=?", (_now(), source_id))
-        conn.execute("UPDATE document_units SET active=0,updated_at=? WHERE source_id=?", (_now(), source_id))
-        conn.execute("UPDATE document_chunks SET active=0,updated_at=? WHERE source_id=?", (_now(), source_id))
-        conn.execute("UPDATE document_edges SET active=0,updated_at=? WHERE source_id=?", (_now(), source_id))
-        archived = _archive_visible_claims(conn, provider, old_links)
-        conn.execute("DELETE FROM document_units_fts WHERE source_id=?", (source_id,))
-        conn.execute("DELETE FROM document_chunks_fts WHERE source_id=?", (source_id,))
+    conn.execute("UPDATE document_sources SET active=0,status='deleted',updated_at=? WHERE source_id=?", (_now(), source_id))
+    conn.execute("UPDATE document_units SET active=0,updated_at=? WHERE source_id=?", (_now(), source_id))
+    conn.execute("UPDATE document_chunks SET active=0,updated_at=? WHERE source_id=?", (_now(), source_id))
+    conn.execute("UPDATE document_edges SET active=0,updated_at=? WHERE source_id=?", (_now(), source_id))
+    archived = _archive_visible_claims(conn, provider, old_links)
+    conn.execute("DELETE FROM document_units_fts WHERE source_id=?", (source_id,))
+    conn.execute("DELETE FROM document_chunks_fts WHERE source_id=?", (source_id,))
     return {"status": "deleted", "source_id": source_id, "archived_claims": archived}
 
 
@@ -3483,28 +3579,24 @@ def _replay_document_source_reference(provider: Any, reference: Dict[str, Any]) 
 
     conn = provider._connect()
     install_document_graph_schema(conn)
-    def restore_file_identities() -> None:
-        if file_identities:
-            with conn:
-                for identity in file_identities:
-                    _remember_file_identity(conn, source_id, identity)
     if action == "delete":
-        current = conn.execute(
-            "SELECT source_id,file_hash,revision_id,active FROM document_sources WHERE source_id=?", (source_id,)
-        ).fetchone()
-        if not current:
-            restore_file_identities()
-            return {"status": "already_deleted", "source_id": source_id}
-        if str(current["file_hash"] or "").lower() != expected_hash or (
-            expected_revision and str(current["revision_id"] or "") != expected_revision
-        ):
-            raise RuntimeError("document delete recovery reference does not match current source revision")
-        if not int(current["active"] or 0):
-            restore_file_identities()
-            return {"status": "already_deleted", "source_id": source_id}
-        result = delete_document(provider, {"source_id": source_id})
-        restore_file_identities()
-        return {"status": "deleted", "source_id": source_id, "result": result}
+        with _document_write_transaction(provider, conn):
+            current = conn.execute(
+                "SELECT source_id,file_hash,revision_id,active FROM document_sources WHERE source_id=?", (source_id,)
+            ).fetchone()
+            if current and (str(current["file_hash"] or "").lower() != expected_hash or (
+                expected_revision and str(current["revision_id"] or "") != expected_revision
+            )):
+                raise RuntimeError("document delete recovery reference does not match current source revision")
+            # Restore and validate the UNION before retirement, not in a
+            # second transaction after delete has already committed.
+            for identity in file_identities:
+                _remember_file_identity(conn, source_id, identity)
+            _document_recovery_file_identities(conn, source_id)
+            if not current or not int(current["active"] or 0):
+                return {"status": "already_deleted", "source_id": source_id}
+            result = _delete_document_locked(provider, conn, source_id)
+            return {"status": "deleted", "source_id": source_id, "result": result}
 
     root = _document_recovery_root(str(reference.get("root_sha256") or ""))
     path = _absolute_unresolved(root / _document_recovery_relative_path(reference.get("relative_path")))
@@ -3513,34 +3605,12 @@ def _replay_document_source_reference(provider: Any, reference: Dict[str, Any]) 
         "scope_id": str(reference.get("scope_id") or ""),
         "repository_id": str(reference.get("repository_id") or ""),
         "embed": False,
-    })
+    }, _replay_reference=reference)
     if str(result.get("source_id") or "") != source_id:
         raise RuntimeError("document recovery source identity changed")
     if str(result.get("file_hash") or "").lower() != expected_hash:
         raise RuntimeError("document recovery source hash changed")
-    row = conn.execute(
-        "SELECT revision_id,parser,parser_version,active FROM document_sources WHERE source_id=?", (source_id,)
-    ).fetchone()
-    if not row or not int(row["active"] or 0):
-        raise RuntimeError("document recovery did not restore an active source")
-    # An unchanged-content ingest may only update the durable file-ID ledger;
-    # its result need not repeat parser metadata. The verified SQLite row is
-    # authoritative for both the unchanged and newly parsed paths.
-    if str(row["parser"] or "") != str(reference.get("parser") or ""):
-        raise RuntimeError("document recovery parser changed")
-    if expected_revision and str(row["revision_id"] or "") != expected_revision:
-        raise RuntimeError("document recovery revision changed")
-    if str(row["parser_version"] or "") != str(reference.get("parser_version") or ""):
-        raise RuntimeError("document recovery parser version changed")
-    actual_counts = {
-        "unit_count": int(conn.execute("SELECT COUNT(*) FROM document_units WHERE source_id=? AND active=1", (source_id,)).fetchone()[0]),
-        "chunk_count": int(conn.execute("SELECT COUNT(*) FROM document_chunks WHERE source_id=? AND active=1", (source_id,)).fetchone()[0]),
-        "edge_count": int(conn.execute("SELECT COUNT(*) FROM document_edges WHERE source_id=? AND active=1", (source_id,)).fetchone()[0]),
-    }
-    expected_counts = {key: int(reference.get(key) or 0) for key in actual_counts}
-    if actual_counts != expected_counts:
-        raise RuntimeError("document recovery structural counts changed")
-    restore_file_identities()
+    actual_counts = _verify_document_ingest_replay(conn, source_id, reference)
     embedding = {}
     if bool(reference.get("embed", False)):
         embedding = embed_pending_documents(provider, {
