@@ -15,6 +15,40 @@
     "earlier_elapsed_seconds": null
   },
   "status": "SOURCE_BOUND_BLOCKED_BOOTSTRAP_EFFECTS",
+  "current_metadata_derivative": {
+    "kind": "current_source_metadata_only_UNIT",
+    "checkpoint_commit": "bcd32456a3341cb277ec0280396b5ba0b0cc901f",
+    "branch": "lead/sdk-qualifier-20261011",
+    "evidence_root": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\evidence",
+    "historical_descriptor": {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\docs\\CURRENT_SDK_COMPONENT_CONTRACT.json",
+      "sha256": "47bd8ec1a444781582afff50f7890505f916e90823cc19aa8a3b8c133a805c53"
+    },
+    "historical_executed_contract": {
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\evidence\\executed-contract.json",
+      "sha256": "fe821d142b5750e70fe3d0614730309ad75dbb1624b83ccf88ea97e6169afa38"
+    },
+    "historical_execution_unchanged": true,
+    "new_component_or_native_admission": false,
+    "unit_only": true,
+    "scope_ru": "Текущие 38 source paths перепривязаны к отдельному worktree и raw SHA; внешние 56 bindings сохранены как историческая metadata, не proof нового loaded SDK. reference_base, captured_contract, preflight, grants и bootstrap policy относятся к неизменному прежнему component gate.",
+    "remaining_gate": "BLOCKED: once-only component не повторяется; historical child2, functional6, unit9 и 26 bootstrap denials не становятся текущим UNIT или native PASS.",
+    "own_source_evidence_scratch_cap_bytes": 12000000,
+    "owner_total_accounting": null
+  },
+  "qualifier_contract": {
+    "finding": "B-CARRIER-QUALIFY-SUPERVISOR-ERRORS",
+    "healthy_supervisor": {
+      "errors": [],
+      "primary_error": null,
+      "both_fields_required": true
+    },
+    "missing_or_non_list_errors_or_missing_primary": "unknown/capture",
+    "nonempty_errors_or_any_nonnull_primary": "failed/harness",
+    "complete_child_flags_do_not_override_supervisor_errors": true,
+    "input_errors_and_primary_preserved": true,
+    "proof_scope_ru": "Авторские UNIT states проверяют qualifier; настоящий supervisor cleanup error-path здесь не воспроизводится."
+  },
   "captured_contract": {
     "evidence_reference_base": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\evidence",
     "status": "SOURCE_BOUND_BLOCKED_BOOTSTRAP_EFFECTS",
@@ -102,9 +136,9 @@
     "frozen_frame_identity_rule": "<frozen ...> co_filename strings in raw sidecar are pseudo-file lexical IDs, not physical fixture files or independently SHA-bound module origins.",
     "no_new_runtime_execution_from_this_projection": true
   },
-  "source_root": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source",
+  "source_root": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source",
   "source_base_commit": "d61268f5da18e11824a5285e4e4096fdd65672e6",
-  "source_layout": "actual lane B SOURCE, not historical terminal-source or COLD frozen-provider pin",
+  "source_layout": "current integration SDK worktree metadata derivative; historical component capture remains at reference_base, not a new SDK execution",
   "selected_python": {
     "executable": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\tools\\python-3.14.7+20260901-win32-x64\\python.exe",
     "facts": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\tools\\facts.json",
@@ -155,7 +189,7 @@
     {
       "class": "MemoryWikiProvider",
       "method": "__init__",
-      "origin": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\__init__.py",
+      "origin": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\__init__.py",
       "line": 6854,
       "signature": "self",
       "ast_sha256": "8bbd878960d93fcb1fc9c2ae1354194c91b47d5d6d27537f2ed1a672939bec12"
@@ -230,11 +264,11 @@
     "old_90a_acceptance_not_relabelled": true
   },
   "metadata_rebind": {
-    "current_provider_origin": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\__init__.py",
+    "current_provider_origin": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\__init__.py",
     "provider_sha256": "7a02f4a2c4217fe1b9b185771fdd7c5a40aa576cf84d712863f1c7f1df31dbd3",
     "historical_COLD": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\docs\\COLD_LANES.json",
     "historical_COLD_unchanged": true,
-    "self_document_excluded_only_from_source_bindings": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\docs\\CURRENT_SDK_COMPONENT_CONTRACT.json",
+    "self_document_excluded_only_from_source_bindings": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\docs\\CURRENT_SDK_COMPONENT_CONTRACT.json",
     "native_authority_from_JSON": false
   },
   "permission": {
@@ -261,7 +295,7 @@
     "MEMORY_WIKI_ONLINE_METRICS_ENABLED": "0"
   },
   "fixture_yaml": "memory:\n  provider: memory-wiki\n  prefetch_spill_enabled: false\nhooks:\n  output_spill:\n    enabled: false\nterminal:\n  backend: local\n",
-  "scratch_root": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\sdk-runtime-20261011",
+  "scratch_root": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\cache\\scratch\\team-lead-20261011\\sdk",
   "budget": {
     "lane_plus_scratch_cap": 30000000,
     "reserve_bytes": 10000000,
@@ -479,155 +513,155 @@
       "sha256": "738f0b0a53c658db9fe8a04537f4d6c71957db12067e39f060473d49021fc047"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\__init__.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\__init__.py",
       "sha256": "7a02f4a2c4217fe1b9b185771fdd7c5a40aa576cf84d712863f1c7f1df31dbd3"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\background_jobs.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\background_jobs.py",
       "sha256": "3ad75ace9a56d9fa00c7b260dd371a2e3a6ceadbac12b0099db43e30f99d04c1"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\code_knowledge_graph.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\code_knowledge_graph.py",
       "sha256": "f8aa8838fc30ab199be71b253d70bbb89b0ef56cd86015c2d4a5800121bd1a0f"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\collapse.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\collapse.py",
       "sha256": "9e5e77c3070fa58767b75230a9a7f99c53b4da23b7509a35e4caefaafdcf978c"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\current_scope_reindex.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\current_scope_reindex.py",
       "sha256": "d81979d49946c0e45fa6eac5c24e4001a1d3fdcd145e5ee3cacacad9c0cd627a"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\decay.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\decay.py",
       "sha256": "7fc1ed579319a3bdf46de4b06f1579c4ccafc1ac547dde3ed2b0186533bd0aab"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\disclosure_fence.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\disclosure_fence.py",
       "sha256": "9893d25f343fda69bcb0e5db05a4b9941b88ec3b1039c9af8621015a86ce54a7"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\docs\\COLD_LANES.json",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\docs\\COLD_LANES.json",
       "sha256": "df73211e54770d2eced223aa55fb0948b8b541e052523744c970e72bfb17f1bd"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\document_extractors.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\document_extractors.py",
       "sha256": "c317b17582755d9a63f03ba64c60748701ea38b09c10f2608dce8b881a049a2e"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\document_knowledge_graph.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\document_knowledge_graph.py",
       "sha256": "f8fa0b48691440c25ee4d594533ec96bf567cea6aea88883a23b799f6be4fb70"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\document_worker.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\document_worker.py",
       "sha256": "2fe998b2d7175e8caedfe806891bfe3130e60b85bdef12f13f4913cfa250606d"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\entity_relation_extractor.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\entity_relation_extractor.py",
       "sha256": "cd884c7c343556cae8a6949d8e3d2fe4afab78ffa7f30fa4694e115812fcb123"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\episodic_memory.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\episodic_memory.py",
       "sha256": "1a0895e860bc25f3e042fb1ac7335b341cdd0481567d50255a0d0b3d41c83b5e"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\extractor.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\extractor.py",
       "sha256": "015c64ae0671d329f3a8a1ca0fbbdc5c79234657c95c11e4d88d2f3c2b4e3222"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\github_source_adapter.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\github_source_adapter.py",
       "sha256": "12e3b35219cc8ac23a02e7ab8ef24ee66bd398f3dd999298d1cd40c0a98c5d0b"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\google_drive_source_adapter.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\google_drive_source_adapter.py",
       "sha256": "fce9f21830b3788053b3e1f6372e6d8aa4124380b3a9377fe411652a27bde517"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\guard.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\guard.py",
       "sha256": "a41dd58b8be0b3d6742a961740fb412d4053afc4d16b01d58c95b0215117a4fc"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\http_safety.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\http_safety.py",
       "sha256": "bbbbda1a1b0d7febcc0f895a40c150060db409b6ff7c5b3b1f8b615d0f145e19"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\memory_events.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\memory_events.py",
       "sha256": "3c4334fa021012c7ed79d9763c1fcb2c79b14e13beede2de405aea184405c231"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\memory_observations.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\memory_observations.py",
       "sha256": "33d8c5d9b6eab8bad2bdd6a3987548f6d94f70cf12501c73e03a5b2212b25e7a"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\migrations.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\migrations.py",
       "sha256": "fb6fe91c8964be591004ebf9378b6dd7bb8084a6e84ae02a4515fc6b7bfa3310"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\online_metrics.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\online_metrics.py",
       "sha256": "8a8dfb53b5c166a45102edeef545798532daa7f582835755214c3c880a03e762"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\patch_secret_context_plugin.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\patch_secret_context_plugin.py",
       "sha256": "60fa2032a6b82c49db685452687315654ed8c873463b583962dc9a52c29ec1f6"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\privacy_erasure.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\privacy_erasure.py",
       "sha256": "0a201b3f4fdefa001946a6ce9caa877a28652503574ee27bdf15485a51f08be0"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\recall_orchestrator.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\recall_orchestrator.py",
       "sha256": "2c6e808e929a1e290e40c521aebc981819bccec659d6d6f88e884229ebff3dd3"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\recall_planner.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\recall_planner.py",
       "sha256": "2ed888c78c8a8bb5ba1663f46d62fa551c8f16033db29d3f5f0fc062f445f9e3"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\scripts\\ci_owned\\current_sdk_bootstrap.py",
-      "sha256": "d9d6cb5e6f68f6dbc62ab1c16bc2d8cffc5b2db7eb8599ca35fe4da1348be27e"
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\scripts\\ci_owned\\current_sdk_bootstrap.py",
+      "sha256": "c3446731fe913e5b459bd8d7d8161576bd9876fd1d4e8fe4041bed7d785c067c"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\sdk.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\sdk.py",
       "sha256": "52fc5b6f930d1b628b8d0731ad0fd540996e5d36d7cc23c16a3ca1dd6ad73bc4"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\secret_context_bridge.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\secret_context_bridge.py",
       "sha256": "4a3f16a110dda04168636b3e6631d042855b668a97488ef5677a8a17b08de051"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\semantic_io.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\semantic_io.py",
       "sha256": "53d2afabffdd360058bf50807ac63fff5ab0c3715fbbec3d1844f27d726086f7"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\setup.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\setup.py",
       "sha256": "cb184df928263e32fd4015c38d41dd71345979d6cb4ecad1c4d44b9090f19780"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\shared_blocks.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\shared_blocks.py",
       "sha256": "88bafd15a37abed67ef0beb55130da06b8291aec26018a66ddbc46435f93f832"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\source_connectors.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\source_connectors.py",
       "sha256": "c36884925be21a322da899eb7307ccf69ef6b273f0cc7f2d71d874cef9e44910"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\tests\\ci_owned\\test_current_sdk_bootstrap.py",
-      "sha256": "e3b8d33fdfd79505e83ece3fb999f235f6e4d73dad3fc2127e604999a2cd80be"
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\tests\\ci_owned\\test_current_sdk_bootstrap.py",
+      "sha256": "447dd6c56fd91617800b7d50acba8be2defaf3df00483c01140eafbe4a799010"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\vault.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\vault.py",
       "sha256": "a0ae470a3f15597fcd0693df0c83af9f844d348d8f6fdaeb058c89c75434a203"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\vault_aead.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\vault_aead.py",
       "sha256": "1417e29b788e8f466d0497a31b62cc3a3674c40256910f1d73c14b88d073936e"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\vault_registry_adapter.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\vault_registry_adapter.py",
       "sha256": "702816f1efe3dd1c9c706a63c1090bb09e2d2180246ab1d2466e2ee4d6f5a16f"
     },
     {
-      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\parallel\\sdk-runtime-20261011\\source\\visual_evidence.py",
+      "path": "C:\\Users\\Kekl\\AppData\\Local\\hermes\\projects\\hermes-memory-stack\\integration\\team-lead-20261011\\sdk\\source\\visual_evidence.py",
       "sha256": "256e5e8bdabb2b35d0e01dea9144e1cf4950897b295daf6d81ede0ac82146042"
     },
     {

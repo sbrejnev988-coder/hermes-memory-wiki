@@ -212,6 +212,12 @@ def qualify(state, payload, unchanged):
     if (not state.get("capture_complete") or not state.get("ownership_complete") or
             state.get("deadline_state") != "completed_before_deadline" or payload is None):
         return "unknown", "capture"
+    # Complete child/capture flags do not dispose of independent supervisor errors.
+    # Only an explicit empty list and explicit null prove supervisor health.
+    if type(state.get("errors")) is not list or "primary_error" not in state:
+        return "unknown", "capture"
+    if state["errors"] or state["primary_error"] is not None:
+        return "failed", "harness"
     if not unchanged:
         return "blocked", "admission"
     try:

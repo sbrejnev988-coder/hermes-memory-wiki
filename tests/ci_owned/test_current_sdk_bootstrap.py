@@ -1,11 +1,14 @@
 """Carrier unit package: no root conftest, SDK fakes or native subprocesses.
 
-Loaded explicitly by current_sdk_bootstrap.worker before the separately guarded
-actual-SDK component. Unit-injected audit calls test tooling only, not Core.
+Load with the existing stdlib unittest API and an explicit CARRIER binding for
+UNIT-only execution. Do not invoke worker: it also runs the actual SDK component.
+Unit-injected audit calls and authored supervisor states test tooling, not Core
+or an actual supervisor cleanup failure.
 """
 from __future__ import annotations
 
 from contextlib import contextmanager
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -107,7 +110,8 @@ class CurrentSdkCarrierTests(unittest.TestCase):
 
     def test_functional_pass_never_erases_denials_exit_or_missing_capture(self):
         state = {"capture_complete": True, "ownership_complete": True,
-                 "deadline_state": "completed_before_deadline", "exit_code": 0}
+                 "deadline_state": "completed_before_deadline", "exit_code": 0,
+                 "errors": [], "primary_error": None}
         cases = [{"id": name, "outcome": "passed"} for name in CARRIER.COMPONENT_CASES]
         payload = {"schema": CARRIER.SCHEMA, "cases": cases, "tests": CARRIER.summarize(cases),
                    "audit": {"refused_total": 26, "diagnostic_failures": 0,
@@ -119,10 +123,83 @@ class CurrentSdkCarrierTests(unittest.TestCase):
         self.assertEqual(CARRIER.qualify(state, payload, True), ("passed", "none"))
         self.assertEqual(CARRIER.qualify(dict(state, exit_code=1), payload, True), ("failed", "fixture"))
         self.assertEqual(CARRIER.qualify(dict(state, capture_complete=False), payload, True), ("unknown", "capture"))
+        self.assertEqual(CARRIER.qualify(dict(state, ownership_complete=False), payload, True), ("unknown", "capture"))
+        self.assertEqual(CARRIER.qualify(dict(state, deadline_state="expired"), payload, True), ("unknown", "capture"))
         self.assertEqual(CARRIER.qualify(state, None, True), ("unknown", "capture"))
         self.assertEqual(CARRIER.qualify(state, payload, False), ("blocked", "admission"))
         payload["audit"]["diagnostic_failures"] = 1
         self.assertEqual(CARRIER.qualify(state, payload, True), ("blocked", "admission"))
+
+    def qualification_fixture(self):
+        # Authored evidence at the qualifier seam; no actual SDK/supervisor run.
+        state = {"capture_complete": True, "ownership_complete": True,
+                 "deadline_state": "completed_before_deadline", "exit_code": 0,
+                 "errors": [], "primary_error": None}
+        cases = [{"id": name, "outcome": "passed"} for name in CARRIER.COMPONENT_CASES]
+        payload = {"schema": CARRIER.SCHEMA, "cases": cases, "tests": CARRIER.summarize(cases),
+                   "audit": {"refused_total": 0, "diagnostic_failures": 0, "counts": []},
+                   "alive_threads": [], "unit": {"total": 1, "failed": 0, "errors": 0}}
+        return state, payload
+
+    def assert_supervisor_refusal(self, state, expected):
+        _, payload = self.qualification_fixture()
+        before_state, before_payload = deepcopy(state), deepcopy(payload)
+        self.assertEqual(CARRIER.qualify(state, payload, True), expected)
+        # A refusal must preserve the ledger/primary and raw child evidence.
+        self.assertEqual(state, before_state)
+        self.assertEqual(payload, before_payload)
+
+    def test_supervisor_explicit_empty_errors_and_null_primary_are_healthy(self):
+        state, payload = self.qualification_fixture()
+        before_state, before_payload = deepcopy(state), deepcopy(payload)
+        self.assertEqual(CARRIER.qualify(state, payload, True), ("passed", "none"))
+        self.assertEqual(state, before_state)
+        self.assertEqual(payload, before_payload)
+
+    def test_supervisor_errors_only_refuse_complete_child_success(self):
+        state, _ = self.qualification_fixture()
+        state["errors"] = ["cleanup_log_stdout_OSError"]
+        self.assert_supervisor_refusal(state, ("failed", "harness"))
+
+    def test_supervisor_primary_only_refuses_complete_child_success(self):
+        state, _ = self.qualification_fixture()
+        state["primary_error"] = "cleanup_pipe_stdout_OSError"
+        self.assert_supervisor_refusal(state, ("failed", "harness"))
+
+    def test_supervisor_errors_and_primary_refuse_complete_child_success(self):
+        state, _ = self.qualification_fixture()
+        state["errors"] = ["cleanup_log_stdout_OSError", "cleanup_pipe_stdout_OSError"]
+        state["primary_error"] = state["errors"][0]
+        self.assert_supervisor_refusal(state, ("failed", "harness"))
+
+    def test_supervisor_malformed_errors_never_count_as_empty_list(self):
+        # Each falsey/non-list shape must refuse; these are variants, not subtests.
+        for errors in (None, "", "cleanup_log_stdout_OSError", {}, (), False, 0,
+                       {"cleanup_log_stdout_OSError": 1}):
+            state, _ = self.qualification_fixture()
+            state["errors"] = errors
+            self.assert_supervisor_refusal(state, ("unknown", "capture"))
+
+    def test_supervisor_nonnull_primary_never_counts_as_null(self):
+        for primary in ("", False, 0, [], {}, (), ["cleanup_pipe_stdout_OSError"]):
+            state, _ = self.qualification_fixture()
+            state["primary_error"] = primary
+            self.assert_supervisor_refusal(state, ("failed", "harness"))
+
+    def test_supervisor_missing_errors_refuses_complete_child_success(self):
+        state, _ = self.qualification_fixture()
+        del state["errors"]
+        self.assert_supervisor_refusal(state, ("unknown", "capture"))
+
+    def test_supervisor_missing_primary_refuses_complete_child_success(self):
+        state, _ = self.qualification_fixture()
+        del state["primary_error"]
+        self.assert_supervisor_refusal(state, ("unknown", "capture"))
+
+    def test_supervisor_missing_both_health_fields_refuses_complete_child_success(self):
+        state, _ = self.qualification_fixture()
+        del state["errors"], state["primary_error"]
+        self.assert_supervisor_refusal(state, ("unknown", "capture"))
 
     def test_case_counts_have_exact_unique_ids_not_projection_totals(self):
         cases = [{"id": "a", "outcome": "passed"}, {"id": "b", "outcome": "error"},
@@ -145,3 +222,13 @@ class CurrentSdkCarrierTests(unittest.TestCase):
         self.assertFalse(descriptor["bootstrap_policy"]["preload_Core_before_audit"])
         self.assertEqual(descriptor["bootstrap_policy"]["refusal_handling"], "retain_and_block_even_if_caught")
         self.assertEqual(descriptor["historical_refusal"]["counts"], {"socket.gethostname": 1, "open": 24, "subprocess.Popen": 1})
+        derivative = descriptor["current_metadata_derivative"]
+        self.assertEqual(derivative["kind"], "current_source_metadata_only_UNIT")
+        self.assertTrue(derivative["historical_execution_unchanged"])
+        self.assertFalse(derivative["new_component_or_native_admission"])
+        self.assertEqual(descriptor["qualifier_contract"]["healthy_supervisor"],
+                         {"errors": [], "primary_error": None, "both_fields_required": True})
+        bindings = {row["path"]: row["sha256"] for row in descriptor["source_bindings"]}
+        for path in (CARRIER.SCRIPT, CARRIER.SOURCE / "tests/ci_owned/test_current_sdk_bootstrap.py"):
+            self.assertEqual(bindings[str(path)], CARRIER.sha(path))
+        self.assertNotIn(str(CARRIER.SOURCE / "docs/CURRENT_SDK_COMPONENT_CONTRACT.json"), bindings)
