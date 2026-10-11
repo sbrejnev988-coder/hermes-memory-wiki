@@ -10050,6 +10050,19 @@ class MemoryWikiProvider(MemoryProvider):
             if tool_name == "memory_wiki_recall":
                 recall_started = time.monotonic()
                 try:
+                    # Finish ordinary FTS maintenance BEFORE recall retains its
+                    # first original disclosure image. Repairing inside _search
+                    # after that image would correctly invalidate the delivery.
+                    c = self._connect()
+                    if not c.in_transaction and not c.execute("PRAGMA query_only").fetchone()[0]:
+                        try:
+                            marker = c.execute("SELECT value FROM meta WHERE key='claims_fts_format'").fetchone()
+                            if not marker or marker[0] != "v3":
+                                self._ensure_fts_current()
+                        except sqlite3.DatabaseError:
+                            if self._transaction_quarantine is not None:
+                                raise
+                            # Keep the existing lexical fallback for known failure.
                     recalled = _recall_orchestrator.recall(
                         self,
                         a.get("query") or "",
@@ -14029,7 +14042,7 @@ class MemoryWikiProvider(MemoryProvider):
         Used by claim/ledger owners and the private writer's native context API.
         This is process-local bookkeeping, not permission or a recovery service.
         """
-        if begin not in {"", "IMMEDIATE"} or (join and adopt):
+        if begin not in {"", "IMMEDIATE", "EXCLUSIVE"} or (join and adopt):
             raise ValueError("invalid_claim_transaction_mode")
         with self._lock:
             c = self._connect() if conn is None else conn
@@ -20278,10 +20291,8 @@ class MemoryWikiProvider(MemoryProvider):
                 else:
                     if len(seen) == active_count:
                         if marker[0] == "stale":
-                            was_in_transaction = c.in_transaction
-                            c.execute("UPDATE meta SET value='v3' WHERE key='claims_fts_format'")
-                            if not was_in_transaction:
-                                c.commit()
+                            with self._claim_transaction(c, join=True):
+                                c.execute("UPDATE meta SET value='v3' WHERE key='claims_fts_format'")
                         return "current"
         except sqlite3.DatabaseError:
             pass
@@ -20292,10 +20303,11 @@ class MemoryWikiProvider(MemoryProvider):
         c = self._connect()
         shadow = "claims_fts_rebuild"
         try:
-            with c:
-                # FTS replacement drops/renames shared tables. Serialize concurrent
-                # provider initialization across independent Windows processes.
-                c.execute("BEGIN EXCLUSIVE")
+            # Rebuild re-enters _connect via _meta_int while SQLite is active.
+            # Register the same real owner through native EXCLUSIVE completion,
+            # including rollback; a raw Connection context has no such lifetime.
+            with self._claim_transaction(c, begin="EXCLUSIVE"):
+                # Preserve cross-process serialization of shared FTS replacement.
                 self._drop_index_sync_triggers(c)
                 c.execute(f"DROP TABLE IF EXISTS {shadow}")
                 c.execute(
@@ -20326,16 +20338,9 @@ class MemoryWikiProvider(MemoryProvider):
                 )
         except Exception as exc:
             _debug_log(f"FTS rebuild failed: {_safe_exception_label(exc)}")
-            try:
-                c.execute(f"DROP TABLE IF EXISTS {shadow}")
-                fts_exists = c.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='claims_fts'"
-                ).fetchone()
-                if fts_exists:
-                    self._install_index_sync_triggers(c)
-                c.commit()
-            except Exception:
-                pass
+            # DDL is in the owned SQLite transaction. Confirmed rollback restores
+            # the old table/triggers; UNKNOWN retains the exact owner and primary.
+            # Never run a second raw cleanup/commit across that refusal.
             raise
 
     # ----- extraction ----------------------------------------------------

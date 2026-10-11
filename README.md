@@ -1,8 +1,16 @@
 # Hermes Memory Wiki v1.24.5
 
-## Lifecycle/TX bug fix после RI-R01 checkpoint
+## FTS/transaction-owner checkpoint — source, не новый релиз
 
-Текущий lifecycle-fix primary buildable PIN: `11a712bc5f770b95c9347895d2c6f604546c9eff`; secondary virtual PIN: `4d0d401465f00579351a6dfbfc5da9003684b3c5`. Они содержат одну и ту же принятую runtime-дельту; secondary отличается только удалением `[build-system]`. Оба заменяют прежние 5af126bf/7724d5a2 code copies, но не изменяют пользовательские stores/settings. Публикация, установка и загрузка проверяются раздельно; этот абзац не заявляет их завершёнными. Saved native7 относится к exact pre-commit runtime SHA `7ebb63ce54ea1c0fb2f56fddc2cb7a7b4aeabae3ae271fa8262c56fcc0aa51f3`, byte-equal обоим этим PIN, а не к новой повторной тестовой сессии.
+Новая проверенная кодовая дельта закреплена в source commit [`ad4d14f42ef967993158a2e07e3a2d8a73dcd7c8`](https://github.com/sbrejnev988-coder/hermes-memory-wiki/commit/ad4d14f42ef967993158a2e07e3a2d8a73dcd7c8). Она устраняет ложный quarantine собственного EXCLUSIVE FTS writer и переносит необходимую maintenance перед original recall snapshot. Runtime/regression bytes сверены; schema и версия **1.24.5** не меняются.
+
+Исторический scoped SDK/SQLite packet на core `90a7cccb1a243af60c5dfdf44868803d9da8ebec` прошёл **22/22, exit 0, audit 0** и независимое component review. После обновления core до `79b45d1647f6b5680768d851c4c406e8cc550a1e` выполнена отдельная совместимость: **22 функциональных PASS, но child exit 1 и 26 refused bootstrap attempts**. Новый native/audit gate не принят; прежний PASS не переназван новым. Детали, remaining recovery/cold/fleet blockers и границы установки — [FTS owner checkpoint](docs/FTS_OWNER_CHECKPOINT_20261011_RU.md).
+
+Новый tag/GitHub Release, wheel, secondary PIN, установка или reload этим checkpoint не выполняются. Старые installed bindings ниже остаются отдельной историей; их нельзя считать новым FTS runtime. Источники и guides опубликованы отдельно от runtime admission; full release остаётся BLOCKED.
+
+## Предыдущий lifecycle/TX bug fix после RI-R01 checkpoint
+
+Предыдущий lifecycle-fix primary buildable PIN (installed binding своего этапа): `11a712bc5f770b95c9347895d2c6f604546c9eff`; secondary virtual PIN: `4d0d401465f00579351a6dfbfc5da9003684b3c5`. Они содержат одну и ту же принятую runtime-дельту; secondary отличается только удалением `[build-system]`. Оба заменяют прежние 5af126bf/7724d5a2 code copies, но не изменяют пользовательские stores/settings. Публикация, установка и загрузка проверяются раздельно; этот абзац не заявляет их завершёнными. Saved native7 относится к exact pre-commit runtime SHA `7ebb63ce54ea1c0fb2f56fddc2cb7a7b4aeabae3ae271fa8262c56fcc0aa51f3`, byte-equal обоим этим PIN, а не к новой повторной тестовой сессии.
 
 Исправлена отсутствующая constructor-инициализация `_transaction_quarantine`, из-за которой terminal-tail мог получить `AttributeError` и withheld вместо штатного результата. Начальное `None` задаётся **один раз в `MemoryWikiProvider.__init__`**, вместе с owner/thread/primary/cleanup defaults; на retry/initialize/reconnect карантин не сбрасывается. Genuine UNKNOWN и foreign-thread owner остаются fail-closed.
 
