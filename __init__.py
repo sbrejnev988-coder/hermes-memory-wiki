@@ -918,6 +918,7 @@ except ImportError:
 # HERMES-DOCUMENT-KNOWLEDGE-GRAPH-v0.4.0: universal structured document ingestion.
 try:
     from .document_knowledge_graph import (
+        _DocumentRecoveryHistoryOverflow,
         _document_profile_scope,
         _assert_source_access as _disclosure_assert_source_access,
         install_document_graph_schema as _install_document_graph_schema,
@@ -940,6 +941,7 @@ try:
 except ImportError:
     try:
         from document_knowledge_graph import (
+            _DocumentRecoveryHistoryOverflow,
             _document_profile_scope,
             _assert_source_access as _disclosure_assert_source_access,
             install_document_graph_schema as _install_document_graph_schema,
@@ -961,6 +963,8 @@ except ImportError:
         )
     except ImportError as _document_graph_import_exc:
         _DOCUMENT_GRAPH_IMPORT_ERROR = _safe_exception_label(_document_graph_import_exc)
+        class _DocumentRecoveryHistoryOverflow(RuntimeError):
+            pass
         @contextmanager
         def _document_profile_scope(_home):
             yield
@@ -10617,6 +10621,13 @@ class MemoryWikiProvider(MemoryProvider):
             except Exception:
                 pass
             return tool_error(f"{_safe_exception_label(e)}; provider connection/database error after reconnect. Run direct quick_check and restart Hermes/plugin runtime if the DB is valid.")
+        except _DocumentRecoveryHistoryOverflow as e:
+            if (self._lifecycle_state == "quarantined"
+                    or getattr(self, "_transaction_quarantine", None) is not None):
+                return tool_error(_safe_exception_label(e) + "; connection quarantined; transaction outcome UNKNOWN")
+            # This specific admission refusal has no source-bearing message.
+            # Ordinary native tool_error envelopes remain error-only.
+            return tool_result(success=False, error="document recovery reference file identity history exceeds journal limit")
         except Exception as e:
             return tool_error(_public_tool_error(e))
 
@@ -12187,9 +12198,22 @@ class MemoryWikiProvider(MemoryProvider):
             return {"error": safe_error}
 
     def _journal_operation(self, op: str, payload: Dict[str, Any], fn) -> Tuple[Any, Dict[str, Any]]:
-        """Journal one mutation and its checkpoint as an indivisible boundary."""
+        """Journal only an idle owner's mutation, never a caller's pending TX."""
+        # Refuse before taking the journal lock: a caller-owned writer already
+        # holds _lock, and another journal boundary may be waiting for it.
+        with self._lock:
+            if (self._claim_tx_connection is not None
+                    or (self._conn is not None and self._conn.in_transaction)):
+                return tool_error("journal_mutation_requires_idle_owner"), {}
         with self._journal_operation_scope():
-            return self._journal_operation_locked(op, payload, fn)
+            # Recheck after waiting, then retain the provider lock through the
+            # mutation, its durable after and checkpoint. No other provider
+            # thread may start an outer writer between admission and publication.
+            with self._lock:
+                if (self._claim_tx_connection is not None
+                        or (self._conn is not None and self._conn.in_transaction)):
+                    return tool_error("journal_mutation_requires_idle_owner"), {}
+                return self._journal_operation_locked(op, payload, fn)
 
     def _journal_operation_locked(self, op: str, payload: Dict[str, Any], fn) -> Tuple[Any, Dict[str, Any]]:
         """Journal-before, execute, journal-after with content-free sensitive refs."""
@@ -12226,7 +12250,10 @@ class MemoryWikiProvider(MemoryProvider):
             )
             raise
         tool_result = self._journal_result_dict(result)
-        if tool_result.get("success") is False:
+        if (tool_result.get("success") is False
+                or ("error" in tool_result and tool_result.get("success") is not True)):
+            # Native tools.registry.tool_error has an error field but no
+            # success flag. Its absence is not a successful mutation receipt.
             # Tool errors may echo user text or a remote provider body. The
             # journal only needs the failure boundary, never its free text.
             error_text = (

@@ -1,6 +1,14 @@
 # Hermes Memory Wiki v1.24.5
 
-## FTS/transaction-owner checkpoint — source, не новый релиз
+## Recovery atomic/error checkpoint — source, не новый релиз
+
+Current source correction PIN: [`d6fa8b37406f767045183e12c538e1f85bc6e702`](https://github.com/sbrejnev988-coder/hermes-memory-wiki/commit/d6fa8b37406f767045183e12c538e1f85bc6e702). Она сохраняет предыдущий FTS fix и закрывает native error-only journaling, отказ history overflow до эффекта, public joined TX boundary и atomic ingest replay identity UNION. Версия/schema не повышались.
+
+Координатор подтвердил **32/32**, actual child exit **0**, audit **0** для exact direct-provider/SQLite component и scoped read-only собственных файлов. Первый independent review старой дельты остался **FAIL**; corrective closeout не объявлен новым independent PASS. [Точные границы, evidence и оставшиеся blockers](docs/RECOVERY_ATOMIC_CHECKPOINT_20261011_RU.md).
+
+Это source-checkpoint, не tag/GitHub Release/новый wheel/secondary install PIN. Parser/private hook H1/H2, heavy MemoryManager bootstrap, cold/native/OS/fleet/live qualification остаются отдельно unaccepted. Старые full-suite counts и installed bindings не переносятся на новые bytes; CI не запускался и не считается PASS.
+
+## Предыдущий FTS/transaction-owner checkpoint — source, не новый релиз
 
 Новая проверенная кодовая дельта закреплена в source commit [`ad4d14f42ef967993158a2e07e3a2d8a73dcd7c8`](https://github.com/sbrejnev988-coder/hermes-memory-wiki/commit/ad4d14f42ef967993158a2e07e3a2d8a73dcd7c8). Она устраняет ложный quarantine собственного EXCLUSIVE FTS writer и переносит необходимую maintenance перед original recall snapshot. Runtime/regression bytes сверены; schema и версия **1.24.5** не меняются.
 
