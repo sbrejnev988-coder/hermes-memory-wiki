@@ -14063,7 +14063,7 @@ class MemoryWikiProvider(MemoryProvider):
 
 
     @contextmanager
-    def _claim_transaction(self, conn=None, *, join=False, adopt=False, begin="IMMEDIATE", _terminal=None):
+    def _claim_transaction(self, conn=None, *, join=False, adopt=False, begin="IMMEDIATE", _terminal=None, _document_hook=None, _document_ingest=None):
         """One SQLite owner stage; joined callers never commit another owner's TX.
 
         Used by claim/ledger owners and the private writer's native context API.
@@ -14075,6 +14075,14 @@ class MemoryWikiProvider(MemoryProvider):
             c = self._connect() if conn is None else conn
             self._require_claim_writer(c)
             active = c.in_transaction
+            if _document_hook is not None:
+                # A private record receipt follows this exact owning stage,
+                # not a second raw BEGIN/COMMIT beside the provider owner.
+                from .document_knowledge_graph import _validate_ingest_commit_hook
+                _validate_ingest_commit_hook(self, c, _document_hook)
+                if (join or adopt or begin != "IMMEDIATE" or _terminal is not None
+                        or c is not self._conn or c is not self._owned_conn):
+                    raise RuntimeError("document_private_commit_owner_refused")
             if adopt and not _owns_private_graph_writer(self, c):
                 raise RuntimeError("claim_mutation_transaction_not_owned")
             if active and not (join or adopt):
@@ -14112,11 +14120,24 @@ class MemoryWikiProvider(MemoryProvider):
             try:
                 if not active:
                     c.execute("BEGIN" + (" " + begin if begin else ""))
+                if _document_hook is not None:
+                    _document_hook.started = True
                 yield c
                 if not c.in_transaction:
                     self._quarantine_claim_connection(c, "transaction_ended_before_owner_finish")
                     raise RuntimeError("claim_transaction_ended_before_owner_finish")
                 claim_journal_image = None if _terminal is not None else self._claim_journal_pending_commit(c)
+                if _document_hook is not None:
+                    _document_hook.validate(self, c, transaction=True)
+                    if (_document_hook.expected is None
+                            or _document_hook._tuple() != _document_hook.expected):
+                        raise RuntimeError("connector_transaction_tuple_mismatch")
+                if _document_ingest is not None:
+                    # Pending journal preparation is also a callback boundary;
+                    # ordinary document authority must still precede COMMIT.
+                    from .document_knowledge_graph import _assert_ingest_authority
+                    source_id, admission = _document_ingest
+                    _assert_ingest_authority(self, c, source_id, admission, before=False)
                 if _terminal is not None and (self._claim_tx_connection is not c
                         or self._claim_tx_thread != threading.get_ident()
                         or self._transaction_quarantine is not None
@@ -14124,10 +14145,14 @@ class MemoryWikiProvider(MemoryProvider):
                         or c.total_changes != _terminal.measurement['after_changes']):
                     raise _DeliveryWithheld("terminal_commit_provenance_unproven")
                 commit_attempted = True  # Only immediately before actual commit.
+                if _document_hook is not None:
+                    _document_hook.commit_attempted = True
                 c.commit()
                 if c.in_transaction:
                     self._quarantine_claim_connection(c, "commit_transaction_still_active")
                     raise RuntimeError("claim_commit_transaction_still_active")
+                if _document_hook is not None:
+                    _document_hook.commit_returned = True
                 if _terminal is None:
                     self._claim_journal_committed(claim_journal_image)
                 else:
@@ -14138,7 +14163,10 @@ class MemoryWikiProvider(MemoryProvider):
                     _terminal.measurement['commit_total_changes'] = c.total_changes
                     _terminal.measurement['native_idle'] = True
             except BaseException as primary:
-                self._rollback_claim_transaction(c, primary, commit_attempted=commit_attempted)
+                rolled_back = self._rollback_claim_transaction(c, primary, commit_attempted=commit_attempted)
+                if (_document_hook is not None and _document_hook.started
+                        and not _document_hook.commit_returned):
+                    _document_hook.rollback_completed = rolled_back
                 raise
             finally:
                 if getattr(self, "_transaction_quarantine", None) is not c:
@@ -18726,6 +18754,7 @@ class MemoryWikiProvider(MemoryProvider):
             "status": selected_status, "events_deleted": 0,
             "event_ids": [], "observations_deleted": 0,
             "episodes_deleted": 0,
+            "transaction_pending": False, "privacy_intent_durable": False,
         }
         if not normalized:
             return empty_result
@@ -18743,12 +18772,13 @@ class MemoryWikiProvider(MemoryProvider):
         }
         stamp = now()
         with self._lock:
-            with c:
+            joined = c.in_transaction
+            with self._claim_transaction(c, join=True):
                 # Acquire the database write reservation before matching.  The
                 # ACL and normalized text inspected below therefore cannot be
                 # changed by another provider between authorization and update.
-                if not c.in_transaction:
-                    c.execute("BEGIN IMMEDIATE")
+                # Register this owner before event/ledger principal metadata
+                # reads. A legal outer owner keeps its own commit/rollback.
                 visible_matches = [
                     row for row in c.execute("SELECT * FROM claims ORDER BY id").fetchall()
                     if self._claim_visible(row)
@@ -18838,20 +18868,31 @@ class MemoryWikiProvider(MemoryProvider):
                                 ),
                             )
 
-        # Status triggers already maintain FTS and the semantic delete outbox
-        # in the same transaction.  Verify the derived local index and wake the
-        # remote worker after commit.
-        for claim_id in changed_ids:
-            self._upsert_fts(claim_id)
-        if changed_ids:
-            self._render_all()
-            if SEMANTIC_ENABLED and not bool(getattr(self, "_journal_recovery_active", False)):
-                _start_outbox_worker(str(self.db_path))
-                _wake_outbox_worker(str(self.db_path))
-        if episode_erasure.get("vector_deletes_queued") and not bool(
-                getattr(self, "_journal_recovery_active", False)):
-            _start_outbox_worker(str(self.db_path))
-            _wake_outbox_worker(str(self.db_path))
+        # Triggers maintain FTS/outbox in the same native transaction. A join
+        # has only staged rows, so it must not publish/render or start another
+        # transaction. The durable privacy intent survives caller rollback.
+        if not joined:
+            try:
+                for claim_id in changed_ids:
+                    self._upsert_fts(claim_id)
+                if changed_ids:
+                    self._render_all()
+                    if SEMANTIC_ENABLED and not bool(getattr(self, "_journal_recovery_active", False)):
+                        _start_outbox_worker(str(self.db_path))
+                        _wake_outbox_worker(str(self.db_path))
+                if episode_erasure.get("vector_deletes_queued") and not bool(
+                        getattr(self, "_journal_recovery_active", False)):
+                    _start_outbox_worker(str(self.db_path))
+                    _wake_outbox_worker(str(self.db_path))
+            except BaseException as primary:
+                # Native status/intent commit is already durable. Do not report
+                # success, retry/reopen, or pretend a rollback undid it when
+                # postcommit derivatives have not completed.
+                self._quarantine_claim_connection(
+                    c, "host_status_postcommit_cleanup_" + type(primary).__name__, primary,
+                )
+                primary.add_note("memory_wiki_status_postcommit_cleanup:outcome=UNKNOWN")
+                raise
         return {
             "claim_ids": changed_ids,
             "count": len(changed_ids),
@@ -18861,6 +18902,8 @@ class MemoryWikiProvider(MemoryProvider):
             "event_ids": list(event_erasure.get("event_ids") or []),
             "observations_deleted": int(event_erasure.get("observations_deleted") or 0),
             "episodes_deleted": int(episode_erasure.get("deleted") or 0),
+            "transaction_pending": joined,
+            "privacy_intent_durable": bool(erase_memory_events),
         }
 
     # ----- search/scoring -----------------------------------------------
