@@ -2,6 +2,8 @@
 
 ## Lifecycle/TX bug fix после RI-R01 checkpoint
 
+Текущий lifecycle-fix primary buildable PIN: `11a712bc5f770b95c9347895d2c6f604546c9eff`; secondary virtual PIN: `4d0d401465f00579351a6dfbfc5da9003684b3c5`. Они содержат одну и ту же принятую runtime-дельту; secondary отличается только удалением `[build-system]`. Оба заменяют прежние 5af126bf/7724d5a2 code copies, но не изменяют пользовательские stores/settings. Публикация, установка и загрузка проверяются раздельно; этот абзац не заявляет их завершёнными. Saved native7 относится к exact pre-commit runtime SHA `7ebb63ce54ea1c0fb2f56fddc2cb7a7b4aeabae3ae271fa8262c56fcc0aa51f3`, byte-equal обоим этим PIN, а не к новой повторной тестовой сессии.
+
 Исправлена отсутствующая constructor-инициализация `_transaction_quarantine`, из-за которой terminal-tail мог получить `AttributeError` и withheld вместо штатного результата. Начальное `None` задаётся **один раз в `MemoryWikiProvider.__init__`**, вместе с owner/thread/primary/cleanup defaults; на retry/initialize/reconnect карантин не сбрасывается. Genuine UNKNOWN и foreign-thread owner остаются fail-closed.
 
 Связанный lifecycle writer также исправлен: event/episode/consumer/observation записи используют существующий `_claim_transaction`; вложенная consolidation присоединяется к владельцу. Это предотвращает ложный `unowned_pending_transaction` на собственном потоке; tool admission согласован с зарегистрированным writer под прежним lock. Live retained state не очищается этим исходным изменением.
