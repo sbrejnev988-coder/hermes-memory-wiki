@@ -586,7 +586,7 @@ def privacy_store(store, monkeypatch):
                        "MEMORY_WIKI_OBSERVATIONS_ENABLED": "1"}.items():
         monkeypatch.setenv(key, value)
     provider = wiki.MemoryWikiProvider()
-    provider.initialize("authored-privacy-chat", hermes_home=str(helpers.OUT / "privacy-home"),
+    provider.initialize("authored-privacy-chat", hermes_home=str(helpers.OUT / "privacy" / "home"),
                         agent_context="test", bot_id="synthetic-privacy-bot",
                         project_id="diagnostic", visibility_scope="chat")
     try:
@@ -882,4 +882,111 @@ def test_host_erasure_unregistered_native_transaction_is_refused_before_effect(p
     assert provider._lifecycle_state == "quarantined" and provider._claim_tx_connection is None
     with pytest.raises(RuntimeError, match="provider_lifecycle_not_ready"):
         provider._connect()
+
+
+def test_host_erasure_holds_current_handle_lock_through_sql_and_postcommit(privacy_store):
+    provider, helpers = privacy_store
+    conn, phrase, cid, _, _ = privacy_seed(provider, helpers)
+    targets = {
+        provider._connect.__wrapped__.__code__: "connect",
+        provider._privacy_erasure.append.__code__: "intent",
+        provider._upsert_fts.__wrapped__.__code__: "fts",
+        provider._render_all.__wrapped__.__code__: "render",
+    }
+    observed = []
+    def profile(frame, event, arg):
+        role = targets.get(frame.f_code)
+        if event == "call" and role is not None:
+            # Observe the real RLock and handle, not a replaced owner callback.
+            assert provider._lock._is_owned()
+            assert provider._conn is provider._owned_conn is conn
+            if role == "intent":
+                assert conn.in_transaction and provider._claim_tx_connection is conn
+                assert provider._claim_tx_thread == threading.get_ident()
+            if role in {"fts", "render"}:
+                assert not conn.in_transaction and provider._claim_tx_connection is None
+            observed.append(role)
+    previous = sys.getprofile()
+    assert previous is None
+    try:
+        sys.setprofile(profile)
+        removed = provider.on_memory_write("remove", "document-intelligence", phrase, {})
+    finally:
+        sys.setprofile(previous)
+    assert set(observed) == {"connect", "intent", "fts", "render"}
+    assert removed["claim_ids"] == [cid] and not removed["transaction_pending"]
+    assert not conn.in_transaction and provider._transaction_quarantine is None
+    assert not provider._lock._is_owned()
+
+
+@pytest.mark.parametrize("outer", ["owned", "caller_rollback"])
+def test_host_erasure_enabled_intent_survives_real_cached_ingest_and_restart(privacy_store, outer):
+    provider, helpers = privacy_store
+    conn, phrase, cid, eid, episode = privacy_seed(provider, helpers)
+    expected_owner = privacy_owner(provider)
+    # Reuse the existing byte-exact SQL/cache helper under this actor's actual
+    # home. Only its authored fixture path is rebound; no parser is replaced.
+    previous_out = helpers.OUT
+    try:
+        helpers.OUT = provider.home.parent
+        graph.install_document_graph_schema(conn)
+        _, _, sid, path, _, _ = cached((provider, helpers), "enabled-privacy-cache")
+    finally:
+        helpers.OUT = previous_out
+    with provider._claim_transaction(conn):
+        conn.execute("UPDATE document_chunks SET embedding_claim_id=? WHERE source_id=?", (cid, sid))
+    before = privacy_image(conn)
+    primary = ValueError("authored-composed-erasure-caller")
+    if outer == "caller_rollback":
+        with pytest.raises(ValueError) as caught:
+            with provider._claim_transaction(conn):
+                removed = provider.on_memory_write("remove", "document-intelligence", phrase, {})
+                assert removed["transaction_pending"] and removed["privacy_intent_durable"]
+                assert conn.in_transaction and provider._claim_tx_connection is conn
+                raise primary
+        assert caught.value is primary and privacy_image(conn) == before
+    else:
+        removed = provider.on_memory_write("remove", "document-intelligence", phrase, {})
+        assert not removed["transaction_pending"] and removed["privacy_intent_durable"]
+        assert removed["claim_ids"] == [cid]
+        assert removed["events_deleted"] == removed["observations_deleted"] == removed["episodes_deleted"] == 1
+        document_before = image(conn)
+        result = graph.ingest_document(provider, {"path": str(path), "embed": False})
+        assert result["status"] == "unchanged" and image(conn) == document_before
+        assert conn.execute("SELECT status FROM claims WHERE id=?", (cid,)).fetchone()[0] == "retired"
+    assert_privacy_pending_intent(provider, expected_owner, phrase, cid)
+    ledger_bytes = provider._privacy_erasure.log_path.read_bytes()
+    home, session, bot, project = provider.home, provider.session_id, provider.bot_id, provider.project_scope
+    assert not conn.in_transaction and provider._transaction_quarantine is None
+    provider.shutdown()
+    # Genuine fresh provider/startup replay, not direct SQL emulation or reset.
+    restarted = wiki.MemoryWikiProvider()
+    try:
+        restarted.initialize(session, hermes_home=str(home), agent_context="test",
+                             bot_id=bot, project_id=project, visibility_scope="chat")
+        actual = restarted._connect()
+        document_before = image(actual)
+        with wiki._native_profile_scope(home), graph._document_profile_scope(home):
+            result = graph.ingest_document(restarted, {"path": str(path), "embed": False})
+        assert result["status"] == "unchanged" and image(actual) == document_before
+        assert restarted._privacy_erasure.log_path.read_bytes() == ledger_bytes
+        assert_privacy_pending_intent(restarted, expected_owner, phrase, cid)
+        assert actual.execute("SELECT status FROM claims WHERE id=?", (cid,)).fetchone()[0] == "retired"
+        assert actual.execute("SELECT embedding_claim_id FROM document_chunks WHERE source_id=?", (sid,)).fetchone()[0] == cid
+        assert actual.execute("SELECT 1 FROM memory_events WHERE event_id=?", (eid,)).fetchone() is None
+        assert actual.execute("SELECT 1 FROM episodic_turns WHERE id=?", (episode,)).fetchone() is None
+        assert actual.execute("SELECT 1 FROM claims_fts WHERE id=?", (cid,)).fetchone() is None
+        assert actual.execute("SELECT value FROM meta WHERE key='privacy_erasure_applied_seq'").fetchone()[0] == "1"
+        assert not actual.in_transaction and restarted._claim_tx_connection is None
+        assert restarted._transaction_quarantine is None and restarted._lifecycle_state == "ready"
+        observer = sqlite3.connect(str(restarted.db_path), timeout=0)
+        try:
+            assert observer.execute("SELECT status FROM claims WHERE id=?", (cid,)).fetchone()[0] == "retired"
+            assert observer.execute("SELECT value FROM meta WHERE key='privacy_erasure_applied_seq'").fetchone()[0] == "1"
+        finally:
+            observer.close()
+        assert actual.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+        assert not actual.execute("PRAGMA foreign_key_check").fetchall()
+    finally:
+        restarted.shutdown()
 

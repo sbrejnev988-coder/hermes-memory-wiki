@@ -18759,7 +18759,6 @@ class MemoryWikiProvider(MemoryProvider):
         if not normalized:
             return empty_result
 
-        c = self._connect()
         visible_matches: List[Any] = []
         changing: List[Any] = []
         changed_ids: List[str] = []
@@ -18772,6 +18771,10 @@ class MemoryWikiProvider(MemoryProvider):
         }
         stamp = now()
         with self._lock:
+            # Bind the current handle under the same lock that protects its SQL
+            # stage and postcommit derivatives. A released preflight handle is
+            # not a lifetime proof if another owner closes/replaces it.
+            c = self._connect()
             joined = c.in_transaction
             with self._claim_transaction(c, join=True):
                 # Acquire the database write reservation before matching.  The
@@ -18868,43 +18871,45 @@ class MemoryWikiProvider(MemoryProvider):
                                 ),
                             )
 
-        # Triggers maintain FTS/outbox in the same native transaction. A join
-        # has only staged rows, so it must not publish/render or start another
-        # transaction. The durable privacy intent survives caller rollback.
-        if not joined:
-            try:
-                for claim_id in changed_ids:
-                    self._upsert_fts(claim_id)
-                if changed_ids:
-                    self._render_all()
-                    if SEMANTIC_ENABLED and not bool(getattr(self, "_journal_recovery_active", False)):
+            # Triggers maintain FTS/outbox in the same native transaction. A
+            # join has only staged rows: no publish/render or second TX. Its
+            # durable privacy intent deliberately survives caller rollback.
+            # Keep this lock through derivatives too, so another cooperating
+            # lifecycle owner cannot replace the committed handle underneath
+            # this status operation and its retained UNKNOWN diagnostic.
+            if not joined:
+                try:
+                    for claim_id in changed_ids:
+                        self._upsert_fts(claim_id)
+                    if changed_ids:
+                        self._render_all()
+                        if SEMANTIC_ENABLED and not bool(getattr(self, "_journal_recovery_active", False)):
+                            _start_outbox_worker(str(self.db_path))
+                            _wake_outbox_worker(str(self.db_path))
+                    if episode_erasure.get("vector_deletes_queued") and not bool(
+                            getattr(self, "_journal_recovery_active", False)):
                         _start_outbox_worker(str(self.db_path))
                         _wake_outbox_worker(str(self.db_path))
-                if episode_erasure.get("vector_deletes_queued") and not bool(
-                        getattr(self, "_journal_recovery_active", False)):
-                    _start_outbox_worker(str(self.db_path))
-                    _wake_outbox_worker(str(self.db_path))
-            except BaseException as primary:
-                # Native status/intent commit is already durable. Do not report
-                # success, retry/reopen, or pretend a rollback undid it when
-                # postcommit derivatives have not completed.
-                self._quarantine_claim_connection(
-                    c, "host_status_postcommit_cleanup_" + type(primary).__name__, primary,
-                )
-                primary.add_note("memory_wiki_status_postcommit_cleanup:outcome=UNKNOWN")
-                raise
-        return {
-            "claim_ids": changed_ids,
-            "count": len(changed_ids),
-            "matched_count": len(all_match_ids),
-            "status": selected_status,
-            "events_deleted": int(event_erasure.get("deleted") or 0),
-            "event_ids": list(event_erasure.get("event_ids") or []),
-            "observations_deleted": int(event_erasure.get("observations_deleted") or 0),
-            "episodes_deleted": int(episode_erasure.get("deleted") or 0),
-            "transaction_pending": joined,
-            "privacy_intent_durable": bool(erase_memory_events),
-        }
+                except BaseException as primary:
+                    # Native status/intent commit is already durable. Do not
+                    # report success or pretend rollback undid derivatives.
+                    self._quarantine_claim_connection(
+                        c, "host_status_postcommit_cleanup_" + type(primary).__name__, primary,
+                    )
+                    primary.add_note("memory_wiki_status_postcommit_cleanup:outcome=UNKNOWN")
+                    raise
+            return {
+                "claim_ids": changed_ids,
+                "count": len(changed_ids),
+                "matched_count": len(all_match_ids),
+                "status": selected_status,
+                "events_deleted": int(event_erasure.get("deleted") or 0),
+                "event_ids": list(event_erasure.get("event_ids") or []),
+                "observations_deleted": int(event_erasure.get("observations_deleted") or 0),
+                "episodes_deleted": int(episode_erasure.get("deleted") or 0),
+                "transaction_pending": joined,
+                "privacy_intent_durable": bool(erase_memory_events),
+            }
 
     # ----- search/scoring -----------------------------------------------
 
