@@ -14790,8 +14790,12 @@ class MemoryWikiProvider(MemoryProvider):
             # order, and internal punctuation. A bag of words cannot prove
             # which actor owns a predicate/object or its negation. Ambiguous
             # paraphrases stay in changed/needs-review rather than confirmed.
+            # Limit casing equivalence to ASCII. Unicode lower/casefold can
+            # collapse distinct actors (Maße/Masse, Kira/Kira); an unproved
+            # Unicode casing equivalence must remain a needs-review result.
+            ascii_case = str.maketrans('ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')
             def signature(value: str):
-                return tuple(re.findall(r"\w+|[^\w\s]", value.casefold().rstrip('.!? ')))
+                return tuple(re.findall(r"\w+|[^\w\s]", value.translate(ascii_case).rstrip('.!? ')))
             return bool(a.strip() and b.strip()) and signature(a) == signature(b)
         for r in rows:
             claim=str(r.get('claim',''))

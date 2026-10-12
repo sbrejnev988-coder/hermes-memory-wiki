@@ -44,6 +44,15 @@ CASES=[
  ('Mira не только одобряет план.','Mira не только одобряет план.',True),
  ('Mira approves the plan.','Mira approves the plan',True),
  ('Mira approves PlanA. Lev approves PlanB.','Lev approves PlanB. Mira approves PlanA.',False),
+ ('Maße approves PlanA, Masse does not approve PlanB.','Masse approves PlanA, Maße does not approve PlanB.',False),
+ ('Maße approves PlanA, Masse does not approve PlanB.','Maße approves PlanA, Masse does not approve PlanB.',True),
+ ('Kira approves PlanA, Kira does not approve PlanB.','Kira approves PlanA, Kira does not approve PlanB.',False),
+ # Native trust normalization changes compatibility characters before the
+ # classifier. That rendered assertion cannot prove the original actor names.
+ ('Kira approves PlanA, Kira does not approve PlanB.','Kira approves PlanA, Kira does not approve PlanB.',False),
+ ('ﬃra approves PlanA, ffira does not approve PlanB.','ffira approves PlanA, ﬃra does not approve PlanB.',False),
+ ('ﬃra approves PlanA, ffira does not approve PlanB.','ﬃra approves PlanA, ffira does not approve PlanB.',False),
+ ('Мира одобряет план.','мира одобряет план.',False),
 ]
 @pytest.mark.parametrize('memory,current,confirmed',CASES)
 def test_direct_diff_polarity(provider,memory,current,confirmed):
@@ -60,4 +69,8 @@ def test_direct_diff_polarity(provider,memory,current,confirmed):
         assert result['changed_or_conflicting'][0]['kind'] in ('conflict','related_changed_or_needs_review')
         assert 'Prefer verified_now' in result['answer_basis']
     assert result['verified_now']
+    if memory == current and any(symbol in memory for symbol in ('K', 'ﬃ')):
+        import unicodedata
+        assert result['remembered'][0]['claim'] == unicodedata.normalize('NFKC', memory)[:len(memory)]
+        assert result['remembered'][0]['claim'] != current
     assert provider._transaction_quarantine is None and provider._lifecycle_state=='ready'
