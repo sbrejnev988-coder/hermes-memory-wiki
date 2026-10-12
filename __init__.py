@@ -14784,6 +14784,15 @@ class MemoryWikiProvider(MemoryProvider):
         def sim(a: str, b: str) -> float:
             ta=tokens(a); tb=tokens(b)
             return len(ta & tb)/max(1, len(ta | tb))
+        def same_statement(a: str, b: str) -> bool:
+            # Overlap is relatedness, not evidence of equivalent assertions.
+            # Keep every word (including one-letter actors and negators), its
+            # order, and internal punctuation. A bag of words cannot prove
+            # which actor owns a predicate/object or its negation. Ambiguous
+            # paraphrases stay in changed/needs-review rather than confirmed.
+            def signature(value: str):
+                return tuple(re.findall(r"\w+|[^\w\s]", value.casefold().rstrip('.!? ')))
+            return bool(a.strip() and b.strip()) and signature(a) == signature(b)
         for r in rows:
             claim=str(r.get('claim',''))
             row_min={'id':r.get('id'), 'topic':r.get('topic'), 'type':r.get('type'), 'status':r.get('status'), 'claim':short(claim,500), 'confidence':r.get('confidence'), 'salience':r.get('salience'), 'trust_score':r.get('trust_score'), 'freshness_at':r.get('freshness_at'), 'verification_status':r.get('verification_status'), 'score':r.get('score')}
@@ -14791,11 +14800,13 @@ class MemoryWikiProvider(MemoryProvider):
             best_fact=''; best_score=0.0
             for f in facts:
                 s=sim(claim, f)
-                if s > best_score:
+                if s > best_score or (s == best_score and same_statement(claim, f)
+                                      and not same_statement(claim, best_fact)):
                     best_score=s; best_fact=f
             stale=self._is_stale(int(r.get('freshness_at') or 0))
             unverified=str(r.get('verification_status') or 'unverified') not in ('verified','current')
-            if facts and best_score >= .62 and neg(claim) == neg(best_fact):
+            if (facts and best_score >= .62 and neg(claim) == neg(best_fact)
+                    and same_statement(claim, best_fact)):
                 confirmed.append({'claim_id':r.get('id'), 'match':round(best_score,3), 'verified_fact':best_fact, 'claim':short(claim,360)})
             elif facts and best_score >= .38:
                 changed.append({'claim_id':r.get('id'), 'match':round(best_score,3), 'memory_negated':neg(claim), 'fact_negated':neg(best_fact), 'verified_fact':best_fact, 'claim':short(claim,360), 'kind':'conflict' if neg(claim) != neg(best_fact) else 'related_changed_or_needs_review'})
