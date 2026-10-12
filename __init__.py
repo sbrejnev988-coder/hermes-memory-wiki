@@ -7117,6 +7117,7 @@ class MemoryWikiProvider(MemoryProvider):
         # Joined documents retain their original authority here until native
         # completion is proved; UNKNOWN must not reset this constructor state.
         self._claim_tx_document_stage = None
+        self._claim_tx_graph_stage = None
         self._transaction_quarantine = None
         self._transaction_primary = None
         self._transaction_cleanup_notes = ()
@@ -14389,7 +14390,7 @@ class MemoryWikiProvider(MemoryProvider):
 
 
     @contextmanager
-    def _claim_transaction(self, conn=None, *, join=False, adopt=False, begin="IMMEDIATE", _terminal=None, _document_hook=None, _document_ingest=None):
+    def _claim_transaction(self, conn=None, *, join=False, adopt=False, begin="IMMEDIATE", _terminal=None, _document_hook=None, _document_ingest=None, _graph_effect=None):
         """One SQLite owner stage; joined callers never commit another owner's TX.
 
         Used by claim/ledger owners and the private writer's native context API.
@@ -14416,6 +14417,7 @@ class MemoryWikiProvider(MemoryProvider):
             previous = getattr(self, "_claim_tx_connection", None)
             previous_thread = getattr(self, "_claim_tx_thread", None)
             previous_document_stage = self._claim_tx_document_stage
+            previous_graph_stage = self._claim_tx_graph_stage
             if active and join and c is self._conn and previous is not c:
                 self._quarantine_claim_connection(c, "unowned_pending_transaction")
                 raise RuntimeError("claim_transaction_owner_pending")
@@ -14451,12 +14453,26 @@ class MemoryWikiProvider(MemoryProvider):
                             or type(previous_document_stage[2]) is not list):
                         raise RuntimeError("document_ingest_owner_stage_unproven")
                     previous_document_stage[2].append(_document_ingest)
+                if _graph_effect is not None:
+                    if (previous is not c or previous_thread != threading.get_ident()
+                            or type(previous_graph_stage) is not tuple
+                            or len(previous_graph_stage) != 3
+                            or previous_graph_stage[0] is not c
+                            or previous_graph_stage[1] != previous_thread
+                            or type(previous_graph_stage[2]) is not list):
+                        raise RuntimeError("graph_effect_owner_stage_unproven")
+                    previous_graph_stage[2].append(_graph_effect)
+                    self._assert_graph_effects(c, (_graph_effect,))
                 yield c
                 return
             self._claim_tx_connection = c
             self._claim_tx_thread = threading.get_ident()
             document_stage = (c, self._claim_tx_thread, [])
             self._claim_tx_document_stage = document_stage
+            graph_stage = (c, self._claim_tx_thread, [])
+            self._claim_tx_graph_stage = graph_stage
+            if _graph_effect is not None:
+                graph_stage[2].append(_graph_effect)
             if _document_ingest is not None:
                 document_stage[2].append(_document_ingest)
             commit_attempted = False
@@ -14466,6 +14482,8 @@ class MemoryWikiProvider(MemoryProvider):
                     c.execute("BEGIN" + (" " + begin if begin else ""))
                 if _document_hook is not None:
                     _document_hook.started = True
+                if graph_stage[2]:
+                    self._assert_graph_effects(c, graph_stage[2])
                 yield c
                 if not c.in_transaction:
                     self._quarantine_claim_connection(c, "transaction_ended_before_owner_finish")
@@ -14482,6 +14500,11 @@ class MemoryWikiProvider(MemoryProvider):
                         or _terminal.phase != 'verify' or _terminal.measurement is None
                         or c.total_changes != _terminal.measurement['after_changes']):
                     raise _DeliveryWithheld("terminal_commit_provenance_unproven")
+                # Run lease callbacks BEFORE the final source/authority reads.
+                # A callback for a later join must not invalidate an earlier
+                # admission after that admission was already checked.
+                if graph_stage[2]:
+                    self._assert_graph_effects(c, graph_stage[2], callbacks_only=True)
                 if document_stage[2]:
                     # Journal/hook preparation and the outer caller body may
                     # run after a joined ingest returns. Check EVERY original
@@ -14496,6 +14519,14 @@ class MemoryWikiProvider(MemoryProvider):
                     from .document_knowledge_graph import _assert_ingest_authority
                     for source_id, admission in document_stage[2]:
                         _assert_ingest_authority(self, c, source_id, admission, before=False)
+                if graph_stage[2]:
+                    if (self._claim_tx_connection is not c
+                            or self._claim_tx_thread != graph_stage[1]
+                            or graph_stage[1] != threading.get_ident()
+                            or self._claim_tx_graph_stage is not graph_stage):
+                        self._quarantine_claim_connection(c, "graph_effect_owner_stage_changed")
+                        raise RuntimeError("graph_effect_owner_stage_unproven")
+                    self._assert_graph_effects(c, graph_stage[2], check_callbacks=False)
                 commit_attempted = True  # Only immediately before actual commit.
                 if _document_hook is not None:
                     _document_hook.commit_attempted = True
@@ -14529,6 +14560,9 @@ class MemoryWikiProvider(MemoryProvider):
                     if self._claim_tx_document_stage is document_stage:
                         document_stage[2].clear()
                         self._claim_tx_document_stage = previous_document_stage
+                    if self._claim_tx_graph_stage is graph_stage:
+                        graph_stage[2].clear()
+                        self._claim_tx_graph_stage = previous_graph_stage
                     self._claim_tx_connection = previous
                     self._claim_tx_thread = previous_thread
 
@@ -22531,28 +22565,85 @@ class MemoryWikiProvider(MemoryProvider):
             pass
         return {'id':tid,'claim_id':cid}
 
-    def _graph_owner(self, a: Dict[str, Any]) -> Dict[str, Any]:
+    def _graph_effect_actor(self):
+        chat_hash = self._chat_hash(self.session_id)
+        return (str(self.bot_id), str(self.session_id), chat_hash,
+                str(self.project_scope), str(self.default_visibility), str(self.home),
+                bool(getattr(self, "_journal_recovery_active", False)))
+
+    @staticmethod
+    def _graph_source_eligible(claim):
+        stamp = now()
+        if (str(claim["status"]) != "active"
+                or str(claim["temporal_status"] or "current") not in {"current", ""}
+                or str(claim["risk"] or "").lower() == "secret"
+                or int(claim["quarantined_at"] or 0) > 0
+                or int(claim["valid_from"] or 0) > stamp
+                or 0 < int(claim["valid_to"] or 0) <= stamp):
+            raise PermissionError("graph_source_not_eligible")
+
+    def _assert_graph_effects(self, conn, admissions, *, callbacks_only=False, check_callbacks=True):
+        self._require_claim_writer(conn, transaction=True)
+        if check_callbacks:
+            for _, _, _, job_admission in admissions:
+                if job_admission is not None:
+                    _, _, _, lease_valid, lease_in_tx = job_admission
+                    callback = lease_in_tx if lease_in_tx is not None else lease_valid
+                    if callback is not None and not (callback(conn) if lease_in_tx is not None else callback()):
+                        raise TimeoutError("graph_original_lease_lost")
+        if callbacks_only:
+            return
+        actor = self._graph_effect_actor()
+        for original_actor, source_id, source_image, job_admission in admissions:
+            if actor != original_actor:
+                raise PermissionError("graph_original_owner_changed")
+            if source_id:
+                row = conn.execute("SELECT rowid AS _graph_rowid,* FROM claims WHERE id=?", (source_id,)).fetchone()
+                # The original row was admitted by the real ACL. Exact actor
+                # and full-row equality preserve it without another late
+                # _chat_hash/ACL callback after the final source read.
+                if row is None or (tuple(row.keys()), tuple(row)) != source_image:
+                    raise PermissionError("graph_original_source_changed")
+                self._graph_source_eligible(row)
+        # Token/generation/expiry are read LAST, after all source checks. A
+        # source-read callback must not expire a previously checked lease.
+        for original_actor, source_id, _, job_admission in admissions:
+            if job_admission is not None:
+                original_source, job_actor, original_job, _, _ = job_admission
+                job = dict(original_job)
+                store = _background_jobs.JobStore(self.db_path, job["profile_key"], job["owner_key"])
+                worker_id = str(job["lease_owner"]).split(":", 1)[0]
+                if (job_actor != original_actor or source_id != original_source["id"]
+                        or _background_jobs.profile_key(self) != job["profile_key"]
+                        or _background_jobs.owner_key(self) != job["owner_key"]
+                        or not store.owns(job, worker_id, connection=conn)):
+                    raise TimeoutError("graph_original_lease_lost")
+
+
+    def _graph_owner(self, a: Dict[str, Any], *, conn=None) -> Dict[str, Any]:
         """Resolve an edge/vertex owner from a visible claim or this consumer.
 
         Caller-supplied bot/session/chat identity is deliberately ignored. A
         project owner must be the provider's active project, not an arbitrary
         project supplied in a tool argument.
         """
+        actor = self._graph_effect_actor()
         source_claim_id = str(a.get("source_claim_id") or "").strip()
-        if source_claim_id and getattr(self, "_journal_recovery_active", False):
-            # Trusted replay must reconstruct an edge from its durable source
-            # even when recovery runs under a different consumer identity.
-            claim = self._connect().execute("SELECT * FROM claims WHERE id=?", (source_claim_id,)).fetchone()
-            if claim is None:
-                raise ValueError("source claim not found during graph replay")
-        else:
-            claim = self._require_visible_claim(source_claim_id) if source_claim_id else None
-        if claim is not None and str(claim["status"]) != "active":
-            raise ValueError("source claim is not active")
-        if (claim is not None and not getattr(self, "_journal_recovery_active", False)
-                and (str(claim["risk"] or "").lower() == "secret"
-                     or int(claim["quarantined_at"] or 0) > 0)):
-            raise ValueError("source claim is not eligible for graph publication")
+        c = self._connect() if conn is None else conn
+        self._require_claim_writer(c)
+        claim = c.execute("SELECT rowid AS _graph_rowid,* FROM claims WHERE id=?", (source_claim_id,)).fetchone() if source_claim_id else None
+        replay = bool(getattr(self, "_journal_recovery_active", False))
+        if source_claim_id and (claim is None or (not replay and not self._claim_visible(claim))):
+            raise ValueError("graph source claim not found")
+        if claim is not None:
+            self._graph_source_eligible(claim)
+        job_admission = getattr(self, "_graph_job_admission", None)
+        if job_admission is not None:
+            original_source, original_actor, _, _, _ = job_admission
+            if (claim is None or source_claim_id != original_source["id"]
+                    or tuple(claim.keys()) != tuple(original_source.keys())
+                    or tuple(claim) != tuple(original_source) or actor != original_actor):
+                raise PermissionError("graph_original_source_changed")
         scope = str(claim["visibility_scope"] if claim else a.get("visibility_scope") or self.default_visibility or "global").lower()
         if scope not in {"global", "bot", "chat", "private", "project"}:
             raise ValueError("invalid graph visibility_scope")
@@ -22579,6 +22670,12 @@ class MemoryWikiProvider(MemoryProvider):
             "project": "project:" + project_id,
         }[scope]
         owner["claim"] = claim
+        # Source-bound vertices never coalesce with ownerless or other-source
+        # vertices, even when their display names and reader partition agree.
+        owner["entity_identity"] = owner["identity"] + ("\0claim:" + source_claim_id if source_claim_id else "")
+        owner["admission"] = (actor, source_claim_id,
+            (tuple(claim.keys()), tuple(claim)) if claim is not None else None,
+            job_admission)
         return owner
 
     @staticmethod
@@ -22612,7 +22709,7 @@ class MemoryWikiProvider(MemoryProvider):
                 return False
         return True
 
-    def _add_entity(self,a):
+    def _add_entity(self,a, *, conn=None):
         raw_name=str(a.get('name') or '')
         raw_aliases=list(a.get('aliases') or [])
         raw_notes=str(a.get('notes') or '')
@@ -22621,16 +22718,17 @@ class MemoryWikiProvider(MemoryProvider):
         aliases=[normalize_claim(redact_secrets(str(x))) for x in raw_aliases if normalize_claim(redact_secrets(str(x)))]
         notes=normalize_claim(redact_secrets(raw_notes))
         if not name: raise ValueError('empty entity name')
-        owner=self._graph_owner(a)
-        eid,h=self._graph_entity_key(name,et,owner['identity'])
-        before=self._table_row('entities', eid)
+        c = conn if conn is not None else (self._claim_tx_connection or self._connect())
+        owner=self._graph_owner(a, conn=c)
+        eid,h=self._graph_entity_key(name,et,owner['entity_identity'])
+        before=self._table_row('entities', eid, conn=c)
         if secret_scan(raw_name+' '+json.dumps(raw_aliases, ensure_ascii=False)+' '+raw_notes).get('raw_secret'):
             raw_payload=raw_name+'\n'+json.dumps(raw_aliases, ensure_ascii=False)+'\n'+raw_notes
             self._quarantine_secret('entities', eid, 'payload', raw_payload, 'add_entity_raw_secret')
             self._make_secret_index_from_raw('entities', eid, 'payload', raw_payload, name+'\n'+json.dumps(aliases, ensure_ascii=False)+'\n'+notes)
         valid_from=max(0,int(a.get('valid_from') or 0)); valid_to=max(0,int(a.get('valid_to') or 0))
         if valid_to and valid_to<=valid_from: raise ValueError('valid_to must exceed valid_from')
-        with self._claim_transaction() as c:
+        with self._claim_transaction(c, join=True, _graph_effect=owner['admission']) as c:
             c.execute('''INSERT INTO entities(id,name,entity_type,aliases,notes,updated_at,hash,visibility_scope,origin_bot_id,origin_session_id,origin_chat_hash,project_id,source_claim_id,valid_from,valid_to)
                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET aliases=excluded.aliases,notes=excluded.notes,updated_at=excluded.updated_at,source_claim_id=excluded.source_claim_id,valid_from=excluded.valid_from,valid_to=excluded.valid_to''',
                       (eid,name,et,json.dumps(aliases,ensure_ascii=False),notes,now(),h,owner['visibility_scope'],owner['origin_bot_id'],owner['origin_session_id'],owner['origin_chat_hash'],owner['project_id'],owner['source_claim_id'],valid_from,valid_to))
@@ -22654,7 +22752,7 @@ class MemoryWikiProvider(MemoryProvider):
         "related_to",                # fallback: co-occurrence (слабый)
     })
 
-    def _add_relation(self,a):
+    def _add_relation(self,a, *, conn=None):
         raw_subj=str(a.get('subject') or ''); raw_obj=str(a.get('object') or ''); raw_ev=str(a.get('evidence') or '')
         subj=normalize_claim(redact_secrets(raw_subj))
         pred=slug(a.get('predicate') or 'related_to')
@@ -22662,30 +22760,31 @@ class MemoryWikiProvider(MemoryProvider):
             pred = 'related_to'  # безопасный fallback вместо неизвестного типа
         obj=normalize_claim(redact_secrets(raw_obj)); evidence=normalize_claim(redact_secrets(raw_ev))
         if not subj or not obj: raise ValueError('empty relation endpoint')
-        owner=self._graph_owner(a)
+        c = conn if conn is not None else (self._claim_tx_connection or self._connect())
+        owner=self._graph_owner(a, conn=c)
         source_claim_id=owner['source_claim_id']
         claim=owner['claim']
         valid_from=max(0,int(a.get('valid_from') or (claim['valid_from'] or claim['event_at'] or claim['created_at'] if claim else 0) or 0))
         valid_to=max(0,int(a.get('valid_to') or (claim['valid_to'] if claim else 0) or 0))
         if valid_to and valid_to<=valid_from: raise ValueError('valid_to must exceed valid_from')
-        subj_id,subj_hash=self._graph_entity_key(subj,'thing',owner['identity'])
-        obj_id,obj_hash=self._graph_entity_key(obj,'thing',owner['identity'])
+        subj_id,subj_hash=self._graph_entity_key(subj,'thing',owner['entity_identity'])
+        obj_id,obj_hash=self._graph_entity_key(obj,'thing',owner['entity_identity'])
         h=sha('relation\0'+owner['identity']+'\0'+source_claim_id+'\0'+subj.casefold()+'\0'+pred+'\0'+obj.casefold()); rid='rel_'+h[:20]
-        before=self._table_row('relations', rid)
+        before=self._table_row('relations', rid, conn=c)
         if secret_scan(raw_subj+' '+raw_obj+' '+raw_ev).get('raw_secret'):
             raw_payload=raw_subj+'\n'+raw_obj+'\n'+raw_ev
             self._quarantine_secret('relations', rid, 'payload', raw_payload, 'add_relation_raw_secret')
             self._make_secret_index_from_raw('relations', rid, 'payload', raw_payload, subj+'\n'+obj+'\n'+evidence)
         source_ref=(str(claim['source_ref'] or '') or ('claim:' + source_claim_id)) if claim else 'tool:memory_wiki_add_relation'
-        endpoint_before={eid:self._table_row('entities',eid) for eid in {subj_id,obj_id}}
-        with self._claim_transaction() as c:
+        endpoint_before={eid:self._table_row('entities',eid,conn=c) for eid in {subj_id,obj_id}}
+        with self._claim_transaction(c, join=True, _graph_effect=owner['admission']) as c:
             for endpoint_id,endpoint_name,endpoint_hash in ((subj_id,subj,subj_hash),(obj_id,obj,obj_hash)):
-                c.execute('''INSERT OR IGNORE INTO entities(id,name,entity_type,aliases,notes,updated_at,hash,visibility_scope,origin_bot_id,origin_session_id,origin_chat_hash,project_id)
-                             VALUES(?,?,'thing','[]','',?,?,?,?,?,?,?)''',
-                          (endpoint_id,endpoint_name,now(),endpoint_hash,owner['visibility_scope'],owner['origin_bot_id'],owner['origin_session_id'],owner['origin_chat_hash'],owner['project_id']))
+                c.execute('''INSERT OR IGNORE INTO entities(id,name,entity_type,aliases,notes,updated_at,hash,visibility_scope,origin_bot_id,origin_session_id,origin_chat_hash,project_id,source_claim_id,valid_from,valid_to)
+                             VALUES(?,?,'thing','[]','',?,?,?,?,?,?,?,?,?,?)''',
+                          (endpoint_id,endpoint_name,now(),endpoint_hash,owner['visibility_scope'],owner['origin_bot_id'],owner['origin_session_id'],owner['origin_chat_hash'],owner['project_id'],source_claim_id,valid_from,valid_to))
             c.execute('''INSERT INTO relations(id,subject,predicate,object,confidence,evidence,created_at,hash,visibility_scope,origin_bot_id,origin_session_id,origin_chat_hash,project_id,source_claim_id,valid_from,valid_to,subject_id,object_id,source_ref)
                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                         ON CONFLICT(id) DO UPDATE SET confidence=excluded.confidence,evidence=excluded.evidence,source_ref=excluded.source_ref,valid_from=excluded.valid_from,valid_to=excluded.valid_to''',
+                         ON CONFLICT(id) DO UPDATE SET confidence=excluded.confidence,evidence=excluded.evidence,source_ref=excluded.source_ref,valid_from=excluded.valid_from,valid_to=excluded.valid_to,subject_id=excluded.subject_id,object_id=excluded.object_id''',
                       (rid,subj,pred,obj,clamp(float(a.get('confidence',.8))),evidence,now(),h,owner['visibility_scope'],owner['origin_bot_id'],owner['origin_session_id'],owner['origin_chat_hash'],owner['project_id'],source_claim_id,valid_from,valid_to,subj_id,obj_id,source_ref))
             for endpoint_id,before_entity in endpoint_before.items():
                 if not before_entity:

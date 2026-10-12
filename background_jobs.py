@@ -628,7 +628,7 @@ def _run_job(
     if kind == "enrich_claim_graph":
         with provider._lock:
             source = provider._connect().execute(
-                "SELECT * FROM claims WHERE id=? AND status='active' AND temporal_status='current'",
+                "SELECT rowid AS _graph_rowid,* FROM claims WHERE id=? AND status='active' AND temporal_status='current'",
                 (payload["claim_id"],),
             ).fetchone()
         if source is None:
@@ -636,16 +636,41 @@ def _run_job(
         partition = _digest(str(source["origin_bot_id"]), str(source["origin_chat_hash"]), payload["claim_id"])
         if partition != job["partition_key"] or str(source["origin_bot_id"]) != str(provider.bot_id):
             return "owner_mismatch"
+        if job["profile_key"] != profile_key(provider) or job["owner_key"] != owner_key(provider):
+            return "owner_mismatch"
         worker = _worker_provider(provider, source)
+        worker._graph_job_admission = (source, worker._graph_effect_actor(),
+            tuple(dict(job).items()), lease_valid, lease_valid_in_transaction)
+        primary = None
         try:
             result = worker._auto_graph_enrich_extracted_claims([payload["claim_id"]])
             if int(result.get("errors") or 0) > 0:
                 return "provider"
             if int(result.get("deadline_exhausted") or 0) > 0:
                 return "timeout"
+        except BaseException as exc:
+            primary = exc
+            raise
         finally:
-            if worker._conn:
-                worker._conn.close()
+            try:
+                if worker._transaction_quarantine is None and worker._conn is not None:
+                    worker._conn.close()
+                    worker._conn = None
+                    worker._owned_conn = None
+            except BaseException as cleanup:
+                worker._quarantine_claim_connection(worker._owned_conn, "graph_worker_close_UNKNOWN", primary or cleanup)
+                if primary is None:
+                    primary = cleanup
+                    raise
+                primary.add_note("memory_wiki_graph_worker_cleanup:close_UNKNOWN")
+            finally:
+                if worker._transaction_quarantine is not None:
+                    # The copied worker is the actual owner. Retain it, its
+                    # admissions and primary; closing/reconnecting is not recovery.
+                    with provider._lock:
+                        provider._graph_effect_quarantined_worker = worker
+                        provider._quarantine_claim_connection(worker._transaction_quarantine,
+                            "graph_worker_owner_retained", worker._transaction_primary or primary)
         return ""
 
     source = _event_source(provider, job, payload)
