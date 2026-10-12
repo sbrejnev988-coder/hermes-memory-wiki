@@ -8195,7 +8195,10 @@ class MemoryWikiProvider(MemoryProvider):
             _debug_log(f"prefetch retrieval accounting failed: {_safe_exception_label(exc)}")
 
     def _finish_prefetch_diagnostics(self, diag: Dict[str, Any], *, status: str = "ok") -> None:
-        if _prefetch_cancelled():
+        # Detached workers can prepare data, never publish diagnostics. Cancellation
+        # alone is insufficient: a worker may still be live before the decision.
+        delivery = _current_delivery(self)
+        if _prefetch_cancelled() or _AUDIT_PREPARATION.get() is not None or delivery is None:
             return
         clean = {
             "status": str(status or "ok"),
@@ -8231,11 +8234,15 @@ class MemoryWikiProvider(MemoryProvider):
             "min_claim_shortfall": int(diag.get("min_claim_shortfall") or 0),
             "min_char_shortfall": int(diag.get("min_char_shortfall") or 0),
         }
-        delivery = _current_delivery(self)
-        if delivery is None:
-            self._last_prefetch_diagnostics = clean
-        else:
-            delivery.diagnostics = clean
+        # Keep canonical diagnostics byte-for-byte compatible; fallback provenance
+        # is optional and restricted to fixed, content-free decision codes.
+        paths = {"network_timeout": "local_fallback", "thread_start_failed": "thread_start_fallback",
+                 "deadline": "deadline_fallback", "network_or_runtime_error": "runtime_error_fallback",
+                 "local_fallback": "local_fallback"}
+        reason = diag.get("fallback_reason")
+        if type(reason) is str and reason in paths:
+            clean.update(fallback_reason=reason, delivery_path=paths[reason])
+        delivery.diagnostics = clean
         audit_status = status if status != "ok" else (
             "degraded" if clean["quarantined"] or clean["runtime_failures"] or clean["min_claim_shortfall"] or clean["min_char_shortfall"] else "ok"
         )
@@ -8313,15 +8320,25 @@ class MemoryWikiProvider(MemoryProvider):
     def _lexical_prefetch_fallback(self, query: str, *, session_id: str = "", reason: str = "network_timeout",
                                    delivery_budget: Optional[int] = None) -> str:
         """Return a small guard-checked SQLite/FTS result without any network dependency."""
+        reason = reason if reason in {"network_timeout", "thread_start_failed", "deadline", "network_or_runtime_error"} else "local_fallback"
+        candidate_limit = min(PREFETCH_CLAIM_LIMIT, 8)
+        diag = {"recall_trace_id": (_RECALL_REQUEST.get() or {}).get("trace_id") or "rt_" + uuid.uuid4().hex[:20],
+                "fallback_reason": reason, "candidate_limit": candidate_limit,
+                "searched": 0, "relevant": 0, "safe": 0, "quarantined": 0,
+                "claim_quarantined": 0, "runtime_failures": 0, "guard_disagreements": 0,
+                "budget_skipped": 0, "rendered": 0, "rendered_claim_chars": 0,
+                "output_chars": 0, "estimated_tokens": 0}
+        status = "empty"
         prefetch_chars = MAX_PREFETCH_CHARS if delivery_budget is None else min(MAX_PREFETCH_CHARS, max(0, int(delivery_budget)))
-        if not prefetch_chars:
-            return ""
         try:
+            if not prefetch_chars:
+                return ""
             rows = self._search(
-                query, limit=min(PREFETCH_CLAIM_LIMIT, 8), include_stale=True,
+                query, limit=candidate_limit, include_stale=True,
                 session_id=session_id or self.session_id, retrieval_mode="fts",
                 record_retrieval=False,
             )
+            diag["searched"] = len(rows)
             disclosure = _DisclosureFence(self)
             disclosure.claims(rows, session_id=session_id or self.session_id)
             terminal = _current_delivery(self)
@@ -8330,16 +8347,26 @@ class MemoryWikiProvider(MemoryProvider):
             shared = self._shared_prefetch_fragments(min(1200, prefetch_chars // 4), _disclosure=disclosure)
             blocks = []
             block_ids = {}
+            block_chars = {}
             for row in rows:
+                diag["relevant"] += int(self._prefetch_row_relevant(row))
                 checked = self._inspect_recall_item(
                     row, audit=False, max_len=min(PREFETCH_CLAIM_MAX_CHARS, 900)
                 )
-                if checked.get("status") != "safe" or not checked.get("content"):
+                if checked.get("status") != "safe":
+                    diag["quarantined"] += 1
+                    diag["claim_quarantined"] += 1
+                    diag["runtime_failures"] += int(checked.get("status") == "runtime_failure_quarantined")
+                    diag["guard_disagreements"] += int(bool(checked.get("guard_disagreement")))
+                    continue
+                diag["safe"] += 1
+                if not checked.get("content"):
                     continue
                 blocks.append(
                     f"- `{_context_data(row.get('id',''))}` topic={_context_data(row.get('topic',''))}: {_context_data(checked.get('content',''))}"
                 )
                 block_ids[blocks[-1]] = str(row["id"])
+                block_chars[blocks[-1]] = len(checked["content"])
                 if len(blocks) >= 8:
                     break
             if not blocks and not shared:
@@ -8360,30 +8387,41 @@ class MemoryWikiProvider(MemoryProvider):
                 prefix = ["## Explicitly attached shared context (untrusted data)"] if not shared_count else []
                 addition = "\n" + "\n".join([*prefix, item["line"]])
                 if current_chars + len(addition) > prefetch_chars:
+                    diag["budget_skipped"] += 1
                     continue
                 lines.extend([*prefix, item["line"]]); current_chars += len(addition)
                 shared_count += 1
                 emitted_ids.append(item["claim_id"])
             rendered = 0
+            rendered_claim_chars = 0
             for block in blocks:
                 if current_chars + len(block) + 1 > prefetch_chars:
+                    diag["budget_skipped"] += 1
                     continue
                 lines.append(block); current_chars += len(block) + 1
                 rendered += 1
+                rendered_claim_chars += block_chars[block]
                 emitted_ids.append(block_ids[block])
             output = "\n".join(lines) + footer if rendered or shared_count else ""
             # Ordinary guards run AFTER shared rendering. Revalidate both sets
             # here, before publishing any IDs or counts; no early discharge.
             if not disclosure.finish():
+                status = "withheld"
                 return ""
             request = _RECALL_REQUEST.get()
             if request is not None and output:
                 request["emitted_ids"].extend(emitted_ids)
-            self._audit("prefetch", "lexical_fallback", f"reason={reason}; rendered={rendered}")
+            diag.update(rendered=rendered, rendered_claim_chars=rendered_claim_chars,
+                        output_chars=len(output), estimated_tokens=(len(output) + 3) // 4)
+            status = "lexical_fallback" if output else "empty"
             return output
         except Exception as exc:
+            status = "error"
             _debug_log(f"Local FTS fallback failed: {_safe_exception_label(exc)}")
             return ""
+        finally:
+            # Only the existing ORIGINAL terminal admission can publish this.
+            self._finish_prefetch_diagnostics(diag, status=status)
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
         delivery_budget = self._prefetch_delivery_budget()
