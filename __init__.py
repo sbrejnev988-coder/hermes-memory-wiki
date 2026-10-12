@@ -1027,6 +1027,7 @@ except ImportError:
 # HERMES-CODE-KNOWLEDGE-GRAPH-v0.1.0: durable repository graph integration.
 try:
     from .code_knowledge_graph import (
+        _GraphCommitConnection,
         _owns_graph_writer as _owns_private_graph_writer,
         install_code_graph_schema as _install_code_graph_schema,
         ingest_code_graph_event as _ingest_code_graph_event,
@@ -1048,6 +1049,7 @@ try:
 except ImportError:
     try:
         from code_knowledge_graph import (
+            _GraphCommitConnection,
             _owns_graph_writer as _owns_private_graph_writer,
         install_code_graph_schema as _install_code_graph_schema,
             ingest_code_graph_event as _ingest_code_graph_event,
@@ -10978,10 +10980,12 @@ class MemoryWikiProvider(MemoryProvider):
                     conn: Optional[sqlite3.Connection] = None
                     prior_state = self._lifecycle_state
                     try:
-                        conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30.0)
+                        conn = sqlite3.connect(str(self.db_path), check_same_thread=False, timeout=30.0,
+                                               factory=_GraphCommitConnection, cached_statements=0)
                         # Publish ownership immediately after actual open, not after PRAGMAs.
                         self._conn = conn
                         self._owned_conn = conn
+                        conn._graph_effect_owner = self
                         conn.create_function("memory_wiki_fts_document", 4, claim_search_text)
                         conn.row_factory = sqlite3.Row
                         conn.execute("PRAGMA busy_timeout=30000")
@@ -14526,7 +14530,8 @@ class MemoryWikiProvider(MemoryProvider):
                             or self._claim_tx_graph_stage is not graph_stage):
                         self._quarantine_claim_connection(c, "graph_effect_owner_stage_changed")
                         raise RuntimeError("graph_effect_owner_stage_unproven")
-                    self._assert_graph_effects(c, graph_stage[2], check_callbacks=False)
+                    c._graph_commit_image = self._assert_graph_effects(
+                        c, graph_stage[2], check_callbacks=False, terminal_stage=graph_stage)
                 commit_attempted = True  # Only immediately before actual commit.
                 if _document_hook is not None:
                     _document_hook.commit_attempted = True
@@ -14561,6 +14566,7 @@ class MemoryWikiProvider(MemoryProvider):
                         document_stage[2].clear()
                         self._claim_tx_document_stage = previous_document_stage
                     if self._claim_tx_graph_stage is graph_stage:
+                        c._graph_commit_image = None
                         graph_stage[2].clear()
                         self._claim_tx_graph_stage = previous_graph_stage
                     self._claim_tx_connection = previous
@@ -22569,7 +22575,7 @@ class MemoryWikiProvider(MemoryProvider):
         chat_hash = self._chat_hash(self.session_id)
         return (str(self.bot_id), str(self.session_id), chat_hash,
                 str(self.project_scope), str(self.default_visibility), str(self.home),
-                bool(getattr(self, "_journal_recovery_active", False)))
+                bool(getattr(self, "_journal_recovery_active", False)), self.home, self.db_path)
 
     @staticmethod
     def _graph_source_eligible(claim):
@@ -22582,7 +22588,10 @@ class MemoryWikiProvider(MemoryProvider):
                 or 0 < int(claim["valid_to"] or 0) <= stamp):
             raise PermissionError("graph_source_not_eligible")
 
-    def _assert_graph_effects(self, conn, admissions, *, callbacks_only=False, check_callbacks=True):
+    def _assert_graph_effects(self, conn, admissions, *, callbacks_only=False, check_callbacks=True, terminal_stage=None):
+        if terminal_stage is not None:
+            admissions = tuple(admissions)
+        final_changes = conn.total_changes
         self._require_claim_writer(conn, transaction=True)
         if check_callbacks:
             for _, _, _, job_admission in admissions:
@@ -22618,6 +22627,12 @@ class MemoryWikiProvider(MemoryProvider):
                         or _background_jobs.owner_key(self) != job["owner_key"]
                         or not store.owns(job, worker_id, connection=conn)):
                     raise TimeoutError("graph_original_lease_lost")
+
+        if terminal_stage is not None:
+            # SQL/lease reads may call arbitrary registered callbacks. The
+            # native authorizer rechecks this unchanged image without SQL and
+            # compares ORIGINAL actors, never a late recaptured authority.
+            return (tuple(admissions), final_changes, terminal_stage)
 
 
     def _graph_owner(self, a: Dict[str, Any], *, conn=None) -> Dict[str, Any]:

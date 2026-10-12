@@ -1203,7 +1203,167 @@ def install_code_graph_schema(conn: sqlite3.Connection) -> None:
         pass
 
 
-class _GraphWriterConnection(sqlite3.Connection):
+def _graph_commit_fence(conn, flight):
+    """No SQL, callable getters, ACL/hash callbacks or authority recapture.
+
+    The owning IMMEDIATE/write transaction excludes foreign source/lease writes.
+    total_changes binds all callback-capable final reads to the unchanged image;
+    the original lease expiry, not a newly adopted lease, bounds native admission.
+    This is a supported in-process connection contract, not an OS sandbox.
+    """
+    stamp = time.time()
+    owner, stage, image, thread = flight
+    if (conn._graph_commit_flight is not flight or thread != threading.get_ident()
+            or owner._claim_tx_connection is not conn
+            or owner._claim_tx_thread != thread or owner._claim_tx_graph_stage is not stage
+            or stage[0] is not conn or stage[1] != thread
+            or len(stage[2]) != len(image[0])
+            or any(a is not b for a, b in zip(stage[2], image[0]))
+            or owner._lifecycle_state in {'failed', 'quarantined', 'stopping'}
+            or owner._transaction_quarantine is not None
+            or conn.total_changes != image[1]):
+        raise PermissionError('graph_native_commit_image_changed')
+    if type(conn) is _GraphWriterConnection:
+        if not _graph_writer_identity(owner, conn):
+            raise PermissionError('graph_native_commit_writer_withdrawn')
+    elif conn is not owner._conn or conn is not owner._owned_conn:
+        raise PermissionError('graph_native_commit_writer_withdrawn')
+    fields = owner.__dict__
+    for admission in image[0]:
+        actor = admission[0]
+        for key, index in (('bot_id', 0), ('session_id', 1), ('project_scope', 3), ('default_visibility', 4)):
+            value = fields.get(key)
+            if type(value) is not str or value != actor[index]:
+                raise PermissionError('graph_original_owner_changed')
+        if (fields.get('home') is not actor[7] or fields.get('db_path') is not actor[8]
+                or type(fields.get('_journal_recovery_active', False)) is not bool
+                or fields.get('_journal_recovery_active', False) != actor[6]):
+            raise PermissionError('graph_original_owner_changed')
+        if admission[2] is not None:
+            source = dict(zip(*admission[2]))
+            if (int(source['valid_from'] or 0) > stamp
+                    or 0 < int(source['valid_to'] or 0) <= stamp):
+                raise PermissionError('graph_source_not_eligible')
+        if admission[3] is not None and stamp >= dict(admission[3][2])['lease_expires_at']:
+            raise TimeoutError('graph_original_lease_lost')
+
+
+class _GraphCommitConnection(sqlite3.Connection):
+    """Shared native connection keeps supported authorizers behind the fence.
+
+    Cached statements are disabled at issuance: SQL/cursor/context shortcuts
+    must reach the same native authorizer. Only the actual owning commit call
+    can arm a graph stage; shortcuts cannot finish it while its body runs.
+    """
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._graph_effect_owner = None
+        self._graph_commit_image = None
+        self._graph_commit_flight = None
+        self._graph_commit_error = None
+        self._graph_user_authorizer = None
+        self._graph_authorizer_depth = 0
+        self._graph_trace = None
+        self._graph_progress = None
+        sqlite3.Connection.set_authorizer(self, self._graph_authorize)
+
+    def set_authorizer(self, callback):
+        if self._graph_commit_flight is not None:
+            raise RuntimeError('graph_writer_operation_in_flight')
+        if callback is not None and not callable(callback):
+            raise TypeError('authorizer_must_be_callable')
+        self._graph_user_authorizer = callback
+        return sqlite3.Connection.set_authorizer(self, self._graph_authorize)
+
+    def close(self):
+        if self._graph_commit_flight is not None:
+            raise RuntimeError('graph_writer_operation_in_flight')
+        return super().close()
+
+    def set_trace_callback(self, callback):
+        if self._graph_commit_flight is not None:
+            raise RuntimeError('graph_writer_operation_in_flight')
+        self._graph_trace = callback
+        return super().set_trace_callback(callback)
+
+    def set_progress_handler(self, callback, n):
+        if self._graph_commit_flight is not None:
+            raise RuntimeError('graph_writer_operation_in_flight')
+        self._graph_progress = callback if n > 0 else None
+        return super().set_progress_handler(callback, n)
+
+    def _graph_authorizer_result(self, action, a, b, database, source):
+        flight = self._graph_commit_flight
+        if (flight is not None and self._graph_authorizer_depth
+                and action in (sqlite3.SQLITE_TRANSACTION, sqlite3.SQLITE_SAVEPOINT)):
+            # Reentrant shared SQL must not finish the transaction INSIDE the
+            # user callback, before the outer callback's final admission.
+            return sqlite3.SQLITE_DENY
+        owner = self._graph_effect_owner
+        stage = getattr(owner, '_claim_tx_graph_stage', None)
+        graph_commit = action == sqlite3.SQLITE_TRANSACTION and a == 'COMMIT' and stage is not None and stage[2]
+        if graph_commit and flight is None:
+            return sqlite3.SQLITE_DENY
+        try:
+            callback = self._graph_user_authorizer
+            self._graph_authorizer_depth += 1
+            try:
+                result = sqlite3.SQLITE_OK if callback is None else callback(action, a, b, database, source)
+            finally:
+                self._graph_authorizer_depth -= 1
+            # Do not let CPython's result coercion run a user __index__ AFTER
+            # our pure fence. Supported authorizers return native SQLite ints.
+            if type(result) is not int or result not in (sqlite3.SQLITE_OK, sqlite3.SQLITE_DENY, sqlite3.SQLITE_IGNORE):
+                return sqlite3.SQLITE_DENY
+            if flight is not None:
+                _graph_commit_fence(self, flight)
+            return result
+        except BaseException as primary:
+            # SQLite suppresses authorizer exceptions. Deliver the actual
+            # cancellation/refusal at native return, before owner cleanup.
+            if self._graph_commit_error is None:
+                self._graph_commit_error = primary
+            return sqlite3.SQLITE_DENY
+
+    def _graph_authorize(self, action, a, b, database, source):
+        return self._graph_authorizer_result(action, a, b, database, source)
+
+    def _graph_start_commit(self):
+        if self._graph_commit_flight is not None:
+            raise RuntimeError('graph_writer_operation_in_flight')
+        owner = self._graph_effect_owner
+        stage = getattr(owner, '_claim_tx_graph_stage', None)
+        self._graph_commit_error = None
+        if stage is not None and stage[2]:
+            image = self._graph_commit_image
+            if image is None or image[2] is not stage:
+                raise PermissionError('graph_native_commit_image_missing')
+            # Trace runs AFTER SQLite's authorizer; progress ordering is not an
+            # atomic fence. Refuse these unsupported terminal callbacks only
+            # for graph stages, rather than silently ignoring their restrictions.
+            if self._graph_trace is not None or self._graph_progress is not None:
+                raise RuntimeError('graph_native_commit_late_callback_unsupported')
+            self._graph_commit_flight = (owner, stage, image, threading.get_ident())
+            _graph_commit_fence(self, self._graph_commit_flight)
+
+    def commit(self):
+        owner = self._graph_effect_owner
+        with _provider_claim_lock(owner):
+            if self._graph_commit_flight is not None:
+                raise RuntimeError('graph_writer_operation_in_flight')
+            try:
+                self._graph_start_commit()
+                try:
+                    return super().commit()
+                except BaseException:
+                    if self._graph_commit_error is not None:
+                        raise self._graph_commit_error
+                    raise
+            finally:
+                self._graph_commit_flight = None
+
+
+class _GraphWriterConnection(_GraphCommitConnection):
     def _admit(self):
         owner = getattr(self, "_graph_owner", None)
         if owner is None:
@@ -1253,8 +1413,13 @@ class _GraphWriterConnection(sqlite3.Connection):
                     self._graph_end_attempt = a
                 elif a == "BEGIN":
                     self._graph_begin_attempt = True
-        callback = self._graph_user_authorizer
-        return sqlite3.SQLITE_OK if callback is None else callback(action, a, b, database, source)
+        result = self._graph_authorizer_result(action, a, b, database, source)
+        # A permitted user callback can withdraw the exact issued handle.
+        # Keep the original flight through native return; never borrow a new one.
+        if (self._graph_inflight is not flight
+                or not _graph_writer_identity(owner, self, states=states)):
+            return sqlite3.SQLITE_DENY
+        return result
 
     def _graph_call(self, operation, *args, _cleanup=False, _commit=False, **kwargs):
         owner = self._graph_owner
@@ -1288,7 +1453,12 @@ class _GraphWriterConnection(sqlite3.Connection):
                 attempted = _commit or self._graph_end_attempt == "COMMIT"
                 if self._graph_state == "issued" and ended:
                     self._graph_state = "expired"
-                if attempted:
+                owned_stage = getattr(owner, "_claim_tx_connection", None) is self
+                if owned_stage and attempted:
+                    # The actual stage owns rollback. A second idle rollback
+                    # would misclassify a known refusal as commit UNKNOWN.
+                    _remember_graph_writer_error(self, primary)
+                elif not owned_stage and attempted:
                     _rollback_graph_writer_connection(self, primary, commit_attempted=True)
                 elif not _cleanup and self._graph_end_attempt == "ROLLBACK":
                     _rollback_graph_writer_connection(self, primary)
@@ -1506,6 +1676,7 @@ def _open_graph_writer_connection(provider: Any) -> Tuple[sqlite3.Connection, bo
         writer = sqlite3.connect(path, check_same_thread=False, timeout=30.0, factory=_GraphWriterConnection, cached_statements=0)
         # Publish exact ownership immediately, including schema/start failures.
         writer._graph_owner = provider
+        writer._graph_effect_owner = provider
         writer._graph_shared = shared
         writer._graph_lifetime = object()
         writer._graph_state = "opening"
