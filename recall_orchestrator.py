@@ -279,6 +279,26 @@ def _rrf_add(
     candidates[key]["_first_rank"] = min(candidates[key]["_first_rank"], max(1, int(rank)))
 
 
+def _preserve_claim_rerank_order(ordered, claim_order):
+    """Reorder only same-request ranked claim slots, never the federated union.
+
+    The first successful query (normally the original question) owns its
+    relative order. Later variants still contribute the unchanged RRF scores,
+    but their raw scores/ranks cannot overwrite that different-query ranking.
+    Final ACL/retirement/snapshot filtering must already have completed.
+    """
+    positions = [index for index, item in enumerate(ordered)
+                 if item['kind'] == 'claim' and item['id'] in claim_order]
+    by_id = {ordered[index]['id']: ordered[index] for index in positions}
+    replacements = [by_id[cid] for cid in claim_order if cid in by_id]
+    if len(replacements) != len(positions):
+        return ordered
+    result = list(ordered)
+    for index, item in zip(positions, replacements):
+        result[index] = item
+    return result
+
+
 def _iter_graph_rows(payload: Any) -> Iterable[tuple[str, Any]]:
     if not isinstance(payload, dict):
         return
@@ -941,6 +961,7 @@ def _recall_prepared(
     }
     raw_claim_ids: dict[str, str] = {}
     original_claim_rows = {}
+    claim_rerank_order = []
     claim_check_failed = False
 
     event_scope = str(os.environ.get("MEMORY_WIKI_EVENT_SCOPE", "chat") or "chat").strip().lower()
@@ -982,6 +1003,7 @@ def _recall_prepared(
             source_status["claims"] = "unavailable"
             claim_check_failed = True
         disclosure.claims(claim_rows or [])
+        query_rerank_order = []
         for rank, row in enumerate(claim_rows or [], 1):
             if not isinstance(row, dict):
                 try:
@@ -1005,6 +1027,11 @@ def _recall_prepared(
             safe_id = _stable_id(raw_id, "c")
             raw_claim_ids[safe_id] = raw_id
             original_claim_rows[raw_id] = dict(row)
+            batch = row.get('_rerank_order')
+            model_rank = row.get('rerank_rank')
+            if (isinstance(batch, str) and re.fullmatch(r'[0-9a-f]{64}', batch)
+                    and type(model_rank) is int and 1 <= model_rank <= 100):
+                query_rerank_order.append((batch, model_rank, safe_id))
             item = {
                 "kind": "claim",
                 "citation": f"[M:C:{safe_id}]",
@@ -1025,6 +1052,12 @@ def _recall_prepared(
                 "_snapshot_fingerprint": _claim_snapshot_fingerprint(row),
             }
             _rrf_add(candidates, kind="claim", source_id=raw_id, rank=rank, item=item)
+
+        if (not claim_rerank_order and query_rerank_order
+                and len({entry[0] for entry in query_rerank_order}) == 1
+                and len({entry[1] for entry in query_rerank_order}) == len(query_rerank_order)
+                and len({entry[2] for entry in query_rerank_order}) == len(query_rerank_order)):
+            claim_rerank_order = [entry[2] for entry in sorted(query_rerank_order, key=lambda entry: entry[1])]
 
         if episodic_backend is not None and runtime_module is not None:
             try:
@@ -1304,6 +1337,7 @@ def _recall_prepared(
             str(item["id"]),
         ),
     )
+    ordered = _preserve_claim_rerank_order(ordered, claim_rerank_order)
     items: list[dict[str, Any]] = []
     used_chars = 0
     for raw_item in ordered:

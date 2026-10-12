@@ -4034,6 +4034,58 @@ def _rerank_weight(query_mode: str, *, settings=None) -> float:
     return settings["RERANK_WEIGHT_MIXED"]
 
 
+def _fuse_rerank_order(original, prefix, ranked, *, query_mode, settings, order_key):
+    """Keep a successful ordinal ranking final inside its guarded top-K slots.
+
+    RRF remains the fallback and a diagnostic; it must not vote down a later
+    successful ranking of the same candidates. Scores from separate rerank
+    requests are never comparable. Missing model results retain local order
+    after the ranked rows; rejected/out-of-top-K rows keep their original slots.
+    """
+    ids = [str(row.get("id") or "") for row in prefix]
+    if (not all(ids) or len(set(ids)) != len(ids)
+            or any(sum(str(row.get("id") or "") == cid for row in original) != 1 for cid in ids)):
+        raise ValueError("invalid_rerank_candidate_identity")
+    if not isinstance(ranked, list) or not settings['RERANK_MIN_CANDIDATES'] <= len(ranked) <= len(prefix):
+        raise ValueError("invalid_rerank_rank_count")
+    ranks, relevance = {}, {}
+    for entry in ranked:
+        if not isinstance(entry, (list, tuple)) or len(entry) != 3:
+            raise ValueError("invalid_rerank_rank_item")
+        cid, score, rank = entry
+        if (not isinstance(cid, str) or cid not in ids or cid in ranks
+                or isinstance(rank, bool) or not isinstance(rank, int)
+                or isinstance(score, bool) or not isinstance(score, (int, float))
+                or not math.isfinite(float(score))):
+            raise ValueError("invalid_rerank_rank_or_score")
+        ranks[cid], relevance[cid] = rank, float(score)
+    if set(ranks.values()) != set(range(1, len(ranked) + 1)):
+        raise ValueError("invalid_rerank_ordinals")
+    reranker_weight = _rerank_weight(query_mode, settings=settings)
+    if reranker_weight <= 0.0:
+        return list(original)
+    base_weight = 1.0 - reranker_weight
+    orig_rank = {cid: rank for rank, cid in enumerate(ids, 1)}
+    ordered_prefix = []
+    for row in sorted(prefix, key=lambda row: (ranks.get(str(row['id']), len(prefix) + 1),
+                                               orig_rank[str(row['id'])])):
+        cid = str(row['id'])
+        item = dict(row)
+        # Preserve the existing arithmetic without using it to undo the ordinal.
+        item['rerank_fusion_score'] = (
+            base_weight / (RRF_K + orig_rank[cid])
+            + reranker_weight / (RRF_K + ranks.get(cid, len(prefix) + 1))
+        )
+        for field in ('rerank_rank', 'rerank_score', '_rerank_order'):
+            item.pop(field, None)
+        if cid in ranks:
+            item.update(rerank_rank=ranks[cid], rerank_score=round(relevance[cid], 6),
+                        _rerank_order=order_key)
+        ordered_prefix.append(item)
+    replacements = iter(ordered_prefix)
+    return [next(replacements) if str(row.get('id') or '') in orig_rank else row for row in original]
+
+
 _RERANK_LOCK = threading.RLock()
 _RERANK_CACHE: Dict[str, Tuple[float, List[Tuple[str, float, int]]]] = {}
 _RERANK_STATS: Dict[str, Any] = {
@@ -19312,7 +19364,7 @@ class MemoryWikiProvider(MemoryProvider):
             return status
 
     def _rerank_rows(self, query: str, scored: List[Dict[str, Any]], query_mode: str) -> List[Dict[str, Any]]:
-        """Rerank a safe top-K with instruction-aware rules and fuse it with RRF."""
+        """Rerank a safe top-K; keep successful ordinals, local RRF on fallback."""
         settings = _rerank_settings()
         api_key = _rerank_api_key()  # Exact own key captured once, never in the public snapshot.
         state = _rerank_scope_state(settings)
@@ -19416,6 +19468,11 @@ class MemoryWikiProvider(MemoryProvider):
                 guarded_documents.append(str(checked["content"]))
                 guarded_prefix.append(row)
         documents, prefix = guarded_documents, guarded_prefix
+        candidate_ids = [str(row.get("id") or "") for row in prefix]
+        if (not all(candidate_ids) or len(set(candidate_ids)) != len(candidate_ids)
+                or any(sum(str(row.get("id") or "") == cid for row in original) != 1 for cid in candidate_ids)):
+            _stage_receipt("rerank", "skipped", "candidate_identity")
+            return original
         _stage_receipt("rerank", "skipped", "safe_document_threshold", safe_candidate_count=len(prefix))
         if len(prefix) < settings['RERANK_MIN_CANDIDATES']:
             return original
@@ -19448,31 +19505,11 @@ class MemoryWikiProvider(MemoryProvider):
         ))
         cache_key = sha(cache_seed)
 
+        order_key = sha(str(_bound_profile_home().resolve()) + "\n" + cache_key)
+
         def fuse_current_order(ranked: List[Tuple[str, float, int]]) -> List[Dict[str, Any]]:
-            """Fuse cached model ranks with THIS call's local RRF order."""
-            reranker_weight = _rerank_weight(query_mode, settings=settings)
-            base_weight = 1.0 - reranker_weight
-            orig_rank = {str(row.get("id")): i for i, row in enumerate(prefix, 1)}
-            reranker_rank = {cid: rank for cid, _score, rank in ranked}
-            relevance = {cid: score for cid, score, _rank in ranked}
-            fused_prefix = sorted(
-                prefix,
-                key=lambda row: (
-                    base_weight / (RRF_K + orig_rank[str(row.get("id"))])
-                    + reranker_weight / (RRF_K + reranker_rank.get(str(row.get("id")), len(prefix) + 1))
-                ),
-                reverse=True,
-            )
-            ordered: List[Dict[str, Any]] = []
-            for row in fused_prefix:
-                cid = str(row.get("id"))
-                item = dict(row)
-                item["rerank_score"] = round(float(relevance.get(cid, 0.0)), 6)
-                item["rerank_rank"] = int(reranker_rank.get(cid, len(prefix) + 1))
-                ordered.append(item)
-            used = {str(row.get("id")) for row in ordered}
-            ordered.extend(row for row in original if str(row.get("id")) not in used)
-            return ordered
+            return _fuse_rerank_order(original, prefix, ranked, query_mode=query_mode,
+                                      settings=settings, order_key=order_key)
 
         if settings['RERANK_CACHE_TTL'] > 0:
             with _RERANK_LOCK:
@@ -19480,11 +19517,27 @@ class MemoryWikiProvider(MemoryProvider):
                 if _prefetch_budget_expired():
                     _stage_receipt("rerank", "timeout", "cancelled" if _prefetch_cancelled() else "deadline")
                     return original
+                if cached is not None and (
+                    not isinstance(cached, (list, tuple)) or len(cached) != 2
+                    or type(cached[0]) is not float or not math.isfinite(cached[0])
+                ):
+                    cache.pop(cache_key, None)
+                    stats["last_error"] = "invalid_rerank_cache"
+                    _stage_receipt("rerank", "failed", "invalid_rerank_cache")
+                    return original
                 if cached and cached[0] > now_mono:
+                    try:
+                        ordered = fuse_current_order(cached[1])
+                    except (TypeError, ValueError, OverflowError):
+                        # Corrupt rank metadata is not a new RPC allowance.
+                        cache.pop(cache_key, None)
+                        stats["last_error"] = "invalid_rerank_cache"
+                        _stage_receipt("rerank", "failed", "invalid_rerank_cache")
+                        return original
                     stats["cache_hits"] += 1
                     _hybrid_note("rerank_cache", "hit")
                     _stage_receipt("rerank", "cache_hit", "", ranks=[{"id": cid, "rank": rank} for cid, _score, rank in cached[1]])
-                    return fuse_current_order(cached[1])
+                    return ordered
                 for key in [k for k, value in cache.items() if value[0] <= now_mono]:
                     cache.pop(key, None)
 
