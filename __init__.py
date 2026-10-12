@@ -9016,9 +9016,13 @@ class MemoryWikiProvider(MemoryProvider):
                         "status": status, "content": "", "trust_level": "quarantined",
                         "injection_signals": signals, "guard_disagreement": disagreement,
                     }
-                # Reserve the published note before shortening. Scan full raw
-                # text too: core normalization/truncation cannot hide a veto.
-                content = _safe_recall_text(item.content, max_len + len(marker))
+                # Strip exactly the formatter-owned note on this native result,
+                # not on raw source. Both the full raw source above and the full
+                # actual core body below remain veto inputs before shortening.
+                core_body = str(item.content or "")
+                if core_body.startswith(marker):
+                    core_body = core_body[len(marker):]
+                content = _safe_recall_text(core_body, max_len)
                 if local_filtered or not content or str(content).startswith("[filtered:") or str(content).startswith("[QUARANTINED:"):
                     if audit:
                         self._audit("injection_guard", "local_filter_quarantined", f"item={item_id or '?'} type={mem_type}")
@@ -9027,10 +9031,7 @@ class MemoryWikiProvider(MemoryProvider):
                         "trust_level": str(item.trust_level or "untrusted"),
                         "injection_signals": signals, "guard_disagreement": False,
                     }
-                # Project only after approval; remove exactly one known note.
-                # Unknown markup and source-owned notes are not formatters.
-                if content.startswith(marker):
-                    content = content[len(marker):]
+                # Projection has no source-owned note exemption.
                 content = content[:max_len]
                 return {
                     "status": "safe", "content": content,
@@ -19413,6 +19414,53 @@ class MemoryWikiProvider(MemoryProvider):
         encoded = _semantic_request_bytes(list(claim_ids)).decode("utf-8")
         return f"{prefix}id IN (SELECT value FROM json_each(?))", [encoded]
 
+    @staticmethod
+    def _unicode_lexical_connection(conn: sqlite3.Connection) -> None:
+        """Connection-local Unicode folding; no schema, global collation or I/O."""
+        conn.create_function("memory_wiki_casefold", 1,
+                             lambda value: str(value or "").casefold(), deterministic=True)
+
+    def _guarded_retrieval_window(
+        self, conn, sql, params, cap, disclosure, *, session_id="", include_all_projects=False,
+    ):
+        """Count approved candidates, not rejected raw rows, within the old 500-row budget.
+
+        One bounded cursor keeps the original query snapshot/order across windows.
+        Raw diagnostic candidates remain private; final model-facing guards still
+        run. Never re-anchor the owning disclosure after a guard callback.
+        """
+        cap = max(1, min(int(cap), 500))
+        cursor = conn.execute(sql + " LIMIT ?", [*params, 500])
+        rows, approved, scanned = [], 0, 0
+        try:
+            while approved < cap and scanned < 500:
+                batch = cursor.fetchmany(min(50, 500 - scanned))
+                if not batch:
+                    break
+                disclosure.claims(batch, session_id=session_id,
+                                  include_all_projects=include_all_projects)
+                for row in batch:
+                    scanned += 1
+                    rows.append(row)
+                    if self._model_safe_row(row) is not None:
+                        approved += 1
+                    if approved >= cap:
+                        break
+            return rows, scanned == 500 and approved < cap
+        finally:
+            cursor.close()
+
+    def _guarded_candidate_prefix(self, rows, limit):
+        """Private raw prefix through the requested approved count; IDs are safe only."""
+        prefix, approved_ids = [], []
+        for row in rows:
+            prefix.append(row)
+            if self._model_safe_row(row) is not None:
+                approved_ids.append(row["id"])
+                if len(approved_ids) >= limit:
+                    break
+        return prefix, approved_ids
+
     def _search_fallback(
         self,
         query: str,
@@ -19448,16 +19496,23 @@ class MemoryWikiProvider(MemoryProvider):
             params.append(pid)
         if topic_slug:
             where.append("topic=?"); params.append(topic_slug)
-        like_terms=[t for t in str(query or "").lower().split()
+        self._unicode_lexical_connection(c)
+        disclosure = _DisclosureFence(self, c)
+        like_terms=[t for t in str(query or "").casefold().split()
                     if len(t)>2 or "%" in t or "_" in t]
         if like_terms:
-            like_clauses=["(claim LIKE ? ESCAPE '\\' OR topic LIKE ? ESCAPE '\\')" for _ in like_terms]
+            like_clauses=["(memory_wiki_casefold(claim) LIKE ? ESCAPE '\\' OR memory_wiki_casefold(topic) LIKE ? ESCAPE '\\')" for _ in like_terms]
             where.append("("+" AND ".join(like_clauses)+")")
             for t in like_terms:
                 literal = f"%{self._escape_like(t)}%"
                 params.extend([literal, literal])
-        sql = "SELECT * FROM claims WHERE " + " AND ".join(where) + " ORDER BY salience DESC, updated_at DESC LIMIT ?"
-        rows = c.execute(sql, [*params, min(500, max(50, limit * 10))]).fetchall()
+        sql = "SELECT * FROM claims WHERE " + " AND ".join(where) + " ORDER BY salience DESC, updated_at DESC"
+        rows, exhausted = self._guarded_retrieval_window(
+            c, sql, params, limit, disclosure, session_id=session_id,
+            include_all_projects=include_all_projects,
+        )
+        if exhausted:
+            _stage_receipt("lexical", "executed", "guard_scan_budget_exhausted", kind="like")
         out: List[Dict[str, Any]] = []
         for row in rows:
             if not self._claim_visible(row, session_id):
@@ -19474,9 +19529,8 @@ class MemoryWikiProvider(MemoryProvider):
             if not include_stale and self._is_stale(int(row["freshness_at"] or 0)):
                 continue
             out.append(self._sanitize_row(row))
-            if len(out) >= limit:
-                break
-        return out
+        out, _approved_ids = self._guarded_candidate_prefix(out, limit)
+        return out if disclosure.finish() else []
 
     def _hydrate_semantic_candidates(
         self,
@@ -19949,10 +20003,15 @@ class MemoryWikiProvider(MemoryProvider):
         semantic_hydrated = self._hydrate_semantic_candidates(c, candidates, semantic_ids, base_where, base_params)
         like_ids = set()
         def add_rows(sql, params, cap=80, *, lexical=False):
-            for row in c.execute(sql + " LIMIT ?", [*params, int(cap)]).fetchall():
+            rows, exhausted = self._guarded_retrieval_window(
+                c, sql, params, cap, disclosure, session_id=session_id,
+                include_all_projects=include_all_projects,
+            )
+            for row in rows:
                 candidates.setdefault(row["id"], row)
                 if lexical:
                     like_ids.add(str(row["id"]))
+            return exhausted
         if retrieval_mode != "vector":
             started = time.monotonic()
             if q.strip() and fts_healthy:
@@ -19961,7 +20020,13 @@ class MemoryWikiProvider(MemoryProvider):
                         # The same predicate/params applies to FTS, LIKE, priors,
                         # eligible-ID filter and authoritative hydration.
                         fts_sql = "SELECT claims.*, bm25(claims_fts) AS rank FROM claims_fts JOIN claims ON claims_fts.id=claims.id WHERE claims_fts MATCH ? AND " + base_where
-                        for row in c.execute(fts_sql + " ORDER BY rank LIMIT 100", [ftsq, *base_params]).fetchall():
+                        rows, exhausted = self._guarded_retrieval_window(
+                            c, fts_sql + " ORDER BY rank", [ftsq, *base_params], 100,
+                            disclosure, session_id=session_id, include_all_projects=include_all_projects,
+                        )
+                        if exhausted:
+                            fts_reason = "guard_scan_budget_exhausted"
+                        for row in rows:
                             candidates.setdefault(row["id"], row)
                             bm25[row["id"]] = max(bm25.get(row["id"], 0.0), bm25_norm(row["rank"]))
                     except sqlite3.DatabaseError:
@@ -19976,8 +20041,10 @@ class MemoryWikiProvider(MemoryProvider):
                                                 _eligible_claim_ids=_eligible_claim_ids):
                     candidates.setdefault(row["id"], row); like_ids.add(row["id"])
             elif q.strip():
-                like = f"%{self._escape_like(q.strip()[:180])}%"
-                add_rows(f"SELECT * FROM claims WHERE {base_where} AND (claim LIKE ? ESCAPE '\\' OR normalized_claim LIKE ? ESCAPE '\\' OR evidence LIKE ? ESCAPE '\\')", base_params + [like, like, like], 80, lexical=True)
+                self._unicode_lexical_connection(c)
+                like = f"%{self._escape_like(q.strip()[:180].casefold())}%"
+                if add_rows(f"SELECT * FROM claims WHERE {base_where} AND (memory_wiki_casefold(claim) LIKE ? ESCAPE '\\' OR memory_wiki_casefold(normalized_claim) LIKE ? ESCAPE '\\' OR memory_wiki_casefold(evidence) LIKE ? ESCAPE '\\')", base_params + [like, like, like], 80, lexical=True):
+                    fts_reason = "guard_scan_budget_exhausted"
             _stage_receipt("lexical", "executed", fts_reason or ("no_hits" if not bm25 and not like_ids else ""),
                            kind="fts5" if fts_healthy else "like", elapsed_ms=(time.monotonic()-started)*1000)
         if retrieval_mode == "hybrid":
@@ -20056,21 +20123,31 @@ class MemoryWikiProvider(MemoryProvider):
                 parts["rrf"] = rrf_fused[r["id"]] * 0.55
             score = sum(parts.values())
             d = self._sanitize_row(r); d["score"] = round(score, 4); d["score_parts"] = {k: round(v,4) for k,v in parts.items() if abs(v) > 0.0001}; scored.append(d)
+        # Guard admission precedes diversity's per-topic cutoff (and rerank's
+        # top-K). Rejected rows remain private diagnostics, not diversity slots.
+        guard_rejected = [row for row in scored if self._model_safe_row(row) is None]
+        rejected_ids = {row["id"] for row in guard_rejected}
+        scored = [row for row in scored if row["id"] not in rejected_ids]
         scored.sort(key=lambda x: x["score"], reverse=True)
         if retrieval_mode == "hybrid" and apply_rerank and not _prefetch_budget_expired(0.20):
             scored = self._rerank_rows(q, scored, query_mode)
         else:
             _stage_receipt("rerank", "skipped", "deadline" if _prefetch_budget_expired(0.20) else "mode_or_disabled")
         scored = self._apply_diversity(scored, query_mode)
+        # Preserve private rejected candidates for diagnostic callers, but LIMIT
+        # counts approved rows. Public projection still guards every field and
+        # revalidates the original authority; early approval is not a capability.
+        scored, approved_ids = self._guarded_candidate_prefix([*guard_rejected, *scored], limit)
         if not disclosure.finish():
             scored = []
+            approved_ids = []
             if receipt is not None:
                 receipt["lexical"]["visible_count"] = receipt["qdrant"]["visible_count"] = 0
                 receipt["fusion"] = {"items": [], "lexical_count": 0, "vector_count": 0,
                                      "overlap_count": 0, "union_count": 0, "prior_count": 0, "like_count": 0}
                 receipt["rerank"]["safe_candidate_count"] = 0
                 receipt["rerank"]["ranks"] = []
-        ids = [x["id"] for x in scored[:limit]]
+        ids = approved_ids
         if ids and record_retrieval and conn is None and not query_only:
             with c:
                 ts=now(); c.executemany("UPDATE claims SET access_count=access_count+1, recall_count=recall_count+1, last_accessed=?, last_recalled=? WHERE id=?", [(ts, ts, i) for i in ids])
@@ -20094,7 +20171,7 @@ class MemoryWikiProvider(MemoryProvider):
                     )
         # Prompt-time prefetch records only claims that survive relevance, visibility,
         # budget and Injection Guard. Candidate expansion must not inflate recall_count.
-        return scored[:limit]
+        return scored
 
     def _upsert_fts(self, cid: str) -> None:
         c = self._connect()

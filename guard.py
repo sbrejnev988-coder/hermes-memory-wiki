@@ -31,6 +31,40 @@ _CONTEXT_PROTOCOL_PATTERN = re.compile(
     r"(?:<\s*/?\s*memory-context(?:\s+[^<>]*)?\s*/?>|<\|\s*(?:im_start|im_end)\s*\|>)", re.I,
 )
 
+# Recalled data cannot issue answer-control directives. These are detection-only
+# grammatical cues, not a general-purpose instruction/intent classifier. Retain
+# descriptive security prose and ordinary procedures; quoted operative commands
+# do not gain authority from quotation or an asserted benign label.
+_RECALLED_MARKER_PATTERN = re.compile(r"^\s*\[\s*recalled\s+data\b", re.I)
+_RUSSIAN_ANSWER_DIRECTIVE = re.compile(
+    r"\b(?:ассистент\s*[,,:]?\s+(?:(?:должен|должна|обязан|обязана)\s+)?"
+    r"(?:(?:в\s+(?:следующем|сво[её]м)\s+(?:ответе|сообщении))\s+)?"
+    r"(?:не\s+)?(?:ответь|ответить|отвечай(?:те)?|отвечать|утверждай(?:те)?|"
+    r"напиши(?:те)?|написать|скажи(?:те)?|сказать|замени(?:те)?|заменить|выдай(?:те)?)\b"
+    r"|(?:в\s+(?:следующем|сво[её]м)\s+(?:ответе|сообщении)|при\s+ответе\s+пользователю)"
+    r"\s+(?:не\s+)?(?:напиши(?:те)?|утверждай(?:те)?|скажи(?:те)?|"
+    r"выдай(?:те)?|ответь|отвечай(?:те)?|придерживай(?:те)?ся)\b"
+    r"|отвечай(?:те)?\s+пользователю\b"
+    r"|(?:скрой(?:те)?|скрывай(?:те)?|не\s+(?:упоминай(?:те)?|раскрывай(?:те)?|"
+    r"сообщай(?:те)?|сообщать|ссылай(?:те)?ся|ссылайтесь))\b[^.!?\n]{0,180}"
+    r"(?:происхождени\w*|источник\w*|памят\w*|указани\w*|эт(?:ой|у)\s+запис\w*))",
+    re.I,
+)
+_ENGLISH_ANSWER_DIRECTIVE = re.compile(
+    r"\b(?:assistant\s*[,,:]?\s+(?:(?:must|should|shall|will)\s+)?"
+    r"(?:(?:in\s+your\s+next\s+(?:answer|response))\s+)?"
+    r"(?:do\s+not\s+)?(?:answer|respond|say|state|claim|output|write|replace)\b"
+    r"|(?:in\s+your\s+next\s+(?:answer|response)|when\s+answering\s+the\s+user)"
+    r"[,,:]?\s+(?:do\s+not\s+)?(?:say|state|claim|output|write|answer|respond)\b)",
+    re.I,
+)
+_ENGLISH_CONCEAL_DIRECTIVE = re.compile(
+    r"(?:^|[.!?;:\n\"'])\s*(?:please\s+|you\s+(?:must|should)\s+)?"
+    r"(?:hide|conceal|do\s+not\s+(?:mention|disclose|reveal|cite))\b"
+    r"[^.!?\n]{0,180}\b(?:origin|source|memory|instruction|record)\b",
+    re.I,
+)
+
 # Only a complete, closed descriptive sentence can exempt a bare term match.
 # Keep the original deny patterns above: unknown commands remain rejected.
 _TERM_GRAMMAR = r"(?:jailbreak|prompt (?:injection|hack|leak))"
@@ -75,9 +109,15 @@ def sanitize_context_text(text: str, max_len: int = 600) -> str:
     # Scan Cyrillic before Latin-lookalike translation; detection only.
     russian = unicodedata.normalize("NFKC", text).casefold()
     if (_RUSSIAN_OVERRIDE_PATTERN.search(text)
-            or _RUSSIAN_OVERRIDE_PATTERN.search(russian)):
+            or _RUSSIAN_OVERRIDE_PATTERN.search(russian)
+            or _RUSSIAN_ANSWER_DIRECTIVE.search(russian)
+            or _RECALLED_MARKER_PATTERN.search(russian)):
         return "[filtered: injection pattern detected]"
     projection = _diagnostic_projection(text)
+    if any(pattern.search(candidate) for pattern in
+           (_ENGLISH_ANSWER_DIRECTIVE, _ENGLISH_CONCEAL_DIRECTIVE)
+           for candidate in (text, projection)):
+        return "[filtered: injection pattern detected]"
     if any(_CONTEXT_PROTOCOL_PATTERN.search(candidate) for candidate in (text, projection)):
         return "[filtered: injection pattern detected]"
     descriptive = bool(_DESCRIPTIVE_TERM_INPUT.fullmatch(projection))
