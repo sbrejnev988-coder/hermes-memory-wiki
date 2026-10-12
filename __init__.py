@@ -42,7 +42,8 @@ import urllib.error
 import urllib.parse
 from collections import OrderedDict
 from contextlib import contextmanager, nullcontext, ExitStack
-from types import MappingProxyType
+from types import MappingProxyType, CodeType, FunctionType, ModuleType
+import struct
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import marshal
@@ -78,6 +79,161 @@ _SCOPED_REINDEX_READ_ONLY = contextvars.ContextVar("memory_wiki_scoped_reindex_r
 _RECALL_REQUEST = contextvars.ContextVar("memory_wiki_recall_request", default=None)
 _SEARCH_RECEIPT = contextvars.ContextVar("memory_wiki_search_receipt", default=None)
 _LOADED_CODE_IDENTITY = ""
+_LOADED_SOURCE_BINDING = None  # sealed once at the end of this entrypoint
+
+
+def _source_code_content(value):
+    """Typed executable content, not marshal serialization or CodeType ==.
+
+    Unknown constant types refuse attestation. In particular, tuple/frozenset,
+    3.14 slice constants and generated annotation code are not discarded.
+    """
+    kind = type(value)
+    if kind is CodeType:
+        fields = ("co_argcount", "co_posonlyargcount", "co_kwonlyargcount", "co_nlocals",
+                  "co_stacksize", "co_flags", "co_code", "co_consts", "co_names",
+                  "co_varnames", "co_filename", "co_name", "co_qualname",
+                  "co_firstlineno", "co_linetable", "co_exceptiontable",
+                  "co_freevars", "co_cellvars")
+        return (kind, tuple(_source_code_content(getattr(value, name)) for name in fields))
+    if kind in (tuple, frozenset):
+        projected = (_source_code_content(item) for item in value)
+        return (kind, tuple(projected) if kind is tuple else frozenset(projected))
+    if kind is slice:
+        return (kind, tuple(_source_code_content(item) for item in (value.start, value.stop, value.step)))
+    if kind is float:
+        return (kind, struct.pack("!d", value))
+    if kind is complex:
+        return (kind, struct.pack("!dd", value.real, value.imag))
+    if kind in (type(None), type(Ellipsis), bool, int, str, bytes):
+        return (kind, value)
+    raise ValueError("unsupported_code_constant")
+
+
+def _pin_loaded_source_identity(loaded_code, namespace):
+    """Import-only code-backed source binding. Never a Git/bundle capability.
+
+    The caller supplies its actual executing module CodeType, not a diagnostic
+    compile or a loader's later get_code(). A source SHA is a compile-matched
+    revision, NOT proof of the loader's exact bytes (comments/pyc may differ).
+    Requests only compare retained in-memory identities; no source re-read.
+    """
+    report = {"version": 1, "status": "unavailable", "reason": "import_attestation_unavailable",
+              "scope": "compiled_entrypoint", "revision_kind": "code_matched_source_sha256",
+              "source_sha256": None, "git_revision": None, "full_bundle_known": False,
+              "exact_loader_bytes_known": False, "disk_freshness": "not_checked_after_import"}
+    slots, functions = [], []
+    try:
+        name, filename = namespace["__name__"], namespace["__file__"]
+        module = sys.modules.get(name)
+        if module is not None and (type(module) is not ModuleType or module.__dict__ is not namespace):
+            raise ValueError("module_registration_mismatch")
+        if (sys.implementation.name != "cpython" or type(loaded_code) is not CodeType
+                or loaded_code.co_name != "<module>" or type(filename) is not str
+                or not Path(filename).is_absolute() or loaded_code.co_filename != filename):
+            raise ValueError("module_code_identity_unproven")
+        spec = namespace.get("__spec__")
+        if spec is not None and (spec.name != name or spec.origin != filename):
+            raise ValueError("module_spec_mismatch")
+        path = Path(filename)
+        for node in (path, *path.parents):
+            info = node.lstat()
+            if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 1024:
+                raise ValueError("source_link_or_reparse")
+        before_path = path.lstat()
+        if not stat.S_ISREG(before_path.st_mode):
+            raise ValueError("source_not_regular")
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(path, flags)
+        try:
+            stream = os.fdopen(fd, "rb")
+        except BaseException:
+            os.close(fd)  # ownership has not transferred to the stream
+            raise
+        with stream:
+            before = os.fstat(stream.fileno())
+            if not stat.S_ISREG(before.st_mode) or not 0 < before.st_size <= 2_000_000:
+                raise ValueError("source_size_or_type_unproven")
+            raw = stream.read(2_000_001)
+            after = os.fstat(stream.fileno())
+        after_path = path.lstat()
+        physical = lambda s: (s.st_dev, s.st_ino, s.st_size)
+        image = lambda s: (*physical(s), s.st_mtime_ns, s.st_ctime_ns)
+        # Windows lstat and fstat have different ctime domains. Compare physical
+        # identity across APIs, but timestamp stability within each exact API.
+        if (len(raw) != before.st_size or physical(before_path) != physical(before)
+                or image(before) != image(after) or image(before_path) != image(after_path)
+                or not stat.S_ISREG(after_path.st_mode)
+                or getattr(after_path, "st_file_attributes", 0) & 1024):
+            raise ValueError("source_changed_during_read")
+        compiled = compile(raw, filename, "exec", dont_inherit=True, optimize=sys.flags.optimize)
+        if _source_code_content(loaded_code) != _source_code_content(compiled):
+            raise ValueError("compiled_entrypoint_mismatch")
+        codes = set()
+        def collect(code):
+            codes.add(id(code))
+            for item in code.co_consts:
+                if type(item) is CodeType:
+                    collect(item)
+        collect(loaded_code)
+        seen = set()
+        def retain(function):
+            if type(function) is not FunctionType or id(function) in seen:
+                return
+            seen.add(id(function))
+            # Dependency wrappers are retained as identities, not source proof.
+            if function.__globals__ is namespace and id(function.__code__) not in codes:
+                raise ValueError("runtime_code_not_in_entrypoint")
+            wrapped = function.__dict__.get("__wrapped__")
+            annotate = getattr(function, "__annotate__", None)  # never evaluate annotations
+            kw = function.__kwdefaults__
+            cells = tuple((cell, cell.cell_contents) for cell in (function.__closure__ or ()))
+            functions.append((function, function.__code__, function.__defaults__, kw,
+                              tuple((kw or {}).items()), wrapped, annotate, cells))
+            retain(wrapped)
+            retain(annotate)
+            for item in (*(function.__defaults__ or ()), *(kw or {}).values(), *(v for _, v in cells)):
+                if type(item) is FunctionType:
+                    retain(item)
+        for key, value in tuple(namespace.items()):
+            if type(value) is FunctionType and value.__module__ == name:
+                slots.append((namespace, key, value))
+                retain(value)
+            elif type(value) is type and value.__module__ == name:
+                slots.append((namespace, key, value))
+                for member, descriptor in tuple(vars(value).items()):
+                    if type(descriptor) is FunctionType:
+                        targets = (descriptor,)
+                    elif type(descriptor) in (staticmethod, classmethod):
+                        targets = (descriptor.__func__,)
+                    elif type(descriptor) is property:
+                        targets = (descriptor.fget, descriptor.fset, descriptor.fdel)
+                    else:
+                        continue
+                    slots.append((vars(value), member, descriptor))
+                    for target in targets:
+                        retain(target)
+                retain(getattr(value, "__annotate__", None))
+        if not functions:
+            raise ValueError("runtime_callable_snapshot_empty")
+        report.update(status="attested", reason="compiled_entrypoint_matches_import_snapshot",
+                      source_sha256=hashlib.sha256(raw).hexdigest())
+    except ValueError as exc:
+        reason = str(exc)
+        allowed = {"unsupported_code_constant", "module_registration_mismatch", "module_code_identity_unproven",
+                   "module_spec_mismatch", "source_link_or_reparse", "source_not_regular",
+                   "source_size_or_type_unproven", "source_changed_during_read", "compiled_entrypoint_mismatch",
+                   "runtime_code_not_in_entrypoint", "runtime_callable_snapshot_empty"}
+        report["reason"] = reason if reason in allowed else "source_binding_unavailable"
+    except FileNotFoundError:
+        report["reason"] = "source_missing"
+    except PermissionError:
+        report["reason"] = "source_read_refused"
+    except (OSError, SyntaxError, AttributeError, TypeError, KeyError, RecursionError):
+        report["reason"] = "source_binding_unavailable"
+    return MappingProxyType({"namespace": namespace, "name": namespace.get("__name__"),
+                             "file": namespace.get("__file__"), "slots": tuple(slots),
+                             "functions": tuple(functions), "report": MappingProxyType(report)})
 
 try:
     from .disclosure_fence import (DisclosureFence as _DisclosureFence, existing_ledger as _existing_disclosure_ledger,
@@ -6919,6 +7075,30 @@ class MemoryWikiProvider(MemoryProvider):
             except (sqlite3.Error, OSError, AttributeError):
                 pass
         scope = _QDRANT_PROFILE_SCOPE.get() or {}
+        # Same pure pointer checks in the pinned terminal producer below. No
+        # diagnostic callback, filesystem read, Git query or annotation call.
+        binding = globals().get("_LOADED_SOURCE_BINDING")
+        source = dict(binding["report"]) if binding is not None else {
+            "version": 1, "status": "unavailable", "reason": "import_attestation_unavailable",
+            "scope": "compiled_entrypoint", "revision_kind": "code_matched_source_sha256",
+            "source_sha256": None, "git_revision": None, "full_bundle_known": False,
+            "exact_loader_bytes_known": False, "disk_freshness": "not_checked_after_import"}
+        if source["status"] == "attested":
+            module = sys.modules.get(__name__)
+            try:
+                same = (globals() is binding["namespace"] and __name__ == binding["name"] and __file__ == binding["file"]
+                        and (module is None or (type(module) is ModuleType and module.__dict__ is globals()))
+                        and all(container.get(key) is value for container, key, value in binding["slots"])
+                        and all(fn.__code__ is code and fn.__defaults__ is defaults and fn.__kwdefaults__ is kw
+                                and len(kw or {}) == len(items) and all(kw[k] is v for k, v in items)
+                                and fn.__dict__.get("__wrapped__") is wrapped
+                                and getattr(fn, "__annotate__", None) is annotate
+                                and all(cell.cell_contents is value for cell, value in cells)
+                                for fn, code, defaults, kw, items, wrapped, annotate, cells in binding["functions"]))
+            except (AttributeError, KeyError, TypeError, ValueError):
+                same = False
+            if not same:
+                source.update(status="drifted", reason="runtime_binding_changed")
         return {
             "importer_home": str(_IMPORT_HERMES_HOME),
             "request_home": _REQUEST_HOME.get() or str(Path(_native_home()).expanduser().resolve()),
@@ -6927,7 +7107,8 @@ class MemoryWikiProvider(MemoryProvider):
             "conn_path": conn_path, "conn_path_matches": conn_matches,
             "module_name": __name__, "module_file": str(Path(__file__).resolve()),
             "loaded_code_identity": _LOADED_CODE_IDENTITY,
-            "loaded_source_revision_known": False,
+            "loaded_source_revision_known": source["status"] == "attested",
+            "loaded_source_binding": source,
             "profile_ready": scope.get("__semantic_compatible", "1") != "0",
             "profile_reason": scope.get("__semantic_reason", "ready"),
             "missing_key_names": scope.get("__missing_keys", "").split(",") if scope.get("__missing_keys") else [],
@@ -6950,6 +7131,28 @@ class MemoryWikiProvider(MemoryProvider):
         # Final native reads cannot enter scoped/guard/receipt hooks.
         main = next((r[2] for r in self._conn.execute("PRAGMA database_list") if r[1] == "main"), None)
         scope = _QDRANT_PROFILE_SCOPE.get() or {}
+        binding = globals().get("_LOADED_SOURCE_BINDING")
+        source = dict(binding["report"]) if binding is not None else {
+            "version": 1, "status": "unavailable", "reason": "import_attestation_unavailable",
+            "scope": "compiled_entrypoint", "revision_kind": "code_matched_source_sha256",
+            "source_sha256": None, "git_revision": None, "full_bundle_known": False,
+            "exact_loader_bytes_known": False, "disk_freshness": "not_checked_after_import"}
+        if source["status"] == "attested":
+            module = sys.modules.get(__name__)
+            try:
+                same = (globals() is binding["namespace"] and __name__ == binding["name"] and __file__ == binding["file"]
+                        and (module is None or (type(module) is ModuleType and module.__dict__ is globals()))
+                        and all(container.get(key) is value for container, key, value in binding["slots"])
+                        and all(fn.__code__ is code and fn.__defaults__ is defaults and fn.__kwdefaults__ is kw
+                                and len(kw or {}) == len(items) and all(kw[k] is v for k, v in items)
+                                and fn.__dict__.get("__wrapped__") is wrapped
+                                and getattr(fn, "__annotate__", None) is annotate
+                                and all(cell.cell_contents is value for cell, value in cells)
+                                for fn, code, defaults, kw, items, wrapped, annotate, cells in binding["functions"]))
+            except (AttributeError, KeyError, TypeError, ValueError):
+                same = False
+            if not same:
+                source.update(status="drifted", reason="runtime_binding_changed")
         identity = {
             "importer_home": str(_IMPORT_HERMES_HOME),
             "request_home": _REQUEST_HOME.get() or str(Path(_native_home()).expanduser().resolve()),
@@ -6959,7 +7162,8 @@ class MemoryWikiProvider(MemoryProvider):
             "conn_path_matches": bool(main and Path(main).resolve() == Path(self.db_path).resolve()),
             "module_name": __name__, "module_file": str(Path(__file__).resolve()),
             "loaded_code_identity": _LOADED_CODE_IDENTITY,
-            "loaded_source_revision_known": False,
+            "loaded_source_revision_known": source["status"] == "attested",
+            "loaded_source_binding": source,
             "profile_ready": scope.get("__semantic_compatible", "1") != "0",
             "profile_reason": scope.get("__semantic_reason", "ready"),
             "missing_key_names": scope.get("__missing_keys", "").split(",") if scope.get("__missing_keys") else [],
@@ -24836,3 +25040,8 @@ def register(ctx) -> None:
             ctx.register_hook(hook_name, handler)
         except Exception as exc:
             _debug_log(f"vault registry hook {hook_name} unavailable: {type(exc).__name__}")
+
+
+# Capture the executing import CodeType AFTER all entrypoint definitions and
+# profile wrappers exist. No loader re-execution, Git/env setting or SDK hook.
+_LOADED_SOURCE_BINDING = _pin_loaded_source_identity(sys._getframe().f_code, globals())

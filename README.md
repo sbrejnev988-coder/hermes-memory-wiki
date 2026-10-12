@@ -385,6 +385,16 @@ Set `MEMORY_WIKI_VISUAL_EVIDENCE_ENABLED=1` together with the event ledger to al
 
 OCR results have `visual_ocr` / `image_ocr_text` provenance and `unverified_host_report` status. The host-supplied hash identifies a source for deletion, but does not cryptographically attest to the image or make OCR text a verified fact. Retrieval keeps the normal event citation and owner ACL. Derived observations use exact-text matching and remain low-confidence. Call `provider.delete_host_ocr_source(asset_sha256=..., scope='chat')` when the source is deleted; this removes matching events in that exact owner partition, FTS entries, source links, and dependent observation history. The default visual scope is the current chat; bot or project sharing must be explicitly selected at capture and deletion. `MEMORY_WIKI_VISUAL_EVIDENCE_ENABLED` defaults to off until Hermes has a trusted attachment/OCR hook.
 
+## Loaded source identity: диагностический контракт
+
+`loaded_source_revision_known` — **вычисляемая диагностика, не ENV/config setting**. Не нужно ставить этот флаг вручную. Вместе с ним `runtime_identity` / `retrieval_receipt.identity` возвращают `loaded_source_binding` с `status`, `reason`, `scope` и отдельными границами доказательства. Обычный и pinned terminal identity используют одинаковую неизменяемую import-привязку и проверки текущих callable identities.
+
+`true` допустим только для `scope=compiled_entrypoint`: actual executing module CodeType целиком совпал с full-source compile файла entrypoint, а сохранённые module/function/class descriptor, wrapper/default/closure и annotation-thunk identities не изменились. `source_sha256` — raw SHA256 проверенного при import файла; `revision_kind=code_matched_source_sha256` означает **code-backed source binding**, не SHA доказанно прочитанных loader bytes. Compile-equivalent comments или `.pyc` могут не различаться; `exact_loader_bytes_known=false` это явно раскрывает. Marshal digest в `loaded_code_identity` остаётся metadata и не используется как oracle равенства code.
+
+`git_revision=null`, `full_bundle_known=false`: этот контракт **не доказывает Git commit, зависимости/весь plugin bundle, installed fleet или native lifecycle**. Один и тот же entrypoint payload может принадлежать разным docs-only Git PIN. После замены файла на диске старая import-привязка сохраняется; `disk_freshness=not_checked_after_import` не подтверждает новое содержимое. После callable/module drift получаем `status=drifted`, `reason=runtime_binding_changed`, флаг `false`; отсутствующий/необычный/нечитаемый source либо несовпавший code дают `unavailable` с безопасной причиной.
+
+Файл читается ограниченно и только при import; запросы и final native SQL boundary не читают source/Git, не вызывают diagnostic callback или annotation thunk и не создают authority. Отсутствие `sys.modules` registration поддерживается существующим `_RuntimeModuleProxy`; чужой module с тем же file path не принимается. Настоящий loaded/native readback после разрешённого обновления остаётся отдельной проверкой. [Подробные границы](docs/ADVANCED_SETTINGS.md#loaded-source-identity-не-настройка).
+
 ## Cache identity (r19 + r20)
 
 - **r19 token governor**: exact embedding reuse inside the provider process; tool-cache contract 2.4.0 with smart initial tool mode (≤24 tools), exact-cache with tools enabled, shadow semantic mode by default.

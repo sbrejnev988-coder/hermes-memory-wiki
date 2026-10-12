@@ -237,6 +237,29 @@ Wiki рассчитывает бюджет **целого serialized relevant bl
 Sources и полный каталог: [ADVANCED_SETTINGS.md](#каталог-env-параметров).
 
 
+## Loaded source identity — не настройка
+
+Ни `.env`, ни `config.yaml` не должны содержать `loaded_source_revision_known`: это result field, а не control. Restart сам по себе не превращает неподдержанную/непроверенную привязку в доказательство.
+
+Минимальный контракт `loaded_source_binding.version=1`:
+
+| Поле | Значение и смысл |
+|---|---|
+| `status`, `reason` | `attested / compiled_entrypoint_matches_import_snapshot`, `drifted / runtime_binding_changed` либо `unavailable` с безопасной enum-причиной |
+| `scope` | `compiled_entrypoint`: только исполняемый root Python entrypoint и retained callable identities; не полный dependency bundle |
+| `revision_kind`, `source_sha256` | `code_matched_source_sha256` и raw SHA256 source, который при import совпал с actual module CodeType по полному typed content |
+| `git_revision` | `null`; Git HEAD/документация/install PIN не используются как loaded proof |
+| `full_bundle_known`, `exact_loader_bytes_known` | `false`; не подтверждены остальные модули/SDK и точные байты, ранее прочитанные loader |
+| `disk_freshness` | `not_checked_after_import`; request не делает I/O для актуализации диска |
+
+Флаг `loaded_source_revision_known=true` означает именно этот code-backed entrypoint контракт, **не provenance всего процесса**. При import source ограничен 2,000,000 bytes, должен быть обычным no-link/no-reparse файлом с согласованной до/после read identity; compile выполняется без исполнения заново. CPython CodeType сравнивается по filename, flags, argument/local/stack metadata, bytecode, line/exception tables и всем вложенным typed constants, включая tuple/frozenset, float bits, slices и annotation code. Неизвестная форма отказывает, а не пропускается. Неподдержанный runtime также остаётся `unavailable`; SOURCE packet проверен отдельно от native plugin boot.
+
+В сохранённом code snapshot проверяются привязки функций/descriptor и code/default/wrapper/closure/annotation identities. Аннотации не вычисляются. Mutable application data, содержимое mutable defaults, instance shadowing, dependency state и OS-level/hostile in-process tampering этим контрактом не аттестуются; это диагностика, не sandbox или разрешение. Значение `attested` не снимает исходные owner, ACL, profile, original context, native transaction и late-delivery fences.
+
+Обычный identity и pinned terminal identity не вызывают новый helper/callback и не добавляют SQL/source/Git reads. Если файл после import заменён или удалён, retained digest продолжает описывать старую code-backed привязку, а не новое installed содержимое. Compile-equivalent raw bytes (например, комментарии) могут дать одну code projection: digest тогда описывает проверенный source candidate, **не exact loader-byte receipt**. Поэтому два разных docs-only commits не получают выдуманный `git_revision`.
+
+Без import attestation возвращается `unavailable / import_attestation_unavailable`; missing/nonregular/read-refused source, wrong module/spec и несовпадение full compiled content имеют отдельные причины. Failure не печатает paths, source text или exception details. После runtime callable/module drift оба producers возвращают `false` и `drifted`; terminal не заходит в заменённый `_runtime_identity` callback. Новая установка, reload, native lifecycle, full-suite и loaded fleet требуют своих разрешений и receipts.
+
 ## Каталог ENV-параметров
 
 143 уникальных осей из действующих readers; выборка, а не обещание полного списка всех internal/fault flags. Default относится к отсутствующему ключу. Тип и условие важнее имени: имя переменной само по себе не доказывает effect. Preset не включает все флаги.
