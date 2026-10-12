@@ -1418,6 +1418,17 @@ def recall(
     delivery = current_delivery(provider)
     token = None
     if delivery is None:
+        scoped_recall = getattr(provider, "_unified_recall", None)
+        if callable(scoped_recall):
+            # Use the provider's existing scoped-method boundary, including its
+            # original caller home, through terminal commit. Entering scopes only
+            # for individual _connect/_search callbacks loses them at the native
+            # tail; never fix that by refreshing the already retained authority.
+            return scoped_recall(
+                query, mode, limit, max_chars, episodic_backend=episodic_backend,
+                event_backend=event_backend, observation_backend=observation_backend,
+                runtime_module=runtime_module, query_expander=query_expander,
+            )
         delivery = TerminalDelivery(provider)
         token = DELIVERY.set(delivery)
     try:

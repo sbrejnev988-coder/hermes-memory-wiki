@@ -9730,7 +9730,11 @@ class MemoryWikiProvider(MemoryProvider):
         with self._lock:
             if (self._lifecycle_state in {"failed", "quarantined", "stopping"}
                     or getattr(self, "_transaction_quarantine", None) is not None):
-                return tool_error("provider_lifecycle_not_ready; transaction outcome UNKNOWN")
+                primary = getattr(self, "_transaction_primary", None)
+                error = "provider_lifecycle_not_ready; transaction outcome UNKNOWN"
+                if primary is not None:
+                    error = _public_tool_error(primary) + "; " + error
+                return tool_error(error)
             if (self._conn is not None and self._conn.in_transaction
                     and (getattr(self, "_claim_tx_connection", None) is not self._conn
                          or getattr(self, "_claim_tx_thread", None) != threading.get_ident())):
@@ -22381,6 +22385,21 @@ class MemoryWikiProvider(MemoryProvider):
                 errors.append(str(result.get('error') or 'relation write failed')[:200])
         return {'claim_id':claim_id,'proposals':proposals,'applied':len(applied),'relation_ids':applied,'errors':errors}
 
+    def _unified_recall(self, query: str, mode: str = "auto", limit: int = 10,
+                        max_chars: int = 6000, *, episodic_backend=None,
+                        event_backend=None, observation_backend=None,
+                        runtime_module=None, query_expander=None) -> Dict[str, Any]:
+        """Direct recall uses the existing original-caller profile/delivery scope.
+
+        The ordinary scoped-method binder owns preparation through native commit;
+        do not reconstruct/adopt profile generation after a fence was captured.
+        """
+        options = dict(episodic_backend=episodic_backend, event_backend=event_backend,
+                       observation_backend=observation_backend, runtime_module=runtime_module)
+        if query_expander is not None:
+            options["query_expander"] = query_expander
+        return _recall_orchestrator._recall_prepared(self, query, mode, limit, max_chars, **options)
+
     def _graph_query(self, query:str, limit:int=20)->Dict[str,Any]:
         q=str(query or '').strip().casefold(); qtokens=tokens(q); ents=[]; rels=[]; c=self._connect(); lim=max(1,min(int(limit or 20),200))
         disclosure=self._retain_read_fence(c)
@@ -24505,7 +24524,7 @@ def _bind_memory_wiki_profile_methods() -> None:
                     delivery_entry = (upper_read or __name == "prefetch" or (__name == "handle_tool_call"
                                       and tool_name in {"memory_wiki_query", "memory_wiki_recall", "memory_wiki_pack_context",
                                                        'memory_wiki_get_project_context', 'memory_wiki_preference_layer', 'memory_wiki_why_believe', 'memory_wiki_dashboard', 'memory_wiki_graph_query', 'memory_wiki_summarize_topic', 'memory_wiki_get_page', 'memory_wiki_export', 'memory_wiki_export_bundle', 'memory_wiki_claim_history'})
-                                      or __name in {"_model_safe_claim_rows", "_record_recall_rows", "_commit_prefetch_delivery",
+                                      or __name in {"_unified_recall", "_model_safe_claim_rows", "_record_recall_rows", "_commit_prefetch_delivery",
                                                     "_lexical_prefetch_fallback", "_pack_context",
                                                     '_get_project_context', '_preference_layer', '_why_believe', '_dashboard', '_graph_query', '_summarize_topic', '_render_topic', '_export', '_export_bundle'}
                                       or (__name == "_prefetch_impl" and kwargs.get("_delivery") is None))
@@ -24545,6 +24564,17 @@ def _bind_memory_wiki_profile_methods() -> None:
                         if child is not None:
                             child["effective_mode"] = "failed"
                         raise
+                    if delivery_token is not None and __name == "handle_tool_call":
+                        payload = json.loads(result)
+                        if isinstance(payload, dict) and (
+                                "error" in payload or payload.get("success") is False
+                                or payload.get("ok") is False):
+                            # The canonical handler already refused. An error is
+                            # not source disclosure: do not freeze identity/ACKs,
+                            # commit queued effects, or mask its causal envelope
+                            # with a second generic quarantine/withheld result.
+                            terminal.discard_preparation()
+                            return result
                     if child is not None:
                         lex = child["lexical"]; vec = child["qdrant"]
                         child["effective_mode"] = (
@@ -24589,6 +24619,9 @@ def _bind_memory_wiki_profile_methods() -> None:
                                     "entrypoint": kind, "searches": [], "emitted_ids": [], "identity": {},
                                 })
                             refused = json.dumps(empty, ensure_ascii=False)
+                        elif __name == "_unified_recall":
+                            refused = _withheld_payload("memory_wiki_recall")
+                            refused.pop("success", None)
                         elif __name == "_model_safe_claim_rows":
                             refused = []
                         elif __name == "_record_recall_rows":
@@ -24607,7 +24640,19 @@ def _bind_memory_wiki_profile_methods() -> None:
                             # the ORIGINAL profile/read owner remains bound.
                             # Qdrant/contextvar resets are callback-free below.
                             read_cleanup.close()
-                        admitted = terminal.commit()
+                        try:
+                            admitted = terminal.commit()
+                        except Exception as exc:
+                            if __name != "handle_tool_call":
+                                raise
+                            # This is the same public JSON error boundary as the
+                            # handler, including failures at its terminal owner.
+                            # BaseException cancellation still propagates; exact
+                            # primary/UNKNOWN ownership stays on the provider.
+                            error = _public_tool_error(exc)
+                            if self._transaction_quarantine is not None:
+                                error += "; connection quarantined; transaction outcome UNKNOWN"
+                            return tool_error(error)
                         if not admitted:
                             if root is not None:
                                 root["searches"] = []; root["emitted_ids"] = []; root["identity"] = {}

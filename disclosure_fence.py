@@ -659,6 +659,22 @@ class TerminalDelivery:
         del self.effects[length:]
         self.events = events
 
+    def discard_preparation(self):
+        """An error envelope is not disclosure and must never commit its intents.
+
+        Retain all original carriers/UNKNOWN ownership; retire only the still
+        uncommitted delivery. No rollback, reconnect or authority adoption here.
+        """
+        if self.phase != 'prepare':
+            raise DeliveryWithheld('terminal_preparation_already_finished')
+        unknown = getattr(self.provider, '_transaction_quarantine', None) is not None
+        for _, staged in self.audit_preparations:
+            if staged.outcome == 'queued':
+                staged.outcome = 'unknown' if unknown else 'withheld'
+                staged.persisted_count = None if unknown else 0
+        self.reason = 'terminal_error_response'
+        self.phase = 'unknown' if unknown else 'withheld'
+
     def owns_snapshot(self, fence):
         p = self.provider
         return (type(self) is TerminalDelivery and self.phase in {'owned', 'verify'}
