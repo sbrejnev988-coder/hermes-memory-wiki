@@ -10322,6 +10322,10 @@ class MemoryWikiProvider(MemoryProvider):
                     record_retrieval=False,
                 )
                 claims = self._model_safe_claim_rows(rows, requested)
+                # Candidate-cohort markers are internal to ranking, not part of
+                # the public model-facing claim schema or access authority.
+                for claim in claims:
+                    claim.pop("_rerank_order", None)
                 # Search candidates are not necessarily emitted. Count only
                 # rows that passed the model-facing guard and reached output.
                 payload = tool_result(success=True, claims=claims)
