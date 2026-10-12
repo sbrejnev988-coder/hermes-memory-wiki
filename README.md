@@ -440,7 +440,264 @@ Plaintext returned intentionally by `secret_context_lookup` can still enter the 
 - `NOUS_API_KEY` (only when `MEMORY_WIKI_EMBED_PROVIDER=nous` — https://inference-api.nousresearch.com)
 - `hermes_trust_core` and `hermes_core_loader` in `{HERMES_HOME}/lib` for the strict security-integrated build
 
+## Расширенные настройки `.env` и `config.yaml`
+
+Ниже — переносимый **целевой рецепт**, а не снимок настроек чьего-либо ПК. Он описывает Memory Wiki 1.24.5 на source-checkpoint `3b77376` и не меняет файлы профилей. Declared Wiki version этого source-checkpoint — 1.24.5.[5] Полный source-grounded каталог дополнительных ENV-параметров, типов, условий и readers: [ADVANCED_SETTINGS.md](docs/ADVANCED_SETTINGS.md).
+
+### Где хранить и как читать настройки
+
+- `.env` содержит поддержанные ENV-параметры и отдельные credentials **этого owner-профиля**; это dotenv, не shell script. Не помещайте туда `source`, команды или credentials в URL.
+- `config.yaml` выбирает один external memory provider рядом с built-in memory и задаёт host delivery, session `extraction` и `graph_extraction`.[12][13] Добавляйте только нужные leaves к существующему файлу, не заменяя main/delegation/compression models, paths, ACL и другие plugins/profiles.
+- Секреты — не в YAML, README, командной строке или публичном отчёте. Нельзя переносить `.env`, `auth.json` либо базу между профилями ради одинаковых настроек.
+- **Code default**, целевое значение, сохранённое значение и значение уже загруженного процесса различаются. Import-time ENV/globals и кешированный provider не получают новые значения только от записи файла.[3][9][19]
+
+### Расширенный локальный режим: больше кандидатов, без новых модельных запросов
+
+База включает SQLite/FTS и уже индексированные документы/код. Semantic embeddings, rerank и LLM extraction вынесены в отдельные opt-in ниже. Чтобы прежнее YAML `enabled:true` не оставило модельный маршрут активным, для этой базы **обе** extraction-ветки должны быть явно выключены в owner YAML.[1][2]
+
+```dotenv
+# Локальный поиск и приватность
+MEMORY_WIKI_SEMANTIC=0
+MEMORY_WIKI_RERANK_ENABLED=0
+MEMORY_WIKI_LLM_PACK=0
+MW_EXTRACTION_ENABLED=0
+MEMORY_WIKI_GRAPH_EXTRACT_ENABLED=0
+MEMORY_WIKI_GRAPH_AUTO_EXTRACT=0
+MEMORY_WIKI_DEFAULT_VISIBILITY=chat
+
+# 16 main claims / 64 candidates — цель, не capacity модели
+MEMORY_WIKI_MAX_PREFETCH_CHARS=16000
+MEMORY_WIKI_PREFETCH_CLAIM_LIMIT=16
+MEMORY_WIKI_PREFETCH_EXPANSION_FACTOR=4
+MEMORY_WIKI_PREFETCH_CANDIDATE_LIMIT=64
+MEMORY_WIKI_PREFETCH_MIN_RELEVANT_CLAIMS=4
+MEMORY_WIKI_PREFETCH_MIN_RELEVANT_CHARS=2000
+MEMORY_WIKI_PREFETCH_CLAIM_MAX_CHARS=1200
+MEMORY_WIKI_PREFETCH_EVIDENCE_MAX_CHARS=600
+MEMORY_WIKI_PREFETCH_DEADLINE_SECONDS=5.5
+MEMORY_WIKI_PREFETCH_DIAGNOSTICS=anomalies
+MEMORY_WIKI_DIVERSITY_MAX_PER_TOPIC=8
+MEMORY_WIKI_DIVERSITY_MAX_SOURCE_SHARE=0.65
+
+# Использовать уже индексированное; не запускать scan/OCR/embed автоматически
+MEMORY_WIKI_DOCUMENT_PREFETCH=1
+MEMORY_WIKI_DOCUMENT_PREFETCH_CHARS=4000
+MEMORY_WIKI_DOCUMENT_RERANK=0
+MEMORY_WIKI_DOCUMENT_AUTO_SCAN_CACHE=0
+MEMORY_WIKI_DOCUMENT_AUTO_EMBED=0
+MEMORY_WIKI_DOCUMENT_EMBED_ON_INGEST=0
+MEMORY_WIKI_DOCUMENT_OCR=0
+MEMORY_WIKI_CODE_GRAPH_PREFETCH=1
+MEMORY_WIKI_CODE_GRAPH_PREFETCH_CHARS=4000
+MEMORY_WIKI_CODE_GRAPH_EMBED=0
+MEMORY_WIKI_CODE_GRAPH_RERANK=0
+
+# Новый retention и worker не включаются этим базовым блоком
+MEMORY_WIKI_EVENT_LEDGER_ENABLED=0
+MEMORY_WIKI_EPISODIC_ENABLED=0
+MEMORY_WIKI_EPISODIC_PREFETCH=0
+MEMORY_WIKI_EPISODIC_SEMANTIC=0
+MEMORY_WIKI_BACKGROUND_JOBS_ENABLED=0
+MEMORY_WIKI_OBSERVATIONS_ENABLED=1
+
+# Не снимать защиту ради объёма или скорости
+HERMES_SECURITY_STRICT=1
+MEMORY_WIKI_STRICT_RECALL=1
+MEMORY_WIKI_SUPPRESSION_FAIL_CLOSED=1
+MEMORY_WIKI_BLOCK_RAW_VAULT_READS=1
+MEMORY_WIKI_GLOBAL_SEARCH_ENABLED=0
+MEMORY_WIKI_ALLOW_LEGACY_UNSCOPED_GRAPH=0
+MEMORY_WIKI_ALLOW_LEGACY_UNSCOPED_PREFERENCES=0
+MEMORY_WIKI_ENABLE_LEGACY_SECRET_INDEX=0
+```
+
+Source default main claims — **12**, candidate pool — **36** при defaults; приведённые `16/64` — рекомендуемая ограниченная выборка. Guard, ACL, relevance, deadline и общий character budget могут сократить результат. Explicit candidate limit уже итоговый; `64` не умножается снова. Source-share limit — мягкий штраф score, topic limit — отдельное ограничение.[3]
+
+### Согласованный host YAML для базы
+
+Это merge-фрагмент, не замена целого `config.yaml`. `.env` Wiki cap и host cap здесь согласованы на `16000` chars; если уже установлен другой допустимый owner budget, не повышайте его автоматически.[3][8][9]
+
+```yaml
+memory:
+  provider: memory-wiki
+  prefetch_spill_enabled: true
+
+hooks:
+  output_spill:
+    enabled: true
+    max_chars: 16000
+    preview_head: 500
+    preview_tail: 500
+
+security:
+  redact_secrets: true
+
+plugins:
+  entries:
+    memory-wiki:
+      settings:
+        extraction:
+          enabled: false
+        graph_extraction:
+          enabled: false
+```
+
+**Exact namespace:** `plugins.entries.memory-wiki.settings.extraction`, не `session_extraction`; graph — `settings.graph_extraction`. ENV-only prefetch/background/auto-graph knobs не получают portable nested YAML counterparts только от похожего имени.[1][2][11]
+
+### Opt-in semantic embeddings и reranking
+
+Добавляйте этот блок **вместо соответствующих выключенных строк базы**, только после проверки owner endpoint/key, Qdrant и согласия на сеть/расход. Это маршрут OpenRouter, не бесплатный local preset. API-key placeholders ниже закомментированы и не являются credentials.
+
+```dotenv
+MEMORY_WIKI_SEMANTIC=1
+MEMORY_WIKI_EMBED_PROVIDER=openrouter
+MEMORY_WIKI_EMBED_URL=https://openrouter.ai/api/v1
+MEMORY_WIKI_EMBED_MODEL=qwen/qwen3-embedding-8b
+MEMORY_WIKI_EMBED_DIMENSIONS=4096
+MEMORY_WIKI_VECTOR_SIZE=4096
+MEMORY_WIKI_EMBED_INPUT_MAX_CHARS=12000
+MEMORY_WIKI_EMBED_CACHE_MAX_ENTRIES=512
+MEMORY_WIKI_EMBED_QUERY_CACHE_TTL_SECONDS=86400
+MEMORY_WIKI_EMBED_DOCUMENT_CACHE_TTL_SECONDS=2592000
+MEMORY_WIKI_EMBED_CACHE_SINGLEFLIGHT_WAIT_SECONDS=45
+MEMORY_WIKI_QDRANT_URL=http://127.0.0.1:6333
+MEMORY_WIKI_QDRANT_COLLECTION=memory_wiki_claims
+MEMORY_WIKI_QDRANT_ALIAS=memory_wiki_claims_active
+MEMORY_WIKI_QDRANT_ALIAS_MODE=auto
+MEMORY_WIKI_RERANK_ENABLED=1
+MEMORY_WIKI_RERANK_MODEL=voyageai/rerank-2.5
+MEMORY_WIKI_RERANK_TIMEOUT=3
+# MEMORY_WIKI_EMBED_API_KEY=<OWNER_EMBED_KEY>
+# MEMORY_WIKI_RERANK_API_KEY=<OWNER_RERANK_KEY>
+# MEMORY_WIKI_QDRANT_API_KEY=<OWNER_QDRANT_KEY_IF_REQUIRED>
+```
+
+Embedding dimensions и Qdrant vector size обязаны совпадать с фактическим ответом выбранной модели. Смена model/dimensions/input/prefix/template меняет manifest; ENV save не доказывает завершённый reindex либо alias switch. Local stub — детерминированный fallback, не доказательство качества neural embeddings. Loopback URL не доказывает отсутствие удалённой или платной inference за прокси. Foreign profile требует собственный согласованный route/contract; credentials importer/sibling не становятся его grant.[3]
+
+### Opt-in session и graph extraction
+
+Следующий пример **не готов к применению без замены placeholder**: `<OWNER_CODEX_MODEL_ID>` умышленно не проходит model validator. Сначала выберите точный разрешённый владельцу ID, подтвердите его native OAuth и квоту. После этого замените соответствующие sections базы. `enabled:true` разрешает отдельные модельные запросы; chat/delegation model этим не меняется.[1][2]
+
+```yaml
+plugins:
+  entries:
+    memory-wiki:
+      settings:
+        extraction:
+          enabled: true
+          provider: openai-codex
+          model: "<OWNER_CODEX_MODEL_ID>"
+          timeout: 30
+          max_tokens: 1800
+          reasoning_effort: low
+        graph_extraction:
+          enabled: true
+          provider: openai-codex
+          model: "<OWNER_CODEX_MODEL_ID>"
+          timeout: 30
+          reasoning_effort: low
+```
+
+| Leaf | `extraction` | `graph_extraction` |
+|---|---|---|
+| `enabled` | strict boolean | strict boolean |
+| `provider` | `openai-codex` или `openrouter`, explicit при включении | то же |
+| `model` | exact provider-specific string, explicit при включении | exact effective model; owner override описан ниже |
+| `timeout` | integer 1–60 секунд, bool запрещён | integer/float 1–60, bool запрещён |
+| `max_tokens` | integer: Codex 256–9000, OpenRouter 256–3000 | key не поддержан; request использует 700-token hint |
+| `reasoning_effort` | `low`, `medium`, `high`, `xhigh`, `max` | тот же accepted enum |
+
+Это полный accepted leaf-набор. Не добавляйте `api_key`, `base_url`, `endpoint`, `retry`, `temperature`, `context_length` или graph `max_tokens`; неизвестные поля и неверные типы/ranges дают отказ. Code default disabled model literal `gpt-6-luna` — не рекомендация и не entitlement.[1][2]
+
+Codex model grammar — 1–200 символов `[A-Za-z0-9][A-Za-z0-9._-]{0,199}`, без `/`. Session OpenRouter требует `org/model`; graph OpenRouter имеет свой validator и допускает bare ID. Не исправляйте slug и не выводите context capacity из suffix. Session effort передаётся обоим native routes; graph OpenRouter payload effort не передаёт. Native Codex может нормализовать effort к vocabulary модели.[1][2][14]
+
+**Auth и стоимость:** Codex использует read-only owner-local native OAuth; present pool авторитетен, empty pool не разрешает singleton/root/sibling fallback. Extractor не выполняет sign-in, refresh, healing или auth-store writes. Subscription расходует квоту и не unlimited. Session OpenRouter — отдельный metered opt-in с owner `OPENROUTER_API_KEY`; graph OpenRouter сохраняет собственные graph endpoint/key readers. Ошибка выбранного route не включает платный fallback.[1][2][14]
+
+Native Codex endpoint закреплён на `https://chatgpt.com/backend-api/codex`; transport/auth failure не выбирает новый endpoint.[14][15]
+
+Codex adapter не отправляет серверный output-token cap: `max_tokens` — hint, **не hard spending/output limit**. Host acceptance deadline/size limits не гарантируют мгновенное прекращение blocked DNS/I/O или удалённой computation/billing.[1][14]
+
+### Opt-in retention, durable jobs и document scan
+
+Events/episodes сохраняют приватные excerpts: это отдельное разрешение, не обязательная часть локального поиска. Сначала выберите retention/scope; YAML extraction может оставаться выключенным.[4][16]
+
+```dotenv
+MEMORY_WIKI_EVENT_LEDGER_ENABLED=1
+MEMORY_WIKI_EVENT_SCOPE=chat
+MEMORY_WIKI_EVENT_TTL_DAYS=30
+MEMORY_WIKI_EVENT_MAX_ROWS=20000
+MEMORY_WIKI_EVENT_MAX_BYTES=32000000
+MEMORY_WIKI_EPISODIC_ENABLED=1
+MEMORY_WIKI_EPISODIC_SCOPE=chat
+MEMORY_WIKI_EPISODIC_TTL_DAYS=30
+MEMORY_WIKI_EPISODIC_PREFETCH=1
+MEMORY_WIKI_EPISODIC_PREFETCH_MAX_RESULTS=5
+MEMORY_WIKI_EPISODIC_PREFETCH_MAX_CHARS=2400
+MEMORY_WIKI_BACKGROUND_JOBS_ENABLED=1
+MEMORY_WIKI_BACKGROUND_DAILY_JOBS=100
+MEMORY_WIKI_BACKGROUND_DAILY_REQUESTS=10
+MEMORY_WIKI_BACKGROUND_LEASE_SECONDS=120
+MEMORY_WIKI_BACKGROUND_MAX_ATTEMPTS=3
+MEMORY_WIKI_BACKGROUND_POLL_SECONDS=10
+```
+
+Daily requests ограничивает nominal leased jobs, **не все API calls, цену или provider quota**. Failed jobs могут повториться в пределах attempts; semantic outbox — отдельный путь. Worker работает пока owner/backend доступен, а не как обещание вечного сервиса. TTL не заменяет erasure. Observations default-on само по себе не включает event ledger или episodes.[3][4][16]
+
+Для автоматического cache scan нужны разрешённые roots и project/access scope. Дополнительные roots на Windows разделяются `;`. Scoped документы ищите explicit scoped query: automatic document prefetch использует `global_only=true`, а не снимает ACL. Scan имеет call/cooldown gate, не самостоятельный daemon. OCR/Tika/semantic embedding имеют отдельные prerequisites; не включайте их одним общим флагом. Полные документные/code/worker controls — в [каталоге](docs/ADVANCED_SETTINGS.md).
+
+### Precedence, типы и реальные лимиты доставки
+
+1. **Host config:** defaults → user YAML → managed overlay; строковые `${VAR}` могут раскрываться host loader. Это не универсальный ENV override каждого leaf.[10]
+2. **PluginContext.get_config:** plugin-relative `settings` leaf → legacy `config` leaf → default; global/cross-plugin/reserved root paths запрещены.[6][7]
+3. **Wiki session:** raw owner `settings.extraction` авторитетен. Present disabled/malformed section не включается `MW_EXTRACTION_*`; legacy доступен при absent section только для genuine standalone/proven launch owner.[1]
+4. **Wiki graph model:** own `MEMORY_WIKI_GRAPH_EXTRACT_MODEL` → process ENV только при proven launch owner → YAML model. Present empty/invalid override — ошибка, не fallback; override меняет только model, не provider/enablement/timeout. Graph auto enrichment дополнительно требует `MEMORY_WIKI_GRAPH_AUTO_EXTRACT=1` и eligibility/deadline gates.[2][3]
+5. **Raw extraction sections** не раскрывают `${...}` model placeholders через host defaults/managed overlay. Literal model ID заменяют до записи.[1][2]
+6. **ENV-only settings:** bare UPPER_SNAKE `hermes config set MEMORY_WIKI_… VALUE` пишет `.env`; это не доказательство nested YAML reader. Не переносите чужие ENV в routed multiplexer process.[10][11][19]
+
+Gateway root-scalar bridge заполняет лишь gaps process ENV; это не универсальное применение nested YAML. CLI mirror имеет собственный ограниченный набор полей.[17][18]
+
+Используйте unquoted YAML booleans и integer caps. Неположительный host character cap возвращает default, не unlimited.[8][20]
+
+У host spill строка `"false"` truthy; у `memory.prefetch_spill_enabled` строка `"true"` не равна boolean `true`.[8][9]
+
+Wiki ENV helpers обычно clamp-ят числа; strict extraction YAML отвергает bad types/ranges. Empty не всегда false: `SEMANTIC=` не выключает semantic path, `STRICT_RECALL=off` не отключает этот reader.[1][2][3]
+
+Wiki рассчитывает бюджет **целого serialized relevant block**: при enabled spill `min(Wiki cap, owner hooks.output_spill.max_chars)`; wrapper/signature включены. При нехватке места удаляются целые units, не срезается готовый block. Doc/code budgets не складываются поверх общего cap. Host default max_chars — `10000`, Wiki default — `16000`; согласованные `16000` в примере — target, не обещание full prompt.[3][8][9]
+
+`memory.prefetch_spill_enabled:false` не значит «spill выключен»: Core повышает receiving ceiling до `max(max_chars*10,100000)`, но Wiki по-прежнему учитывает свой owner host cap. Overflow возвращает в model-bound content preview/path, не только сокращает UI; середина автоматически не восстанавливается. Manager кеширует spill dict при `add_provider`: YAML save не доказывает новое loaded value. Activation отдельно, без private-cache mutation и самовольного restart.[3][8][9]
+
+Не путайте `CONTEXT_MAX_*` XML/debug renderer с основным explicit pack; `FTS_TOP_K`/`HYBRID_TOP_K` declaration-only в root runtime, `MEMORY_WIKI_CODE_GRAPH` status-only. Эти имена не доказывают универсальный enable/cap control. Продолжайте сохранять strict recall, redaction, ACL и legacy/shared gates; больший preset не является native/release admission.
+
+**Граница проверки:** examples и readers проверяются как документация; доступность модели, квота/цена, installed dependencies, реальная latency/качество, сохранённые и загруженные значения конкретного ПК этим не доказываются. Ничего из этого раздела автоматически не применяется к профилям.
+
+Sources и полный каталог: [ADVANCED_SETTINGS.md](docs/ADVANCED_SETTINGS.md).
+
+### Источники расширенных настроек
+
+[1] https://github.com/sbrejnev988-coder/hermes-memory-wiki/blob/3b77376b9098584538962977f227940e7e183ec3/extractor.py — extractor.py
+[2] https://github.com/sbrejnev988-coder/hermes-memory-wiki/blob/3b77376b9098584538962977f227940e7e183ec3/entity_relation_extractor.py — entity_relation_extractor.py
+[3] https://github.com/sbrejnev988-coder/hermes-memory-wiki/blob/3b77376b9098584538962977f227940e7e183ec3/__init__.py — __init__.py
+[4] https://github.com/sbrejnev988-coder/hermes-memory-wiki/blob/3b77376b9098584538962977f227940e7e183ec3/background_jobs.py — background_jobs.py
+[5] https://github.com/sbrejnev988-coder/hermes-memory-wiki/blob/3b77376b9098584538962977f227940e7e183ec3/plugin.yaml — plugin.yaml
+[6] https://github.com/NousResearch/hermes-agent/blob/79b45d1647f6b5680768d851c4c406e8cc550a1e/hermes_cli/plugins.py — hermes_cli/plugins.py
+[7] https://github.com/NousResearch/hermes-agent/blob/79b45d1647f6b5680768d851c4c406e8cc550a1e/hermes_cli/plugins_state.py — hermes_cli/plugins_state.py
+[8] https://github.com/NousResearch/hermes-agent/blob/79b45d1647f6b5680768d851c4c406e8cc550a1e/tools/hook_output_spill.py — tools/hook_output_spill.py
+[9] https://github.com/NousResearch/hermes-agent/blob/79b45d1647f6b5680768d851c4c406e8cc550a1e/agent/memory_manager.py — agent/memory_manager.py
+[10] https://github.com/NousResearch/hermes-agent/blob/79b45d1647f6b5680768d851c4c406e8cc550a1e/hermes_cli/config.py — hermes_cli/config.py
+[11] https://github.com/NousResearch/hermes-agent/blob/79b45d1647f6b5680768d851c4c406e8cc550a1e/hermes_cli/config_env_routing.py — hermes_cli/config_env_routing.py
+[12] https://github.com/NousResearch/hermes-agent/blob/79b45d1647f6b5680768d851c4c406e8cc550a1e/hermes_cli/config_defaults.py — hermes_cli/config_defaults.py
+[13] https://github.com/NousResearch/hermes-agent/blob/79b45d1647f6b5680768d851c4c406e8cc550a1e/agent/agent_init.py — agent/agent_init.py
+[14] https://github.com/NousResearch/hermes-agent/blob/79b45d1647f6b5680768d851c4c406e8cc550a1e/agent/auxiliary_client.py — agent/auxiliary_client.py
+[15] https://github.com/NousResearch/hermes-agent/blob/79b45d1647f6b5680768d851c4c406e8cc550a1e/agent/codex_headers.py — agent/codex_headers.py
+[16] https://github.com/sbrejnev988-coder/hermes-memory-wiki/blob/3b77376b9098584538962977f227940e7e183ec3/memory_events.py — memory_events.py
+[17] https://github.com/NousResearch/hermes-agent/blob/79b45d1647f6b5680768d851c4c406e8cc550a1e/gateway/run.py — gateway/run.py
+[18] https://github.com/NousResearch/hermes-agent/blob/79b45d1647f6b5680768d851c4c406e8cc550a1e/hermes_cli/cli_config_load.py — hermes_cli/cli_config_load.py
+[19] https://github.com/NousResearch/hermes-agent/blob/79b45d1647f6b5680768d851c4c406e8cc550a1e/hermes_cli/env_loader.py — hermes_cli/env_loader.py
+[20] https://github.com/NousResearch/hermes-agent/blob/79b45d1647f6b5680768d851c4c406e8cc550a1e/tools/tool_output_limits.py — tools/tool_output_limits.py
+
 ## Environment variables
+
+Таблица ниже — краткая совместимая выборка; актуальные типы, условия и дополнительные controls перечислены в [полном каталоге](docs/ADVANCED_SETTINGS.md#каталог-env-параметров).
 
 | Variable | Default | Description |
 |---|---|---|
@@ -504,11 +761,11 @@ Plaintext returned intentionally by `secret_context_lookup` can still enter the 
 | `MEMORY_WIKI_GLOBAL_SEARCH_ENABLED` | `0` | Enable the explicit read-only profile-fleet search tool; never changes automatic prefetch |
 | `MEMORY_WIKI_GLOBAL_SEARCH_PROFILES` | (empty) | Comma-separated normalized sibling profile names authorized for the fleet search, e.g. `default,gaming,learning,work` |
 | `MEMORY_WIKI_GLOBAL_SEARCH_CANDIDATE_LIMIT` | `400` | Candidate cap per participating profile, range 20–1000; tool results remain capped at 200 |
-| `MEMORY_WIKI_PREFETCH_CLAIM_LIMIT` | `20` | Maximum main claims in automatic prompt-time recall |
+| `MEMORY_WIKI_PREFETCH_CLAIM_LIMIT` | `12` | Maximum main claims, clamped to 5–50; separate candidate pool and delivery cap |
 | `MEMORY_WIKI_PREFETCH_DEADLINE_SECONDS` | `5.5` | Hard prompt-time budget, clamped to 5–6 seconds |
 | `MEMORY_WIKI_PREFETCH_NETWORK_RESERVE_SECONDS` | `0.25` | Time reserved after every bounded network operation |
 | `MEMORY_WIKI_PREFETCH_FALLBACK_RESERVE_SECONDS` | `0.45` | Tail budget reserved for local FTS/SQLite fallback |
-| `MEMORY_WIKI_MAX_PREFETCH_CHARS` | `24000` | Character budget for automatic prompt-time recall |
+| `MEMORY_WIKI_MAX_PREFETCH_CHARS` | `16000` | Wiki cap 4000–60000 chars; effective automatic delivery also respects owner host spill cap |
 | `MEMORY_WIKI_PREFETCH_MIN_RELEVANT_CLAIMS` | `4` | Soft minimum of relevant, guard-safe claims; never pads with unrelated/quarantined rows |
 | `MEMORY_WIKI_ONLINE_METRICS_ENABLED` | `true` | Keep fixed-dimension, content-free daily prefetch and explicit-recall aggregates; set `0` to disable |
 | `MEMORY_WIKI_ONLINE_METRICS_DAYS` | `30` | Retain aggregates for 1–90 days; health shows at most the latest seven days |
@@ -520,9 +777,9 @@ Plaintext returned intentionally by `secret_context_lookup` can still enter the 
 | `MEMORY_WIKI_PREFETCH_EVIDENCE_MAX_CHARS` | `600` | Maximum guard-safe evidence text per claim |
 | `MEMORY_WIKI_DIVERSITY_MAX_PER_TOPIC` | `8` | Maximum claims retained from one topic after reranking |
 | `MEMORY_WIKI_DIVERSITY_MAX_SOURCE_SHARE` | `0.65` | Source-share threshold that applies a soft score penalty |
-| `MEMORY_WIKI_CONTEXT_MAX_TOKENS` | `6000` | Token budget for structured context packer |
-| `MEMORY_WIKI_CONTEXT_MAX_CLAIMS` | `24` | Max claims in structured context packer |
-| `MEMORY_WIKI_CONTEXT_MAX_PER_TOPIC` | `8` | Max claims from one topic in structured context packer |
+| `MEMORY_WIKI_CONTEXT_MAX_TOKENS` | `4000` | XML/debug renderer token budget, 800–32000; not the main explicit pack max_chars argument |
+| `MEMORY_WIKI_CONTEXT_MAX_CLAIMS` | `24` | XML/debug renderer claim budget; not an unconditional main prefetch result count |
+| `MEMORY_WIKI_CONTEXT_MAX_PER_TOPIC` | `8` | XML/debug renderer per-topic limit; main prefetch has its own diversity gate |
 | `MEMORY_WIKI_SIMHASH_MAX_DISTANCE` | `3` | Conservative 64-bit near-duplicate threshold |
 | `HERMES_SECURITY_STRICT` | `1` | Quarantine recalled content if the shared trust core fails |
 | `HERMES_HOME` | `~/.hermes` | Hermes data directory (DB at `{HERMES_HOME}/memory-wiki/memory_wiki.sqlite3`) |
@@ -555,7 +812,7 @@ Enabling `MW_EXTRACTION_ENABLED` sends a bounded recent transcript (at most 32 m
 - `prefetch()` returns within the configured 5–6 second hard budget. A daemon worker is cancelled logically at the deadline, and a small guard-checked local FTS/SQLite result is returned instead.
 - OpenRouter `/models`/embedding health is **stale-while-revalidate**: prefetch immediately uses the last known state while a daemon thread refreshes stale health in the background. Cold start is optimistic and the bounded embedding call remains authoritative.
 - Embedding and Qdrant HTTP timeouts are clamped to the remaining prefetch budget. Prompt-time embedding is single-attempt; any failure continues through lexical SQLite/FTS retrieval.
-- Prompt-time reranking is one attempt with a hard maximum of 3 seconds. Timeout/error returns the local RRF order rather than empty recall.
+- Prompt-time reranking is one attempt: default timeout 3 seconds, supported configured timeout 0.25–4 seconds, additionally trimmed by the remaining prefetch budget. Timeout/error returns the local RRF order rather than empty recall.
 - The model-facing `memory_wiki_add_preference_rule` records a chat-scoped **pending candidate**. Caller-provided `source`, `status`, and broad visibility are ignored; the candidate does not enter recall as a trusted rule or create a curated claim. To activate one exact candidate, review it from a trusted host shell with `python tools/attest_preference.py --database PATH --id pref_ID`. The dry run prints `attestation_digest`; run again with `--apply --expected-digest DIGEST --attest "I reviewed this exact preference rule"`. The command makes an SQLite backup and binds approval to the exact text, priority, and owner. A changed candidate invalidates the reviewed digest. Only matching host approval and unchanged code-owned policy rules enter `# Trusted User Preference Layer` in `system_prompt_block`. Old `explicit`/`user` source labels alone are no longer proof of approval.
 - `memory_wiki_post_task` and `memory_wiki_add_decision` reject secret-like list elements, topic, and source arguments before ordinary SQLite persistence and cap list sizes. Their auxiliary row and corresponding claim commit together, so a failed claim write rolls back the auxiliary row. Model-provided provenance is ignored; the resulting claim remains unverified and chat-scoped.
 - Public `memory_wiki_add_claim` and `memory_wiki_write_firewall` mutations ignore caller-supplied curated source and broad visibility. They save unverified chat claims. Model-created mistake and task-capsule claims are unverified chat claims; project-profile claims remain limited to the active project and are unverified. Model approval of a review item and bundle imports keep untrusted provenance, while an ordinary import update revokes a former `verified` label. A one-time migration removes unsupported `verified` labels from older curated-source claims and profile timestamps.
