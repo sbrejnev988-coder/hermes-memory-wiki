@@ -1,5 +1,28 @@
 # Hermes Memory Wiki v1.24.5
 
+## Rerank: порядок безопасной cohort и diversity
+
+При успешном rerank (включая валидный cache hit) любой положительный
+`MEMORY_WIKI_RERANK_WEIGHT_TECHNICAL`, `_MIXED` или `_SEMANTIC` сохраняет
+model ordinals внутри соответствующей безопасной bounded cohort. Вес `0`
+оставляет локальный порядок, **но не отключает HTTP**: eligibility, cache,
+deadline и cost gates проверяются независимо. Это изменение прежней
+weight-as-blending-strength семантики: например, `0.01` и `1` дают одинаковый
+ordinal order, хотя диагностический `rerank_fusion_score` различается.
+Сохранённые значения весов и presets не изменены; это не означает неизменное
+sorting behavior. [Точный контракт и ограничения](docs/ADVANCED_SETTINGS.md#семантика-весов-и-граница-rerankdiversity).
+
+Уже проверенные и отвергнутые recall/document guard строки исходного top-K
+удаляются из локального rerank результата **до** downstream diversity, в том
+числе при fallback после этой проверки. Они больше не расходуют topic quota
+и не вытесняют safe model rank1. Top-K не пополняется, лимиты не повышаются;
+непроверенный tail и ранние skipped пути не получают новой гарантии фильтрации.
+ACL, final revalidation, schema и модели не меняются. Для outer query fusion
+сохраняется относительный порядок surviving claim cohort первой успешной
+query, а не первое место среди всех kinds/sources; raw relevance scores разных
+запросов не сравниваются. Это узкий source/component контракт, не real-provider
+quality, native bootstrap, installed/loaded/fleet или release acceptance.
+
 ## Document authority / host-erasure / SDK qualifier — source-checkpoint
 
 Новая принятая source-дельта: [`5d8a8b57319a8fa27ef8edd15f97bfb0a1f06ed1`](https://github.com/sbrejnev988-coder/hermes-memory-wiki/commit/5d8a8b57319a8fa27ef8edd15f97bfb0a1f06ed1). Она сохраняет предыдущие FTS/recovery исправления, удерживает original ingest admissions у actual outer owner до COMMIT, исправляет private document writer и host-erasure lifetime, а tooling qualifier отказывает при supervisor error/missing health fields.

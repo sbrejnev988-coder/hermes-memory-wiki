@@ -19415,7 +19415,9 @@ class MemoryWikiProvider(MemoryProvider):
                 return original
 
         prefix: List[Dict[str, Any]] = []
-        for row in original[:settings['RERANK_TOP_K']]:
+        prefix_positions = []
+        guard_refused_positions = set()
+        for position, row in enumerate(original[:settings['RERANK_TOP_K']]):
             if str(row.get("status") or "active") != "active":
                 continue
             if str(row.get("risk") or "low") == "secret" or int(row.get("quarantined_at") or 0) > 0:
@@ -19429,13 +19431,15 @@ class MemoryWikiProvider(MemoryProvider):
                 continue
             checked = self._inspect_recall_item(row, audit=False, max_len=settings['RERANK_DOCUMENT_MAX_CHARS'])
             if checked.get("status") != "safe":
+                guard_refused_positions.add(position)
                 continue
             prefix.append(row)
+            prefix_positions.append(position)
         _stage_receipt("rerank", "skipped", "safe_candidate_threshold", safe_candidate_count=len(prefix))
         if len(prefix) < settings['RERANK_MIN_CANDIDATES']:
             with _RERANK_LOCK:
                 stats["skipped"] += 1
-            return original
+            return [row for position, row in enumerate(original) if position not in guard_refused_positions]
 
         # Fetch code metadata once for the whole top-K. This makes repository,
         # file, symbol, commit and content-hash rules actually enforceable.
@@ -19461,16 +19465,24 @@ class MemoryWikiProvider(MemoryProvider):
         ]
         guarded_documents = []
         guarded_prefix = []
-        for row, document in zip(prefix, documents):
+        for position, row, document in zip(prefix_positions, prefix, documents):
             checked = self._inspect_recall_text(document, source="rerank_document", mem_type="claim",
                                                 audit=False, max_len=len(document) + 100)
             if checked.get("status") == "safe":
                 guarded_documents.append(str(checked["content"]))
                 guarded_prefix.append(row)
+            else:
+                guard_refused_positions.add(position)
         documents, prefix = guarded_documents, guarded_prefix
         candidate_ids = [str(row.get("id") or "") for row in prefix]
-        if (not all(candidate_ids) or len(set(candidate_ids)) != len(candidate_ids)
-                or any(sum(str(row.get("id") or "") == cid for row in original) != 1 for cid in candidate_ids)):
+        invalid_identity = (not all(candidate_ids) or len(set(candidate_ids)) != len(candidate_ids)
+                            or any(sum(str(row.get("id") or "") == cid for row in original) != 1 for cid in candidate_ids))
+        # Only already inspected, guard-refused top-K slots are removed. They
+        # must not spend downstream diversity quota, even on local fallback.
+        # Positions, not IDs, bind each refusal: colliding/unknown IDs cannot
+        # remove another row. The original top-K is never refilled or expanded.
+        original = [row for position, row in enumerate(original) if position not in guard_refused_positions]
+        if invalid_identity:
             _stage_receipt("rerank", "skipped", "candidate_identity")
             return original
         _stage_receipt("rerank", "skipped", "safe_document_threshold", safe_candidate_count=len(prefix))

@@ -110,6 +110,42 @@ plugins:
 
 ### Opt-in semantic embeddings и reranking
 
+#### Семантика весов и граница rerank/diversity
+
+В текущей ordinal correction `MEMORY_WIKI_RERANK_WEIGHT_TECHNICAL`,
+`MEMORY_WIKI_RERANK_WEIGHT_MIXED` и `MEMORY_WIKI_RERANK_WEIGHT_SEMANTIC`
+выбирают **local order при `0` / успешный ordinal order при любом `>0`**,
+а не непрерывную силу blending. При `0.01` и `1` порядок одной успешно
+ранжированной cohort одинаков. `0` не является выключателем HTTP: admission
+запроса и cache lookup выполняются раньше fusion; для отключения rerank
+существует отдельный `MEMORY_WIKI_RERANK_ENABLED` gate. Этот текст не меняет
+настройки профилей, presets, ENV/config routing, модели или API routes.
+
+Прежняя формула `(1-w)/(RRF_K+local_rank) + w/(RRF_K+model_rank)` остаётся
+в `rerank_fusion_score` **только диагностикой**, не ключом сортировки после
+успешного rerank. Отсутствующие model results идут после ranked rows в прежнем
+локальном порядке. При skipped/failed/invalid-cache rerank порядок оставшихся
+строк остаётся локальным; внешний RRF сохраняет прежнюю арифметику fallback.
+Сохранение численных defaults/весов не означает сохранение прежнего sorting
+behavior — это явное изменение совместимости weight-as-strength.
+
+Recall/document guard refusals связываются с точными позициями исходного
+top-K и исключаются до diversity; unknown/non-safe guard status тоже отказ.
+Отказ одной строки не удаляет другую по совпавшему ID. Identity validation
+по исходному набору, ACL и последняя schema/generation/disclosure revalidation
+не ослаблены. Новые rows за пределами исходного top-K не подставляются,
+дополнительных RPC нет. Topic quota (штатно `8`), source-share, candidate pool
+и остальные budgets сохраняются.
+
+Гарантия ограничена уже проверенной eligible cohort: ранний skip не запускает
+новый guard pass; непроверенные gaps/tail, optional/mixed kinds и строки иных
+источников не становятся ранжированными. Outer fusion сохраняет только
+относительный порядок surviving ranked claims первой успешной query после
+авторитетных фильтров (primary обычно первая; при её skip — возможен variant).
+Это не гарантия абсолютного top1 во всём heterogeneous union и не сравнение
+raw scores разных requests. Authored числовые cache fixtures проверяют
+композицию компонента, но не реальное качество модели или live/native fleet.
+
 Добавляйте этот блок **вместо соответствующих выключенных строк базы**, только после проверки owner endpoint/key, Qdrant и согласия на сеть/расход. Это маршрут OpenRouter, не бесплатный local preset. API-key placeholders ниже закомментированы и не являются credentials.
 
 ```dotenv
