@@ -28,6 +28,29 @@ import unittest
 from unittest import mock
 import zlib
 
+# A real CPython audit observer, left installed and inert outside each owned
+# observation. Calibration proves the three offending getters are not hidden.
+AUDIT = {"mode": None, "events": [], "refusals": 0}
+OBSERVATIONS = {}
+
+
+def identity_audit_observer(event, args):
+    mode = AUDIT["mode"]
+    if mode is None:
+        return
+    sensitive = event == "object.__getattr__" and len(args) > 1 and args[1] in (
+        "__code__", "__defaults__", "__kwdefaults__")
+    if mode == "refuse_introspection" and not sensitive:
+        return
+    if len(AUDIT["events"]) < 32:
+        AUDIT["events"].append((event, args[1] if sensitive else None))
+    if mode in ("refuse", "refuse_introspection"):
+        AUDIT["refusals"] += 1
+        raise RuntimeError("source_identity_owned_audit_refusal")
+
+
+sys.addaudithook(identity_audit_observer)
+
 SOURCE = Path(__file__).resolve().parents[1] / "__init__.py"
 if "DEVTOOLS_INPUTS" in globals():
     RAW = zlib.decompress(devtools_read_bound(DEVTOOLS_INPUTS["entrypoint.zlib"]))
@@ -118,8 +141,12 @@ class SourceIdentityCases(unittest.TestCase):
 
     def both(self):
         normal = self.identity(self.owner)
+        authority_normal, before = self.context(self.owner)
         terminal, generation = self.context(self.owner, terminal=True)
+        self.assertEqual(normal, authority_normal)
         self.assertEqual(normal, terminal)
+        self.assertEqual(before, generation)
+        self.assertEqual(json.dumps(authority_normal, sort_keys=True), json.dumps(terminal, sort_keys=True))
         self.assertEqual(generation, ("unit-generation", 0, 0, 0))
         self.assertIs(normal["conn_path_matches"], True)
         return normal
@@ -127,7 +154,9 @@ class SourceIdentityCases(unittest.TestCase):
     def assert_status(self, status, reason=None):
         identity = self.both()
         self.assertEqual(identity["loaded_source_binding"]["status"], status)
-        self.assertIs(identity["loaded_source_revision_known"], status == "attested")
+        self.assertIs(identity["loaded_source_revision_known"], False)
+        self.assertIs(identity["loaded_source_binding"]["current_callable_fields_known"], False)
+        self.assertIs(identity["loaded_source_binding"]["import_snapshot_known"], status in ("import_snapshot", "drifted"))
         if reason:
             self.assertEqual(identity["loaded_source_binding"]["reason"], reason)
         return identity["loaded_source_binding"]
@@ -136,7 +165,10 @@ class SourceIdentityCases(unittest.TestCase):
         sys.modules[self.module.__name__] = self.module
         self.modules.append(self.module.__name__)
         self.namespace["_LOADED_SOURCE_BINDING"] = pin(self.code, self.namespace)
-        report = self.assert_status("attested", "compiled_entrypoint_matches_import_snapshot")
+        report = self.assert_status("import_snapshot", "current_callable_fields_not_checked")
+        self.assertEqual(report["version"], 2)
+        self.assertEqual(report["observation"], "import_time")
+        self.assertEqual(report["unchecked_callable_fields"], ("code", "defaults", "kwdefaults_binding", "annotation_binding"))
         self.assertEqual(report["source_sha256"], hashlib.sha256(FIXTURE).hexdigest())
         self.assertEqual(report["revision_kind"], "code_matched_source_sha256")
         self.assertEqual(report["scope"], "compiled_entrypoint")
@@ -149,7 +181,7 @@ class SourceIdentityCases(unittest.TestCase):
     def test_unregistered_module_proxy_contract(self):
         proxy = types.FunctionType(code_at("_RuntimeModuleProxy.__getattr__"), self.namespace)
         self.assertIs(proxy(None, "target"), self.module.target)
-        self.assert_status("attested")
+        self.assert_status("import_snapshot")
 
     def test_same_file_wrong_registered_module_refuses_before_source_read(self):
         foreign = types.ModuleType(self.module.__name__)
@@ -172,15 +204,15 @@ class SourceIdentityCases(unittest.TestCase):
         self.assertIsNone(report["source_sha256"])
 
     def test_source_replaced_after_import_retains_old_loaded_binding(self):
-        old = self.assert_status("attested")
+        old = self.assert_status("import_snapshot")
         self.path.write_bytes(FIXTURE.replace(b"return 5", b"return 6"))
         with mock.patch.object(os, "open", side_effect=AssertionError("request re-read source")):
-            self.assertEqual(self.assert_status("attested"), old)
+            self.assertEqual(self.assert_status("import_snapshot"), old)
 
     def test_source_removed_after_import_does_not_invent_new_revision(self):
-        old = self.assert_status("attested")
+        old = self.assert_status("import_snapshot")
         self.path.unlink()
-        self.assertEqual(self.assert_status("attested"), old)
+        self.assertEqual(self.assert_status("import_snapshot"), old)
 
     def test_missing_source_refuses(self):
         self.path.unlink()
@@ -222,8 +254,11 @@ class SourceIdentityCases(unittest.TestCase):
         self.assert_status("unavailable", "module_code_identity_unproven")
 
     def test_runtime_code_drift_preserves_observed_marshal_metadata(self):
+        # The original live-code oracle is deliberately NOT claimed: audited
+        # current fields are UNKNOWN, while the honest import snapshot survives.
+        old = self.assert_status("import_snapshot")
         self.module.target.__code__ = self.module.target.__code__.replace(co_consts=(None, 99))
-        self.assert_status("drifted", "runtime_binding_changed")
+        self.assertEqual(self.assert_status("import_snapshot", "current_callable_fields_not_checked"), old)
         self.assertEqual(self.both()["loaded_code_identity"], "unit-observed-marshal-metadata")
 
     def test_runtime_global_callable_replacement_drifts(self):
@@ -249,7 +284,7 @@ capture = sys._getframe().f_code
         self.namespace.pop("target")
         self.namespace.pop("Witness")
         self.namespace["_LOADED_SOURCE_BINDING"] = pin(code, self.namespace)
-        self.assert_status("attested")
+        self.assert_status("import_snapshot")
         self.module.wrapper.__dict__["__wrapped__"] = lambda: 2
         self.assert_status("drifted")
 
@@ -257,19 +292,20 @@ capture = sys._getframe().f_code
         self.module.target.__kwdefaults__["option"] = False
         self.assert_status("drifted")
 
-    def test_runtime_positional_default_replacement_drifts(self):
+    def test_runtime_positional_default_replacement_stays_unknown(self):
+        old = self.assert_status("import_snapshot")
         self.module.target.__defaults__ = (7,)
-        self.assert_status("drifted")
+        self.assertEqual(self.assert_status("import_snapshot", "current_callable_fields_not_checked"), old)
 
-    def test_annotation_thunk_not_called_and_drift_detected(self):
+    def test_annotation_thunk_not_called_and_current_code_stays_unknown(self):
         if not hasattr(self.module.target, "__annotate__"):
             self.skipTest("annotation thunks are CPython 3.14+")
         self.assertEqual(self.annotation_calls, [])
         annotation = self.module.target.__annotate__
         self.assertIsInstance(annotation, types.FunctionType)
-        self.assert_status("attested")
+        old = self.assert_status("import_snapshot")
         annotation.__code__ = annotation.__code__.replace(co_consts=annotation.__code__.co_consts + ("drift",))
-        self.assert_status("drifted")
+        self.assertEqual(self.assert_status("import_snapshot", "current_callable_fields_not_checked"), old)
         self.assertEqual(self.annotation_calls, [])
 
     def test_code_modified_before_import_pin_refuses(self):
@@ -278,18 +314,18 @@ capture = sys._getframe().f_code
         self.assert_status("unavailable", "runtime_code_not_in_entrypoint")
 
     def test_identical_payload_different_docs_git_pin_never_claims_commit(self):
-        old = self.assert_status("attested")
+        old = self.assert_status("import_snapshot")
         (self.root / "README.md").write_text("authored docs PIN A\n", encoding="utf-8")
         (self.root / "HEAD").write_text("1" * 40, encoding="ascii")
         (self.root / "README.md").write_text("authored docs PIN B\n", encoding="utf-8")
         (self.root / "HEAD").write_text("2" * 40, encoding="ascii")
-        self.assertEqual(self.assert_status("attested"), old)
+        self.assertEqual(self.assert_status("import_snapshot"), old)
         self.assertIsNone(old["git_revision"])
 
     def test_compile_equivalent_comment_bytes_are_explicitly_not_exact_loader_receipt(self):
         self.path.write_bytes(FIXTURE + b"# same compiled code, different raw SHA\n")
         self.namespace["_LOADED_SOURCE_BINDING"] = pin(self.code, self.namespace)
-        report = self.assert_status("attested")
+        report = self.assert_status("import_snapshot")
         self.assertNotEqual(report["source_sha256"], hashlib.sha256(FIXTURE).hexdigest())
         self.assertFalse(report["exact_loader_bytes_known"])
 
@@ -297,10 +333,96 @@ capture = sys._getframe().f_code
         self.namespace.pop("_LOADED_SOURCE_BINDING")
         self.assert_status("unavailable", "import_attestation_unavailable")
 
+    def test_audit_observer_and_refusal_are_live(self):
+        fields = ("__code__", "__defaults__", "__kwdefaults__")
+        AUDIT.update(mode="observe", events=[], refusals=0)
+        try:
+            for field in fields:
+                getattr(self.module.target, field)
+        finally:
+            AUDIT["mode"] = None
+        self.assertEqual(AUDIT["events"], [("object.__getattr__", field) for field in fields])
+        hits = 0
+        for field in fields:
+            AUDIT.update(mode="refuse_introspection", events=[], refusals=0)
+            raised = False
+            try:
+                getattr(self.module.target, field)
+            except RuntimeError:
+                raised = True
+            finally:
+                AUDIT["mode"] = None
+            self.assertTrue(raised)
+            self.assertEqual(AUDIT["events"], [("object.__getattr__", field)])
+            self.assertEqual(AUDIT["refusals"], 1)
+            hits += AUDIT["refusals"]
+        OBSERVATIONS["calibration"] = {"getter_events": len(fields), "refused_getters": hits}
+
+    def observe_producer(self, mode, *, terminal):
+        sql = []
+        self.owner._conn.set_trace_callback(sql.append)
+        AUDIT.update(mode=mode, events=[], refusals=0)
+        try:
+            identity = self.context(self.owner, terminal=True)[0] if terminal else self.identity(self.owner)
+        finally:
+            AUDIT["mode"] = None
+            OBSERVATIONS[("terminal_" if terminal else "normal_") + mode] = {
+                "audit_events": len(AUDIT["events"]), "refusals": AUDIT["refusals"], "sql": list(sql)}
+        self.assertEqual(AUDIT["events"], [])
+        self.assertEqual(AUDIT["refusals"], 0)
+        self.assertEqual(sql, ["PRAGMA database_list"])
+        self.assertFalse(identity["loaded_source_revision_known"])
+        self.assertEqual(identity["loaded_source_binding"]["status"], "import_snapshot")
+        self.assertTrue(identity["loaded_source_binding"]["import_snapshot_known"])
+        self.assertEqual(self.annotation_calls, [])
+        return identity
+
+    def test_terminal_observer_reports_zero_new_audit_events(self):
+        expected = self.identity(self.owner)
+        self.assertEqual(self.observe_producer("observe", terminal=True), expected)
+
+    def test_terminal_refusal_hook_has_no_getter_to_refuse(self):
+        expected = self.identity(self.owner)
+        self.assertEqual(self.observe_producer("refuse", terminal=True), expected)
+
+    def test_normal_observer_and_refusal_match_terminal_snapshot(self):
+        observed = self.observe_producer("observe", terminal=False)
+        refused = self.observe_producer("refuse", terminal=False)
+        terminal, _ = self.context(self.owner, terminal=True)
+        self.assertEqual(observed, refused)
+        self.assertEqual(refused, terminal)
+
+    def test_import_audit_refusal_is_safe_unavailable_not_current_proof(self):
+        AUDIT.update(mode="refuse_introspection", events=[], refusals=0)
+        try:
+            binding = pin(self.code, self.namespace)
+        finally:
+            AUDIT["mode"] = None
+        self.namespace["_LOADED_SOURCE_BINDING"] = binding
+        self.assertEqual(AUDIT["events"], [("object.__getattr__", "__code__")])
+        self.assertEqual(AUDIT["refusals"], 1)
+        report = self.assert_status("unavailable", "import_introspection_refused")
+        self.assertIsNone(report["source_sha256"])
+        self.assertNotIn("source_identity_owned_audit_refusal", json.dumps(report))
+        OBSERVATIONS["import_refusal"] = {"getter_events": len(AUDIT["events"]), "refusals": AUDIT["refusals"]}
+
+    def test_runtime_kwdefault_object_replacement_stays_unknown(self):
+        old = self.assert_status("import_snapshot")
+        self.module.target.__kwdefaults__ = {"option": False}
+        self.assertEqual(self.assert_status("import_snapshot", "current_callable_fields_not_checked"), old)
+
+    def test_runtime_annotation_binding_replacement_stays_unknown(self):
+        if not hasattr(self.module.target, "__annotate__"):
+            self.skipTest("annotation thunks are CPython 3.14+")
+        old = self.assert_status("import_snapshot")
+        self.module.target.__annotate__ = lambda format: int
+        self.assertEqual(self.assert_status("import_snapshot", "current_callable_fields_not_checked"), old)
+        self.assertEqual(self.annotation_calls, [])
+
     def test_receipt_is_detached_from_pin(self):
         receipt = self.both()
         receipt["loaded_source_binding"]["status"] = "spoofed"
-        self.assert_status("attested")
+        self.assert_status("import_snapshot")
         with self.assertRaises(TypeError):
             self.namespace["_LOADED_SOURCE_BINDING"]["report"]["status"] = "spoofed"
 
@@ -312,7 +434,8 @@ capture = sys._getframe().f_code
                 mock.patch.object(builtins, "open", side_effect=AssertionError("terminal open")), \
                 mock.patch.object(Path, "read_bytes", side_effect=AssertionError("terminal read")):
             identity, _ = self.context(self.owner, terminal=True)
-        self.assertTrue(identity["loaded_source_revision_known"])
+        self.assertFalse(identity["loaded_source_revision_known"])
+        self.assertTrue(identity["loaded_source_binding"]["import_snapshot_known"])
         self.assertEqual(sql, ["PRAGMA database_list"])
 
     def test_late_callable_drift_changes_terminal_anchor(self):
@@ -320,8 +443,10 @@ capture = sys._getframe().f_code
         self.module.target.__kwdefaults__["option"] = False
         terminal, after = self.context(self.owner, terminal=True)
         self.assertEqual(generation, after)
-        self.assertTrue(normal["loaded_source_revision_known"])
+        self.assertFalse(normal["loaded_source_revision_known"])
         self.assertFalse(terminal["loaded_source_revision_known"])
+        self.assertEqual(normal["loaded_source_binding"]["status"], "import_snapshot")
+        self.assertEqual(terminal["loaded_source_binding"]["status"], "drifted")
         self.assertNotEqual(json.dumps(normal, sort_keys=True), json.dumps(terminal, sort_keys=True))
 
     def test_owner_and_configuration_fields_still_change_at_terminal(self):
@@ -378,7 +503,7 @@ capture = sys._getframe().f_code
             return types.SimpleNamespace(**values)
         with mock.patch.object(os, "fstat", side_effect=handle_domain):
             self.namespace["_LOADED_SOURCE_BINDING"] = pin(self.code, self.namespace)
-        self.assert_status("attested")
+        self.assert_status("import_snapshot")
 
     def test_cross_api_physical_identity_mismatch_still_refuses(self):
         real = os.fstat
@@ -413,7 +538,7 @@ callback = factory()
         code = compile(text, str(self.path), "exec", dont_inherit=True, optimize=sys.flags.optimize)
         exec(code, self.namespace)
         self.namespace["_LOADED_SOURCE_BINDING"] = pin(code, self.namespace)
-        self.assert_status("attested")
+        self.assert_status("import_snapshot")
         self.module.callback.__closure__[0].cell_contents = lambda: 8
         self.assert_status("drifted")
 
@@ -470,6 +595,7 @@ def run_source_packet():
     print(json.dumps({"schema": "memory-stack.cases/v1", "cases": rows, "total": len(rows),
         "passed": counts["passed"], "failed": counts["failed"], "errors": counts["error"], "skipped": counts["skipped"],
         "boundary": "SOURCE units, real fixture imports/SQLite only; no native provider or manager bootstrap",
+        "observations": OBSERVATIONS,
         "raw_source_sha256": hashlib.sha256(RAW).hexdigest(), "subprocess_invocations": 0}))
     raise SystemExit(1 if counts["failed"] or counts["error"] else 0)
 

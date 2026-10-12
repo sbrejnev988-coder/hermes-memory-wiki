@@ -116,12 +116,19 @@ def _pin_loaded_source_identity(loaded_code, namespace):
     The caller supplies its actual executing module CodeType, not a diagnostic
     compile or a loader's later get_code(). A source SHA is a compile-matched
     revision, NOT proof of the loader's exact bytes (comments/pyc may differ).
-    Requests only compare retained in-memory identities; no source re-read.
+    Requests compare only declaration slots and retained ordinary containers.
+    Audited callable fields are observed at import, never at terminal delivery;
+    the snapshot cannot attest to their current values. No source re-read.
     """
-    report = {"version": 1, "status": "unavailable", "reason": "import_attestation_unavailable",
+    report = {"version": 2, "status": "unavailable", "reason": "import_attestation_unavailable",
               "scope": "compiled_entrypoint", "revision_kind": "code_matched_source_sha256",
               "source_sha256": None, "git_revision": None, "full_bundle_known": False,
-              "exact_loader_bytes_known": False, "disk_freshness": "not_checked_after_import"}
+              "exact_loader_bytes_known": False, "disk_freshness": "not_checked_after_import",
+              "observation": "import_time", "import_snapshot_known": False,
+              "current_callable_fields_known": False,
+              "unchecked_callable_fields": ("code", "defaults", "kwdefaults_binding", "annotation_binding"),
+              "runtime_checks": ("module_namespace", "declaration_slots", "wrapped_links",
+                                 "retained_kwdefault_items", "retained_closure_cells")}
     slots, functions = [], []
     try:
         name, filename = namespace["__name__"], namespace["__file__"]
@@ -181,18 +188,19 @@ def _pin_loaded_source_identity(loaded_code, namespace):
             if type(function) is not FunctionType or id(function) in seen:
                 return
             seen.add(id(function))
+            # These three getters emit CPython audit callbacks: import only.
+            code, defaults, kw = function.__code__, function.__defaults__, function.__kwdefaults__
             # Dependency wrappers are retained as identities, not source proof.
-            if function.__globals__ is namespace and id(function.__code__) not in codes:
+            if function.__globals__ is namespace and id(code) not in codes:
                 raise ValueError("runtime_code_not_in_entrypoint")
             wrapped = function.__dict__.get("__wrapped__")
             annotate = getattr(function, "__annotate__", None)  # never evaluate annotations
-            kw = function.__kwdefaults__
             cells = tuple((cell, cell.cell_contents) for cell in (function.__closure__ or ()))
-            functions.append((function, function.__code__, function.__defaults__, kw,
+            functions.append((function, code, defaults, kw,
                               tuple((kw or {}).items()), wrapped, annotate, cells))
             retain(wrapped)
             retain(annotate)
-            for item in (*(function.__defaults__ or ()), *(kw or {}).values(), *(v for _, v in cells)):
+            for item in (*(defaults or ()), *(kw or {}).values(), *(v for _, v in cells)):
                 if type(item) is FunctionType:
                     retain(item)
         for key, value in tuple(namespace.items()):
@@ -216,7 +224,8 @@ def _pin_loaded_source_identity(loaded_code, namespace):
                 retain(getattr(value, "__annotate__", None))
         if not functions:
             raise ValueError("runtime_callable_snapshot_empty")
-        report.update(status="attested", reason="compiled_entrypoint_matches_import_snapshot",
+        report.update(status="import_snapshot", reason="current_callable_fields_not_checked",
+                      import_snapshot_known=True,
                       source_sha256=hashlib.sha256(raw).hexdigest())
     except ValueError as exc:
         reason = str(exc)
@@ -229,6 +238,10 @@ def _pin_loaded_source_identity(loaded_code, namespace):
         report["reason"] = "source_missing"
     except PermissionError:
         report["reason"] = "source_read_refused"
+    except RuntimeError:
+        # An import-time audit refusal is unavailable evidence, never attestation.
+        # Terminal producers do not perform these getters or catch their refusal.
+        report["reason"] = "import_introspection_refused"
     except (OSError, SyntaxError, AttributeError, TypeError, KeyError, RecursionError):
         report["reason"] = "source_binding_unavailable"
     return MappingProxyType({"namespace": namespace, "name": namespace.get("__name__"),
@@ -7075,24 +7088,27 @@ class MemoryWikiProvider(MemoryProvider):
             except (sqlite3.Error, OSError, AttributeError):
                 pass
         scope = _QDRANT_PROFILE_SCOPE.get() or {}
-        # Same pure pointer checks in the pinned terminal producer below. No
-        # diagnostic callback, filesystem read, Git query or annotation call.
+        # Same bounded snapshot checks in the pinned terminal producer below.
+        # No audited callable getters: current code/default fields stay UNKNOWN.
         binding = globals().get("_LOADED_SOURCE_BINDING")
         source = dict(binding["report"]) if binding is not None else {
-            "version": 1, "status": "unavailable", "reason": "import_attestation_unavailable",
+            "version": 2, "status": "unavailable", "reason": "import_attestation_unavailable",
             "scope": "compiled_entrypoint", "revision_kind": "code_matched_source_sha256",
             "source_sha256": None, "git_revision": None, "full_bundle_known": False,
-            "exact_loader_bytes_known": False, "disk_freshness": "not_checked_after_import"}
-        if source["status"] == "attested":
+            "exact_loader_bytes_known": False, "disk_freshness": "not_checked_after_import",
+            "observation": "import_time", "import_snapshot_known": False,
+            "current_callable_fields_known": False,
+            "unchecked_callable_fields": ("code", "defaults", "kwdefaults_binding", "annotation_binding"),
+            "runtime_checks": ("module_namespace", "declaration_slots", "wrapped_links",
+                               "retained_kwdefault_items", "retained_closure_cells")}
+        if source["status"] == "import_snapshot":
             module = sys.modules.get(__name__)
             try:
                 same = (globals() is binding["namespace"] and __name__ == binding["name"] and __file__ == binding["file"]
                         and (module is None or (type(module) is ModuleType and module.__dict__ is globals()))
                         and all(container.get(key) is value for container, key, value in binding["slots"])
-                        and all(fn.__code__ is code and fn.__defaults__ is defaults and fn.__kwdefaults__ is kw
-                                and len(kw or {}) == len(items) and all(kw[k] is v for k, v in items)
+                        and all(len(kw or {}) == len(items) and all(kw[k] is v for k, v in items)
                                 and fn.__dict__.get("__wrapped__") is wrapped
-                                and getattr(fn, "__annotate__", None) is annotate
                                 and all(cell.cell_contents is value for cell, value in cells)
                                 for fn, code, defaults, kw, items, wrapped, annotate, cells in binding["functions"]))
             except (AttributeError, KeyError, TypeError, ValueError):
@@ -7107,7 +7123,7 @@ class MemoryWikiProvider(MemoryProvider):
             "conn_path": conn_path, "conn_path_matches": conn_matches,
             "module_name": __name__, "module_file": str(Path(__file__).resolve()),
             "loaded_code_identity": _LOADED_CODE_IDENTITY,
-            "loaded_source_revision_known": source["status"] == "attested",
+            "loaded_source_revision_known": False,  # current callable fields are not proved
             "loaded_source_binding": source,
             "profile_ready": scope.get("__semantic_compatible", "1") != "0",
             "profile_reason": scope.get("__semantic_reason", "ready"),
@@ -7133,20 +7149,23 @@ class MemoryWikiProvider(MemoryProvider):
         scope = _QDRANT_PROFILE_SCOPE.get() or {}
         binding = globals().get("_LOADED_SOURCE_BINDING")
         source = dict(binding["report"]) if binding is not None else {
-            "version": 1, "status": "unavailable", "reason": "import_attestation_unavailable",
+            "version": 2, "status": "unavailable", "reason": "import_attestation_unavailable",
             "scope": "compiled_entrypoint", "revision_kind": "code_matched_source_sha256",
             "source_sha256": None, "git_revision": None, "full_bundle_known": False,
-            "exact_loader_bytes_known": False, "disk_freshness": "not_checked_after_import"}
-        if source["status"] == "attested":
+            "exact_loader_bytes_known": False, "disk_freshness": "not_checked_after_import",
+            "observation": "import_time", "import_snapshot_known": False,
+            "current_callable_fields_known": False,
+            "unchecked_callable_fields": ("code", "defaults", "kwdefaults_binding", "annotation_binding"),
+            "runtime_checks": ("module_namespace", "declaration_slots", "wrapped_links",
+                               "retained_kwdefault_items", "retained_closure_cells")}
+        if source["status"] == "import_snapshot":
             module = sys.modules.get(__name__)
             try:
                 same = (globals() is binding["namespace"] and __name__ == binding["name"] and __file__ == binding["file"]
                         and (module is None or (type(module) is ModuleType and module.__dict__ is globals()))
                         and all(container.get(key) is value for container, key, value in binding["slots"])
-                        and all(fn.__code__ is code and fn.__defaults__ is defaults and fn.__kwdefaults__ is kw
-                                and len(kw or {}) == len(items) and all(kw[k] is v for k, v in items)
+                        and all(len(kw or {}) == len(items) and all(kw[k] is v for k, v in items)
                                 and fn.__dict__.get("__wrapped__") is wrapped
-                                and getattr(fn, "__annotate__", None) is annotate
                                 and all(cell.cell_contents is value for cell, value in cells)
                                 for fn, code, defaults, kw, items, wrapped, annotate, cells in binding["functions"]))
             except (AttributeError, KeyError, TypeError, ValueError):
@@ -7162,7 +7181,7 @@ class MemoryWikiProvider(MemoryProvider):
             "conn_path_matches": bool(main and Path(main).resolve() == Path(self.db_path).resolve()),
             "module_name": __name__, "module_file": str(Path(__file__).resolve()),
             "loaded_code_identity": _LOADED_CODE_IDENTITY,
-            "loaded_source_revision_known": source["status"] == "attested",
+            "loaded_source_revision_known": False,  # current callable fields are not proved
             "loaded_source_binding": source,
             "profile_ready": scope.get("__semantic_compatible", "1") != "0",
             "profile_reason": scope.get("__semantic_reason", "ready"),
