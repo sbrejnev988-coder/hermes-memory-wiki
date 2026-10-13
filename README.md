@@ -1,5 +1,32 @@
 # Hermes Memory Wiki v1.24.5
 
+## Current plugin fixes — проверенный SOURCE checkpoint, не релиз
+
+Объединённое runtime/tests дерево проверки:
+[`37afe64af95421a735c584e71f8717976393976d`](https://github.com/sbrejnev988-coder/hermes-memory-wiki/commit/37afe64af95421a735c584e71f8717976393976d).
+Исправлены terminal recall delivery/UNKNOWN retention, actor/polarity в Memory Diff,
+guarded refill и SQLite lexical fallback, rerank/diversity и internal-only marker,
+current fallback diagnostics и original graph/job admissions до owning COMMIT.
+Import snapshot честно оставляет current-callable/Git loaded attestation UNKNOWN.
+
+Родитель сверил агрегат **285 уникальных pytest main cases / 855 фаз** и
+**45 отдельных pure SOURCE identity cases** на этих точных runtime/test bytes.
+Принятые captures имеют child exit0, audit0, complete ownership/capture и пустой
+supervisor error ledger. В pytest числе отдельно присутствуют 16 числовых
+ranking UNIT, 3 guard UNIT и 2 SOURCE controls; это не 285 native E2E.
+Пакеты: recovery32, documents55, delivery17, graph51, MemoryDiff21, ranking42,
+prefetch13, security54. Это агрегат применимых результатов после адресных
+carrier corrections, **не новый единый monolithic/full-suite run**. Прежние
+resource/setup/timeout/projection отказы сохранены, не переписаны в PASS.
+
+Graph-коррекция native COMMIT проверена вручную родителем; исходный независимый
+BLOCKED verdict сохранён, новое независимое review не заявляется. SOURCE
+публикация не доказывает installed/loaded fleet, host MemoryManager/bootstrap,
+cross-platform FULL, OS containment, real-provider quality или release readiness.
+Обязательные недопущенные native/CI/activation gates остаются незакрытыми.
+Версия пакета не повышена и новый tag/Release здесь не создаётся.
+[Совместимость graph callbacks и границы guard](docs/ADVANCED_SETTINGS.md#совместимость-current-plugin-fixes).
+
 ## Rerank: порядок безопасной cohort и diversity
 
 При успешном rerank (включая валидный cache hit) любой положительный

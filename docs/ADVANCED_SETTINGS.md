@@ -300,6 +300,48 @@ Bounded контракт `loaded_source_binding.version=2` (import snapshot, н�
 
 Без import match возвращается `unavailable / import_attestation_unavailable`; missing/nonregular/read-refused source, wrong module/spec и несовпадение full compiled content имеют отдельные причины. Import-time `RuntimeError` от introspection даёт `unavailable / import_introspection_refused`, не доказательство current code. Failure не печатает paths, source text или exception details. **Обнаруживаемый** drift даёт `drifted` обоим producers; не наблюдаемые current fields остаются явно UNKNOWN. Terminal не заходит в заменённый `_runtime_identity` callback и не лечится одним расширенным except. Native boot, новые install/reload, full-suite и loaded fleet требуют собственных разрешений и receipts.
 
+## Совместимость current plugin fixes
+
+Это source/component checkpoint на runtime/tests PIN
+`37afe64af95421a735c584e71f8717976393976d`, не новая installed/loaded версия.
+Добавление публикационной документации не является повторным выполнением этих
+тестов. Saved ENV/YAML, модели, credentials, ACL, schema и профили этим текстом
+не меняются; loaded identity сохраняет описанные выше known=false ограничения.
+
+Graph effects сохраняют исходные actor/source admissions и frozen background-job
+lease у actual owning transaction до native COMMIT, включая legal joined ingest.
+Shared/private writers проверяют поздний authorizer после пользовательского
+callback. Поддержанные authorizers возвращают именно builtin `int` с
+`SQLITE_OK`, `SQLITE_DENY` или `SQLITE_IGNORE`; user-defined `__index__` после
+fence не принимается. Connection statements cache отключён при выдаче handle
+(`cached_statements=0`), чтобы SQL/cursor/context shortcuts достигали той же
+границы; отдельное измерение performance этой настройки не выполнено.
+
+**Trace/progress callbacks при завершении graph stage не поддержаны:** такой
+COMMIT отказывает с `graph_native_commit_late_callback_unsupported`, а не
+игнорирует callback или объявляет его атомарно защищённым. Reentrant transaction
+completion/изменение authorizer/закрытие handle во время graph COMMIT запрещены.
+Обычные поддержанные shared/private writer positives сохранены; отказ вызывает
+rollback всей пачки endpoints/relations либо retained exact owner/primary при
+неподтверждённом cleanup. Это не универсальный SQLite sandbox или защита от
+hostile in-process вмешательства через несогласованный native API.
+
+Guarded recall не делает сохранённый текст инструкцией для модели. Operative
+directives отсекаются, benign discussion/literal data и owned formatter prefix
+сохраняются в проверенных случаях; bounded refill использует настоящий SQL
+eligibility до LIMIT и final admission. Это не доказательство универсального
+распознавания любой формулировки prompt injection. Memory Diff не подтверждает
+проверенные actor/polarity swaps; неоднозначные Unicode identity случаи остаются
+неподтверждёнными, не лечатся переписыванием literals.
+
+Публичный `memory_wiki_query` удаляет internal `_rerank_order` после построения
+результата, не меняя internal ordinals/guards. Prefetch diagnostic выбранного
+fallback/empty outcome публикуется только исходным owning terminal admission;
+detached/late worker не должен заменить выбранный trace. Эти contracts не
+исполняют Core MemoryManager/bootstrap и не устраняют ограничения Core;
+Core/SDK/PM source не изменялись. Full native, loaded fleet, CI и релиз требуют
+своих отдельных проверок. Сводка counts и execution scope — в [README](../README.md#current-plugin-fixes--проверенный-source-checkpoint-не-релиз).
+
 ## Каталог ENV-параметров
 
 143 уникальных осей из действующих readers; выборка, а не обещание полного списка всех internal/fault flags. Default относится к отсутствующему ключу. Тип и условие важнее имени: имя переменной само по себе не доказывает effect. Preset не включает все флаги.
