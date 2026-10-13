@@ -169,6 +169,13 @@ class _RecordCommitHook:
         self.owner = _owner(provider)
         self.key, self.uri, self.namespace = source_key, uri, namespace
         self.source_id = source_id
+        # Only the trusted local-file entry has no adapter revision/hash. Derive
+        # both from the document image within its actual owning transaction;
+        # caller records never get to replace their fixed expected hash.
+        if namespace == "local_file" and (
+                source_type != "local_file" or revision_key or content_hash
+                or not uri.startswith("file:")):
+            raise ValueError("connector_local_revision_binding_invalid")
         self.fields = dict(source_key=source_key, source_type=source_type,
                            display_uri=display_uri, scope_id=scope_id,
                            repository_id=repository_id,
@@ -242,7 +249,15 @@ class _RecordCommitHook:
             "WHERE s.source_id=? AND s.active=1 AND r.status='active' "
             "AND s.scope_id=? AND s.repository_id=?",
             (self.source_id, self.fields['scope_id'], self.fields['repository_id'])).fetchone()
-        if row is None or str(row['file_hash']) != self.fields['content_hash']:
+        if row is None:
+            raise RuntimeError('connector_document_ingest_incomplete')
+        if self.namespace == "local_file":
+            actual_hash = str(row['file_hash'] or '')
+            if not actual_hash:
+                raise RuntimeError('connector_document_ingest_incomplete')
+            self.fields['content_hash'] = actual_hash
+            self.fields['revision_key'] = actual_hash[:20]
+        elif str(row['file_hash']) != self.fields['content_hash']:
             raise RuntimeError('connector_document_ingest_incomplete')
         _put_source_in_transaction(provider, conn, _expected_owner=self.owner, **self.fields)
         expected = (str(row['source_id']), str(row['revision_id']), str(row['file_hash']),
@@ -273,29 +288,29 @@ def sync_local_file(provider: Any, args: dict[str, Any]) -> dict[str, Any]:
     path = path.resolve(strict=True)
     uri = path.as_uri()
     key = _source_key(provider, uri, scope_id, repository_id, "local_file")
-    authorize_write(provider, key)
+    conn = provider._connect()
+    if conn.in_transaction or provider._connect() is not conn:
+        raise RuntimeError('connector_transaction_ownership_refused')
+    authorize_write(provider, key, _conn=conn)
+    hook = _RecordCommitHook(provider, conn, source_key=key, uri=uri,
+        namespace="local_file", source_id=documents._source_id(path),
+        source_type="local_file", display_uri=_display_uri(uri),
+        scope_id=scope_id, repository_id=repository_id,
+        revision_key="", content_hash="")
     result = documents.ingest_document(provider, {
         "path": str(path), "scope_id": scope_id,
         "repository_id": repository_id, "embed": False,
-    })
-    source_id = str(result.get("source_id") or "")
-    row = provider._connect().execute(
-        "SELECT file_hash,revision_id,active FROM document_sources WHERE source_id=?", (source_id,)
-    ).fetchone()
-    if row is None or not int(row["active"] or 0):
-        raise RuntimeError("connector_document_ingest_incomplete")
-    content_hash = str(row["file_hash"] or "")
-    _put_source(provider, source_key=key, source_type="local_file",
-                display_uri=_display_uri(uri), scope_id=scope_id,
-                repository_id=repository_id, document_source_id=source_id,
-                revision_key=content_hash[:20], content_hash=content_hash)
+    }, _commit_hook=hook)
+    if hook.outcome() != 'committed' or hook.expected is None:
+        raise RuntimeError('connector_transaction_commit_outcome_unknown')
+    source_id, document_revision, _, _, _ = hook.expected
     if bool(args.get("embed", False)):
         documents.embed_pending_documents(provider, {
             "source_id": source_id, "scope_id": scope_id,
             "repository_id": repository_id, "limit": 200,
         })
     return {"status": str(result.get("status") or "indexed"), "source_key": key,
-            "source_id": source_id, "revision_id": str(row["revision_id"] or ""),
+            "source_id": source_id, "revision_id": document_revision,
             "scope_id": scope_id, "repository_id": repository_id}
 
 

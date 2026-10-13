@@ -342,6 +342,22 @@ detached/late worker не должен заменить выбранный trace
 Core/SDK/PM source не изменялись. Full native, loaded fleet, CI и релиз требуют
 своих отдельных проверок. Сводка counts и execution scope — в [README](../README.md#current-plugin-fixes--проверенный-source-checkpoint-не-релиз).
 
+## Local file connector: единый SQL publication contract
+
+Для `memory_wiki_source_file_sync` canonical document revision и строка
+`external_sources` теперь публикуются в одном owning SQL transaction через
+существующий private `_RecordCommitHook`. Local revision/content hash берутся
+из actual active document image внутри этой транзакции, не из result JSON или
+повторного чтения пользовательского файла. Отказ metadata INSERT/UPDATE должен
+откатить также изменения document image; embedding вызывается только после
+подтверждённого committed tuple. Уже открытая чужая транзакция не присваивается.
+Record/GitHub/Drive paths сохраняют собственные fixed expected hashes.
+
+Это scoped correction SQL boundary, а не атомарность файловой системы+SQL при
+hard process crash: пользовательский local file не изменяется/не удаляется.
+Durable connector-record staging/replay, parser-worker, host/native B4 и loaded
+profile acceptance остаются отдельными gates. Нового ENV/YAML/schema нет.
+
 ## Каталог ENV-параметров
 
 143 уникальных осей из действующих readers; выборка, а не обещание полного списка всех internal/fault flags. Default относится к отсутствующему ключу. Тип и условие важнее имени: имя переменной само по себе не доказывает effect. Preset не включает все флаги.
