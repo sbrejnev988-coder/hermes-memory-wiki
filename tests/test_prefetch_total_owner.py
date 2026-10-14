@@ -226,3 +226,144 @@ def test_real_rollback_unknown_precludes_new_prefetch_worker(recalled):
         assert caught.value is primary and p._transaction_quarantine is p._conn
         old=p._prefetch_attempt;assert p.prefetch(QUERY)=='' and p._prefetch_attempt is old
     finally:p._conn.set_authorizer(None)
+
+
+# Review R1/R2/R3 composition controls. The prior 11 cases/assertions are intact.
+def connection_accounting(conn):
+    statements=('SELECT id,access_count,recall_count,last_recalled FROM claims ORDER BY id',
+                'SELECT id,claim_id,used FROM recall_events ORDER BY id',
+                'SELECT consumer_id,last_seen_revision FROM memory_consumers ORDER BY consumer_id')
+    return tuple(tuple(tuple(r) for r in conn.execute(sql).fetchall()) for sql in statements)
+
+@pytest.mark.parametrize('withdrawal',['lifecycle','owned_handle','erasure','policy','config','rollback_unknown'])
+def test_native_authorizer_non_sql_authority_withdrawal_never_commits(recalled,withdrawal):
+    p=recalled;c=p._conn;peer=sqlite3.connect(str(p.db_path),timeout=0)
+    before=connection_accounting(peer);seen=[]
+    old=(p._lifecycle_state,p._owned_conn,p._privacy_erasure)
+    old_policy=os.environ.get('HERMES_SECURITY_STRICT');env_bytes=(p.home/'.env').read_bytes()
+    def authorizer(action,a,b,database,trigger):
+        if action==sqlite3.SQLITE_TRANSACTION and a=='COMMIT':
+            seen.append(True)
+            if withdrawal=='lifecycle':p._lifecycle_state='stopping'
+            elif withdrawal=='owned_handle':p._owned_conn=None
+            elif withdrawal=='erasure':p._privacy_erasure=None
+            elif withdrawal=='policy':os.environ['HERMES_SECURITY_STRICT']='true'
+            elif withdrawal=='config':(p.home/'.env').write_bytes(env_bytes+b'\n# owned-config-withdrawal\n')
+            elif withdrawal=='rollback_unknown':p._owned_conn=None
+        if withdrawal=='rollback_unknown' and action==sqlite3.SQLITE_TRANSACTION and a=='ROLLBACK':
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+    c.set_authorizer(authorizer);value=None;error=None
+    try:
+        try:value=p.prefetch(QUERY)
+        except RuntimeError as caught:error=caught
+        a=join_attempt(p)
+        assert seen
+        assert value=='' or error is not None
+        assert connection_accounting(peer)==before
+        if withdrawal=='rollback_unknown':
+            assert error is p._transaction_primary and error is a.error
+            assert p._transaction_quarantine is c and p._claim_tx_connection is c
+            assert c._prefetch_terminal is not None and c.in_transaction
+            assert c._prefetch_terminal._prefetch_attempt is a
+            assert p.prefetch(QUERY)=='' and p._prefetch_attempt is a
+            with pytest.raises(RuntimeError):p._connect()
+        else:assert error is None and not c.in_transaction and p._transaction_quarantine is None
+    finally:
+        c.set_authorizer(None);peer.close()
+        p._lifecycle_state,p._owned_conn,p._privacy_erasure=old
+        if old_policy is None:os.environ.pop('HERMES_SECURITY_STRICT',None)
+        else:os.environ['HERMES_SECURITY_STRICT']=old_policy
+        (p.home/'.env').write_bytes(env_bytes)
+
+
+class OwnedCallerCancellation(BaseException):
+    pass
+
+@pytest.mark.parametrize('rollback_unknown',[False,True])
+def test_caller_unwind_cancels_exact_prefetch_terminal_before_accounting(recalled,rollback_unknown):
+    from agent.memory_provider import spawn_context_thread
+    p=recalled;c=p._conn;peer=sqlite3.connect(str(p.db_path),timeout=0)
+    before=connection_accounting(peer);entered,release=threading.Event(),threading.Event()
+    primary=OwnedCallerCancellation('owned-caller-unwind');caught=[];witness=[]
+    def authorizer(action,a,b,database,trigger):
+        return sqlite3.SQLITE_DENY if rollback_unknown and action==sqlite3.SQLITE_TRANSACTION and a=='ROLLBACK' else sqlite3.SQLITE_OK
+    if rollback_unknown:c.set_authorizer(authorizer)
+    def profile(frame,event,arg):
+        if event!='call':return
+        current=threading._active.get(threading.get_ident())
+        if current is None:return
+        delivery=frame.f_locals.get('_delivery')
+        if (current.name=='memory-wiki-prefetch-owner' and frame.f_code.co_name=='finish'
+                and delivery is not None and delivery.phase=='verify' and not witness):
+            witness.append({'phase':delivery.phase,'after_changes':c.total_changes,'owned_changes':delivery.delta})
+            entered.set();assert release.wait(8)
+        if (current.name=='owned-prefetch-caller-unwind' and frame.f_code.co_name=='wait'
+                and p._prefetch_attempt is not None and frame.f_locals.get('self') is p._prefetch_attempt.done):
+            assert entered.wait(3),'owned-verify-seam-not-reached'
+            raise primary
+    def caller():
+        try:p.prefetch(QUERY)
+        except BaseException as error:caught.append(error)
+    previous=threading.getprofile();threading.setprofile(profile)
+    caller_thread=spawn_context_thread(caller,name='owned-prefetch-caller-unwind',daemon=False)
+    caller_thread.start()
+    try:
+        caller_thread.join(4)
+        assert not caller_thread.is_alive() and caught==[primary]
+        a=p._prefetch_attempt
+        assert entered.is_set() and witness and a.worker.is_alive() and p._prefetch_admission.locked()
+        cancel_when_caller_left=a.cancel.is_set()
+        assert p.prefetch(QUERY)=='' and p._prefetch_attempt is a
+    finally:
+        release.set();threading.setprofile(previous);caller_thread.join(3);a=join_attempt(p)
+    try:
+        assert cancel_when_caller_left,'waiting caller BaseException did not withdraw original worker attempt'
+        assert connection_accounting(peer)==before
+        if rollback_unknown:
+            assert p._transaction_quarantine is c and p._transaction_primary is a.error
+            assert c._prefetch_terminal is not None and c._prefetch_terminal._prefetch_attempt is a
+            assert p._claim_tx_connection is c and c.in_transaction
+            assert c._prefetch_terminal.phase=='verify'
+            assert p.prefetch(QUERY)=='' and p._prefetch_attempt is a
+            with pytest.raises(RuntimeError):p._connect()
+        else:
+            assert p._transaction_quarantine is None and not c.in_transaction
+            assert c._prefetch_terminal is None
+            assert TEXT in p.prefetch(QUERY);join_attempt(p)
+    finally:
+        c.set_authorizer(None);peer.close()
+
+
+def test_healthy_empty_primary_publishes_new_diagnostic_without_ack(recalled):
+    p=recalled
+    assert TEXT in p.prefetch(QUERY);join_attempt(p)
+    old=dict(p._last_prefetch_diagnostics)
+    # The authored row is pinned, so a different query alone is not an empty
+    # oracle. Make the owned fixture genuinely ineligible, preserving its row.
+    with p._claim_transaction() as conn:
+        conn.execute("UPDATE claims SET status='archived' WHERE id='c_prefetch_owned'")
+    before_ack=tuple(tuple(r) for r in p._conn.execute('SELECT consumer_id,last_seen_revision FROM memory_consumers ORDER BY consumer_id'))
+    value=p.prefetch('zqxwvn unrecalled botanical zephyr');join_attempt(p)
+    assert value==''
+    current=p._last_prefetch_diagnostics
+    assert current.get('status')=='empty' and current.get('rendered')==0
+    assert current.get('recall_trace_id') and current['recall_trace_id']!=old['recall_trace_id']
+    assert tuple(tuple(r) for r in p._conn.execute('SELECT consumer_id,last_seen_revision FROM memory_consumers ORDER BY consumer_id'))==before_ack
+
+
+def test_benign_native_user_authorizer_reader_supported_terminal_explicitly_refused(recalled):
+    p=recalled;before=accounting(p);actions=[]
+    def authorizer(action,a,b,database,trigger):
+        actions.append((action,a));return sqlite3.SQLITE_OK
+    p._conn.set_authorizer(authorizer)
+    try:
+        assert p.prefetch(QUERY)=='';join_attempt(p)
+        assert p._conn._graph_user_authorizer is authorizer
+        assert any(action==sqlite3.SQLITE_TRANSACTION and a=='COMMIT' for action,a in actions)
+        assert accounting(p)==before and not p._conn.in_transaction
+        # Refusal is only the new critical prefetch lifetime, not a disabled
+        # user guard or blanket no-memory replacement of other public readers.
+        result=json.loads(p.handle_tool_call('memory_wiki_query',{'query':QUERY,'limit':5}))
+        assert any(row.get('claim')==TEXT for row in result.get('claims',[]))
+    finally:p._conn.set_authorizer(None)

@@ -1323,8 +1323,23 @@ class _GraphCommitConnection(sqlite3.Connection):
                 return sqlite3.SQLITE_DENY
             if flight is not None:
                 _graph_commit_fence(self, flight)
+            if self._prefetch_commit_flight is not None and callback is not None:
+                # The supported user callback has actually run, not been
+                # disabled. A full ORIGINAL policy/config/erasure/readset fence
+                # cannot safely rerun SQL/filesystem guards inside an authorizer.
+                # Actor/total_changes alone is NOT that lease: explicitly refuse
+                # this critical prefetch lifetime before any native effect.
+                # Ordinary readers/nonprefetch transactions retain the callback.
+                raise RuntimeError('prefetch_native_authorizer_lifetime_unsupported')
             if prefetch_commit:
-                if (not terminal.prefetch_ready() or terminal.measurement is None
+                if (self._prefetch_terminal is not terminal or terminal.provider is not owner
+                        or owner._conn is not self or owner._owned_conn is not self
+                        or owner._claim_tx_connection is not self
+                        or owner._claim_tx_thread != threading.get_ident()
+                        or owner._lifecycle_state not in {'ready', 'idle'}
+                        or owner._transaction_quarantine is not None
+                        or terminal.phase != 'verify'
+                        or not terminal.prefetch_ready() or terminal.measurement is None
                         or self.total_changes != terminal.measurement['after_changes']):
                     raise RuntimeError('prefetch_terminal_attempt_expired')
             return result

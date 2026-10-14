@@ -3825,13 +3825,20 @@ def _bounded_prefetch_callback(provider, dispatch, query, *, session_id=""):
         if not start_attempted:
             admission.release()
         raise
-    attempt.done.wait(attempt.remaining())
-    if not attempt.done.is_set() or attempt.remaining() <= 0.0:
+    try:
+        attempt.done.wait(attempt.remaining())
+        if not attempt.done.is_set() or attempt.remaining() <= 0.0:
+            attempt.cancel.set()
+            return ""
+        if attempt.error is not None:
+            raise attempt.error
+        return attempt.value
+    except BaseException:
+        # The whole worker now owns terminal effects. Caller unwind must
+        # withdraw THAT exact attempt, without releasing its live/UNKNOWN slot
+        # or replacing the original cancellation with a cleanup diagnostic.
         attempt.cancel.set()
-        return ""
-    if attempt.error is not None:
-        raise attempt.error
-    return attempt.value
+        raise
 
 
 def _prefetch_active() -> bool:
@@ -8602,7 +8609,7 @@ class MemoryWikiProvider(MemoryProvider):
                         reason=reason, delivery_budget=delivery_budget)
                 if _prefetch_budget_expired():
                     return ""
-            elif result and not self._commit_prefetch_delivery(delivery):
+            elif delivery and not self._commit_prefetch_delivery(delivery):
                 result = ""
                 if request is not None:
                     request["emitted_ids"] = []
@@ -14564,6 +14571,7 @@ class MemoryWikiProvider(MemoryProvider):
                         or self._claim_tx_thread != threading.get_ident()
                         or self._transaction_quarantine is not None
                         or _terminal.phase != 'verify' or _terminal.measurement is None
+                        or (_terminal._prefetch_attempt is not None and c._prefetch_terminal is not _terminal)
                         or c.total_changes != _terminal.measurement['after_changes']):
                     raise _DeliveryWithheld("terminal_commit_provenance_unproven")
                 # Run lease callbacks BEFORE the final source/authority reads.
