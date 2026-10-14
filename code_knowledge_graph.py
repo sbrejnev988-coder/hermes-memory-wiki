@@ -1265,10 +1265,12 @@ class _GraphCommitConnection(sqlite3.Connection):
         self._graph_authorizer_depth = 0
         self._graph_trace = None
         self._graph_progress = None
+        self._prefetch_terminal = None
+        self._prefetch_commit_flight = None
         sqlite3.Connection.set_authorizer(self, self._graph_authorize)
 
     def set_authorizer(self, callback):
-        if self._graph_commit_flight is not None:
+        if self._graph_commit_flight is not None or self._prefetch_commit_flight is not None:
             raise RuntimeError('graph_writer_operation_in_flight')
         if callback is not None and not callable(callback):
             raise TypeError('authorizer_must_be_callable')
@@ -1276,25 +1278,25 @@ class _GraphCommitConnection(sqlite3.Connection):
         return sqlite3.Connection.set_authorizer(self, self._graph_authorize)
 
     def close(self):
-        if self._graph_commit_flight is not None:
+        if self._graph_commit_flight is not None or self._prefetch_commit_flight is not None:
             raise RuntimeError('graph_writer_operation_in_flight')
         return super().close()
 
     def set_trace_callback(self, callback):
-        if self._graph_commit_flight is not None:
+        if self._graph_commit_flight is not None or self._prefetch_commit_flight is not None:
             raise RuntimeError('graph_writer_operation_in_flight')
         self._graph_trace = callback
         return super().set_trace_callback(callback)
 
     def set_progress_handler(self, callback, n):
-        if self._graph_commit_flight is not None:
+        if self._graph_commit_flight is not None or self._prefetch_commit_flight is not None:
             raise RuntimeError('graph_writer_operation_in_flight')
         self._graph_progress = callback if n > 0 else None
         return super().set_progress_handler(callback, n)
 
     def _graph_authorizer_result(self, action, a, b, database, source):
         flight = self._graph_commit_flight
-        if (flight is not None and self._graph_authorizer_depth
+        if ((flight is not None or self._prefetch_commit_flight is not None) and self._graph_authorizer_depth
                 and action in (sqlite3.SQLITE_TRANSACTION, sqlite3.SQLITE_SAVEPOINT)):
             # Reentrant shared SQL must not finish the transaction INSIDE the
             # user callback, before the outer callback's final admission.
@@ -1303,6 +1305,10 @@ class _GraphCommitConnection(sqlite3.Connection):
         stage = getattr(owner, '_claim_tx_graph_stage', None)
         graph_commit = action == sqlite3.SQLITE_TRANSACTION and a == 'COMMIT' and stage is not None and stage[2]
         if graph_commit and flight is None:
+            return sqlite3.SQLITE_DENY
+        terminal = self._prefetch_terminal
+        prefetch_commit = terminal is not None and action == sqlite3.SQLITE_TRANSACTION and a == 'COMMIT'
+        if prefetch_commit and self._prefetch_commit_flight is not terminal:
             return sqlite3.SQLITE_DENY
         try:
             callback = self._graph_user_authorizer
@@ -1317,6 +1323,25 @@ class _GraphCommitConnection(sqlite3.Connection):
                 return sqlite3.SQLITE_DENY
             if flight is not None:
                 _graph_commit_fence(self, flight)
+            if self._prefetch_commit_flight is not None and callback is not None:
+                # The supported user callback has actually run, not been
+                # disabled. A full ORIGINAL policy/config/erasure/readset fence
+                # cannot safely rerun SQL/filesystem guards inside an authorizer.
+                # Actor/total_changes alone is NOT that lease: explicitly refuse
+                # this critical prefetch lifetime before any native effect.
+                # Ordinary readers/nonprefetch transactions retain the callback.
+                raise RuntimeError('prefetch_native_authorizer_lifetime_unsupported')
+            if prefetch_commit:
+                if (self._prefetch_terminal is not terminal or terminal.provider is not owner
+                        or owner._conn is not self or owner._owned_conn is not self
+                        or owner._claim_tx_connection is not self
+                        or owner._claim_tx_thread != threading.get_ident()
+                        or owner._lifecycle_state not in {'ready', 'idle'}
+                        or owner._transaction_quarantine is not None
+                        or terminal.phase != 'verify'
+                        or not terminal.prefetch_ready() or terminal.measurement is None
+                        or self.total_changes != terminal.measurement['after_changes']):
+                    raise RuntimeError('prefetch_terminal_attempt_expired')
             return result
         except BaseException as primary:
             # SQLite suppresses authorizer exceptions. Deliver the actual
@@ -1351,6 +1376,16 @@ class _GraphCommitConnection(sqlite3.Connection):
         with _provider_claim_lock(owner):
             if self._graph_commit_flight is not None:
                 raise RuntimeError('graph_writer_operation_in_flight')
+            terminal = self._prefetch_terminal
+            if terminal is not None:
+                if (self._prefetch_commit_flight is not None
+                        or not terminal.prefetch_ready()):
+                    raise RuntimeError('prefetch_terminal_attempt_expired')
+                # These callbacks run after authorizer admission. Refuse this
+                # unsupported critical lifetime rather than disabling them.
+                if self._graph_trace is not None or self._graph_progress is not None:
+                    raise RuntimeError('prefetch_terminal_late_callback_unsupported')
+                self._prefetch_commit_flight = terminal
             try:
                 self._graph_start_commit()
                 try:
@@ -1361,6 +1396,7 @@ class _GraphCommitConnection(sqlite3.Connection):
                     raise
             finally:
                 self._graph_commit_flight = None
+                self._prefetch_commit_flight = None
 
 
 class _GraphWriterConnection(_GraphCommitConnection):
