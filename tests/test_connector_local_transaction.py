@@ -70,6 +70,8 @@ def test_healthy_local_file_tuple_is_published_once_in_actual_owner_commit(store
     p,c,sid,path,*_=cached(store,'healthy-'+str(repeat));key=key_for(p,path)
     if repeat:call(p,path)
     observer=sqlite3.connect(str(p.db_path),timeout=0);observed=[];embedded=[]
+    observer.row_factory=sqlite3.Row
+    before_observer=image(observer)
     target=connectors._RecordCommitHook.apply.__code__
     def profile(frame,event,arg):
         if event=='call' and frame.f_code is graph.embed_pending_documents.__code__:
@@ -80,16 +82,25 @@ def test_healthy_local_file_tuple_is_published_once_in_actual_owner_commit(store
             assert c.in_transaction and p._claim_tx_connection is c
             row=observer.execute('SELECT document_source_id,revision_key,content_hash FROM external_sources WHERE source_key=?',(key,)).fetchone()
             if not repeat:assert row is None
+            assert image(observer)==before_observer
             assert hook.expected is not None
     prior=sys.getprofile();sys.setprofile(profile)
-    try:result=call(p,path,embed=embed)
-    finally:sys.setprofile(prior);observer.close()
-    assert len(observed)==1 and observed[0].outcome()=='committed'
-    assert embedded==(['after-owning-commit'] if embed else [])
-    row=c.execute('SELECT e.*,s.revision_id,s.file_hash FROM external_sources e JOIN document_sources s ON s.source_id=e.document_source_id WHERE e.source_key=?',(key,)).fetchone()
-    assert result['source_key']==key and result['source_id']==sid and result['revision_id']==row['revision_id']
-    assert row['content_hash']==row['file_hash'] and row['revision_key']==row['file_hash'][:20] and row['owner_bot_id']==p.bot_id
-    assert not c.in_transaction and p._transaction_quarantine is None
+    try:
+        result=call(p,path,embed=embed)
+        sys.setprofile(prior)
+        assert len(observed)==1 and observed[0].outcome()=='committed'
+        assert embedded==(['after-owning-commit'] if embed else [])
+        sql='SELECT e.*,s.revision_id,s.file_hash FROM external_sources e JOIN document_sources s ON s.source_id=e.document_source_id WHERE e.source_key=?'
+        row=c.execute(sql,(key,)).fetchone()
+        committed_observer=observer.execute(sql,(key,)).fetchone()
+        assert committed_observer is not None and dict(committed_observer)==dict(row)
+        revision=observer.execute("SELECT file_hash,status FROM document_revisions WHERE revision_id=? AND source_id=?",(row['revision_id'],sid)).fetchone()
+        assert revision is not None and revision['status']=='active' and revision['file_hash']==row['file_hash']
+        assert result['source_key']==key and result['source_id']==sid and result['revision_id']==row['revision_id']
+        assert row['content_hash']==row['file_hash'] and row['revision_key']==row['file_hash'][:20] and row['owner_bot_id']==p.bot_id
+        assert not c.in_transaction and p._transaction_quarantine is None
+    finally:
+        sys.setprofile(prior);observer.close()
 
 @pytest.mark.parametrize('command',['COMMIT','ROLLBACK'])
 def test_real_sql_completion_denial_keeps_beforeimage_or_exact_unknown_owner(store,command):
