@@ -3724,6 +3724,114 @@ PREFETCH_FALLBACK_RESERVE_SECONDS = _rerank_env_float(
     "MEMORY_WIKI_PREFETCH_FALLBACK_RESERVE_SECONDS", 0.45, 0.20, 1.0
 )
 _PREFETCH_LOCAL = threading.local()
+_PREFETCH_ATTEMPT = contextvars.ContextVar("memory_wiki_prefetch_attempt", default=None)
+
+
+class _PrefetchAttempt:
+    """One retained whole callback, never a second shared-connection reader.
+
+    This is process-local admission, not a host lease or hard realtime promise.
+    A caller timeout cancels its exact attempt; the slot belongs to the worker
+    until its actual finally, not until the waiting caller stops watching it.
+    """
+    def __init__(self, provider, deadline, home):
+        self.provider, self.deadline, self.home = provider, deadline, home
+        self.admission, self.owner_lock = provider._prefetch_admission, provider._lock
+        self.actor = (provider.home, provider.db_path, provider.bot_id,
+                      provider.session_id, provider.project_scope, provider.turn)
+        self.cancel = threading.Event()
+        self.done = threading.Event()
+        self.worker = None
+        self.thread_id = None
+        self.value = ""
+        self.error = None
+
+    def remaining(self):
+        return max(0.0, self.deadline - time.monotonic())
+
+    def permitted(self):
+        return (self.provider._prefetch_attempt is self
+                and self.provider._prefetch_admission is self.admission
+                and self.provider._lock is self.owner_lock
+                and (self.provider.home, self.provider.db_path, self.provider.bot_id,
+                     self.provider.session_id, self.provider.project_scope, self.provider.turn) == self.actor
+                and self.thread_id == threading.get_ident()
+                and not self.cancel.is_set() and self.remaining() > 0.0)
+
+    def run(self, dispatch, query, session_id):
+        token = _PREFETCH_ATTEMPT.set(self)
+        caller_token = _REQUEST_HOME.set(self.home)
+        acquired = False
+        self.thread_id = threading.get_ident()
+        try:
+            acquired = self.owner_lock.acquire(timeout=self.remaining())
+            if not acquired or not self.permitted():
+                return
+            with _prefetch_budget(self.remaining(), self.cancel, deadline=self.deadline):
+                value = dispatch(self.provider, query, session_id=session_id)
+                if self.permitted():
+                    self.value = value
+        except BaseException as exc:
+            self.error = exc
+        finally:
+            if acquired:
+                self.owner_lock.release()
+            _REQUEST_HOME.reset(caller_token)
+            _PREFETCH_ATTEMPT.reset(token)
+            self.admission.release()
+            self.done.set()
+
+
+def _bounded_prefetch_callback(provider, dispatch, query, *, session_id=""):
+    deadline = time.monotonic() + PREFETCH_DEADLINE_SECONDS
+    admission = provider._prefetch_admission
+    if (_PREFETCH_ATTEMPT.get() is not None
+            or provider._transaction_quarantine is not None
+            or not admission.acquire(blocking=False)):
+        return ""
+    attempt = None
+    worker = None
+    start_attempted = False
+    try:
+        home = _REQUEST_HOME.get() or str(_native_home())
+        attempt = _PrefetchAttempt(provider, deadline, home)
+        provider._prefetch_attempt = attempt
+        try:
+            from agent.memory_provider import spawn_context_thread
+        except ModuleNotFoundError as exc:
+            if exc.name not in {"agent", "agent.memory_provider"}:
+                raise
+            context = contextvars.copy_context()
+            worker = threading.Thread(target=context.run,
+                args=(attempt.run, dispatch, query, session_id), daemon=True,
+                name="memory-wiki-prefetch-owner")
+        else:
+            worker = spawn_context_thread(attempt.run,
+                name="memory-wiki-prefetch-owner", daemon=True,
+                args=(dispatch, query, session_id))
+        attempt.worker = worker
+        if attempt.remaining() <= 0.0:
+            attempt.cancel.set()
+            admission.release()
+            return ""
+        start_attempted = True
+        worker.start()
+    except BaseException:
+        if attempt is not None:
+            attempt.cancel.set()
+        # None ident/is_alive before bootstrap cannot prove native creation
+        # never occurred. Constructor refusal is known; start refusal retains
+        # exact admission until that worker's finally, or explicit UNKNOWN.
+        if not start_attempted:
+            admission.release()
+        raise
+    attempt.done.wait(attempt.remaining())
+    if not attempt.done.is_set() or attempt.remaining() <= 0.0:
+        attempt.cancel.set()
+        return ""
+    if attempt.error is not None:
+        raise attempt.error
+    return attempt.value
 
 
 def _prefetch_active() -> bool:
@@ -3757,12 +3865,13 @@ def _prefetch_network_timeout(requested: float, reserve: Optional[float] = None)
 
 
 @contextmanager
-def _prefetch_budget(seconds: float, cancel_event: Optional[threading.Event] = None):
+def _prefetch_budget(seconds: float, cancel_event: Optional[threading.Event] = None, *, deadline=None):
     previous_deadline = float(getattr(_PREFETCH_LOCAL, "deadline", 0.0) or 0.0)
     previous_event = getattr(_PREFETCH_LOCAL, "cancel_event", None)
-    candidate = time.monotonic() + max(0.05, float(seconds or 0.05))
+    candidate = (time.monotonic() + max(0.0, float(seconds or 0.0))
+                 if deadline is None else float(deadline))
     _PREFETCH_LOCAL.deadline = min(previous_deadline, candidate) if previous_deadline > 0.0 else candidate
-    _PREFETCH_LOCAL.cancel_event = cancel_event
+    _PREFETCH_LOCAL.cancel_event = previous_event if cancel_event is None else cancel_event
     try:
         yield
     finally:
@@ -7104,6 +7213,8 @@ class MemoryWikiProvider(MemoryProvider):
         self._degraded = False
         self._last_io_error = ""
         self._lock = threading.RLock()
+        self._prefetch_admission = threading.Lock()
+        self._prefetch_attempt = None
         self._secret_store = None
         self._last_prefetch_diagnostics: Dict[str, Any] = {}
         self._background_worker = None
@@ -8459,105 +8570,44 @@ class MemoryWikiProvider(MemoryProvider):
         sid = session_id or self.session_id
         with _hybrid_scope("request", new=True):
             _hybrid_note("request", "started")
-            result_box: Dict[str, str] = {}
-            error_box: Dict[str, Exception] = {}
-            cancel_event = threading.Event()
-            worker_budget = max(0.5, PREFETCH_DEADLINE_SECONDS - PREFETCH_FALLBACK_RESERVE_SECONDS)
-            request = _RECALL_REQUEST.get()
-            worker_request = json.loads(json.dumps(request)) if request is not None else None
-            worker_context = contextvars.copy_context()
-            terminal = _current_delivery(self)
-            if terminal is None:
-                raise _DeliveryWithheld("detached_audit_original_parent_required")
-            audits = terminal.detach_audits(sid, cancel_event)
-            delivery = {"audits": audits}
-
-            def _run_bounded() -> None:
-                token = _RECALL_REQUEST.set(worker_request)
-                terminal_token = _DELIVERY.set(None)
-                audit_token = _AUDIT_PREPARATION.set(audits)
-                try:
-                    audits.bind_worker()
-                    with _prefetch_budget(worker_budget, cancel_event), _hybrid_scope("worker"):
-                        worker_started = time.monotonic()
-                        _hybrid_note("worker", "started")
-                        outcome = "failed"
-                        try:
-                            value = self._prefetch_impl(query, session_id=sid, delivery_budget=delivery_budget, _delivery=delivery) or ""
-                            if not _prefetch_budget_expired():
-                                result_box["value"] = value
-                                outcome = "completed"
-                            else:
-                                outcome = "discarded"
-                        finally:
-                            _hybrid_note("worker", outcome, cancel_requested=cancel_event.is_set(),
-                                         elapsed_ms=(time.monotonic() - worker_started) * 1000)
-                except Exception as exc:
-                    error_box["value"] = exc
-                finally:
-                    try:
-                        audits.seal()
-                    finally:
-                        _AUDIT_PREPARATION.reset(audit_token)
-                        _DELIVERY.reset(terminal_token)
-                    _RECALL_REQUEST.reset(token)
-
-            def fallback(path, reason, metric=None):
-                if request is not None:
-                    request["delivery_path"] = path
-                _hybrid_note("request", "thread_start_fallback" if path == "thread_start_fallback" else
-                             "deadline_fallback" if path == "deadline_fallback" else "error_fallback",
-                             cancel_requested=cancel_event.is_set())
-                with _hybrid_scope("fallback"):
-                    fallback_started = time.monotonic()
-                    _hybrid_note("fallback", "started")
-                    try:
-                        result = self._lexical_prefetch_fallback(query, session_id=sid, reason=reason, delivery_budget=delivery_budget)
-                    finally:
-                        _hybrid_note("fallback", "completed", elapsed_ms=(time.monotonic() - fallback_started) * 1000)
-                if metric is not None:
-                    _online_metrics.record_path(self.db_path, "prefetch", metric, (time.monotonic() - started) * 1000)
-                return result
-
             started = time.monotonic()
+            request = _RECALL_REQUEST.get()
+            delivery = {}
+            primary_seconds = max(0.0, _prefetch_time_remaining() - PREFETCH_FALLBACK_RESERVE_SECONDS)
+            result = ""
+            reason = "deadline"
+            # The complete scoped callback is already on one bounded owner.
+            # Do not start an inner reader which can still own SQLite when the
+            # same callback begins its fallback. Existing terminal preparation
+            # remains attached to this original attempt/thread.
             try:
-                worker = threading.Thread(target=worker_context.run, args=(_run_bounded,),
-                                          daemon=True, name="memory-wiki-bounded-prefetch")
-                worker.start()
-                worker.join(worker_budget)
-            except Exception:
-                cancel_event.set()
-                audits.drop("dropped_thread_start")
-                return fallback("thread_start_fallback", "thread_start_failed")
-            if worker.is_alive() or cancel_event.is_set() or ("value" not in result_box and not error_box):
-                cancel_event.set()
-                audits.drop("dropped_deadline")
-                _hybrid_note("cancel", "requested", cancel_requested=True)
-                _debug_log(f"PREFETCH deadline reached after {worker_budget:.3f}s; returning local FTS fallback")
-                return fallback("deadline_fallback", "deadline", "timeout_fallback")
-            if error_box:
-                audits.drop("dropped_worker_error")
-                exc = error_box["value"]
+                with _prefetch_budget(primary_seconds), _hybrid_scope("worker"):
+                    if not _prefetch_budget_expired():
+                        result = self._prefetch_impl(query, session_id=sid,
+                            delivery_budget=delivery_budget, _delivery=delivery) or ""
+                    if _prefetch_budget_expired():
+                        result = ""
+                    else:
+                        reason = "empty" if not result else "selected"
+            except Exception as exc:
+                reason = "network_or_runtime_error"
                 _debug_log(f"PREFETCH degraded to local FTS: {_safe_exception_label(exc)}")
-                return fallback("runtime_error_fallback", "network_or_runtime_error", "error_fallback")
-            _debug_log(f"PREFETCH bounded completion_ms={int((time.monotonic() - started) * 1000)}")
-            _hybrid_note("request", "selected")
-            if "value" not in result_box:
-                audits.drop("dropped_worker_budget")
+            if _prefetch_budget_expired():
                 return ""
-            result = result_box.get("value", "")
-            # Metadata is preparation, too. Admission/ACK remains the original
-            # owner fence AFTER join, diagnostics and all observation callbacks.
-            if delivery and not self._commit_prefetch_delivery(delivery):
+            if not result and reason in {"deadline", "network_or_runtime_error"}:
+                if request is not None:
+                    request["delivery_path"] = "deadline_fallback" if reason == "deadline" else "runtime_error_fallback"
+                with _hybrid_scope("fallback"):
+                    result = self._lexical_prefetch_fallback(query, session_id=sid,
+                        reason=reason, delivery_budget=delivery_budget)
+                if _prefetch_budget_expired():
+                    return ""
+            elif result and not self._commit_prefetch_delivery(delivery):
                 result = ""
                 if request is not None:
                     request["emitted_ids"] = []
-            elif request is not None and worker_request is not None:
-                # Only the successfully admitted current attempt can replace the
-                # parent receipt. Dropped/late workers retain a separate copy.
-                admitted_ids = request["emitted_ids"]
-                request.update(json.loads(json.dumps(worker_request)))
-                request["emitted_ids"] = list(dict.fromkeys([*request["emitted_ids"], *admitted_ids]))
+            if _prefetch_budget_expired():
+                return ""
             _online_metrics.record_path(self.db_path, "prefetch", "hit" if result else "empty", (time.monotonic() - started) * 1000)
             return result
 
@@ -9846,6 +9896,10 @@ class MemoryWikiProvider(MemoryProvider):
         The host must quiesce foreground callers before shutdown; this is not
         a new host-wide lease or process/thread containment mechanism.
         """
+        attempt = self._prefetch_attempt
+        if (self._prefetch_admission.locked() and attempt is not None
+                and attempt.thread_id != threading.get_ident()):
+            raise RuntimeError("provider_prefetch_worker_pending")
         if (getattr(self, "_transaction_quarantine", None) is not None
                 or getattr(self, "_graph_writer_connections", {})
                 or getattr(self, "_graph_reader_connections", {})):
@@ -14422,6 +14476,10 @@ class MemoryWikiProvider(MemoryProvider):
             previous_thread = getattr(self, "_claim_tx_thread", None)
             previous_document_stage = self._claim_tx_document_stage
             previous_graph_stage = self._claim_tx_graph_stage
+            previous_prefetch_terminal = c._prefetch_terminal
+            if (_terminal is not None and _terminal._prefetch_attempt is not None
+                    and previous_prefetch_terminal is not None):
+                raise _DeliveryWithheld("terminal_prefetch_owner_pending")
             if active and join and c is self._conn and previous is not c:
                 self._quarantine_claim_connection(c, "unowned_pending_transaction")
                 raise RuntimeError("claim_transaction_owner_pending")
@@ -14434,6 +14492,8 @@ class MemoryWikiProvider(MemoryProvider):
                         or c is not self._conn or c is not self._owned_conn
                         or active or join or adopt or previous is not None or begin != "IMMEDIATE"):
                     raise _DeliveryWithheld("terminal_transaction_owner_unproven")
+                if not _terminal.prefetch_ready():
+                    raise _DeliveryWithheld("terminal_prefetch_attempt_expired")
                 capture = _CLAIM_JOURNAL_CAPTURE.get()
                 if capture is not None and capture.get("provider") is self and capture.get("pending") is not None:
                     raise _DeliveryWithheld("terminal_active_journal_postcommit_required_BLOCKED")
@@ -14475,6 +14535,8 @@ class MemoryWikiProvider(MemoryProvider):
             self._claim_tx_document_stage = document_stage
             graph_stage = (c, self._claim_tx_thread, [])
             self._claim_tx_graph_stage = graph_stage
+            if _terminal is not None and _terminal._prefetch_attempt is not None:
+                c._prefetch_terminal = _terminal
             if _graph_effect is not None:
                 graph_stage[2].append(_graph_effect)
             if _document_ingest is not None:
@@ -14532,6 +14594,8 @@ class MemoryWikiProvider(MemoryProvider):
                         raise RuntimeError("graph_effect_owner_stage_unproven")
                     c._graph_commit_image = self._assert_graph_effects(
                         c, graph_stage[2], check_callbacks=False, terminal_stage=graph_stage)
+                if _terminal is not None and not _terminal.prefetch_ready():
+                    raise _DeliveryWithheld("terminal_prefetch_attempt_expired")
                 commit_attempted = True  # Only immediately before actual commit.
                 if _document_hook is not None:
                     _document_hook.commit_attempted = True
@@ -14561,6 +14625,8 @@ class MemoryWikiProvider(MemoryProvider):
             finally:
                 if completed and getattr(self, "_transaction_quarantine", None) is not c:
                     # Retire only our own exact stage after proved completion.
+                    if c._prefetch_terminal is _terminal:
+                        c._prefetch_terminal = previous_prefetch_terminal
                     # Failed rollback/postcommit keeps owner+primary+admissions.
                     if self._claim_tx_document_stage is document_stage:
                         document_stage[2].clear()
@@ -25065,7 +25131,7 @@ def _bind_memory_wiki_profile_methods() -> None:
                                                     '_get_project_context', '_preference_layer', '_why_believe', '_dashboard', '_graph_query', '_summarize_topic', '_render_topic', '_export', '_export_bundle'}
                                       or (__name == "_prefetch_impl" and kwargs.get("_delivery") is None))
                     if delivery_entry and terminal is None:
-                        terminal = _TerminalDelivery(self)
+                        terminal = _TerminalDelivery(self, _prefetch_attempt=_PREFETCH_ATTEMPT.get())
                         delivery_token = _DELIVERY.set(terminal)
                     if entrypoint and root is None:
                         root = _new_recall_request(self, tool_name if __name == "handle_tool_call" else "prefetch")
@@ -25177,6 +25243,9 @@ def _bind_memory_wiki_profile_methods() -> None:
                             # Qdrant/contextvar resets are callback-free below.
                             read_cleanup.close()
                         try:
+                            if __name == "prefetch" and _prefetch_budget_expired():
+                                terminal.discard_preparation()
+                                return ""
                             admitted = terminal.commit()
                         except Exception as exc:
                             if __name != "handle_tool_call":
@@ -25206,6 +25275,10 @@ def _bind_memory_wiki_profile_methods() -> None:
                     _REQUEST_HOME.reset(caller_token)
 
         bound = functools.wraps(method)(scoped)
+        if method_name == "prefetch":
+            def bounded_prefetch(self, query, *, session_id="", __dispatch=bound):
+                return _bounded_prefetch_callback(self, __dispatch, query, session_id=session_id)
+            bound = functools.wraps(method)(bounded_prefetch)
         if method_name == "handle_tool_call":
             def bounded_scope_dispatch(self, tool_name, args, __dispatch=bound, **kwargs):
                 if (tool_name != "memory_wiki_reindex" or not isinstance(args, dict)

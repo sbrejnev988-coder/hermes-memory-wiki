@@ -593,8 +593,9 @@ class TerminalDelivery:
     an in-function SQLite admission snapshot, not a lease for host speech or an
     OS-atomic return. Actor/config/erasure carriers are never refreshed.
     """
-    def __init__(self, provider):
+    def __init__(self, provider, *, _prefetch_attempt=None):
         self.provider = provider
+        self._prefetch_attempt = _prefetch_attempt
         self.fences = []
         self.effects = []
         self.events = {}
@@ -772,6 +773,10 @@ class TerminalDelivery:
                 if row is None or int(row[0]) < values[0]:
                     raise DeliveryWithheld('terminal_ack_readback_missing')
 
+    def prefetch_ready(self):
+        attempt = self._prefetch_attempt
+        return attempt is None or (attempt.provider is self.provider and attempt.permitted())
+
     def commit(self):
         if getattr(self.provider, '_transaction_quarantine', None) is not None:
             for _, staged in self.audit_preparations:
@@ -781,6 +786,10 @@ class TerminalDelivery:
             if primary is not None:
                 raise primary
             raise RuntimeError('terminal_owner_quarantine_UNKNOWN')
+        if not self.prefetch_ready():
+            self.reason = 'terminal_prefetch_attempt_expired'
+            self.discard_preparation()
+            return False
         if self.phase != 'prepare' or not self.fences:
             self.reason = 'terminal_original_carrier_missing'
             return False
@@ -798,7 +807,7 @@ class TerminalDelivery:
                         or source._graph_read_fence is not fence
                         or source in getattr(self.provider, '_graph_reader_connections', {})):
                     raise DeliveryWithheld('terminal_reader_cleanup_unproven')
-                if not fence.finish():
+                if not fence.finish() or not self.prefetch_ready():
                     raise DeliveryWithheld('terminal_protected_drift')
                 for purpose in {p[0] for p in fence.purposes.values()}:
                     self.policies[(id(fence), purpose)] = self.provider._claim_metadata_eligibility_sql(purpose)
@@ -806,6 +815,8 @@ class TerminalDelivery:
             # terminal owner. Other callers keep their historical journal path.
             with self.provider._claim_transaction(conn, _terminal=self):
                 self.phase = 'owned'
+                if not self.prefetch_ready():
+                    raise DeliveryWithheld('terminal_prefetch_attempt_expired')
                 if not all(f.finish(_delivery=self) for f in self.fences):
                     raise DeliveryWithheld('terminal_protected_drift')
                 if any(staged.outcome == "queued" and (staged.cancel.is_set() or staged.parent_thread != threading.get_ident() or attempt is not staged.attempt) for attempt, staged in self.audit_preparations):
@@ -813,6 +824,8 @@ class TerminalDelivery:
                 before = conn.total_changes
                 self._apply(conn)
                 self.phase = 'verify'
+                if not self.prefetch_ready():
+                    raise DeliveryWithheld('terminal_prefetch_attempt_expired')
                 if any(staged.outcome == "queued" and (staged.cancel.is_set() or staged.parent_thread != threading.get_ident() or attempt is not staged.attempt) for attempt, staged in self.audit_preparations):
                     raise DeliveryWithheld("detached_audit_attempt_cancelled")
                 if not all(f.finish(_delivery=self) for f in self.fences):
