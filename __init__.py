@@ -8580,7 +8580,14 @@ class MemoryWikiProvider(MemoryProvider):
             started = time.monotonic()
             request = _RECALL_REQUEST.get()
             delivery = {}
-            primary_seconds = max(0.0, _prefetch_time_remaining() - PREFETCH_FALLBACK_RESERVE_SECONDS)
+            remaining_seconds = _prefetch_time_remaining()
+            # The reserve covers BOTH fresh serial fallback preparation and
+            # the original terminal tail, not just one FTS read. Spending all
+            # but the configured minimum on primary starves that full path.
+            # Split the remaining cooperative budget, retaining any larger
+            # explicit reserve; the absolute total/deadline is never extended.
+            primary_seconds = max(0.0, min(remaining_seconds * 0.5,
+                remaining_seconds - PREFETCH_FALLBACK_RESERVE_SECONDS))
             result = ""
             reason = "deadline"
             # The complete scoped callback is already on one bounded owner.

@@ -367,3 +367,70 @@ def test_benign_native_user_authorizer_reader_supported_terminal_explicitly_refu
         result=json.loads(p.handle_tool_call('memory_wiki_query',{'query':QUERY,'limit':5}))
         assert any(row.get('claim')==TEXT for row in result.get('claims',[]))
     finally:p._conn.set_authorizer(None)
+
+
+@pytest.mark.parametrize('boundary',['deadline','prepared_error','original_config_withdrawal'])
+def test_prepared_primary_to_serial_fallback_preserves_original_admission(recalled,monkeypatch,boundary):
+    p=recalled;before=connection_accounting(p._conn);before_diag=dict(p._last_prefetch_diagnostics)
+    env_path=p.home/'.env';env_bytes=env_path.read_bytes();witness=[];fallback=[]
+    # Same default total; only the supported reserve1.0 is chosen for this
+    # elapsed subdeadline positive. No clock/SDK/callable replacement.
+    if boundary=='deadline':monkeypatch.setattr(wiki,'PREFETCH_FALLBACK_RESERVE_SECONDS',1.0)
+    def profile(frame,event,arg):
+        current=threading._active.get(threading.get_ident())
+        if current is None or current.name!='memory-wiki-prefetch-owner':return
+
+        if event!='return' or frame.f_code.co_name!='_prefetch_impl' or witness:return
+        delivery=frame.f_locals.get('_delivery')
+        if not isinstance(delivery,dict) or type(arg) is not str or TEXT not in arg:return
+        assert delivery.get('fence') is not None and len(delivery['rows'])==1
+        witness.append((threading.get_ident(),id(p._conn),id(delivery['fence'])))
+        if boundary=='deadline':
+            wait=wiki._prefetch_time_remaining()+.025
+            assert 0<wait<5.5
+            threading.Event().wait(wait)
+        else:
+            if boundary=='original_config_withdrawal':env_path.write_bytes(env_bytes+b'\n# owned-primary-authority-withdrawal\n')
+            raise TimeoutError('owned-prepared-primary-refusal')
+    def trace(frame,event,arg):
+        current=threading._active.get(threading.get_ident())
+        if (current is not None and current.name=='memory-wiki-prefetch-owner'
+                and event=='call' and frame.f_code.co_name=='_lexical_prefetch_fallback'):
+            fallback.append((threading.get_ident(),id(p._conn),frame.f_locals.get('reason')))
+        return None
+    old_trace=threading.gettrace();threading.settrace(trace)
+    old_profile=threading.getprofile();threading.setprofile(profile)
+    try:
+        started=time.monotonic();value=p.prefetch(QUERY);elapsed=time.monotonic()-started;join_attempt(p)
+        print(json.dumps({'boundary':boundary,'elapsed':elapsed,'prepared':bool(witness),'fallback':fallback,'value_chars':len(value),'attempt_error':type(p._prefetch_attempt.error).__name__,'cancel':p._prefetch_attempt.cancel.is_set()},ensure_ascii=False))
+        assert witness and fallback
+        assert witness[0][:2]==fallback[0][:2]
+        assert fallback[0][2]==('deadline' if boundary=='deadline' else 'network_or_runtime_error')
+        assert elapsed<5.5
+        if boundary=='original_config_withdrawal':
+            assert value=='' and connection_accounting(p._conn)==before
+            assert p._last_prefetch_diagnostics==before_diag
+        else:
+            assert TEXT in value
+            receipt=json.loads(value.partition('\nRetrieval receipt: ')[2])
+            assert receipt['delivery_path']==('deadline_fallback' if boundary=='deadline' else 'runtime_error_fallback')
+            assert receipt['final']['emitted_claim_count']==1
+            # Legacy lexical fallback prepares disclosure/diagnostics, not
+            # primary recall-count/event or revision ACK. Do not transfer the
+            # rejected primary's pending accounting to this narrower output.
+            after=connection_accounting(p._conn)
+            assert after[:2]==before[:2]
+            prior_consumers=dict(before[2])
+            assert all(seen==prior_consumers.get(consumer,0) for consumer,seen in after[2])
+        assert not p._conn.in_transaction and p._transaction_quarantine is None
+    finally:
+        threading.setprofile(old_profile);threading.settrace(old_trace);env_path.write_bytes(env_bytes)
+
+
+def test_healthy_primary_keeps_canonical_path_with_earlier_cutoff(recalled):
+    p=recalled;value=p.prefetch(QUERY);join_attempt(p)
+    assert TEXT in value
+    receipt=json.loads(value.partition('\nRetrieval receipt: ')[2])
+    assert receipt['delivery_path']=='canonical'
+    assert receipt['final']['emitted_claim_count']==1
+    assert not p._conn.in_transaction and p._transaction_quarantine is None
