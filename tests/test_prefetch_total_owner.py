@@ -434,3 +434,41 @@ def test_healthy_primary_keeps_canonical_path_with_earlier_cutoff(recalled):
     assert receipt['delivery_path']=='canonical'
     assert receipt['final']['emitted_claim_count']==1
     assert not p._conn.in_transaction and p._transaction_quarantine is None
+
+
+@pytest.mark.parametrize('token_name',['_PREFETCH_ATTEMPT','_REQUEST_HOME'])
+@pytest.mark.parametrize('base_exception',[False,True])
+def test_prefetch_worker_context_setup_failure_releases_finished_owner(recalled,token_name,base_exception):
+    p=recalled;before=accounting(p);caller_home=wiki._REQUEST_HOME.get()
+    target=getattr(wiki,token_name)
+    class OwnedContextSetupAbort(BaseException):pass
+    error=(OwnedContextSetupAbort if base_exception else RuntimeError)('owned-context-setup-refusal')
+    fired=[];returned=[];prior=threading.getprofile();prior_trace=threading.gettrace()
+    def refuse(frame,event,arg):
+        if (not fired and event=='c_call' and frame.f_code is wiki._PrefetchAttempt.run.__code__
+                and getattr(arg,'__self__',None) is target and getattr(arg,'__name__','')=='set'
+                and threading.current_thread().name=='memory-wiki-prefetch-owner'):
+            fired.append({'thread':threading.get_ident(),'token':token_name})
+            raise error
+    def observe_return(frame,event,arg):
+        # CPython disables a profile callback that raises. A separate passive
+        # trace witnesses cleanup in the worker, not just the caller context.
+        if frame.f_code is wiki._PrefetchAttempt.run.__code__ and event=='return':
+            returned.append((wiki._PREFETCH_ATTEMPT.get(),wiki._REQUEST_HOME.get()))
+        return observe_return
+    threading.setprofile(refuse);threading.settrace(observe_return)
+    try:
+        with pytest.raises(type(error),match='owned-context-setup-refusal') as caught:
+            p.prefetch(QUERY)
+    finally:threading.setprofile(prior);threading.settrace(prior_trace)
+    assert caught.value is error and len(fired)==1
+    attempt=join_attempt(p)
+    assert attempt.error is error and attempt.cancel.is_set() and attempt.value==''
+    assert returned==[(None,caller_home)]
+    assert wiki._REQUEST_HOME.get()==caller_home and wiki._PREFETCH_ATTEMPT.get() is None
+    assert accounting(p)==before and not p._conn.in_transaction and p._transaction_quarantine is None
+    # A known finished, side-effect-free worker must not permanently consume
+    # the only slot. UNKNOWN native-start/rollback ownership is NOT released.
+    value=p.prefetch(QUERY);recovered=join_attempt(p)
+    assert recovered is not attempt and TEXT in value
+    assert json.loads(value.partition('\nRetrieval receipt: ')[2])['delivery_path']=='canonical'

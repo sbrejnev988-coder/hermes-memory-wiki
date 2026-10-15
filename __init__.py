@@ -3759,11 +3759,14 @@ class _PrefetchAttempt:
                 and not self.cancel.is_set() and self.remaining() > 0.0)
 
     def run(self, dispatch, query, session_id):
-        token = _PREFETCH_ATTEMPT.set(self)
-        caller_token = _REQUEST_HOME.set(self.home)
+        token = caller_token = None
         acquired = False
-        self.thread_id = threading.get_ident()
         try:
+            # Context setup is part of this worker's lifetime too: a refusal
+            # must retain its primary error and finish its owned admission.
+            token = _PREFETCH_ATTEMPT.set(self)
+            caller_token = _REQUEST_HOME.set(self.home)
+            self.thread_id = threading.get_ident()
             acquired = self.owner_lock.acquire(timeout=self.remaining())
             if not acquired or not self.permitted():
                 return
@@ -3776,8 +3779,10 @@ class _PrefetchAttempt:
         finally:
             if acquired:
                 self.owner_lock.release()
-            _REQUEST_HOME.reset(caller_token)
-            _PREFETCH_ATTEMPT.reset(token)
+            if caller_token is not None:
+                _REQUEST_HOME.reset(caller_token)
+            if token is not None:
+                _PREFETCH_ATTEMPT.reset(token)
             self.admission.release()
             self.done.set()
 
