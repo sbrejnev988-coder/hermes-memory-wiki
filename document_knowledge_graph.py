@@ -3358,7 +3358,10 @@ def query_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
                            "score": item["score"], "score_parts": {}, "updated_at": int(item.get("updated_at") or 0)})
             mapping[rid] = item
         try:
-            rr = provider._rerank_rows(query, pseudo, "technical")
+            if not disclosure.finish():
+                disclosure.ok = False
+                return _disclosed_document_output(provider, {}, disclosure)
+            rr = provider._rerank_rows(query, pseudo, "technical", _disclosure=disclosure)
             ordered: List[Dict[str, Any]] = []
             used_rids = set()
             for row in rr:

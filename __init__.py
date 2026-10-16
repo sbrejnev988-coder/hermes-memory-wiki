@@ -445,7 +445,7 @@ def _hybrid_scope(purpose, *, new=False):
 
 
 @contextmanager
-def _observed_semantic_http(request, *, timeout, stage):
+def _observed_semantic_http(request, *, timeout, stage, _before_dispatch=None):
     # Metadata never licenses dispatch. Recheck the admitted owner/cancel/budget
     # immediately before the unchanged transport; gates do not count as HTTP.
     _semantic_io_check("embedding" if stage == "health_models" else stage)
@@ -456,6 +456,9 @@ def _observed_semantic_http(request, *, timeout, stage):
     try:
         # Prepare actual owner/route/key/body inputs before final admission.
         _health_http_check(request.get_method(), request.full_url, dict(request.header_items()), request.data)
+        if _before_dispatch is not None:
+            _before_dispatch()  # Same original document read-set, after body/route preparation.
+        # SQL read admission may wait: reclamp the SAME Event/deadline afterwards.
         # This check reads the owner first, then the SAME Event/deadline. Nothing
         # blocking is prepared between this gate/reclamp and adapter entry.
         _semantic_io_check("embedding" if stage == "health_models" else stage)
@@ -19531,8 +19534,21 @@ class MemoryWikiProvider(MemoryProvider):
             status["cost_usd"] = round(float(status.get("cost_usd", 0.0)), 6)
             return status
 
-    def _rerank_rows(self, query: str, scored: List[Dict[str, Any]], query_mode: str) -> List[Dict[str, Any]]:
-        """Rerank a safe top-K; keep successful ordinals, local RRF on fallback."""
+    def _rerank_rows(self, query: str, scored: List[Dict[str, Any]], query_mode: str, *, _disclosure=None) -> List[Dict[str, Any]]:
+        """Rerank a safe top-K; a document caller retains its original read fence."""
+        def check_document_disclosure():
+            if _disclosure is None:
+                return
+            if type(_disclosure) is not _DisclosureFence or _disclosure.provider is not self:
+                raise _SemanticIOError("document_disclosure_unproven")
+            try:
+                valid = _disclosure.finish()
+            except BaseException:
+                _disclosure.ok = False
+                raise  # Cancellation/primary identity is not a transport retry.
+            if not valid:
+                _disclosure.ok = False  # No later recapture or local-order fallback grant.
+                raise _SemanticIOError("document_disclosure_changed")
         settings = _rerank_settings()
         api_key = _rerank_api_key()  # Exact own key captured once, never in the public snapshot.
         state = _rerank_scope_state(settings)
@@ -19691,6 +19707,8 @@ class MemoryWikiProvider(MemoryProvider):
             return _fuse_rerank_order(original, prefix, ranked, query_mode=query_mode,
                                       settings=settings, order_key=order_key)
 
+        check_document_disclosure()
+        cached_ordered = None
         if settings['RERANK_CACHE_TTL'] > 0:
             with _RERANK_LOCK:
                 cached = cache.get(cache_key)
@@ -19717,9 +19735,14 @@ class MemoryWikiProvider(MemoryProvider):
                     stats["cache_hits"] += 1
                     _hybrid_note("rerank_cache", "hit")
                     _stage_receipt("rerank", "cache_hit", "", ranks=[{"id": cid, "rank": rank} for cid, _score, rank in cached[1]])
-                    return ordered
-                for key in [k for k, value in cache.items() if value[0] <= now_mono]:
-                    cache.pop(key, None)
+                    cached_ordered = ordered
+                if cached_ordered is None:
+                    for key in [k for k, value in cache.items() if value[0] <= now_mono]:
+                        cache.pop(key, None)
+            if cached_ordered is not None:
+                # Do not acquire the provider/SQL lock while holding _RERANK_LOCK.
+                check_document_disclosure()
+                return cached_ordered
 
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -19747,6 +19770,8 @@ class MemoryWikiProvider(MemoryProvider):
         started = time.monotonic()
         _hybrid_note("rerank_cache", "producer")
         observation = None
+        request_accounted = False
+        stored_cache_entry = None
         try:
             obj: Dict[str, Any] = {}
             last_error = ""
@@ -19762,10 +19787,12 @@ class MemoryWikiProvider(MemoryProvider):
                     request_timeout = _prefetch_network_timeout(settings['RERANK_TIMEOUT'])
                     if request_timeout <= 0.0:
                         raise TimeoutError("rerank skipped because prefetch budget expired")
-                    with _observed_semantic_http(req, timeout=request_timeout, stage="rerank") as (response, observation):
+                    with _observed_semantic_http(req, timeout=request_timeout, stage="rerank",
+                                                 _before_dispatch=check_document_disclosure) as (response, observation):
                         obj = _semantic_response_json(response, check=lambda: _semantic_io_check("rerank"))
                         _hybrid_http_response(observation, obj)
                     _semantic_io_check("rerank")
+                    check_document_disclosure()
                     break
                 except urllib.error.HTTPError as exc:
                     # Rerank providers may echo the query or a document in the
@@ -19811,6 +19838,7 @@ class MemoryWikiProvider(MemoryProvider):
 
             latency_ms = int((time.monotonic() - started) * 1000)
             usage = obj.get("usage") or {}
+            check_document_disclosure()
             with _RERANK_LOCK:
                 _semantic_io_check("rerank")
                 if state.get("generation") == generation:
@@ -19818,6 +19846,7 @@ class MemoryWikiProvider(MemoryProvider):
                     state["circuit_until"] = 0.0
                 stats["requests"] += 1
                 stats["successes"] += 1
+                request_accounted = True
                 stats["search_units"] += int(usage.get("search_units") or 0)
                 stats["cost_usd"] += float(usage.get("cost") or 0.0)
                 stats["last_latency_ms"] = latency_ms
@@ -19826,12 +19855,26 @@ class MemoryWikiProvider(MemoryProvider):
                     if len(cache) >= settings['RERANK_CACHE_MAX']:
                         oldest = min(cache, key=lambda k: cache[k][0])
                         cache.pop(oldest, None)
-                    cache[cache_key] = (time.monotonic() + settings['RERANK_CACHE_TTL'], cached_meta)
+                    stored_cache_entry = (time.monotonic() + settings['RERANK_CACHE_TTL'], cached_meta)
+                    cache[cache_key] = stored_cache_entry
                     _hybrid_note("rerank_cache", "stored")
             _stage_receipt("rerank", "executed", "", elapsed_ms=latency_ms,
                            ranks=[{"id": cid, "rank": rank} for cid, _score, rank in ranked])
+            check_document_disclosure()
             return ordered
         except Exception as exc:
+            if _disclosure is not None and not _disclosure.ok:
+                with _RERANK_LOCK:
+                    # Refused admission is not a provider/circuit failure. A response
+                    # already received remains an actual request, never a new retry.
+                    if observation is not None and observation.get("http_issued") and not request_accounted:
+                        stats["requests"] += 1
+                    if stored_cache_entry is not None and cache.get(cache_key) is stored_cache_entry:
+                        cache.pop(cache_key, None)
+                    stats["skipped"] += 1
+                    stats["last_error"] = "document_disclosure_changed"
+                _stage_receipt("rerank", "skipped", "document_disclosure_changed")
+                return []
             # Cancellation after valid ranking is discard, not invalid response.
             if isinstance(exc, ValueError) and observation is not None and observation.get("response_valid") is None:
                 _hybrid_http_valid(observation, False)
