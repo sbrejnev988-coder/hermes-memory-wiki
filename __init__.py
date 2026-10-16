@@ -19771,6 +19771,7 @@ class MemoryWikiProvider(MemoryProvider):
         _hybrid_note("rerank_cache", "producer")
         observation = None
         request_accounted = False
+        response_received = False  # Local effect evidence, independent of optional telemetry.
         stored_cache_entry = None
         try:
             obj: Dict[str, Any] = {}
@@ -19789,6 +19790,7 @@ class MemoryWikiProvider(MemoryProvider):
                         raise TimeoutError("rerank skipped because prefetch budget expired")
                     with _observed_semantic_http(req, timeout=request_timeout, stage="rerank",
                                                  _before_dispatch=check_document_disclosure) as (response, observation):
+                        response_received = True
                         obj = _semantic_response_json(response, check=lambda: _semantic_io_check("rerank"))
                         _hybrid_http_response(observation, obj)
                     _semantic_io_check("rerank")
@@ -19862,19 +19864,25 @@ class MemoryWikiProvider(MemoryProvider):
                            ranks=[{"id": cid, "rank": rank} for cid, _score, rank in ranked])
             check_document_disclosure()
             return ordered
-        except Exception as exc:
-            if _disclosure is not None and not _disclosure.ok:
+        except BaseException as exc:
+            fatal = not isinstance(exc, Exception)
+            if _disclosure is not None and (not _disclosure.ok or fatal):
                 with _RERANK_LOCK:
                     # Refused admission is not a provider/circuit failure. A response
                     # already received remains an actual request, never a new retry.
-                    if observation is not None and observation.get("http_issued") and not request_accounted:
+                    if response_received and not request_accounted:
                         stats["requests"] += 1
+                        request_accounted = True
                     if stored_cache_entry is not None and cache.get(cache_key) is stored_cache_entry:
                         cache.pop(cache_key, None)
                     stats["skipped"] += 1
                     stats["last_error"] = "document_disclosure_changed"
+                if fatal:
+                    raise  # Exact primary, after identity-guarded tentative-cache discard.
                 _stage_receipt("rerank", "skipped", "document_disclosure_changed")
                 return []
+            if fatal:
+                raise
             # Cancellation after valid ranking is discard, not invalid response.
             if isinstance(exc, ValueError) and observation is not None and observation.get("response_valid") is None:
                 _hybrid_http_valid(observation, False)

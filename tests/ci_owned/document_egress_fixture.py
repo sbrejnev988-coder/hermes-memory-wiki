@@ -1,10 +1,8 @@
-"""RI-R03: восемь сохранённых business controls, readonly 7319.
+"""SC2: genuine direct-provider/SQLite fixture with authored SQL and HTTP.
 
-Только genuine direct MemoryProvider/SQLite; не MemoryManager/bootstrap/native.
-SQL и все HTTP-потоки authored synthetic; это не parser/ingestion/model proof.
-Файл лишь подготовлен. Запуск — только родителем через existing direct_entry
-и devtools/harness.supervise. CURRENT v2 explicitly requalifies one incompatible connector gold;
-seven original case assertion/raise/return sequences are preserved. No config/env file writes.
+Peer is shipped; regular pytest owns its tmp_path when no parent packet root
+is supplied. No model/socket/MemoryManager execution or protected file writes.
+The explicit parent packet keeps its own root and stronger offline audit fence.
 """
 from __future__ import annotations
 
@@ -27,16 +25,11 @@ SOURCE = Path(os.environ.get('SC2_SOURCE_ROOT', str(Path(__file__).resolve().par
 QUERY = 'needle semantic retrieval'
 SAFE = 'Verified durable navigation remains within the current source boundary.'
 SOURCE_FILES = ('__init__.py', 'background_jobs.py', 'code_knowledge_graph.py', 'collapse.py', 'current_scope_reindex.py', 'decay.py', 'disclosure_fence.py', 'document_extractors.py', 'document_knowledge_graph.py', 'document_worker.py', 'entity_relation_extractor.py', 'episodic_memory.py', 'extractor.py', 'github_source_adapter.py', 'google_drive_source_adapter.py', 'guard.py', 'http_safety.py', 'memory_events.py', 'memory_observations.py', 'migrations.py', 'online_metrics.py', 'patch_secret_context_plugin.py', 'privacy_erasure.py', 'recall_orchestrator.py', 'recall_planner.py', 'sdk.py', 'secret_context_bridge.py', 'semantic_io.py', 'setup.py', 'shared_blocks.py', 'source_connectors.py', 'vault.py', 'vault_aead.py', 'vault_registry_adapter.py', 'visual_evidence.py')
-SOURCE_INVENTORY_SHA256 = '155c803872de9869cc42bbbd0659bed2452d207f26864f050c502d3dee56d126'
-CASE_IDS = ('sc2_healthy', 'sc2_disabled_initial', 'sc2_late_status_before_rank', 'sc2_late_status_before_http', 'sc2_late_owner_before_http', 'sc2_sql_ABA_before_http', 'sc2_session_before_http', 'sc2_generation_before_http', 'sc2_cache_healthy', 'sc2_cache_late_revoke', 'sc2_response_revoke')
+SOURCE_INVENTORY_SHA256 = 'b57b833ca118a4d13e4142153cbe5ad47f2108acddc6ae2dde197fe8d7239eb4'
+CASE_IDS = ('sc2_healthy', 'sc2_disabled_initial', 'sc2_late_status_before_rank', 'sc2_late_status_before_http', 'sc2_late_owner_before_http', 'sc2_sql_ABA_before_http', 'sc2_session_before_http', 'sc2_generation_before_http', 'sc2_cache_healthy', 'sc2_cache_late_revoke', 'sc2_response_revoke', 'sc2_tail_false_discards_cache', 'sc2_tail_baseexception_discards_cache', 'sc2_tail_baseexception_preserves_replacement')
 PREREQUISITE_BLOCKERS = {}  # CURRENT v2 contract below; original blocked gold preserved.
 _ACTIVE = None
 N = P = doc = code = io_source = Baseline = None
-
-# Полные неизменённые frozen тела historical main/fallback, НЕ current-as-before.
-# Позднее компилируются только внутри допущенного теста, на реальных current
-# callee/globals и классе. Это не полный historical package и не old AST-P.
-
 
 def require(condition, code):
     if not condition:
@@ -60,7 +53,7 @@ def unwrapped(fn):
 
 
 @pytest.fixture
-def ri_r03_case(request):
+def ri_r03_case(request, tmp_path_factory):
     global _ACTIVE
     original = request.node.name.removeprefix('test_')
     require(original in CASE_IDS, 'unknown_original_id')
@@ -68,14 +61,17 @@ def ri_r03_case(request):
     require(original not in PREREQUISITE_BLOCKERS,
             PREREQUISITE_BLOCKERS.get(original, ''))
     raw_root = os.environ.get('RI_R03_TEST_ROOT', '')
-    root = Path(raw_root)
-    require(bool(raw_root) and root.is_absolute() and '..' not in root.parts,
-            'parent_owned_RI_R03_TEST_ROOT_required')
+    # numbered=False avoids pytest's optional per-case 'current' symlink.
+    root = (Path(raw_root) if raw_root else tmp_path_factory.mktemp(
+        'document-egress-' + hashlib.sha256(request.node.nodeid.encode()).hexdigest()[:16],
+        numbered=False))
+    require(root.is_absolute() and '..' not in root.parts,
+            'owned_absolute_test_root_required')
     no_links(root)
     ordinary = sys.modules.get('memory_wiki')
     require(ordinary is not None and Path(ordinary.__file__).resolve() == SOURCE / '__init__.py',
             'parent_genuine_direct_entry_required')
-    require('agent.memory_manager' not in sys.modules, 'MemoryManager_bootstrap_forbidden')
+    # A full-suite sibling may import MemoryManager; this fixture never runs it.
     observed_pins = {}
     for name in SOURCE_FILES:
         target = SOURCE / name
@@ -222,8 +218,7 @@ class Fixture:
                     'genuine_registry_identity')
             require(m._INJECTION_GUARD_AVAILABLE and m._sanitize_recalled is trust.sanitize_recalled,
                     'genuine_trust_identity')
-            require(Path(m._IMPORT_HERMES_HOME) == self.home and 'agent.memory_manager' not in sys.modules,
-                    'fresh_importer_home_or_bootstrap')
+            require(Path(m._IMPORT_HERMES_HOME) == self.home, 'fresh_importer_home_required')
             doc = sys.modules[self._namespace + '.document_knowledge_graph']
             code = sys.modules[self._namespace + '.code_knowledge_graph']
             io_source = sys.modules[self._namespace + '.semantic_io']
@@ -568,4 +563,3 @@ class Fixture:
 
 def ids(rows):
     return [r['id'] for r in rows]
-
