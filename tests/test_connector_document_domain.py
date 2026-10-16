@@ -16,7 +16,7 @@ from memory_wiki import document_knowledge_graph as graph
     ('bot-own', ['owned', 'plain', 'twice-owned']),
     ('bot-foreign', ['foreign', 'plain']),
     ('', ['plain']),
-])
+], ids=['owned-actor', 'foreign-actor', 'empty-actor'])
 def test_connector_domain_matches_terminal_active_owner_policy(actor, expected):
     source_ids = ['plain', 'owned', 'foreign', 'disabled-own', 'disabled-foreign',
                   'deleted-own', 'ownerless', 'null-owner', 'null-status', 'mixed',
