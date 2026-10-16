@@ -23844,8 +23844,21 @@ class MemoryWikiProvider(MemoryProvider):
                 continue
         return sorted(items, key=lambda x:x['score'], reverse=True)[:max_items]
 
-    def _llm_pack_context(self, query: str, candidate_context: str, max_chars: int) -> str:
-        """Use the configured local GPT-5.5-compatible endpoint as a secondary context analyst."""
+    def _llm_pack_context(self, query: str, candidate_context: str, max_chars: int, *, _disclosure=None) -> str:
+        """Secondary context analyst; retain the pack caller's original read set."""
+        def check_pack_disclosure():
+            if _disclosure is None:
+                return  # Existing private text-only callers have no SQL read set.
+            if type(_disclosure) is not _DisclosureFence or _disclosure.provider is not self:
+                raise _SemanticIOError('pack_disclosure_unproven')
+            try:
+                valid = _disclosure.finish()
+            except BaseException:
+                _disclosure.ok = False
+                raise  # Preserve cancellation/primary identity; never recapture.
+            if not valid:
+                _disclosure.ok = False
+                raise _SemanticIOError('pack_disclosure_changed')
         llm_keys = {
             'MEMORY_WIKI_LLM_PACK', 'MEMORY_WIKI_LLM_BASE_URL',
             'MEMORY_WIKI_LLM_API_KEY', 'MEMORY_WIKI_LLM_MODEL',
@@ -23905,6 +23918,7 @@ class MemoryWikiProvider(MemoryProvider):
                 headers['Authorization']=f'Bearer {api_key}'
             req=urllib.request.Request(endpoint, data=json.dumps(payload, ensure_ascii=False).encode('utf-8'), headers=headers, method='POST')
             timeout=max(1.0, min(float(llm_env.get('MEMORY_WIKI_LLM_TIMEOUT') or '45'), 60.0))
+            check_pack_disclosure()  # After config/key/body/codec/timeout callbacks.
             with _urlopen_no_redirect(req, timeout=timeout) as resp:
                 raw_response=resp.read(1_000_001)
             if len(raw_response) > 1_000_000:
@@ -23918,7 +23932,9 @@ class MemoryWikiProvider(MemoryProvider):
                     mem_type='llm_packed_context', audit=False, max_len=budget,
                 )
                 if inspected.get('status') == 'safe':
-                    return str(inspected.get('content') or '')[:budget]
+                    result = str(inspected.get('content') or '')[:budget]
+                    check_pack_disclosure()  # After response inspection, before publication.
+                    return result
         except Exception:
             return ''
         return ''
@@ -24215,7 +24231,7 @@ class MemoryWikiProvider(MemoryProvider):
                 if cid and label == 'claim':
                     delivered_claim_ids.add(cid)
         context='\n'.join(out)
-        refined=self._llm_pack_context(query, context, max_chars)
+        refined=self._llm_pack_context(query, context, max_chars, _disclosure=disclosure)
         if refined and not is_ephemeral_fragment(refined):
             context=_context_prefix(_context_data(refined), max_chars); used=len(context); sources['llm_refined']=True
         elif refined:
