@@ -379,15 +379,21 @@ def _assert_connector_owner(provider: Any, source_id: str, *, _conn=None) -> Non
 
 def _connector_visibility_clause(conn: sqlite3.Connection, provider: Any,
                                  source_expression: str) -> tuple[str, list[str]]:
-    """Exclude another bot's connector document from shared project queries."""
+    """Intersect connector eligibility before cutoff with terminal disclosure.
+
+    A linked document is not an ordinary unlinked document just because its
+    connector is inactive. Every retained link must still be active and owned;
+    otherwise it must not enter retrieval or model-facing candidate cohorts.
+    """
     if not conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='external_sources'"
     ).fetchone():
         return "", []
     bot_id = str(getattr(provider, "bot_id", "") or "").strip()
     return ("NOT EXISTS (SELECT 1 FROM external_sources x WHERE "
-            f"x.document_source_id={source_expression} AND x.status='active' "
-            "AND (?='' OR COALESCE(x.owner_bot_id,'')<>?))", [bot_id, bot_id])
+            f"x.document_source_id={source_expression} AND "
+            "(COALESCE(x.status,'')<>'active' OR ?='' "
+            "OR COALESCE(x.owner_bot_id,'')<>?))", [bot_id, bot_id])
 
 
 def _absolute_unresolved(value: Any) -> Path:
