@@ -2961,7 +2961,10 @@ def _query_code_graph_on_connection(
             candidate_by_rerank_id[rerank_id] = candidate
         if len(pseudo) >= 3:
             try:
-                reranked_rows = provider._rerank_rows(query, pseudo, "technical")
+                # Pseudo-rows have no source authority. Carry the original code
+                # read-set through the existing cache/HTTP/response checks; a
+                # fresh fence here would adopt a late SQL or lifecycle change.
+                reranked_rows = provider._rerank_rows(query, pseudo, "technical", _disclosure=disclosure)
                 ordered_candidates = [candidate_by_rerank_id[str(row.get("id"))]
                                       for row in reranked_rows
                                       if str(row.get("id")) in candidate_by_rerank_id]
