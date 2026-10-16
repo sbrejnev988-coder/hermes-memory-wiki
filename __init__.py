@@ -20637,7 +20637,7 @@ class MemoryWikiProvider(MemoryProvider):
         scored = [row for row in scored if row["id"] not in rejected_ids]
         scored.sort(key=lambda x: x["score"], reverse=True)
         if retrieval_mode == "hybrid" and apply_rerank and not _prefetch_budget_expired(0.20):
-            scored = self._rerank_rows(q, scored, query_mode)
+            scored = self._rerank_rows(q, scored, query_mode, _disclosure=disclosure)
         else:
             _stage_receipt("rerank", "skipped", "deadline" if _prefetch_budget_expired(0.20) else "mode_or_disabled")
         scored = self._apply_diversity(scored, query_mode)

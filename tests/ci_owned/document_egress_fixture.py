@@ -25,8 +25,11 @@ SOURCE = Path(os.environ.get('SC2_SOURCE_ROOT', str(Path(__file__).resolve().par
 QUERY = 'needle semantic retrieval'
 SAFE = 'Verified durable navigation remains within the current source boundary.'
 SOURCE_FILES = ('__init__.py', 'background_jobs.py', 'code_knowledge_graph.py', 'collapse.py', 'current_scope_reindex.py', 'decay.py', 'disclosure_fence.py', 'document_extractors.py', 'document_knowledge_graph.py', 'document_worker.py', 'entity_relation_extractor.py', 'episodic_memory.py', 'extractor.py', 'github_source_adapter.py', 'google_drive_source_adapter.py', 'guard.py', 'http_safety.py', 'memory_events.py', 'memory_observations.py', 'migrations.py', 'online_metrics.py', 'patch_secret_context_plugin.py', 'privacy_erasure.py', 'recall_orchestrator.py', 'recall_planner.py', 'sdk.py', 'secret_context_bridge.py', 'semantic_io.py', 'setup.py', 'shared_blocks.py', 'source_connectors.py', 'vault.py', 'vault_aead.py', 'vault_registry_adapter.py', 'visual_evidence.py')
-SOURCE_INVENTORY_SHA256 = '5f94c625d1e1855c3edeeac6852c21395c142ce1ba6f2ed2ca6b74c2734e0b47'
+SOURCE_INVENTORY_SHA256 = '284062dc8ce12475ec3714854e8033760d08f5166b7f8cab1dd4c79e93574b6c'
 CASE_IDS = ('sc2_healthy', 'sc2_disabled_initial', 'sc2_late_status_before_rank', 'sc2_late_status_before_http', 'sc2_late_owner_before_http', 'sc2_sql_ABA_before_http', 'sc2_session_before_http', 'sc2_generation_before_http', 'sc2_cache_healthy', 'sc2_cache_late_revoke', 'sc2_response_revoke', 'sc2_tail_false_discards_cache', 'sc2_tail_baseexception_discards_cache', 'sc2_tail_baseexception_preserves_replacement', 'sc3_healthy_cache', 'sc3_unavailable_initial', 'sc3_late_delete_before_http', 'sc3_sql_ABA_before_http', 'sc3_session_before_http', 'sc3_generation_before_http', 'sc3_cache_late_revoke', 'sc3_response_revoke')
+CASE_IDS += ('sc4_healthy_cache', 'sc4_ineligible_initial', 'sc4_late_retire_before_http',
+             'sc4_sql_ABA_before_http', 'sc4_session_before_http', 'sc4_generation_before_http',
+             'sc4_cache_late_revoke', 'sc4_response_revoke')
 PREREQUISITE_BLOCKERS = {}  # CURRENT v2 contract below; original blocked gold preserved.
 _ACTIVE = None
 N = P = doc = code = io_source = Baseline = None
@@ -111,13 +114,14 @@ class Stream:
 
 class Fixture:
     """Reused genuine constructor/migrate/owner/guards; authored HTTP streams only."""
-    def __init__(self, label, *, bot_id="bot-own", cache_ttl=0):
+    def __init__(self, label, *, bot_id="bot-own", cache_ttl=0, rank_claim_ids=()):
         require(_ACTIVE is not None, 'pytest_fixture_scope_missing')
         self.dir = _ACTIVE['root'] / label
         self.home = self.dir / 'home'
         self.p = self.conn = self.m = None
         self.bot_id = bot_id
         self.cache_ttl = cache_ttl
+        self.rank_claim_ids = tuple(rank_claim_ids)  # Explicit authored claim transport cohort.
         self.rank_documents = []
         self._mp = pytest.MonkeyPatch()
         self._scopes = ExitStack()
@@ -402,8 +406,14 @@ class Fixture:
                         if self.rerank_ids else [], 'calls': dict(self.calls), 'injected_timeout': self.rank_failure})
             require(body.get('model') == 'synthetic-no-model' and body.get('return_documents') is False,
                     'authored_rank_request_contract')
-            require(all('codegraph:' in text or 'docgraph:' in text for text in body['documents']),
-                    'inner_claim_rerank_spent')
+            if self.rank_claim_ids:
+                require(bool(self.rerank_ids) and len(body['documents']) == len(self.rank_claim_ids)
+                        and len(self.rerank_ids[-1]) == len(self.rank_claim_ids)
+                        and set(self.rerank_ids[-1]) == set(self.rank_claim_ids),
+                        'authored_claim_rank_cohort')
+            else:
+                require(all('codegraph:' in text or 'docgraph:' in text for text in body['documents']),
+                        'inner_claim_rerank_spent')
             if self.rank_failure:
                 raise TimeoutError('authored_rank_transport_failure')
             payload = {'results': [{'index': i, 'relevance_score': 1.0 - rank / 100}
