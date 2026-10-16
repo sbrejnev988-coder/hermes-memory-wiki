@@ -389,11 +389,13 @@ def _connector_visibility_clause(conn: sqlite3.Connection, provider: Any,
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='external_sources'"
     ).fetchone():
         return "", []
-    bot_id = str(getattr(provider, "bot_id", "") or "").strip()
+    # Terminal disclosure compares the original actor literally. Strip only
+    # for the missing-identity veto, never to authorize a different owner.
+    bot_id = str(getattr(provider, "bot_id", "") or "")
     return ("NOT EXISTS (SELECT 1 FROM external_sources x WHERE "
             f"x.document_source_id={source_expression} AND "
             "(COALESCE(x.status,'')<>'active' OR ?='' "
-            "OR COALESCE(x.owner_bot_id,'')<>?))", [bot_id, bot_id])
+            "OR COALESCE(x.owner_bot_id,'')<>?))", [bot_id.strip(), bot_id])
 
 
 def _absolute_unresolved(value: Any) -> Path:

@@ -16,11 +16,13 @@ from memory_wiki import document_knowledge_graph as graph
     ('bot-own', ['owned', 'plain', 'twice-owned']),
     ('bot-foreign', ['foreign', 'plain']),
     ('', ['plain']),
-], ids=['owned-actor', 'foreign-actor', 'empty-actor'])
+    (' bot-own ', ['plain', 'raw-padded']),
+    ('   ', ['plain']),
+], ids=['owned-actor', 'foreign-actor', 'empty-actor', 'padded-actor', 'blank-actor'])
 def test_connector_domain_matches_terminal_active_owner_policy(actor, expected):
     source_ids = ['plain', 'owned', 'foreign', 'disabled-own', 'disabled-foreign',
                   'deleted-own', 'ownerless', 'null-owner', 'null-status', 'mixed',
-                  'twice-owned']
+                  'twice-owned', 'raw-padded', 'mixed-disabled-own', 'mixed-disabled-foreign']
     links = [
         ('owned', 'bot-own', 'active'),
         ('foreign', 'bot-foreign', 'active'),
@@ -34,6 +36,11 @@ def test_connector_domain_matches_terminal_active_owner_policy(actor, expected):
         ('mixed', 'bot-foreign', 'active'),
         ('twice-owned', 'bot-own', 'active'),
         ('twice-owned', 'bot-own', 'active'),
+        ('raw-padded', ' bot-own ', 'active'),
+        ('mixed-disabled-own', 'bot-own', 'active'),
+        ('mixed-disabled-own', 'bot-own', 'disabled'),
+        ('mixed-disabled-foreign', 'bot-own', 'active'),
+        ('mixed-disabled-foreign', 'bot-foreign', 'disabled'),
     ]
     with closing(sqlite3.connect(':memory:')) as conn:
         conn.execute('CREATE TABLE sources(source_id TEXT PRIMARY KEY)')
