@@ -14,6 +14,7 @@ import hmac
 import json
 import os
 import re
+import tempfile
 import threading
 import time
 from contextlib import contextmanager, nullcontext
@@ -70,29 +71,53 @@ class ErasureLedger:
         self.key_path = self.dir / "key.bin"
         self.log_path = self.dir / "intents.jsonl"
         self.lock_path = self.dir / "intents.lock"
-        self.dir.mkdir(parents=True, exist_ok=True)
-        with _file_lock(self.lock_path):
-            key_exists = self.key_path.exists()
-            log_exists = self.log_path.exists()
-            if key_exists != log_exists:
+        # Serialize enrollment outside the canonical directory: creating the
+        # lock must not make an absent generation look like an existing one.
+        with _file_lock(self.dir.parent / "privacy-erasure.init.lock"):
+            try:
+                self.dir.lstat()
+            except FileNotFoundError:
+                self._publish_initial_generation()
+            # Even an existing empty directory has unknown history. Never fill
+            # in missing authority, rotate its key, or adopt an orphan stage.
+            if not self.key_path.exists() or not self.log_path.exists():
                 raise RuntimeError("privacy erasure ledger is incomplete")
-            if not key_exists:
-                key = os.urandom(32)
-                with open(self.key_path, "xb") as out:
-                    out.write(key)
-                    out.flush()
-                    os.fsync(out.fileno())
-                with open(self.log_path, "xb") as out:
-                    out.flush()
-                    os.fsync(out.fileno())
-                _fsync_dir(self.dir)
-        self.key = self.key_path.read_bytes()
-        if len(self.key) != 32:
-            raise RuntimeError("privacy erasure key is invalid")
-        self._base = (int.from_bytes(hmac.digest(self.key, b"rolling-base", "sha256")[:8], "big") | 1) & _MASK
-        if self._base < 257:
-            self._base += 257
-        self.load()
+            with _file_lock(self.lock_path):
+                self.key = self.key_path.read_bytes()
+                if len(self.key) != 32:
+                    raise RuntimeError("privacy erasure key is invalid")
+                self._base = (int.from_bytes(hmac.digest(self.key, b"rolling-base", "sha256")[:8], "big") | 1) & _MASK
+                if self._base < 257:
+                    self._base += 257
+                self._load_unlocked()
+
+    def _publish_initial_generation(self) -> None:
+        """Publish only a complete private generation under the init lock.
+
+        All stage handles are closed before rename (including on Windows).
+        Failure leaves the private stage alone and preserves the primary error;
+        no retry ever selects it as historical authority. A failure after rename
+        leaves the full canonical pair in place, to be validated on retry.
+        This is cooperating-owner publication, not a historical continuity
+        manifest or a Windows hard-crash durability guarantee.
+        """
+        stage = Path(tempfile.mkdtemp(prefix=".privacy-erasure-stage-", dir=self.dir.parent))
+        with open(stage / "key.bin", "xb") as out:
+            out.write(os.urandom(32))
+            out.flush()
+            os.fsync(out.fileno())
+        with open(stage / "intents.jsonl", "xb") as out:
+            out.flush()
+            os.fsync(out.fileno())
+        with open(stage / "intents.lock", "xb") as out:
+            out.write(b"\0")
+            out.flush()
+            os.fsync(out.fileno())
+        _fsync_dir(stage)
+        # No replace: an established directory is never deliberately replaced.
+        # Mixed-version/noncooperating writers are outside this lock contract.
+        os.rename(stage, self.dir)
+        _fsync_dir(self.dir.parent)
 
     def digest(self, kind: str, value: str) -> str:
         return hmac.new(self.key, kind.encode() + b"\0" + str(value).encode("utf-8"), hashlib.sha256).hexdigest()
