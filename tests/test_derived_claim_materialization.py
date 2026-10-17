@@ -392,18 +392,39 @@ def test_duplicate_and_review_patch_have_no_pending_effects(derived_case):
                          dict(file_path='src/auxiliary.py', new_content_hash=hashlib.sha256(b'different').hexdigest())]})
         assert duplicate['deduplicated'] and duplicate['invalidations'] == []
         assert c.durable()['images']['code_graph_chunks'] == before['images']['code_graph_chunks']
-        # The compact natural-language outcome can legitimately pass quality.
-        # This supported long-path outcome is borderline instead: >420 chars,
-        # few unique tokens, no durable hint. Exercise the real review queue,
-        # not a permissive/queued _prepare_claim stand-in.
-        review_files = ['src/main.py', 'src/' + 'auxiliary/' * 65 + 'plain.py']
+        # One oversized path is mapped to a compact opaque identity and can
+        # legitimately pass quality. Five individually bounded ordinary paths
+        # instead retain a >420-character low-diversity outcome after the real
+        # mapper. Exercise the genuine quality/review path, never a stand-in.
+        review_files = ['src/main.py', *[
+            'src/' + 'auxiliary/' * 9 + leaf + '.py'
+            for leaf in ('alpha', 'beta', 'gamma', 'delta')
+        ]]
         review_event = {**original, 'event_id': 'event-plain', 'patch_id': 'plain', 'outcome': 'applied',
                         'changed_files': review_files,
                         'per_file': [dict(file_path=path, new_content_hash=hashlib.sha256(b'different').hexdigest())
                                      for path in review_files]}
+        assert c.conn.execute("SELECT COUNT(*) FROM code_graph_chunks WHERE embedding_claim_id=''").fetchone()[0] > 0
         queued = c.p._apply_code_shrinker_patch_event(review_event)
         assert not queued['outcome'].get('id') and queued['invalidations'] == [], queued
+        assert queued['outcome']['status'] == 'need_review'
+        review_id = queued['outcome']['review_id']
+        assert review_id.startswith('rq_')
+        row = c.conn.execute('SELECT candidate,status,reason FROM review_queue WHERE id=?', (review_id,)).fetchone()
+        assert row is not None and row['status'] == 'pending'
+        assert 420 < len(row['candidate']) <= 1400
+        assert '<opaque_code_graph_id>' not in row['candidate']
+        lint = c.m.lint_claim_text(row['candidate'], 'patch-outcomes')
+        gate = c.m.memory_gate_decision(row['candidate'], 'patch-outcomes', 'tool:patch_outcome_add')
+        assert lint['quality'] < 0.48 and gate['action'] == 'queue'
         assert c.durable()['images']['code_graph_chunks'] == before['images']['code_graph_chunks']
+        after_review = c.durable()
+        for table in ('claims', 'patch_outcomes', 'integration_events', 'code_graph_chunks', 'code_graph_chunks_fts'):
+            assert after_review['images'][table] == before['images'][table], table
+        c._emit(dict(event='actual_queued_patch_no_effects', review_id=review_id,
+                     candidate_chars=len(row['candidate']), quality=lint['quality'],
+                     reason=row['reason'], unchanged_tables=['claims', 'patch_outcomes',
+                         'integration_events', 'code_graph_chunks', 'code_graph_chunks_fts']))
 
 
 def test_model_revision_does_not_withdraw_global_pending_graph(derived_case):
