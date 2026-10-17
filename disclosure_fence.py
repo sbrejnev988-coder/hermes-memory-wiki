@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import time
 try:
     from .shared_blocks import _attached_claims, _block_refs
 except ImportError:
@@ -40,7 +41,7 @@ KEYS = {
     'project_profiles': 'project_id', 'contradictions': 'id',
     'preference_rules': 'id', 'preference_attestations': 'rule_id',
     'claims_history': 'id', 'memory_mutations': 'id', 'memory_changes': 'id',
-    'recall_events': 'id',
+    'recall_events': 'id', 'index_outbox': 'id',
     'shared_blocks': 'id',
     'shared_block_grants': ('block_id', 'principal_type', 'principal_id'),
     'shared_block_attachments': ('block_id', 'principal_type', 'principal_id'),
@@ -106,6 +107,7 @@ class DisclosureFence:
         self.foreign = foreign
         self.ledger = ledger if foreign or _worker is not None else getattr(provider, '_privacy_erasure', None)
         self.images, self.selectors, self.purposes = {}, {}, {}
+        self.episode_indexes = {}  # Fixed episode-index purpose, never claim/recall eligibility.
         self.shared_sets = {}
         self.policy_environment = tuple(os.environ.get(k) for k in
                                         ('MEMORY_WIKI_STRICT_RECALL', 'HERMES_SECURITY_STRICT'))
@@ -420,6 +422,59 @@ class DisclosureFence:
                 else:
                     raise
 
+    # Identical retained mode=ro/query_only factory and UNKNOWN quarantine;
+    # only the read-set/purpose differs. Do not duplicate a permission engine.
+    episode_worker = claim_worker
+
+    def index_episode(self, snapshot, payload, *, outbox_id, worker_id):
+        """Bind canonical episode and its actual claimed queue before embedding.
+
+        The raw image was first read under this ORIGINAL worker epoch. Queue
+        JSON is only a matching delivery hint, never an admission capability.
+        """
+        if self.worker is None or snapshot is None:
+            raise DeliveryWithheld('episode_index_owner_unproven')
+        eid = str(snapshot['id'])
+        originals = self.watch('episodic_turns', 'id', [eid])
+        queued = self.watch('index_outbox', 'id', [outbox_id])
+        if (len(originals) != 1 or len(queued) != 1
+                or self.worker._episode_index_snapshot(originals[0]) != snapshot):
+            raise DeliveryWithheld('episode_index_original_image_changed')
+        job = queued[0]
+        hint = json.loads(job['payload_json'])
+        if (str(job['object_type']).strip().lower() != 'episode'
+                or str(job['object_id']) != eid
+                or job['operation'] not in {'upsert', 'embed_and_upsert'}
+                or job['status'] != 'processing' or job['worker_id'] != worker_id
+                or not isinstance(hint, dict) or hint != payload):
+            raise DeliveryWithheld('episode_index_queue_changed')
+        original = (originals[0], hint)
+        if eid in self.episode_indexes and self.episode_indexes[eid] != original:
+            raise DeliveryWithheld('episode_index_cannot_adopt_new_image')
+        self.episode_indexes[eid] = original
+        self.admit_episode_index()
+
+    def admit_episode_index(self):
+        if not self.episode_indexes or not self.finish():
+            raise DeliveryWithheld('episode_index_source_changed')
+
+    def _episode_index_eligible(self, row, payload):
+        if (self.worker is None or not self.worker._episode_outbox_payload_matches(
+                payload, self.worker._episode_index_snapshot(row), str(row['id']))):
+            return False
+        # Exact same owner-aware episode-id / normalized phrase + older cutoff
+        # as authenticated ErasureLedger.replay. No replay/create at admission.
+        text = self.worker._episodic_memory._removal_surface(str(row['content']))
+        for entry in self.erasure:
+            if not self.ledger._owner_allows(entry['owner'], row, 'episode'):
+                continue
+            if (self.ledger.digest('episode-id', str(row['id'])) in entry['episodes']
+                    or (int(row['created_at']) <= int(entry['created_at'])
+                        and self.ledger._contains_digest(text, entry['episode_text'],
+                            'episode-text', boundary=True))):
+                return False
+        return True
+
     def documents(self, rows):
         ids = [r.get('source_id','') for r in rows]
         sources = self.watch('document_sources','source_id',ids)
@@ -533,11 +588,18 @@ class DisclosureFence:
                         if 'id' in row and row['id'] in self.purposes and 'claim' in row:
                             if not self._eligible(row,*self.purposes[row['id']]):
                                 return False
+                for raw, payload in self.episode_indexes.values():
+                    if not self._episode_index_eligible(raw, payload):
+                        return False
                 # Same owner/config/erasure and revision epoch around the read.
                 if not self._same(_delivery):
                     return False
                 self.conn.execute('RELEASE '+savepoint); begun = False
-                return self._same(_delivery)
+                # Absolute retention can expire while the last owner/SQL read
+                # waits, even with an unchanged data_version. Check at return.
+                return self._same(_delivery) and all(
+                    int(raw['expires_at']) > time.time()
+                    for raw, _payload in self.episode_indexes.values())
         except Exception:
             return False
         finally:

@@ -2515,35 +2515,51 @@ def _load_active_claim_index_snapshot(db_path: str, claim_id: str) -> Optional[D
 
 
 def _load_active_episode_index_snapshot(
-    db_path: str, episode_id: str,
+    db_path: str, episode_id: str, *, _disclosure=None,
 ) -> Optional[Dict[str, Any]]:
-    """Read one live canonical episode plus its currently configured target.
+    """Read canonical input, optionally from the ORIGINAL retained worker.
 
-    Episode outbox JSON is retained delivery data and can outlive deletion,
-    expiry, an ACL edit, or a vector-target migration.  SQLite and the active
-    runtime configuration are therefore re-read around every remote embed.
+    Later projection checks may use fresh readers. Embedding admission may not:
+    its fence/epoch must predate the first raw row hydration.
     """
-    stamp = int(time.time())
-    with sqlite3.connect(db_path, timeout=30.0) as source_db:
-        source_db.row_factory = sqlite3.Row
-        source_db.execute("PRAGMA busy_timeout=30000")
-        row = source_db.execute(
-            """SELECT id,content,role,turn_id,owner_bot_id,owner_chat_hash,
-                      visibility_scope,created_at,expires_at,
-                      vector_manifest_hash,vector_target_hash,
-                      vector_collection,vector_endpoint
-                 FROM episodic_turns
-                WHERE id=? AND content!='' AND expires_at>?""",
-            (str(episode_id), stamp),
-        ).fetchone()
+    if _disclosure is not None:
+        rows = _disclosure.watch('episodic_turns', 'id', [str(episode_id)])
+        if not _disclosure.ok:
+            raise _DeliveryWithheld('episode_index_original_image_changed')
+        row = rows[0] if rows else None
+    else:
+        stamp = int(time.time())
+        with sqlite3.connect(db_path, timeout=30.0) as source_db:
+            source_db.row_factory = sqlite3.Row
+            source_db.execute("PRAGMA busy_timeout=30000")
+            row = source_db.execute(
+                """SELECT id,content,role,turn_id,owner_bot_id,owner_chat_hash,
+                          visibility_scope,created_at,expires_at,
+                          vector_manifest_hash,vector_target_hash,
+                          vector_collection,vector_endpoint
+                     FROM episodic_turns
+                    WHERE id=? AND content!='' AND expires_at>?""",
+                (str(episode_id), stamp),
+            ).fetchone()
+    return _episode_index_snapshot(row)
+
+
+def _episode_index_snapshot(row) -> Optional[Dict[str, Any]]:
+    """Existing episode indexing policy/target, NOT end-user recall ACL.
+
+    Re-evaluate the absolute TTL even without a SQLite change. The namespace
+    worker legitimately indexes host-attested rows from several chat partitions.
+    """
     if row is None:
         return None
     snapshot = dict(row)
     if (
-        str(snapshot.get("role") or "") not in {"user", "assistant"}
+        not str(snapshot.get("content") or "").strip()
+        or int(snapshot.get("expires_at") or 0) <= time.time()
+        or str(snapshot.get("role") or "") not in {"user", "assistant"}
         or str(snapshot.get("visibility_scope") or "") not in {"chat", "bot"}
-        or not str(snapshot.get("owner_bot_id") or "")
-        or not str(snapshot.get("owner_chat_hash") or "")
+        or not str(snapshot.get("owner_bot_id") or "").strip()
+        or not str(snapshot.get("owner_chat_hash") or "").strip()
     ):
         return None
     manifest = _embedding_manifest()
@@ -3122,101 +3138,105 @@ def _outbox_process_scoped(batch_size=50, *, db_path: Optional[str] = None, work
                     # instruction to publish the retained copy.
                     cleanup_collection = _episode_outbox_collection(payload)
                     cleanup_endpoint = _episode_outbox_endpoint(payload)
-                    snapshot = _load_active_episode_index_snapshot(
-                        path, str(row["object_id"]),
-                    )
-                    if not _episode_outbox_payload_matches(
-                        payload, snapshot, str(row["object_id"]),
-                    ):
-                        if not _qdrant_delete_target(
-                            row["object_id"], collection=cleanup_collection,
-                            endpoint=cleanup_endpoint,
+                    with _DisclosureFence.episode_worker(sys.modules[__name__], path) as disclosure:
+                        snapshot = _load_active_episode_index_snapshot(
+                            path, str(row["object_id"]), _disclosure=disclosure,
+                        )
+                        if not _episode_outbox_payload_matches(
+                            payload, snapshot, str(row["object_id"]),
                         ):
-                            raise RuntimeError("stale episode cleanup failed")
-                        performed_operation = "delete"
-                    else:
-                        document = str(snapshot.get("content") or "")
-                        vector: Optional[List[float]] = None
-                        if operation == "upsert":
-                            supplied = payload.get("vector")
-                            supplied_qpayload = payload.get("qdrant_payload")
-                            if (
-                                isinstance(supplied, list)
-                                and len(supplied) == QDRANT_VECTOR_SIZE
-                                and isinstance(supplied_qpayload, dict)
-                                and str(supplied_qpayload.get("vector_text_hash") or "") == sha(document)
-                                and str(supplied_qpayload.get("manifest_hash") or "")
-                                == str(snapshot.get("manifest_hash") or "")
-                                and str(supplied_qpayload.get("vector_target_hash") or "")
-                                == str(snapshot.get("current_vector_target_hash") or "")
+                            if not _qdrant_delete_target(
+                                row["object_id"], collection=cleanup_collection,
+                                endpoint=cleanup_endpoint,
                             ):
-                                vector = supplied
-                            else:
-                                if not _qdrant_delete_target(
-                                    row["object_id"], collection=cleanup_collection,
-                                    endpoint=cleanup_endpoint,
-                                ):
-                                    raise RuntimeError("stale episode cleanup failed")
-                                performed_operation = "delete"
+                                raise RuntimeError("stale episode cleanup failed")
+                            performed_operation = "delete"
                         else:
-                            vector = _embed_document(document)
-                            embedded_document = True
-                            if not vector:
-                                raise RuntimeError("embedding generation failed")
-
-                        if performed_operation != "delete":
-                            # The embedding call can race retention deletion or
-                            # an ownership/target migration.  Re-read everything
-                            # before the first possible publication.
-                            latest = _load_active_episode_index_snapshot(
-                                path, str(row["object_id"]),
-                            )
-                            if not _episode_outbox_payload_matches(
-                                payload, latest, str(row["object_id"]),
-                            ):
-                                if not _qdrant_delete_target(
-                                    row["object_id"], collection=cleanup_collection,
-                                    endpoint=cleanup_endpoint,
+                            disclosure.index_episode(snapshot, payload,
+                                outbox_id=row["id"], worker_id=worker_id)
+                            document = str(snapshot.get("content") or "")
+                            vector: Optional[List[float]] = None
+                            if operation == "upsert":
+                                supplied = payload.get("vector")
+                                supplied_qpayload = payload.get("qdrant_payload")
+                                if (
+                                    isinstance(supplied, list)
+                                    and len(supplied) == QDRANT_VECTOR_SIZE
+                                    and isinstance(supplied_qpayload, dict)
+                                    and str(supplied_qpayload.get("vector_text_hash") or "") == sha(document)
+                                    and str(supplied_qpayload.get("manifest_hash") or "")
+                                    == str(snapshot.get("manifest_hash") or "")
+                                    and str(supplied_qpayload.get("vector_target_hash") or "")
+                                    == str(snapshot.get("current_vector_target_hash") or "")
                                 ):
-                                    raise RuntimeError("stale episode cleanup failed")
-                                performed_operation = "delete"
+                                    vector = supplied
+                                else:
+                                    if not _qdrant_delete_target(
+                                        row["object_id"], collection=cleanup_collection,
+                                        endpoint=cleanup_endpoint,
+                                    ):
+                                        raise RuntimeError("stale episode cleanup failed")
+                                    performed_operation = "delete"
                             else:
-                                qmetadata = dict(latest)
-                                qmetadata["vector_target_hash"] = str(
-                                    latest.get("current_vector_target_hash") or ""
-                                )
-                                qpayload = _qdrant_episode_payload(
-                                    str(row["object_id"]), document, qmetadata,
-                                    manifest_hash=str(latest.get("manifest_hash") or ""),
-                                )
-                                if not _qdrant_upsert(
-                                    row["object_id"], vector, qpayload,
-                                    collection=str(latest.get("collection") or ""),
-                                ):
-                                    raise RuntimeError("Qdrant upsert failed")
+                                vector = _embed_document(document, _admit=disclosure.admit_episode_index)
+                                embedded_document = True
+                                if not vector:
+                                    raise RuntimeError("embedding generation failed")
 
-                                # If deletion landed during the Qdrant request,
-                                # immediately remove the just-written stale point.
-                                final_snapshot = _load_active_episode_index_snapshot(
+                            if performed_operation != "delete":
+                                disclosure.admit_episode_index()
+                                # The embedding call can race retention deletion or
+                                # an ownership/target migration.  Re-read everything
+                                # before the first possible publication.
+                                latest = _load_active_episode_index_snapshot(
                                     path, str(row["object_id"]),
                                 )
                                 if not _episode_outbox_payload_matches(
-                                    payload, final_snapshot, str(row["object_id"]),
+                                    payload, latest, str(row["object_id"]),
                                 ):
                                     if not _qdrant_delete_target(
-                                        row["object_id"],
-                                        collection=str(latest.get("collection") or cleanup_collection),
-                                        endpoint=str(latest.get("endpoint") or cleanup_endpoint),
+                                        row["object_id"], collection=cleanup_collection,
+                                        endpoint=cleanup_endpoint,
                                     ):
-                                        raise RuntimeError("raced episode cleanup failed")
+                                        raise RuntimeError("stale episode cleanup failed")
                                     performed_operation = "delete"
                                 else:
-                                    episode_index_snapshot = final_snapshot
-                                    payload["text"] = document
-                                    payload["manifest_hash"] = qpayload["manifest_hash"]
-                                    payload["vector_target_hash"] = qpayload[
-                                        "vector_target_hash"
-                                    ]
+                                    qmetadata = dict(latest)
+                                    qmetadata["vector_target_hash"] = str(
+                                        latest.get("current_vector_target_hash") or ""
+                                    )
+                                    qpayload = _qdrant_episode_payload(
+                                        str(row["object_id"]), document, qmetadata,
+                                        manifest_hash=str(latest.get("manifest_hash") or ""),
+                                    )
+                                    if not _qdrant_upsert(
+                                        row["object_id"], vector, qpayload,
+                                        collection=str(latest.get("collection") or ""),
+                                    ):
+                                        raise RuntimeError("Qdrant upsert failed")
+
+                                    # If deletion landed during the Qdrant request,
+                                    # immediately remove the just-written stale point.
+                                    final_snapshot = _load_active_episode_index_snapshot(
+                                        path, str(row["object_id"]),
+                                    )
+                                    if not _episode_outbox_payload_matches(
+                                        payload, final_snapshot, str(row["object_id"]),
+                                    ):
+                                        if not _qdrant_delete_target(
+                                            row["object_id"],
+                                            collection=str(latest.get("collection") or cleanup_collection),
+                                            endpoint=str(latest.get("endpoint") or cleanup_endpoint),
+                                        ):
+                                            raise RuntimeError("raced episode cleanup failed")
+                                        performed_operation = "delete"
+                                    else:
+                                        episode_index_snapshot = final_snapshot
+                                        payload["text"] = document
+                                        payload["manifest_hash"] = qpayload["manifest_hash"]
+                                        payload["vector_target_hash"] = qpayload[
+                                            "vector_target_hash"
+                                        ]
                 elif operation == "upsert" and payload.get("vector"):
                     result = _qdrant_upsert(
                         row["object_id"], payload["vector"], payload.get("qdrant_payload", {}),
