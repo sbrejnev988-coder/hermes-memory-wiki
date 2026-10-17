@@ -377,6 +377,102 @@ def _assert_connector_owner(provider: Any, source_id: str, *, _conn=None) -> Non
         raise PermissionError("connector_source_not_owned")
 
 
+def _managed_connector_cache_root(provider: Any) -> Path:
+    # Reserved by the record writer, NOT the configurable attachment scan root.
+    return _absolute_unresolved(Path(provider.home) / "cache" / "documents" / "connectors")
+
+
+def _within_managed_connector_cache(path: Path, root: Path) -> bool:
+    # Check both lexical and canonical spellings (including Windows 8.3 aliases).
+    # Existing secure-open/no-reparse/file-ID admission remains mandatory.
+    return (path.is_relative_to(root)
+            or path.resolve(strict=False).is_relative_to(root.resolve(strict=False)))
+
+
+def _managed_connector_image(provider, conn, path, source_id, scope_id, repository_id, file_hash):
+    """A coherent active SQL generation, never authority inferred from a file."""
+    source = conn.execute("SELECT * FROM document_sources WHERE source_id=?", (source_id,)).fetchone()
+    revision = conn.execute("SELECT * FROM document_revisions WHERE revision_id=? AND source_id=?",
+                            (source['revision_id'], source_id)).fetchone() if source is not None else None
+    links = conn.execute("SELECT * FROM external_sources WHERE document_source_id=? ORDER BY source_key",
+                         (source_id,)).fetchall()
+    link = links[0] if len(links) == 1 else None
+    root = _managed_connector_cache_root(provider)
+    if (source is None or revision is None or link is None
+            or not int(source['active'] or 0) or revision['status'] != 'active' or link['status'] != 'active'
+            or source['file_hash'] != file_hash or revision['file_hash'] != file_hash or link['content_hash'] != file_hash
+            or revision['parser'] != source['parser'] or revision['parser_version'] != source['parser_version']
+            or source['scope_id'] != scope_id or source['repository_id'] != repository_id
+            or link['scope_id'] != scope_id or link['repository_id'] != repository_id
+            or not str(getattr(provider, 'bot_id', '') or '').strip()
+            or link['owner_bot_id'] != str(provider.bot_id)
+            or link['source_type'] not in {'record', 'github_public', 'github_authenticated', 'google_drive', 'api'}
+            or not re.fullmatch(r"ext_[0-9a-f]{20}", str(link['source_key'] or ''))
+            or not re.fullmatch(r"[0-9a-f]{20}", str(link['revision_key'] or ''))
+            or not re.fullmatch(r"[0-9a-f]{64}", file_hash)
+            or path.resolve(strict=False) != (root / (link['source_key'] + '.txt')).resolve(strict=False)
+            or _absolute_unresolved(source['source_path']).resolve(strict=False) != path.resolve(strict=False)):
+        raise PermissionError("document_managed_connector_generation_uncommitted")
+    return (tuple(source), tuple(revision), tuple(link))
+
+
+def _managed_connector_admission(provider, conn, path, source_id, scope_id, repository_id, file_hash, hook):
+    root = _managed_connector_cache_root(provider)
+    if not _within_managed_connector_cache(path, root):
+        return None
+    if hook is not None:
+        try:
+            from .source_connectors import _managed_record_generation
+        except ImportError:
+            from source_connectors import _managed_record_generation
+        original = _managed_record_generation(provider, conn, hook, path, scope_id, repository_id, file_hash)
+    else:
+        original = _managed_connector_image(provider, conn, path, source_id, scope_id, repository_id, file_hash)
+        if conn.in_transaction:
+            # A legitimate joined ingest may use a COMMITTED generation, never
+            # bless its caller's tentative connector/document SQL. Reuse the
+            # existing tracked query-only reader and its UNKNOWN close policy.
+            try:
+                from .code_knowledge_graph import _open_graph_reader_connection, _close_graph_writer_connection
+            except ImportError:
+                from code_knowledge_graph import _open_graph_reader_connection, _close_graph_writer_connection
+            reader, owned = _open_graph_reader_connection(provider)
+            try:
+                if not owned or reader is conn or _managed_connector_image(
+                        provider, reader, path, source_id, scope_id, repository_id, file_hash) != original:
+                    raise PermissionError("document_managed_connector_generation_uncommitted")
+            except BaseException as primary:
+                if owned:
+                    reader._graph_read_primary = primary
+                raise
+            finally:
+                _close_graph_writer_connection(reader, owned)
+    return (root, hook, file_hash, original)
+
+
+def _assert_managed_connector_admission(provider, conn, path, source_id, scope_id, repository_id, admission, *, before):
+    root, hook, file_hash, original = admission
+    if _managed_connector_cache_root(provider) != root:
+        raise PermissionError("document_managed_connector_home_changed")
+    if hook is not None:
+        try:
+            from .source_connectors import _managed_record_generation
+        except ImportError:
+            from source_connectors import _managed_record_generation
+        if _managed_record_generation(provider, conn, hook, path, scope_id, repository_id, file_hash) != original:
+            raise PermissionError("document_managed_connector_hook_changed")
+        if not before:
+            _managed_connector_image(provider, conn, path, source_id, scope_id, repository_id, file_hash)
+            if hook.expected is None or hook._tuple() != hook.expected:
+                raise RuntimeError("connector_transaction_tuple_mismatch")
+    else:
+        current = _managed_connector_image(provider, conn, path, source_id, scope_id, repository_id, file_hash)
+        # Re-materialization may legitimately create a new document revision for
+        # the SAME bytes/parser options. It cannot alter/rebase the connector.
+        if (before and current != original) or current[2] != original[2]:
+            raise PermissionError("document_managed_connector_generation_changed")
+
+
 def _connector_visibility_clause(conn: sqlite3.Connection, provider: Any,
                                  source_expression: str) -> tuple[str, list[str]]:
     """Intersect connector eligibility before cutoff with terminal disclosure.
@@ -2234,7 +2330,7 @@ def _assert_ingest_authority(provider, conn, source_id, admission, *, before):
         if current is not None:
             _assert_source_access(provider, current)
         return
-    path, scope_id, repository_id, actor, original_source, file_identity = admission
+    path, scope_id, repository_id, actor, original_source, file_identity = admission[:6]
     if (str(getattr(provider, "bot_id", "") or ""),
             str(getattr(provider, "project_scope", "") or "")) != actor:
         raise PermissionError("document_ingest_actor_changed")
@@ -2248,6 +2344,9 @@ def _assert_ingest_authority(provider, conn, source_id, admission, *, before):
         raise RuntimeError("document_ingest_source_binding_changed")
     _assert_ingest_path_alias_owner(provider, conn, path, source_id, scope_id, repository_id,
                                     opened_identity=file_identity)
+    if len(admission) == 7:
+        _assert_managed_connector_admission(provider, conn, path, source_id, scope_id, repository_id,
+                                             admission[6], before=before)
 
 
 def _verify_document_ingest_replay(conn, source_id, reference):
@@ -2354,6 +2453,8 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
         ),
     )
     try:
+        managed_admission = _managed_connector_admission(
+            provider, conn, path, source_id, scope_id, repository_id, str(snapshot_meta['file_hash']), _commit_hook)
         payload = None
         if existing is not None and int(existing["active"] or 0) and str(existing["file_hash"]) == snapshot_meta["file_hash"]:
             cached = conn.execute("SELECT metadata_json FROM document_revisions WHERE revision_id=? AND source_id=?",
@@ -2390,6 +2491,10 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
     extraction_payload = _sanitize_extracted_json(payload, max_items=1_000_000, max_string=2_000_000, max_depth=16)
     file_identity = snapshot_meta["file_identity"]
     admission = (path, scope_id, repository_id, original_actor, original_source, file_identity)
+    if managed_admission is not None:
+        # The existing owning stage retains this ORIGINAL snapshot/SQL binding
+        # through parser and late journal/hook callbacks to actual COMMIT.
+        admission += (managed_admission,)
     _assert_connector_owner(provider, source_id, _conn=conn if _commit_hook is not None else None)
     file_hash = str(payload.get("file_hash") or "")
     parser = str(payload.get("parser") or "")
@@ -2629,6 +2734,7 @@ def _discover_document_candidates(
     max_directories: int,
     max_depth: int,
     max_seconds: float,
+    reserved_connector_root: Optional[Path] = None,
 ) -> Tuple[List[Path], Dict[str, Any]]:
     """Stream a bounded, no-reparse filesystem traversal for document scans."""
     started = time.monotonic()
@@ -2644,6 +2750,9 @@ def _discover_document_candidates(
             traversal_truncated = True
             break
         directory, depth = stack.pop()
+        if reserved_connector_root is not None and _within_managed_connector_cache(directory, reserved_connector_root):
+            ignored_skipped += 1
+            continue
         try:
             iterator = os.scandir(directory)
         except OSError:
@@ -2662,6 +2771,9 @@ def _discover_document_candidates(
                     reparse_skipped += 1
                     continue
                 if stat.S_ISDIR(info.st_mode):
+                    if reserved_connector_root is not None and _within_managed_connector_cache(Path(entry.path), reserved_connector_root):
+                        ignored_skipped += 1
+                        continue
                     directories_seen += 1
                     if entry.name in excludes:
                         ignored_skipped += 1
@@ -2815,6 +2927,7 @@ def scan_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
         max_directories=max_directories,
         max_depth=max_depth,
         max_seconds=max_seconds,
+        reserved_connector_root=_managed_connector_cache_root(provider),
     )
     if os.name == "nt" and candidates:
         # With no ingestable candidates, reporting missing owned paths remains
@@ -2897,6 +3010,8 @@ def scan_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
             + scoped_sources_sql, scoped_source_params,
         ).fetchall():
             source_path = _absolute_unresolved(str(row["source_path"] or ""))
+            if _within_managed_connector_cache(source_path, _managed_connector_cache_root(provider)):
+                continue  # Connector sync, not an attachment scan/prune owner.
             # Compare both lexical spellings and resolved identities. Windows can
             # mix 8.3 and long-path forms, and a missing leaf cannot use samefile.
             raw_root = _absolute_unresolved(root)

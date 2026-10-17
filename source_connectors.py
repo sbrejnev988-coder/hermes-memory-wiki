@@ -8,6 +8,7 @@ credentials, query strings, or raw record bodies in the journal.
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import os
 import shutil
@@ -26,6 +27,11 @@ except ImportError:
 
 
 MAX_RECORD_BYTES = 1_000_000
+
+# Source-private identity of the selected synchronous upsert. An exact hook
+# type alone is insufficient: local-file (or manually constructed) hooks must
+# never turn an uncommitted managed cache file into a new record generation.
+_RECORD_INGEST_HOOK = contextvars.ContextVar("memory_wiki_record_ingest_hook", default=None)
 
 
 @dataclass(frozen=True)
@@ -314,6 +320,23 @@ def sync_local_file(provider: Any, args: dict[str, Any]) -> dict[str, Any]:
             "scope_id": scope_id, "repository_id": repository_id}
 
 
+def _managed_record_generation(provider, conn, hook, path, scope_id, repository_id, file_hash):
+    """Bind only the selected upsert's exact expected generation, not a grant."""
+    if (type(hook) is not _RecordCommitHook or _RECORD_INGEST_HOOK.get() is not hook
+            or hook.provider is not provider or hook.conn is not conn
+            or hook.namespace not in {"record", "github", "google_drive", "api"}
+            or hook.fields['source_type'] not in {
+                "record", "github_public", "github_authenticated", "google_drive", "api"}
+            or hook.source_id != documents._source_id(path)
+            or path != documents._managed_connector_cache_root(provider) / (hook.key + ".txt")
+            or hook.fields['scope_id'] != scope_id or hook.fields['repository_id'] != repository_id
+            or hook.fields['content_hash'] != file_hash):
+        raise PermissionError("document_managed_connector_hook_refused")
+    hook.validate(provider, conn, transaction=conn.in_transaction)
+    return (hook.key, hook.uri, hook.namespace, hook.source_id, hook.owner,
+            tuple(sorted(hook.fields.items())))
+
+
 def _record_snapshot_path(provider: Any, source_key: str) -> Path:
     # Bind staging to the actual provider instance. A process-wide cache env
     # may refer to another Hermes profile while this provider has an explicit
@@ -324,7 +347,7 @@ def _record_snapshot_path(provider: Any, source_key: str) -> Path:
     documents._reject_link_or_reparse_components(cache)
     cache.mkdir(mode=0o700, parents=True, exist_ok=True)
     documents._reject_link_or_reparse_components(cache)
-    folder = cache / "connectors"
+    folder = documents._managed_connector_cache_root(provider)
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
     documents._reject_link_or_reparse_components(folder)
     return folder / f"{source_key}.txt"
@@ -406,10 +429,14 @@ def upsert_record(provider: Any, record: SourceRecord) -> dict[str, Any]:
             os.fsync(stream.fileno())
         os.replace(temporary, path)
         replaced = True
-        result = documents.ingest_document(provider, {
-            "path": str(path), "scope_id": scope_id,
-            "repository_id": repository_id, "embed": False,
-        }, _commit_hook=hook)
+        token = _RECORD_INGEST_HOOK.set(hook)
+        try:
+            result = documents.ingest_document(provider, {
+                "path": str(path), "scope_id": scope_id,
+                "repository_id": repository_id, "embed": False,
+            }, _commit_hook=hook)
+        finally:
+            _RECORD_INGEST_HOOK.reset(token)
         if hook.outcome() != 'committed' or hook.expected is None:
             raise RuntimeError('connector_transaction_commit_outcome_unknown')
     except BaseException as exc:
