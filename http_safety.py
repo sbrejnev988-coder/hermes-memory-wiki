@@ -25,7 +25,7 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def urlopen_no_redirect(request: Any, *, timeout: float):
+def urlopen_no_redirect(request: Any, *, timeout: float, _before_dispatch=None):
     """Open one URL while refusing HTTP redirects.
 
     Tests in this repository traditionally replace ``urllib.request.urlopen``
@@ -34,6 +34,10 @@ def urlopen_no_redirect(request: Any, *, timeout: float):
     """
     transport = urllib.request.urlopen
     if transport is not _ORIGINAL_URLOPEN:
+        if _before_dispatch is not None:
+            timeout = min(timeout, _before_dispatch())
+            if timeout <= 0:
+                raise TimeoutError('HTTP original deadline exceeded')
         return transport(request, timeout=timeout)
     url = request.full_url if isinstance(request, urllib.request.Request) else str(request)
     hostname = (urllib.parse.urlsplit(url).hostname or "").lower()
@@ -46,6 +50,11 @@ def urlopen_no_redirect(request: Any, *, timeout: float):
         # Local Qdrant/embedding credentials must never traverse an inherited
         # HTTP_PROXY even when the process has no NO_PROXY configuration.
         handlers.append(urllib.request.ProxyHandler({}))
-    return urllib.request.build_opener(*handlers).open(
-        request, timeout=timeout,
-    )
+    # Finish opener/route/Request/codec preparation before original admission.
+    # This is a synchronous snapshot, not an atomic SQL-to-wire lease.
+    opened = urllib.request.build_opener(*handlers).open
+    if _before_dispatch is not None:
+        timeout = min(timeout, _before_dispatch())
+        if timeout <= 0:
+            raise TimeoutError('HTTP original deadline exceeded')
+    return opened(request, timeout=timeout)

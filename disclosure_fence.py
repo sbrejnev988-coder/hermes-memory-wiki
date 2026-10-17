@@ -109,6 +109,10 @@ class DisclosureFence:
         self.images, self.selectors, self.purposes = {}, {}, {}
         self.episode_indexes = {}  # Fixed episode-index purpose, never claim/recall eligibility.
         self.shared_sets = {}
+        # Graph writes are fixed, row-counted own effects, never a recaptured
+        # post-write epoch. No authority/meta/data_version component advances.
+        self.graph_changes = 0
+        self.graph_attempt = None
         self.policy_environment = tuple(os.environ.get(k) for k in
                                         ('MEMORY_WIKI_STRICT_RECALL', 'HERMES_SECURITY_STRICT'))
         # Pin the original read body before guards, never a receipt capability.
@@ -195,7 +199,8 @@ class DisclosureFence:
         return entries
 
     def _same(self, delivery=None):
-        expected = delivery.expected_epoch(self) if delivery is not None else self.epoch
+        expected = (delivery.expected_epoch(self) if delivery is not None else
+                    (self.epoch[0], self.epoch[1], self.epoch[2] + self.graph_changes))
         return (self.ok and self.anchor == self._authority(terminal=delivery is not None) and expected == self._epoch()
                 and self.policy_environment == tuple(os.environ.get(k) for k in
                     ('MEMORY_WIKI_STRICT_RECALL', 'HERMES_SECURITY_STRICT'))
@@ -336,10 +341,10 @@ class DisclosureFence:
         ids = list(by_id)
         self.watch('evidence','claim_id',ids,optional=True)
         links = self.watch('document_chunks','embedding_claim_id',ids,optional=True)
-        if links:
+        if links and purpose != 'graph_extract':
             self.documents(links)
         code = self.watch('code_claim_metadata','claim_id',ids,optional=True)
-        if code:
+        if code and purpose != 'graph_extract':
             self.code(code)
         for row in rows:
             cid = str(row['id'])
@@ -552,7 +557,10 @@ class DisclosureFence:
         try:
             with getattr(self.provider,'_lock',nullcontext()):
                 owned = _delivery is not None and _delivery.owns_snapshot(self)
-                if (self.conn.in_transaction and not owned) or not self._same(_delivery):
+                graph_owned = self.graph_attempt is not None and self.graph_attempt.owns_stage()
+                if self.graph_attempt is not None:
+                    self.graph_attempt.check_stop()
+                if (self.conn.in_transaction and not owned and not graph_owned) or not self._same(_delivery):
                     return False
                 self.conn.execute('SAVEPOINT '+savepoint); begun = True
                 current = {}
@@ -597,6 +605,8 @@ class DisclosureFence:
                 self.conn.execute('RELEASE '+savepoint); begun = False
                 # Absolute retention can expire while the last owner/SQL read
                 # waits, even with an unchanged data_version. Check at return.
+                if self.graph_attempt is not None:
+                    self.graph_attempt.check_stop()
                 return self._same(_delivery) and all(
                     int(raw['expires_at']) > time.time()
                     for raw, _payload in self.episode_indexes.values())
@@ -614,6 +624,103 @@ class DisclosureFence:
 # Private in-process preparation, never serialized in a receipt or accepted from
 # tool JSON. Callback phase may fail or mutate authority; it cannot commit ACKs.
 DELIVERY = contextvars.ContextVar('memory_wiki_terminal_delivery', default=None)
+
+# One original extraction invocation, not a JSON capability or a new backend.
+GRAPH_EXTRACTION = contextvars.ContextVar('memory_wiki_graph_extraction', default=None)
+
+
+class GraphExtraction:
+    """Original graph read-set, same stop/deadline and exact owning SQL stage.
+
+    An external wait never owns a writer TX. Only three existing graph SQL
+    statements can reconcile their literal row counts. Trigger/callback writes,
+    foreign commits, meta drift and owner/config/erasure changes remain denial.
+    """
+    def __init__(self, fence, cancel, deadline):
+        if type(fence) is not DisclosureFence or fence.graph_attempt is not None:
+            raise DeliveryWithheld('graph_original_carrier_required')
+        self.fence, self.cancel, self.deadline = fence, cancel, deadline
+        self.started = time.monotonic()
+        self.thread = threading.get_ident()
+        self.actor = fence.provider._graph_effect_actor()
+        self.stage = None
+        fence.graph_attempt = self
+
+    def check_stop(self):
+        if self.thread != threading.get_ident() or self.cancel.is_set():
+            raise DeliveryWithheld('graph_original_attempt_cancelled')
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('graph_original_deadline_exceeded')
+        return remaining
+
+    def owns_stage(self):
+        p, c, stage = self.fence.provider, self.fence.conn, self.stage
+        return (stage is not None and GRAPH_EXTRACTION.get() is self
+                and p._claim_tx_graph_stage is stage and stage[0] is c
+                and stage[1] == self.thread == threading.get_ident()
+                and p._claim_tx_connection is c and p._claim_tx_thread == self.thread
+                and c is p._conn is p._owned_conn and c.in_transaction
+                and bool(stage[2]))
+
+    def admit(self):
+        self.check_stop()
+        p = self.fence.provider
+        if (p._graph_effect_actor() != self.actor or not self.fence.purposes
+                or not self.fence.finish()):
+            self.fence.ok = False
+            raise DeliveryWithheld('graph_original_source_changed')
+        return self.check_stop()  # SQL/ledger/owner callbacks can wait.
+
+    @contextmanager
+    def scope(self):
+        if GRAPH_EXTRACTION.get() is not None:
+            raise DeliveryWithheld('graph_extraction_attempt_pending')
+        token = GRAPH_EXTRACTION.set(self)
+        try:
+            self.admit()
+            yield self
+        finally:
+            GRAPH_EXTRACTION.reset(token)
+
+
+# Existing statements, unchanged semantics. Callers cannot submit SQL text.
+GRAPH_EFFECTS = {
+    'entity': ('''INSERT OR IGNORE INTO entities(id,name,entity_type,aliases,notes,updated_at,hash,visibility_scope,origin_bot_id,origin_session_id,origin_chat_hash,project_id,source_claim_id,valid_from,valid_to)
+                             VALUES(?,?,'thing','[]','',?,?,?,?,?,?,?,?,?,?)''', 12),
+    'relation': ('''INSERT INTO relations(id,subject,predicate,object,confidence,evidence,created_at,hash,visibility_scope,origin_bot_id,origin_session_id,origin_chat_hash,project_id,source_claim_id,valid_from,valid_to,subject_id,object_id,source_ref)
+                         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                         ON CONFLICT(id) DO UPDATE SET confidence=excluded.confidence,evidence=excluded.evidence,source_ref=excluded.source_ref,valid_from=excluded.valid_from,valid_to=excluded.valid_to,subject_id=excluded.subject_id,object_id=excluded.object_id''', 19),
+    'mutation': ('''INSERT INTO memory_mutations(id,batch_id,actor,operation,target_table,target_id,before_json,after_json,reason,reversible,undone_at,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)''', 12),
+}
+
+
+def graph_sql(provider, conn, kind, values):
+    sql, size = GRAPH_EFFECTS[kind]
+    if len(values) != size:
+        raise ValueError('graph_effect_shape_invalid')
+    attempt = GRAPH_EXTRACTION.get()
+    if attempt is None:
+        return conn.execute(sql, values)
+    if (attempt.fence.provider is not provider or conn is not attempt.fence.conn
+            or not attempt.owns_stage()):
+        raise DeliveryWithheld('graph_effect_stage_unproven')
+    if kind == 'mutation' and (values[3], values[4]) not in {
+            ('upsert_entity', 'entities'), ('upsert_relation', 'relations')}:
+        raise DeliveryWithheld('graph_effect_kind_unproven')
+    attempt.admit()
+    before = conn.total_changes
+    cursor = conn.execute(sql, values)
+    count = cursor.rowcount
+    # A callback/trigger's changes (including ABA) cannot be adopted merely
+    # because the final claim image still compares equal.
+    if count not in ({0, 1} if kind == 'entity' else {1}) or conn.total_changes != before + count:
+        attempt.fence.ok = False
+        raise DeliveryWithheld('graph_unaccounted_SQL_effect')
+    attempt.fence.graph_changes += count
+    attempt.admit()
+    return cursor
 
 
 # Inserted only into the existing disclosure_fence module, not a new service.
@@ -845,7 +952,7 @@ class TerminalDelivery:
         if not self.owns_snapshot(fence):
             raise DeliveryWithheld('terminal_transaction_provenance_missing')
         # Original meta/data_version stay EXACT; only measured own changes move.
-        return (fence.epoch[0], fence.epoch[1], fence.epoch[2] + self.delta)
+        return (fence.epoch[0], fence.epoch[1], fence.epoch[2] + fence.graph_changes + self.delta)
 
     def expected_image(self, fence, key):
         if not self.owns_snapshot(fence):
@@ -931,7 +1038,15 @@ class TerminalDelivery:
 
     def prefetch_ready(self):
         attempt = self._prefetch_attempt
-        return attempt is None or (attempt.provider is self.provider and attempt.permitted())
+        if attempt is not None and (attempt.provider is not self.provider or not attempt.permitted()):
+            return False
+        # Also used by the existing native connection's callback-free terminal
+        # fence. Keep the exact graph Event/absolute deadline through COMMIT,
+        # not only before the last potentially waiting source/erasure read.
+        try:
+            return all(f.graph_attempt is None or f.graph_attempt.check_stop() > 0 for f in self.fences)
+        except (PermissionError, TimeoutError):
+            return False
 
     def commit(self):
         if getattr(self.provider, '_transaction_quarantine', None) is not None:
@@ -1042,6 +1157,9 @@ def withheld_payload(kind):
         return {'success': True, 'counts': {}, 'topics': [], 'top_claims': [], 'stale': [], 'contradictions': [], 'review_pending': 0, 'disclosure_status': 'withheld'}
     if kind in {'memory_wiki_graph_query', '_graph_query'}:
         return {'entities': [], 'relations': [], 'disclosure_status': 'withheld'}
+    if kind in {'memory_wiki_graph_extract_claim', '_graph_extract_claim'}:
+        return {'claim_id': '', 'proposals': [], 'applied': 0, 'relation_ids': [],
+                'errors': [], 'disclosure_status': 'withheld'}
     if kind in {'memory_wiki_summarize_topic', '_summarize_topic'}:
         return {'topic': '', 'summary': '', 'claim_count': 0, 'key_facts': [], 'contradictions': 0, 'disclosure_status': 'withheld'}
     if kind in {'memory_wiki_export', '_export'}:

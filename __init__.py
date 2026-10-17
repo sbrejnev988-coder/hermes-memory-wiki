@@ -252,12 +252,14 @@ try:
     from .disclosure_fence import (DisclosureFence as _DisclosureFence, existing_ledger as _existing_disclosure_ledger,
         TerminalDelivery as _TerminalDelivery, DELIVERY as _DELIVERY,
         current_delivery as _current_delivery, withheld_payload as _withheld_payload,
-        DeliveryWithheld as _DeliveryWithheld, AUDIT_PREPARATION as _AUDIT_PREPARATION)
+        DeliveryWithheld as _DeliveryWithheld, AUDIT_PREPARATION as _AUDIT_PREPARATION,
+        GraphExtraction as _GraphExtraction, GRAPH_EXTRACTION as _GRAPH_EXTRACTION, graph_sql as _graph_sql)
 except ImportError:
     from disclosure_fence import (DisclosureFence as _DisclosureFence, existing_ledger as _existing_disclosure_ledger,
         TerminalDelivery as _TerminalDelivery, DELIVERY as _DELIVERY,
         current_delivery as _current_delivery, withheld_payload as _withheld_payload,
-        DeliveryWithheld as _DeliveryWithheld, AUDIT_PREPARATION as _AUDIT_PREPARATION)
+        DeliveryWithheld as _DeliveryWithheld, AUDIT_PREPARATION as _AUDIT_PREPARATION,
+        GraphExtraction as _GraphExtraction, GRAPH_EXTRACTION as _GRAPH_EXTRACTION, graph_sql as _graph_sql)
 
 
 
@@ -7507,9 +7509,14 @@ class MemoryWikiProvider(MemoryProvider):
         Claims' expires_at is retained schema metadata, not an existing recall
         TTL rule; do not import event/episode expiry or change include_stale here.
         """
-        if prefix not in {"", "claims."} or purpose not in {"recall", "revision_delta", "scoped_reindex"}:
+        if prefix not in {"", "claims."} or purpose not in {"recall", "revision_delta", "scoped_reindex", "graph_extract"}:
             raise ValueError("invalid claim eligibility policy")
         p = prefix
+        if purpose == 'graph_extract':
+            # Manual graph is not recall: no quality/artifact/TTL restrictions.
+            return (f"{p}status='active' AND COALESCE(NULLIF({p}temporal_status,''),'current')='current'"
+                    f" AND COALESCE(NULLIF({p}secrecy_level,''),'public')='public'"
+                    f" AND LOWER(COALESCE({p}risk,''))!='secret' AND COALESCE({p}quarantined_at,0)<=0")
         clauses = [f"{p}status='active'", f"{p}risk!='secret'", f"{p}quarantined_at=0"]
         strict = os.environ.get("MEMORY_WIKI_STRICT_RECALL", "1").lower() not in ("0", "false", "no")
         if strict or purpose != "recall":
@@ -14595,8 +14602,9 @@ class MemoryWikiProvider(MemoryProvider):
             previous_document_stage = self._claim_tx_document_stage
             previous_graph_stage = self._claim_tx_graph_stage
             previous_prefetch_terminal = c._prefetch_terminal
-            if (_terminal is not None and _terminal._prefetch_attempt is not None
-                    and previous_prefetch_terminal is not None):
+            terminal_native = (_terminal is not None and (_terminal._prefetch_attempt is not None
+                               or any(f.graph_attempt is not None for f in _terminal.fences)))
+            if terminal_native and previous_prefetch_terminal is not None:
                 raise _DeliveryWithheld("terminal_prefetch_owner_pending")
             if active and join and c is self._conn and previous is not c:
                 self._quarantine_claim_connection(c, "unowned_pending_transaction")
@@ -14653,7 +14661,10 @@ class MemoryWikiProvider(MemoryProvider):
             self._claim_tx_document_stage = document_stage
             graph_stage = (c, self._claim_tx_thread, [])
             self._claim_tx_graph_stage = graph_stage
-            if _terminal is not None and _terminal._prefetch_attempt is not None:
+            graph_extraction = _GRAPH_EXTRACTION.get()
+            if graph_extraction is not None and graph_extraction.fence.provider is self:
+                graph_extraction.stage = graph_stage
+            if terminal_native:
                 c._prefetch_terminal = _terminal
             if _graph_effect is not None:
                 graph_stage[2].append(_graph_effect)
@@ -14682,7 +14693,7 @@ class MemoryWikiProvider(MemoryProvider):
                         or self._claim_tx_thread != threading.get_ident()
                         or self._transaction_quarantine is not None
                         or _terminal.phase != 'verify' or _terminal.measurement is None
-                        or (_terminal._prefetch_attempt is not None and c._prefetch_terminal is not _terminal)
+                        or (terminal_native and c._prefetch_terminal is not _terminal)
                         or c.total_changes != _terminal.measurement['after_changes']):
                     raise _DeliveryWithheld("terminal_commit_provenance_unproven")
                 # Run lease callbacks BEFORE the final source/authority reads.
@@ -14713,6 +14724,12 @@ class MemoryWikiProvider(MemoryProvider):
                         raise RuntimeError("graph_effect_owner_stage_unproven")
                     c._graph_commit_image = self._assert_graph_effects(
                         c, graph_stage[2], check_callbacks=False, terminal_stage=graph_stage)
+                if graph_extraction is not None and graph_extraction.fence.provider is self:
+                    graph_extraction.admit()
+                    # Cannot safely reenter SQL/erasure guards from authorizer.
+                    # Refuse this critical lifetime, never disable its callback.
+                    if c._graph_user_authorizer is not None:
+                        raise _DeliveryWithheld('graph_extraction_native_authorizer_unsupported')
                 if _terminal is not None and not _terminal.prefetch_ready():
                     raise _DeliveryWithheld("terminal_prefetch_attempt_expired")
                 commit_attempted = True  # Only immediately before actual commit.
@@ -14754,6 +14771,8 @@ class MemoryWikiProvider(MemoryProvider):
                         c._graph_commit_image = None
                         graph_stage[2].clear()
                         self._claim_tx_graph_stage = previous_graph_stage
+                        if graph_extraction is not None and graph_extraction.stage is graph_stage:
+                            graph_extraction.stage = None
                     self._claim_tx_connection = previous
                     self._claim_tx_thread = previous_thread
 
@@ -14898,9 +14917,7 @@ class MemoryWikiProvider(MemoryProvider):
                     or after_json != json.dumps(after or {}, ensure_ascii=False, sort_keys=True, default=str)):
                 reversible = False
         mid = "mut_" + sha(f"{operation}:{target_table}:{target_id}:{before_json}:{after_json}:{ts}")[:14]
-        c.execute(
-            """INSERT INTO memory_mutations(id,batch_id,actor,operation,target_table,target_id,before_json,after_json,reason,reversible,undone_at,created_at)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+        _graph_sql(self, c, 'mutation',
             (mid, short(batch_id,80), "memory-wiki", short(operation,120), short(target_table,80), short(target_id,160), before_json, after_json, short(redact_secrets(reason),1200), 1 if reversible else 0, 0, ts),
         )
         if conn is None:
@@ -22835,6 +22852,9 @@ class MemoryWikiProvider(MemoryProvider):
                         raise TimeoutError("graph_original_lease_lost")
         if callbacks_only:
             return
+        extraction = _GRAPH_EXTRACTION.get()
+        if extraction is not None and extraction.fence.provider is self:
+            extraction.admit()
         actor = self._graph_effect_actor()
         for original_actor, source_id, source_image, job_admission in admissions:
             if actor != original_actor:
@@ -22885,6 +22905,14 @@ class MemoryWikiProvider(MemoryProvider):
             raise ValueError("graph source claim not found")
         if claim is not None:
             self._graph_source_eligible(claim)
+        extraction = _GRAPH_EXTRACTION.get()
+        if extraction is not None and extraction.fence.provider is self:
+            extraction.admit()
+            original = extraction.fence.images.get(('claims', 'id', (source_claim_id,)), [])
+            raw = dict(claim) if claim is not None else {}
+            raw.pop('_graph_rowid', None)
+            if len(original) != 1 or raw != original[0] or actor != extraction.actor:
+                raise _DeliveryWithheld('graph_extraction_original_application_changed')
         job_admission = getattr(self, "_graph_job_admission", None)
         if job_admission is not None:
             original_source, original_actor, _, _, _ = job_admission
@@ -23027,12 +23055,9 @@ class MemoryWikiProvider(MemoryProvider):
         endpoint_before={eid:self._table_row('entities',eid,conn=c) for eid in {subj_id,obj_id}}
         with self._claim_transaction(c, join=True, _graph_effect=owner['admission']) as c:
             for endpoint_id,endpoint_name,endpoint_hash in ((subj_id,subj,subj_hash),(obj_id,obj,obj_hash)):
-                c.execute('''INSERT OR IGNORE INTO entities(id,name,entity_type,aliases,notes,updated_at,hash,visibility_scope,origin_bot_id,origin_session_id,origin_chat_hash,project_id,source_claim_id,valid_from,valid_to)
-                             VALUES(?,?,'thing','[]','',?,?,?,?,?,?,?,?,?,?)''',
+                _graph_sql(self, c, 'entity',
                           (endpoint_id,endpoint_name,now(),endpoint_hash,owner['visibility_scope'],owner['origin_bot_id'],owner['origin_session_id'],owner['origin_chat_hash'],owner['project_id'],source_claim_id,valid_from,valid_to))
-            c.execute('''INSERT INTO relations(id,subject,predicate,object,confidence,evidence,created_at,hash,visibility_scope,origin_bot_id,origin_session_id,origin_chat_hash,project_id,source_claim_id,valid_from,valid_to,subject_id,object_id,source_ref)
-                         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                         ON CONFLICT(id) DO UPDATE SET confidence=excluded.confidence,evidence=excluded.evidence,source_ref=excluded.source_ref,valid_from=excluded.valid_from,valid_to=excluded.valid_to,subject_id=excluded.subject_id,object_id=excluded.object_id''',
+            _graph_sql(self, c, 'relation',
                       (rid,subj,pred,obj,clamp(float(a.get('confidence',.8))),evidence,now(),h,owner['visibility_scope'],owner['origin_bot_id'],owner['origin_session_id'],owner['origin_chat_hash'],owner['project_id'],source_claim_id,valid_from,valid_to,subj_id,obj_id,source_ref))
             for endpoint_id,before_entity in endpoint_before.items():
                 if not before_entity:
@@ -23089,7 +23114,27 @@ class MemoryWikiProvider(MemoryProvider):
             raise PermissionError('graph extraction requires explicit enablement')
         is_codex = graph_settings is not None and graph_settings.provider == 'openai-codex'
         claim_id=str(a.get('claim_id') or '').strip()
+        # Original purpose/epoch precede raw hydration and every ACL/route/
+        # codec callback. TerminalDelivery retains this carrier, not proposals.
+        fence = _DisclosureFence(self, self._connect())
+        cancel = getattr(_PREFETCH_LOCAL, 'cancel_event', None)
+        if cancel is None:
+            cancel = threading.Event()
+        deadline = time.monotonic() + 60.0
+        ambient = getattr(_PREFETCH_LOCAL, 'deadline', 0.0)
+        if ambient and ambient > 0:
+            deadline = min(deadline, ambient)
+        attempt = _GraphExtraction(fence, cancel, deadline)
+        terminal = _current_delivery(self)
+        if terminal is None:
+            raise _DeliveryWithheld('graph_original_upper_owner_required')
+        terminal.retain(fence)
+        fence.purposes[claim_id] = ('graph_extract', '', False)
+        originals = fence.watch('claims', 'id', [claim_id])
+        fence.claims(originals, purpose='graph_extract')
         claim=self._require_visible_claim(claim_id)
+        if len(originals) != 1 or dict(claim) != originals[0]:
+            raise _DeliveryWithheld('graph_original_hydration_changed')
         if str(claim['status']) != 'active' or str(claim['temporal_status'] or 'current') != 'current':
             raise ValueError('source claim is not current')
         source_text=str(claim['claim'] or '')
@@ -23098,6 +23143,14 @@ class MemoryWikiProvider(MemoryProvider):
                 or int(claim['quarantined_at'] or 0) > 0
                 or secret_scan(source_text).get('raw_secret')):
             raise ValueError('source claim is not eligible for remote extraction')
+        with attempt.scope():
+            return self._graph_extract_admitted(a, attempt, source_text, graph_settings, is_codex, claim_id)
+
+    def _graph_extract_admitted(self, a, attempt, source_text, graph_settings, is_codex, claim_id):
+        try:
+            from .entity_relation_extractor import extract_relations
+        except ImportError:
+            from entity_relation_extractor import extract_relations
         endpoint=(
             _profile_secret_setting('MEMORY_WIKI_GRAPH_EXTRACT_URL', os.environ.get('MEMORY_WIKI_GRAPH_EXTRACT_URL', ''))
             or _profile_secret_setting('MEMORY_WIKI_LLM_BASE_URL', os.environ.get('MEMORY_WIKI_LLM_BASE_URL', ''))
@@ -23129,6 +23182,8 @@ class MemoryWikiProvider(MemoryProvider):
         except (TypeError,ValueError):
             auto_timeout=configured_timeout
         request_timeout=max(1.0,min(configured_timeout,auto_timeout,60.0))
+        attempt.deadline = min(attempt.deadline, attempt.started + request_timeout)
+        request_timeout = min(request_timeout, attempt.admit())
         if graph_settings is not None:
             from dataclasses import replace
             graph_settings = replace(graph_settings, timeout=request_timeout)
@@ -23137,21 +23192,32 @@ class MemoryWikiProvider(MemoryProvider):
                 source_text, endpoint=endpoint, api_key=key, model=model,
                 predicates=self.GRAPH_RELATION_TYPES,
                 timeout=request_timeout, extraction_settings=graph_settings,
+                _admit=attempt.admit, _deadline=attempt.deadline,
             )
         except (ValueError, PermissionError):
             raise
         except Exception as exc:
+            if self._transaction_quarantine is not None and self._transaction_primary is not None:
+                raise self._transaction_primary
             raise RuntimeError('graph extraction request failed: ' + type(exc).__name__) from None
+        attempt.admit()
         if not bool(a.get('apply', True)):
             return {'claim_id':claim_id,'proposals':proposals,'applied':0}
         applied=[]; errors=[]
         for proposal in proposals:
+            attempt.admit()
             args={**proposal, 'source_claim_id':claim_id}
             result=json.loads(self.handle_tool_call('memory_wiki_add_relation', args))
             if result.get('success'):
                 applied.append(str(result['id']))
             else:
                 errors.append(str(result.get('error') or 'relation write failed')[:200])
+            if self._transaction_quarantine is not None:
+                if self._transaction_primary is not None:
+                    raise self._transaction_primary
+                raise RuntimeError('graph_application_outcome_UNKNOWN')
+            attempt.admit()
+        attempt.admit()
         return {'claim_id':claim_id,'proposals':proposals,'applied':len(applied),'relation_ids':applied,'errors':errors}
 
     def _unified_recall(self, query: str, mode: str = "auto", limit: int = 10,
@@ -25328,7 +25394,9 @@ def _bind_memory_wiki_profile_methods() -> None:
             receipt_budget = self._prefetch_delivery_budget() if __name == "prefetch" else None
             root = _RECALL_REQUEST.get()
             tool_name = (args[0] if args else kwargs.get("tool_name")) if __name == "handle_tool_call" else None
-            upper_read = __name == "handle_tool_call" and tool_name in _DOC_CODE_READ_TOOLS
+            graph_read = (__name == '_graph_extract_claim' or
+                          (__name == 'handle_tool_call' and tool_name == 'memory_wiki_graph_extract_claim'))
+            upper_read = graph_read or (__name == "handle_tool_call" and tool_name in _DOC_CODE_READ_TOOLS)
             entrypoint = (__name == "prefetch" or (__name == "handle_tool_call"
                           and tool_name in {"memory_wiki_query", "memory_wiki_recall"}))
             try:
@@ -25447,7 +25515,7 @@ def _bind_memory_wiki_profile_methods() -> None:
                             refused = {}
                         elif __name == "_commit_prefetch_delivery":
                             refused = False
-                        elif __name in {'_export_bundle', '_get_project_context', '_preference_layer', '_why_believe', '_summarize_topic', '_dashboard', '_export', '_graph_query'}:
+                        elif __name in {'_graph_extract_claim', '_export_bundle', '_get_project_context', '_preference_layer', '_why_believe', '_summarize_topic', '_dashboard', '_export', '_graph_query'}:
                             refused = _withheld_payload(kind)
                         elif __name == "_pack_context":
                             refused = _withheld_payload(kind)

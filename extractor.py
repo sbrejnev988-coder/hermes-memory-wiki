@@ -987,15 +987,43 @@ def _own_codex_grant(settings: ExtractionSettings) -> str:
     raise ValueError("own Codex OAuth requires native refresh or reauthentication")
 
 
-def _codex_content(settings: ExtractionSettings, messages: List[Dict[str, Any]]) -> str:
+def _codex_http_client(deadline, *, _admit=None, transport=None):
+    """Public final per-client HTTPX hook, after SDK/native body encoding.
+
+    No dispatcher/SDK patch and no progress/telemetry authorization. Hook
+    exceptions propagate through the real SDK (its owner uses max_retries=0).
+    Missing dependencies/capabilities fail closed, not a compatibility claim.
+    Transport is an offline SOURCE fixture seam, never an auth validator.
+    This snapshot does not provide an atomic SQL-to-wire lease.
+    """
+    from openai import DefaultHttpxClient
+
+    def bound_request(request):
+        request.read()  # Finish lazy body preparation before original admission.
+        if _admit is not None:
+            _admit()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError('Codex original deadline exceeded')
+        request.extensions['timeout'] = {k: remaining for k in ('connect', 'read', 'write', 'pool')}
+
+    kwargs = dict(follow_redirects=False, trust_env=False, event_hooks={'request': [bound_request]})
+    if transport is not None:
+        kwargs['transport'] = transport
+    return DefaultHttpxClient(**kwargs)
+
+
+def _codex_content(settings: ExtractionSettings, messages: List[Dict[str, Any]], *, _admit=None, _deadline=None) -> str:
     """Use the public native Responses adapter, not the mutating provider resolver."""
     from agent.auxiliary_client import CodexAuxiliaryClient, aux_stream_deadline
     from agent.codex_headers import CODEX_AUX_BASE_URL, codex_cloudflare_headers
     from agent.secret_scope import set_secret_scope, reset_secret_scope, current_secret_scope_home
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-    from openai import OpenAI, DefaultHttpxClient
+    from openai import OpenAI
 
     deadline = time.monotonic() + settings.timeout
+    if _deadline is not None:
+        deadline = min(deadline, _deadline)
     access = _own_codex_grant(settings)
     home_token = set_hermes_home_override(settings.home)
     try:
@@ -1005,8 +1033,9 @@ def _codex_content(settings: ExtractionSettings, messages: List[Dict[str, Any]])
             with aux_stream_deadline(deadline):
                 if current_secret_scope_home() != str(settings.home):
                     raise ValueError("Codex owner scope mismatch")
-                http_client = DefaultHttpxClient(follow_redirects=False, trust_env=False)
+                http_client = _codex_http_client(deadline, _admit=_admit)
                 client = None
+                primary = None
                 try:
                     real_client = OpenAI(
                         api_key=access, base_url=CODEX_AUX_BASE_URL,
@@ -1030,12 +1059,22 @@ def _codex_content(settings: ExtractionSettings, messages: List[Dict[str, Any]])
                         raise TimeoutError("Codex response exceeded budget")
                     if response.model != settings.model or response.choices[0].message.tool_calls:
                         raise ValueError("Codex non-text response")
+                    if _admit is not None:
+                        _admit()
                     return response.choices[0].message.content
+                except BaseException as exc:
+                    primary = exc
+                    raise
                 finally:
-                    if client is not None:
-                        client.close()
-                    else:
-                        http_client.close()
+                    try:
+                        if client is not None:
+                            client.close()
+                        else:
+                            http_client.close()
+                    except BaseException as cleanup:
+                        if primary is None:
+                            raise
+                        primary.add_note('Codex client cleanup: ' + type(cleanup).__name__)
         finally:
             reset_secret_scope(secret_token)
     finally:

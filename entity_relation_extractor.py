@@ -198,6 +198,8 @@ def extract_relations(
     predicates: frozenset[str],
     timeout: float = 30.0,
     extraction_settings: ExtractionSettings | None = None,
+    _admit=None,
+    _deadline=None,
 ) -> list[dict[str, Any]]:
     """Return up to eight strictly validated, text-grounded relation rows."""
     is_codex = extraction_settings is not None and extraction_settings.provider == "openai-codex"
@@ -245,7 +247,7 @@ def extract_relations(
         ],
     }
     if is_codex:
-        content = _codex_content(extraction_settings, payload["messages"])
+        content = _codex_content(extraction_settings, payload["messages"], _admit=_admit, _deadline=_deadline)
     else:
         request = urllib.request.Request(
             endpoint,
@@ -253,9 +255,14 @@ def extract_relations(
             headers={"Authorization": "Bearer " + api_key, "Content-Type": "application/json"},
             method="POST",
         )
-        with _urlopen_no_redirect(request, timeout=max(1.0, min(timeout, 60.0))) as response:
+        request_timeout = min(timeout, 60.0)
+        if request_timeout <= 0:
+            raise TimeoutError('graph original deadline exceeded')
+        with _urlopen_no_redirect(request, timeout=request_timeout, _before_dispatch=_admit) as response:
             envelope = json.loads(response.read(1_000_001).decode("utf-8"))
         content = envelope["choices"][0]["message"]["content"]
+    if _admit is not None:
+        _admit()
     if not isinstance(content, str) or len(content) > 100_000:
         raise ValueError("invalid graph extraction response")
     parsed = json.loads(content)
@@ -284,4 +291,6 @@ def extract_relations(
             raise ValueError("relation endpoints and predicate are not grounded in one evidence clause")
         output.append({"subject": subject, "predicate": predicate, "object": obj,
                        "evidence": evidence, "confidence": float(confidence)})
+    if _admit is not None:
+        _admit()
     return output
