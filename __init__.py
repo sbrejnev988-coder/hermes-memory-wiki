@@ -1046,6 +1046,7 @@ try:
         canonicalize_code_graph_recovery_event as _canonicalize_code_graph_recovery_event,
         normalized_code_graph_event_payload_hash as _normalized_code_graph_event_payload_hash,
         scrub_code_graph_storage as _scrub_code_graph_storage,
+        _provider_graph_redactor as _resolve_code_graph_redactor,
         _graph_lookup_identity as _map_code_graph_identity,
         register_code_graph_identity_provenance as _register_code_graph_identity_provenance,
         collect_code_graph_event_opaque_ids as _collect_code_graph_event_opaque_ids,
@@ -1068,6 +1069,7 @@ except ImportError:
             canonicalize_code_graph_recovery_event as _canonicalize_code_graph_recovery_event,
             normalized_code_graph_event_payload_hash as _normalized_code_graph_event_payload_hash,
             scrub_code_graph_storage as _scrub_code_graph_storage,
+            _provider_graph_redactor as _resolve_code_graph_redactor,
             _graph_lookup_identity as _map_code_graph_identity,
             register_code_graph_identity_provenance as _register_code_graph_identity_provenance,
             collect_code_graph_event_opaque_ids as _collect_code_graph_event_opaque_ids,
@@ -1081,6 +1083,7 @@ except ImportError:
         def _install_code_graph_schema(conn): return None
         _ingest_code_graph_event = _query_code_graph = _code_line_context = _code_graph_neighbors = _code_graph_status = _embed_pending_chunks = _code_graph_unavailable
         _scrub_code_graph_storage = _code_graph_unavailable
+        _resolve_code_graph_redactor = _code_graph_unavailable
         def _map_code_graph_identity(_provider, value, **_kwargs): return str(value or "").replace("\x00", "")
         def _register_code_graph_identity_provenance(_conn, _values, **_kwargs): return None
         def _collect_code_graph_event_opaque_ids(_event): return frozenset()
@@ -18514,6 +18517,7 @@ class MemoryWikiProvider(MemoryProvider):
         semantics.  Malformed or oversized legacy data becomes a digest-only
         stub rather than remaining a local secret store.
         """
+        redactor = _resolve_code_graph_redactor(self)
         max_files = max(1, min(int(limit or 200), 10_000))
         max_bytes = max(
             64 * 1024,
@@ -18557,7 +18561,7 @@ class MemoryWikiProvider(MemoryProvider):
                     else:
                         safe = _sanitize_code_graph_event_for_recovery(
                             {"terminal_record": parsed},
-                            self._redact_code_graph_text,
+                            redactor,
                         )["terminal_record"]
                         if safe != parsed:
                             replacement = safe
@@ -24893,7 +24897,10 @@ class MemoryWikiProvider(MemoryProvider):
         return {'candidates':candidates,'created':created,'applied':apply}
 
     def _scrub_secrets(self, apply: bool=False, limit: int=200) -> Dict[str, Any]:
-        """Redact raw secrets already stored in memory tables without surfacing them."""
+        """Redact stored secrets without surfacing them; propagate stage failures.
+
+        Earlier table updates may already be committed when a later stage fails.
+        """
         c=self._connect(); limit=max(1,min(int(limit or 200),1000)); hits=[]; updated=0; secret_refs=[]; graph_scrub={"rows":0,"fields":0}; terminal_scrub={"scanned":0,"redacted":0,"stubs":0}
         targets=[('claims','id',['claim','evidence','source']),('evidence','id',['text','source']),('review_queue','id',['candidate','evidence','suggested_claim','reason']),('secret_index','id',['subject','scope','purpose','source']),('task_capsules','id',['intent','plan','files','commands','errors','fixes','verification','followups']),('entities','id',['name','aliases','notes']),('relations','id',['subject','object','evidence']),('project_profiles','project_id',['root','purpose','commands','services','notes','stack_json','current_status']),('post_task_log','id',['summary','changed_files','backups','verification','services']),('preference_rules','id',['rule','scope','source'])]
         for table, pk, fields in targets:
@@ -24942,15 +24949,9 @@ class MemoryWikiProvider(MemoryProvider):
             if len(hits) >= limit:
                 break
         if apply:
-            try:
-                with c:
-                    graph_scrub=_scrub_code_graph_storage(self, c, apply=True, limit=max(5000, limit))
-            except Exception as exc:
-                _debug_log(f"code graph secret scrub failed: {type(exc).__name__}")
-            try:
-                terminal_scrub=self._scrub_code_graph_terminal_artifacts(apply=True, limit=max(5000, limit))
-            except Exception as exc:
-                _debug_log(f"code graph terminal artifact scrub failed: {type(exc).__name__}")
+            with c:
+                graph_scrub=_scrub_code_graph_storage(self, c, apply=True, limit=max(5000, limit))
+            terminal_scrub=self._scrub_code_graph_terminal_artifacts(apply=True, limit=max(5000, limit))
             self._rebuild_fts(); self._render_active_dashboard(); self._audit('scrub_secrets','ok',f'hits={len(hits)} updated={updated}')
         return {'applied':apply,'hits':hits,'hit_count':len(hits),'updated_rows':updated,'secret_refs':sorted(set(secret_refs))[:100], 'code_graph':graph_scrub, 'code_graph_terminal':terminal_scrub}
 
