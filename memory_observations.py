@@ -858,6 +858,7 @@ def consolidate_events(
     session_id: str = "",
     limit: int | None = None,
     lease_valid: Callable[[], bool] | None = None,
+    _event_job=None,
 ) -> dict[str, Any]:
     """One bounded pass; decisions/retries are the durable progress cursor.
 
@@ -866,7 +867,7 @@ def consolidate_events(
     nor a deleted source can authorize a later materialization write.
     """
     conn = provider._connect()
-    with provider._claim_transaction(conn):
+    with provider._claim_transaction(conn, join=True, _event_job=_event_job):
         if lease_valid is not None:
             if not lease_valid():
                 raise TimeoutError("memory observation lease lost")

@@ -1305,6 +1305,38 @@ def _document_commit_fence(conn, flight, *, check_sql_image=True):
         raise PermissionError('document_native_commit_writer_withdrawn')
 
 
+def _event_job_commit_fence(conn, flight, *, admission=True):
+    """Pure original event-job image at native admission, never a lease reader.
+
+    Only the owning COMMIT's admission checks expiry/SQL delta. SQLite's later
+    FTS synchronization may legitimately advance total_changes after COMMIT;
+    it still belongs to this exact live owner/flight until native return.
+    """
+    owner, stage, image, thread = flight
+    if (conn._event_job_commit_flight is not flight or conn._event_job_commit_image is not image
+            or thread != threading.get_ident()
+            or owner._claim_tx_connection is not conn or owner._claim_tx_thread != thread
+            or owner._claim_tx_event_job_stage is not stage
+            or image[0] is not stage or stage[0] is not conn or stage[1] != thread or stage[3] is not True
+            or len(stage[2]) != len(image[1])
+            or any(a is not b for a, b in zip(stage[2], image[1]))
+            or (admission and conn.total_changes != image[3])
+            or owner._lifecycle_state in {'failed', 'quarantined', 'stopping'}
+            or owner._transaction_quarantine is not None):
+        raise PermissionError('event_job_native_commit_image_changed')
+    if type(conn) is _GraphWriterConnection:
+        if not _graph_writer_identity(owner, conn):
+            raise PermissionError('event_job_native_commit_writer_withdrawn')
+    elif conn is not owner._conn or conn is not owner._owned_conn:
+        raise PermissionError('event_job_native_commit_writer_withdrawn')
+    for original in image[1]:
+        if (type(owner.bot_id) is not str or owner.bot_id != original[1]
+                or owner.home is not original[2] or owner.db_path is not original[3]):
+            raise PermissionError('event_job_original_owner_changed')
+    if admission and time.time() >= min(image[2]):
+        raise TimeoutError('event_job_original_lease_lost')
+
+
 class _GraphCommitConnection(sqlite3.Connection):
     """Shared native connection keeps supported authorizers behind the fence.
 
@@ -1318,6 +1350,8 @@ class _GraphCommitConnection(sqlite3.Connection):
         self._graph_commit_image = None
         self._document_commit_image = None
         self._document_commit_flight = None
+        self._event_job_commit_image = None
+        self._event_job_commit_flight = None
         self._graph_extraction_stage = None
         self._graph_commit_flight = None
         self._graph_commit_error = None
@@ -1331,6 +1365,7 @@ class _GraphCommitConnection(sqlite3.Connection):
 
     def set_authorizer(self, callback):
         if (self._graph_commit_flight is not None or self._document_commit_flight is not None
+                or self._event_job_commit_flight is not None
                 or self._prefetch_commit_flight is not None):
             raise RuntimeError('graph_writer_operation_in_flight')
         if callback is not None and not callable(callback):
@@ -1340,12 +1375,14 @@ class _GraphCommitConnection(sqlite3.Connection):
 
     def close(self):
         if (self._graph_commit_flight is not None or self._document_commit_flight is not None
+                or self._event_job_commit_flight is not None
                 or self._prefetch_commit_flight is not None):
             raise RuntimeError('graph_writer_operation_in_flight')
         return super().close()
 
     def set_trace_callback(self, callback):
         if (self._graph_commit_flight is not None or self._document_commit_flight is not None
+                or self._event_job_commit_flight is not None
                 or self._prefetch_commit_flight is not None):
             raise RuntimeError('graph_writer_operation_in_flight')
         self._graph_trace = callback
@@ -1353,6 +1390,7 @@ class _GraphCommitConnection(sqlite3.Connection):
 
     def set_progress_handler(self, callback, n):
         if (self._graph_commit_flight is not None or self._document_commit_flight is not None
+                or self._event_job_commit_flight is not None
                 or self._prefetch_commit_flight is not None):
             raise RuntimeError('graph_writer_operation_in_flight')
         self._graph_progress = callback if n > 0 else None
@@ -1361,7 +1399,9 @@ class _GraphCommitConnection(sqlite3.Connection):
     def _graph_authorizer_result(self, action, a, b, database, source):
         flight = self._graph_commit_flight
         document_flight = self._document_commit_flight
-        if ((flight is not None or document_flight is not None or self._prefetch_commit_flight is not None)
+        event_job_flight = self._event_job_commit_flight
+        if ((flight is not None or document_flight is not None or event_job_flight is not None
+             or self._prefetch_commit_flight is not None)
                 and self._graph_authorizer_depth
                 and action in (sqlite3.SQLITE_TRANSACTION, sqlite3.SQLITE_SAVEPOINT)):
             # Reentrant shared SQL must not finish the transaction INSIDE the
@@ -1378,6 +1418,11 @@ class _GraphCommitConnection(sqlite3.Connection):
         if document_commit and document_flight is None:
             # SQL COMMIT/END, previous/returned cursors, executescript and native
             # context exit cannot complete a document owner's still-running body.
+            return sqlite3.SQLITE_DENY
+        event_job_stage = getattr(owner, '_claim_tx_event_job_stage', None)
+        event_job_commit = (action == sqlite3.SQLITE_TRANSACTION and a == 'COMMIT'
+                            and event_job_stage is not None and event_job_stage[2])
+        if event_job_commit and event_job_flight is None:
             return sqlite3.SQLITE_DENY
         terminal = self._prefetch_terminal
         prefetch_commit = terminal is not None and action == sqlite3.SQLITE_TRANSACTION and a == 'COMMIT'
@@ -1396,6 +1441,9 @@ class _GraphCommitConnection(sqlite3.Connection):
                 return sqlite3.SQLITE_DENY
             if flight is not None:
                 _graph_commit_fence(self, flight)
+            if event_job_flight is not None:
+                _event_job_commit_fence(self, event_job_flight,
+                    admission=action == sqlite3.SQLITE_TRANSACTION and a == 'COMMIT')
             if document_flight is not None:
                 _document_commit_fence(
                     self, document_flight,
@@ -1437,12 +1485,22 @@ class _GraphCommitConnection(sqlite3.Connection):
         return self._graph_authorizer_result(action, a, b, database, source)
 
     def _graph_start_commit(self):
-        if self._graph_commit_flight is not None or self._document_commit_flight is not None:
+        if (self._graph_commit_flight is not None or self._document_commit_flight is not None
+                or self._event_job_commit_flight is not None):
             raise RuntimeError('graph_writer_operation_in_flight')
         owner = self._graph_effect_owner
         stage = getattr(owner, '_claim_tx_graph_stage', None)
         document_stage = getattr(owner, '_claim_tx_document_stage', None)
+        event_job_stage = getattr(owner, '_claim_tx_event_job_stage', None)
         self._graph_commit_error = None
+        if event_job_stage is not None and event_job_stage[2]:
+            image = self._event_job_commit_image
+            if image is None or image[0] is not event_job_stage:
+                raise PermissionError('event_job_native_commit_image_missing')
+            if self._graph_trace is not None or self._graph_progress is not None:
+                raise RuntimeError('event_job_native_commit_late_callback_unsupported')
+            self._event_job_commit_flight = (owner, event_job_stage, image, threading.get_ident())
+            _event_job_commit_fence(self, self._event_job_commit_flight)
         if document_stage is not None and document_stage[2]:
             image = self._document_commit_image
             if image is None or image[0] is not document_stage:
@@ -1466,7 +1524,8 @@ class _GraphCommitConnection(sqlite3.Connection):
     def commit(self):
         owner = self._graph_effect_owner
         with _provider_claim_lock(owner):
-            if self._graph_commit_flight is not None or self._document_commit_flight is not None:
+            if (self._graph_commit_flight is not None or self._document_commit_flight is not None
+                    or self._event_job_commit_flight is not None):
                 raise RuntimeError('graph_writer_operation_in_flight')
             terminal = self._prefetch_terminal
             if terminal is not None:
@@ -1489,6 +1548,7 @@ class _GraphCommitConnection(sqlite3.Connection):
             finally:
                 self._graph_commit_flight = None
                 self._document_commit_flight = None
+                self._event_job_commit_flight = None
                 self._prefetch_commit_flight = None
 
 

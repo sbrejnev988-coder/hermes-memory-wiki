@@ -611,11 +611,61 @@ def _event_source(provider: Any, job: Mapping[str, Any], payload: Mapping[str, A
     return row
 
 
+def _event_job_obligation(provider, job, lease_valid, lease_valid_in_transaction):
+    """Immutable original queue identity, not a new lease or writer capability.
+
+    Expiry is deliberately absent: a lawful renewal of THIS exact random token
+    before BEGIN must use its current database expiry, not the old job dict E0.
+    """
+    keys = ('job_id', 'profile_key', 'owner_key', 'lease_owner', 'lease_generation')
+    original = tuple((key, job[key]) for key in keys)
+    if (type(job['job_id']) is not str or not re.fullmatch(r'job_[0-9a-f]{32}', job['job_id'])
+            or any(type(job[key]) is not str or not _DIGEST.fullmatch(job[key])
+                   for key in ('profile_key', 'owner_key'))
+            or type(job['lease_owner']) is not str
+            or not re.fullmatch(r'[0-9a-f]{32}:[0-9a-f]{32}', job['lease_owner'])
+            or type(job['lease_generation']) is not int or job['lease_generation'] < 0):
+        raise ValueError('invalid_event_job_obligation')
+    return (original, provider.bot_id, provider.home, provider.db_path,
+            lease_valid, lease_valid_in_transaction)
+
+
+def _close_job_worker(provider, worker, primary):
+    """The existing graph worker UNKNOWN protocol, also for event writers."""
+    retained = None
+    try:
+        if worker._transaction_quarantine is None and worker._conn is not None:
+            worker._conn.close()
+            worker._conn = None
+            worker._owned_conn = None
+    except BaseException as cleanup:
+        worker._quarantine_claim_connection(worker._owned_conn, 'graph_worker_close_UNKNOWN',
+                                            primary if primary is not None else cleanup)
+        if primary is None:
+            raise
+        primary.add_note('memory_wiki_graph_worker_cleanup:close_UNKNOWN')
+    finally:
+        if worker._transaction_quarantine is not None:
+            # Keep the actual copied owner, its stage/admissions and primary.
+            # No close/reconnect or ACK can recover a genuinely UNKNOWN TX.
+            if worker._transaction_primary is None and primary is not None:
+                worker._quarantine_claim_connection(worker._transaction_quarantine, 'owner_retained', primary)
+            retained = worker._transaction_primary
+            with provider._lock:
+                provider._graph_effect_quarantined_worker = worker
+                provider._quarantine_claim_connection(worker._transaction_quarantine,
+                    'graph_worker_owner_retained', retained if retained is not None else primary)
+    if primary is None and retained is not None:
+        raise retained
+
+
 def _run_job(
     provider: Any, module: Any, job: Mapping[str, Any],
     lease_valid: Callable[[], bool] | None = None,
     lease_valid_in_transaction: Callable[[sqlite3.Connection], bool] | None = None,
 ) -> str | tuple[str, int]:
+    # A later lease callback cannot replace the original job's token in-place.
+    job = dict(job)
     try:
         payload = json.loads(str(job["payload_json"]))
         if validate_payload(str(job["job_type"]), payload) != job["payload_json"]:
@@ -652,25 +702,7 @@ def _run_job(
             primary = exc
             raise
         finally:
-            try:
-                if worker._transaction_quarantine is None and worker._conn is not None:
-                    worker._conn.close()
-                    worker._conn = None
-                    worker._owned_conn = None
-            except BaseException as cleanup:
-                worker._quarantine_claim_connection(worker._owned_conn, "graph_worker_close_UNKNOWN", primary or cleanup)
-                if primary is None:
-                    primary = cleanup
-                    raise
-                primary.add_note("memory_wiki_graph_worker_cleanup:close_UNKNOWN")
-            finally:
-                if worker._transaction_quarantine is not None:
-                    # The copied worker is the actual owner. Retain it, its
-                    # admissions and primary; closing/reconnecting is not recovery.
-                    with provider._lock:
-                        provider._graph_effect_quarantined_worker = worker
-                        provider._quarantine_claim_connection(worker._transaction_quarantine,
-                            "graph_worker_owner_retained", worker._transaction_primary or primary)
+            _close_job_worker(provider, worker, primary)
         return ""
 
     source = _event_source(provider, job, payload)
@@ -679,7 +711,9 @@ def _run_job(
         # the existing job pending, without reconstructing deleted evidence.
         return ("defer", int(time.time()) + 60)
     worker = _worker_provider(provider, source)
+    primary = None
     try:
+        event_obligation = _event_job_obligation(worker, job, lease_valid, lease_valid_in_transaction)
         if kind == "consolidate_observations":
             scope = str(source["visibility_scope"])
             if scope not in {"chat", "bot", "project"}:
@@ -694,6 +728,7 @@ def _run_job(
                 limit=_limit("MEMORY_WIKI_OBSERVATION_BACKGROUND_BATCH", 64, 1, 1000),
                 lease_valid=(lambda: lease_valid_in_transaction(worker._connect()))
                 if lease_valid_in_transaction is not None else lease_valid,
+                _event_job=event_obligation,
             )
             if result.get("ready_work_remaining"):
                 # Yield between bounded passes. Every lease still consumes the
@@ -777,7 +812,12 @@ def _run_job(
         class _EventClaimLeaseLost(Exception):
             """Roll back this claim transaction on lost ownership."""
 
+        persistence_primary = None
+
         def persist_if_current(*args: Any, **kwargs: Any) -> str:
+            nonlocal persistence_primary
+            if persistence_primary is not None:
+                raise persistence_primary
             # Guard after the remote response and immediately before every
             # claim write. A deleted/edited event invalidates this extraction.
             ids = list(originals)
@@ -816,8 +856,7 @@ def _run_job(
             # validation and the claim write. The callback cannot resurrect
             # an event erased while the remote extractor was running.
             try:
-                with conn:
-                    conn.execute("BEGIN IMMEDIATE")
+                with worker._claim_transaction(conn, _event_job=event_obligation):
                     live = conn.execute(
                         f"""SELECT event_id,content_hash,owner_bot_id,owner_chat_hash,
                                owner_session_hash,visibility_scope,project_id,event_type,role
@@ -856,6 +895,12 @@ def _run_job(
                         raise _EventClaimLeaseLost
             except _EventClaimLeaseLost:
                 return ""
+            except BaseException as exc:
+                # extract_session_claims catches ordinary Exceptions. Keep the
+                # actual primary until its caller returns; never report an
+                # empty/persisted ID as successful recovery from UNKNOWN.
+                persistence_primary = exc
+                raise
             if claim_id and not prepared.get("_no_op"):
                 worker._after_claim_commit(claim_id, prepared["topic"], prepared["claim"])
             return str(claim_id or "")
@@ -867,6 +912,8 @@ def _run_job(
             secret_scan_callback=module.secret_scan,
             extraction_settings=module.read_extraction_settings(worker.home),
         )
+        if persistence_primary is not None:
+            raise persistence_primary
         # Graph jobs only refer to new, still active claims; execution repeats
         # full graph eligibility checks against authoritative current rows.
         graph_allowed, graph_available = worker.relevant_graph_extraction_settings()
@@ -878,12 +925,19 @@ def _run_job(
         if result.get("error") or result.get("errors"):
             return "provider"
         return ""
+    except BaseException as exc:
+        primary = exc
+        raise
     finally:
-        if worker._conn:
-            worker._conn.close()
+        _close_job_worker(provider, worker, primary)
 
 
 def run_once(provider: Any, module: Any, *, worker_id: str | None = None) -> bool:
+    if provider._transaction_quarantine is not None:
+        # Do not open another queue writer/heartbeat behind the retained owner.
+        if provider._transaction_primary is not None:
+            raise provider._transaction_primary
+        raise RuntimeError('provider_lifecycle_not_ready')
     store = JobStore(provider.db_path, profile_key(provider), owner_key(provider))
     worker_id = worker_id or uuid.uuid4().hex
     job = store.lease(worker_id)
@@ -914,16 +968,14 @@ def run_once(provider: Any, module: Any, *, worker_id: str | None = None) -> boo
             lease_valid_in_transaction=lambda conn: store.owns(job, worker_id, connection=conn),
         )
         error_code = outcome if isinstance(outcome, str) else ""
-    except sqlite3.Error:
-        error_code = "database"
-    except TimeoutError:
-        error_code = "timeout"
-    except ConnectionError:
-        error_code = "network"
-    except Exception:
+    except BaseException as primary:
+        if provider._transaction_quarantine is not None or not isinstance(primary, Exception):
+            raise
         # Deliberately never log or persist str(exc); providers sometimes
         # include a request body or bearer token in exception messages.
-        error_code = "unknown"
+        error_code = ('database' if isinstance(primary, sqlite3.Error) else
+                      'timeout' if isinstance(primary, TimeoutError) else
+                      'network' if isinstance(primary, ConnectionError) else 'unknown')
     finally:
         heartbeat_stop.set()
         heartbeat_thread.join(timeout=2)

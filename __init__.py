@@ -7344,6 +7344,7 @@ class MemoryWikiProvider(MemoryProvider):
         # completion is proved; UNKNOWN must not reset this constructor state.
         self._claim_tx_document_stage = None
         self._claim_tx_graph_stage = None
+        self._claim_tx_event_job_stage = None
         self._transaction_quarantine = None
         self._transaction_primary = None
         self._transaction_cleanup_notes = ()
@@ -14563,8 +14564,50 @@ class MemoryWikiProvider(MemoryProvider):
             return True
 
 
+    def _assert_event_job_leases(self, conn, admissions, *, callbacks_only=False, check_callbacks=True, terminal_stage=None):
+        """Original queue tokens under the exact owning IMMEDIATE transaction.
+
+        Run every optional callback before the final same-connection reads.
+        The native connection checks only the retained image/current expiry;
+        it never calls JobStore, SQL, filesystem or a lease callback itself.
+        """
+        if check_callbacks:
+            for admission in admissions:
+                callback = admission[5] if admission[5] is not None else admission[4]
+                if callback is not None and not (callback(conn) if admission[5] is not None else callback()):
+                    raise TimeoutError('event_job_original_lease_lost')
+        if callbacks_only:
+            return
+        originals = tuple(admissions)
+        changes = conn.total_changes
+        self._require_claim_writer(conn, transaction=True)
+        profile, owner = _background_jobs.profile_key(self), _background_jobs.owner_key(self)
+        expiries = []
+        for admission in originals:
+            job = dict(admission[0])
+            if (profile != job['profile_key'] or owner != job['owner_key']
+                    or self.bot_id != admission[1] or self.home is not admission[2]
+                    or self.db_path is not admission[3]):
+                raise PermissionError('event_job_original_owner_changed')
+            worker_id = job['lease_owner'].split(':', 1)[0]
+            store = _background_jobs.JobStore(self.db_path, job['profile_key'], job['owner_key'])
+            if not store.owns(job, worker_id, connection=conn):
+                raise TimeoutError('event_job_original_lease_lost')
+            # BEGIN IMMEDIATE excludes foreign reassignment/renewal. The native
+            # SQL counter refuses reentrant same-connection mutation during any
+            # of these final reads. Do not compare global coalescing generation.
+            expiry = conn.execute(
+                'SELECT lease_expires_at FROM memory_jobs WHERE job_id=? AND profile_key=? AND owner_key=?',
+                (job['job_id'], job['profile_key'], job['owner_key'])).fetchone()
+            if expiry is None:
+                raise TimeoutError('event_job_original_lease_lost')
+            expiries.append(int(expiry[0]))
+        if terminal_stage is not None:
+            return (terminal_stage, originals, tuple(expiries), changes)
+
+
     @contextmanager
-    def _claim_transaction(self, conn=None, *, join=False, adopt=False, begin="IMMEDIATE", _terminal=None, _document_hook=None, _document_ingest=None, _graph_effect=None):
+    def _claim_transaction(self, conn=None, *, join=False, adopt=False, begin="IMMEDIATE", _terminal=None, _document_hook=None, _document_ingest=None, _graph_effect=None, _event_job=None):
         """One SQLite owner stage; joined callers never commit another owner's TX.
 
         Used by claim/ledger owners and the private writer's native context API.
@@ -14592,6 +14635,7 @@ class MemoryWikiProvider(MemoryProvider):
             previous_thread = getattr(self, "_claim_tx_thread", None)
             previous_document_stage = self._claim_tx_document_stage
             previous_graph_stage = self._claim_tx_graph_stage
+            previous_event_job_stage = self._claim_tx_event_job_stage
             previous_prefetch_terminal = c._prefetch_terminal
             terminal_native = (_terminal is not None and (_terminal._prefetch_attempt is not None
                                or any(f.graph_attempt is not None for f in _terminal.fences)))
@@ -14622,6 +14666,17 @@ class MemoryWikiProvider(MemoryProvider):
                     raise _DeliveryWithheld("terminal_active_journal_postcommit_required_BLOCKED")
             if not owns:
                 # Exact caller-owned TX: its outer scope owns cleanup/commit.
+                if _event_job is not None:
+                    if (previous is not c or previous_thread != threading.get_ident()
+                            or type(previous_event_job_stage) is not tuple
+                            or len(previous_event_job_stage) != 4
+                            or previous_event_job_stage[0] is not c
+                            or previous_event_job_stage[1] != previous_thread
+                            or type(previous_event_job_stage[2]) is not list
+                            or previous_event_job_stage[3] is not True):
+                        raise RuntimeError('event_job_owner_stage_unproven')
+                    previous_event_job_stage[2].append(_event_job)
+                    self._assert_event_job_leases(c, (_event_job,))
                 if _document_ingest is not None:
                     # An admission tuple is not a writer capability. Register
                     # only in the stage created by the actual provider owner,
@@ -14646,12 +14701,16 @@ class MemoryWikiProvider(MemoryProvider):
                     self._assert_graph_effects(c, (_graph_effect,))
                 yield c
                 return
+            if _event_job is not None and (adopt or begin not in {'IMMEDIATE', 'EXCLUSIVE'}):
+                raise RuntimeError('event_job_requires_immediate_owner')
             self._claim_tx_connection = c
             self._claim_tx_thread = threading.get_ident()
             document_stage = (c, self._claim_tx_thread, [])
             self._claim_tx_document_stage = document_stage
             graph_stage = (c, self._claim_tx_thread, [])
             self._claim_tx_graph_stage = graph_stage
+            event_job_stage = (c, self._claim_tx_thread, [], not adopt and begin in {'IMMEDIATE', 'EXCLUSIVE'})
+            self._claim_tx_event_job_stage = event_job_stage
             graph_extraction = _GRAPH_EXTRACTION.get()
             graph_obligation = None
             if terminal_native:
@@ -14660,6 +14719,8 @@ class MemoryWikiProvider(MemoryProvider):
                 graph_stage[2].append(_graph_effect)
             if _document_ingest is not None:
                 document_stage[2].append(_document_ingest)
+            if _event_job is not None:
+                event_job_stage[2].append(_event_job)
             commit_attempted = False
             completed = False
             document_commits = ()
@@ -14672,6 +14733,8 @@ class MemoryWikiProvider(MemoryProvider):
                     _document_hook.started = True
                 if graph_stage[2]:
                     self._assert_graph_effects(c, graph_stage[2])
+                if event_job_stage[2]:
+                    self._assert_event_job_leases(c, event_job_stage[2])
                 yield c
                 if not c.in_transaction:
                     self._quarantine_claim_connection(c, "transaction_ended_before_owner_finish")
@@ -14692,6 +14755,8 @@ class MemoryWikiProvider(MemoryProvider):
                 # Run lease callbacks BEFORE the final source/authority reads.
                 # A callback for a later join must not invalidate an earlier
                 # admission after that admission was already checked.
+                if event_job_stage[2]:
+                    self._assert_event_job_leases(c, event_job_stage[2], callbacks_only=True)
                 if graph_stage[2]:
                     self._assert_graph_effects(c, graph_stage[2], callbacks_only=True)
                 if document_stage[2]:
@@ -14730,6 +14795,19 @@ class MemoryWikiProvider(MemoryProvider):
                         raise _DeliveryWithheld('graph_extraction_native_authorizer_unsupported')
                 if _terminal is not None and not _terminal.prefetch_ready():
                     raise _DeliveryWithheld("terminal_prefetch_attempt_expired")
+                if event_job_stage[2]:
+                    # LAST callback-capable owner/journal/source/lease tail.
+                    # Retain every original join at this actual owner's native
+                    # admission, not at the child return or a later queue ACK.
+                    if (self._claim_tx_connection is not c
+                            or self._claim_tx_thread != event_job_stage[1]
+                            or event_job_stage[1] != threading.get_ident()
+                            or self._claim_tx_event_job_stage is not event_job_stage
+                            or event_job_stage[3] is not True):
+                        self._quarantine_claim_connection(c, 'event_job_owner_stage_changed')
+                        raise RuntimeError('event_job_owner_stage_unproven')
+                    c._event_job_commit_image = self._assert_event_job_leases(
+                        c, event_job_stage[2], check_callbacks=False, terminal_stage=event_job_stage)
                 commit_attempted = True  # Only immediately before actual commit.
                 if _document_hook is not None:
                     _document_hook.commit_attempted = True
@@ -14771,6 +14849,12 @@ class MemoryWikiProvider(MemoryProvider):
                             c._document_commit_image = None
                         document_stage[2].clear()
                         self._claim_tx_document_stage = previous_document_stage
+                    if self._claim_tx_event_job_stage is event_job_stage:
+                        if (c._event_job_commit_image is not None
+                                and c._event_job_commit_image[0] is event_job_stage):
+                            c._event_job_commit_image = None
+                        event_job_stage[2].clear()
+                        self._claim_tx_event_job_stage = previous_event_job_stage
                     if self._claim_tx_graph_stage is graph_stage:
                         c._graph_commit_image = None
                         graph_stage[2].clear()
