@@ -1213,6 +1213,7 @@ def _graph_commit_fence(conn, flight):
     """
     stamp = time.time()
     owner, stage, image, thread = flight
+    obligation = image[3]
     if (conn._graph_commit_flight is not flight or thread != threading.get_ident()
             or owner._claim_tx_connection is not conn
             or owner._claim_tx_thread != thread or owner._claim_tx_graph_stage is not stage
@@ -1246,6 +1247,29 @@ def _graph_commit_fence(conn, flight):
                 raise PermissionError('graph_source_not_eligible')
         if admission[3] is not None and stamp >= dict(admission[3][2])['lease_expires_at']:
             raise TimeoutError('graph_original_lease_lost')
+    # Every owning extraction APPLY (not merely its later delivery COMMIT)
+    # carries the exact original Event/absolute monotonic deadline. This is a
+    # pure check of the stage-bound tuple AFTER all callback-capable reads.
+    # No SQL, ledger, admission callback or current authority is recaptured.
+    if conn._graph_extraction_stage is not obligation:
+        raise PermissionError('graph_original_native_stage_changed')
+    if obligation is not None:
+        attempt, cancel, deadline, original_stage, stop = obligation
+        fence = attempt.fence
+        if (attempt.native_stage is not obligation or attempt.stage is not original_stage
+                or original_stage is not stage or attempt.thread != thread
+                or fence.graph_attempt is not attempt or fence.provider is not owner or fence.conn is not conn
+                or (attempt._original_stop if attempt._request_stop is None else attempt._request_stop) is not stop
+                or stop[0] is not cancel or stop[1] != deadline
+                or attempt.cancel is not cancel or type(attempt.deadline) is not float
+                or attempt.deadline != deadline or type(cancel) is not threading.Event):
+            raise PermissionError('graph_original_native_stage_changed')
+        # Exact stdlib Event's primitive flag: do not dispatch an overridable
+        # is_set()/admit() callback from the SQLite authorizer.
+        if cancel.__dict__.get('_flag') is not False:
+            raise PermissionError('graph_original_attempt_cancelled')
+        if time.monotonic() >= deadline:
+            raise TimeoutError('graph_original_deadline_exceeded')
 
 
 class _GraphCommitConnection(sqlite3.Connection):
@@ -1259,6 +1283,7 @@ class _GraphCommitConnection(sqlite3.Connection):
         super().__init__(*args, **kwargs)
         self._graph_effect_owner = None
         self._graph_commit_image = None
+        self._graph_extraction_stage = None
         self._graph_commit_flight = None
         self._graph_commit_error = None
         self._graph_user_authorizer = None

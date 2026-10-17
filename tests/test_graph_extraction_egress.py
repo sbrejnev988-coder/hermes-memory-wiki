@@ -153,9 +153,15 @@ def test_primary_unknown(graph_case):
         assert p._transaction_quarantine is c and p._transaction_primary is primary
         assert p._owned_conn is c is p._claim_tx_connection and c.in_transaction
         assert p._claim_tx_graph_stage[2]
+        obligation = c._graph_extraction_stage
+        original = obligation[0]
+        assert original.native_stage is obligation and original.stage is p._claim_tx_graph_stage
+        assert obligation[1] is original.cancel and obligation[2] == original.deadline
+        assert obligation[3] is original.stage and original.fence.conn is c
         denied = case.call()
         f.denied(denied)
         assert len(case.posts) == 1 and p._transaction_primary is primary
+        assert c._graph_extraction_stage is obligation and original.native_stage is obligation
         case._emit(dict(event='original_primary_UNKNOWN_retained', same_primary=True,
                         same_owner=True, stage_retained=True, new_call_refused=True))
         # Exact-owned fixture safety cleanup only. Do not clear quarantine or
@@ -175,11 +181,69 @@ def test_synchronous_auto(graph_case):
         assert case.conn.execute('SELECT COUNT(*) FROM relations WHERE source_claim_id=?', (rows[0]['id'],)).fetchone()[0] == 1
 
 
+@pytest.mark.parametrize('mode', ['cancel', 'deadline'])
+def test_native_apply_original_stop(graph_case, mode):
+    with f.Fixture('native-stop-' + mode) as case:
+        original = f.durable_graph(case)
+        event = threading.Event()
+        deadline = time.monotonic() + 2.5
+        with case.m._prefetch_budget(3, event, deadline=deadline):
+            with f.native_apply_stop(case, mode, event, deadline) as seen:
+                out = case.call(apply=True)
+            assert case.m._PREFETCH_LOCAL.cancel_event is event
+            assert case.m._PREFETCH_LOCAL.deadline == deadline
+        after = f.durable_graph(case)  # Fresh independent file-backed reader AFTER public return.
+        case._emit(dict(event='native_apply_stop_outcome', mode=mode, witness=seen,
+                        before=original, after=after, public=out))
+        assert len(seen) == 1 and seen[0]['pending_own_changes'] == 6
+        assert seen[0]['original_event'] and seen[0]['original_deadline']
+        assert seen[0]['after_python_admit'] and seen[0]['native_authorizer']
+        assert seen[0]['before_expiry'] and not seen[0]['before_cancel'] and seen[0]['stopped']
+        assert len(case.posts) == 1
+        f.denied(out)  # Not the prevention oracle: old 2ad also withholds.
+        assert after['entities'] == original['entities'], 'cancelled_native_apply_committed_vertices'
+        assert after['relations'] == original['relations'], 'cancelled_native_apply_committed_edge'
+        assert after['mutations'] == original['mutations'], 'cancelled_native_apply_committed_mutations'
+        assert after['row_images'] == original['row_images']
+        assert after['journal_phases'] == original['journal_phases'] + ['before', 'error']
+        assert not case.conn.in_transaction and case.p._transaction_quarantine is None
+        assert case.p._claim_tx_connection is None and case.p._claim_tx_graph_stage is None
+        # Known rollback retires the exact obligation. A fresh original attempt
+        # can apply the SAME proposal, with real journal and own row counts.
+        with f.schedule(case, 'unused', lambda: None):
+            healthy = case.call(apply=True)
+        assert healthy['applied'] == 1 and len(case.posts) == 2
+        recovered = f.durable_graph(case)
+        assert recovered['entities'] == original['entities'] + 2
+        assert recovered['relations'] == original['relations'] + 1
+        assert recovered['mutations'] == original['mutations'] + 3
+        assert recovered['journal_phases'] == after['journal_phases'] + ['before', 'after']
+        assert case.fences[-1].graph_changes == 6
+        assert case.p._transaction_quarantine is None and not case.conn.in_transaction
+        assert case.conn._graph_extraction_stage is None and case.fences[-1].graph_attempt.native_stage is None
+        # Ordinary nongraph and graph owners keep their genuine builtin-int
+        # authorizer. No extraction obligation or event is adopted by them.
+        callbacks = []
+        def ordinary(action, a, b, db, source):
+            callbacks.append((action, a))
+            return sqlite3.SQLITE_OK
+        case.conn.set_authorizer(ordinary)
+        with case.p._claim_transaction(case.conn):
+            case.conn.execute('SELECT 1').fetchone()
+        normal = json.loads(case.p.handle_tool_call('memory_wiki_add_relation',
+                            {**f.PROPOSAL, 'source_claim_id': f.CID}))
+        case.conn.set_authorizer(None)
+        assert normal['id'] == healthy['relation_ids'][0]
+        assert callbacks.count((sqlite3.SQLITE_TRANSACTION, 'COMMIT')) >= 2
+        assert case.conn._graph_extraction_stage is None and case.p._transaction_quarantine is None
+        assert len(case.posts) == 2
+
+
 def test_public_sdk_final_hook(graph_case):
-    if importlib.util.find_spec('httpx') is None:
-        pytest.skip('BLOCKED: registered read-only environment lacks genuine HTTPX; no SDK/adapter stand-in')
+    # OpenAI 3.31's actual DefaultHttpxClient inherits genuine httpx2.Client.
+    # A missing mandatory SDK transport is a setup failure, never a green SKIP.
     with f.Fixture('sdk-hook') as case:
-        import httpx
+        import httpx2 as httpx
         import openai
         ex = __import__(case._namespace + '.extractor', fromlist=['_codex_http_client'])
         assert Path(openai.__file__).is_relative_to(Path(sys.prefix))

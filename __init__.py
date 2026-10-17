@@ -14662,8 +14662,7 @@ class MemoryWikiProvider(MemoryProvider):
             graph_stage = (c, self._claim_tx_thread, [])
             self._claim_tx_graph_stage = graph_stage
             graph_extraction = _GRAPH_EXTRACTION.get()
-            if graph_extraction is not None and graph_extraction.fence.provider is self:
-                graph_extraction.stage = graph_stage
+            graph_obligation = None
             if terminal_native:
                 c._prefetch_terminal = _terminal
             if _graph_effect is not None:
@@ -14673,6 +14672,8 @@ class MemoryWikiProvider(MemoryProvider):
             commit_attempted = False
             completed = False
             try:
+                if graph_extraction is not None and graph_extraction.fence.provider is self:
+                    graph_obligation = graph_extraction.bind_stage(c, graph_stage)
                 if not active:
                     c.execute("BEGIN" + (" " + begin if begin else ""))
                 if _document_hook is not None:
@@ -14772,6 +14773,10 @@ class MemoryWikiProvider(MemoryProvider):
                         graph_stage[2].clear()
                         self._claim_tx_graph_stage = previous_graph_stage
                         if graph_extraction is not None and graph_extraction.stage is graph_stage:
+                            if c._graph_extraction_stage is graph_obligation:
+                                c._graph_extraction_stage = None
+                            if graph_extraction.native_stage is graph_obligation:
+                                graph_extraction.native_stage = None
                             graph_extraction.stage = None
                     self._claim_tx_connection = previous
                     self._claim_tx_thread = previous_thread
@@ -22885,7 +22890,7 @@ class MemoryWikiProvider(MemoryProvider):
             # SQL/lease reads may call arbitrary registered callbacks. The
             # native authorizer rechecks this unchanged image without SQL and
             # compares ORIGINAL actors, never a late recaptured authority.
-            return (tuple(admissions), final_changes, terminal_stage)
+            return (tuple(admissions), final_changes, terminal_stage, conn._graph_extraction_stage)
 
 
     def _graph_owner(self, a: Dict[str, Any], *, conn=None) -> Dict[str, Any]:
@@ -23182,7 +23187,7 @@ class MemoryWikiProvider(MemoryProvider):
         except (TypeError,ValueError):
             auto_timeout=configured_timeout
         request_timeout=max(1.0,min(configured_timeout,auto_timeout,60.0))
-        attempt.deadline = min(attempt.deadline, attempt.started + request_timeout)
+        attempt.bind_timeout(request_timeout)
         request_timeout = min(request_timeout, attempt.admit())
         if graph_settings is not None:
             from dataclasses import replace

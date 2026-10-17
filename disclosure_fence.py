@@ -640,13 +640,20 @@ class GraphExtraction:
         if type(fence) is not DisclosureFence or fence.graph_attempt is not None:
             raise DeliveryWithheld('graph_original_carrier_required')
         self.fence, self.cancel, self.deadline = fence, cancel, deadline
+        self._original_stop = (cancel, deadline)
+        self._request_stop = None
         self.started = time.monotonic()
         self.thread = threading.get_ident()
         self.actor = fence.provider._graph_effect_actor()
         self.stage = None
+        self.native_stage = None
         fence.graph_attempt = self
 
     def check_stop(self):
+        stop = self._original_stop if self._request_stop is None else self._request_stop
+        if (self.cancel is not stop[0] or type(self.deadline) is not float
+                or self.deadline != stop[1]):
+            raise DeliveryWithheld('graph_original_stop_changed')
         if self.thread != threading.get_ident() or self.cancel.is_set():
             raise DeliveryWithheld('graph_original_attempt_cancelled')
         remaining = self.deadline - time.monotonic()
@@ -654,9 +661,43 @@ class GraphExtraction:
             raise TimeoutError('graph_original_deadline_exceeded')
         return remaining
 
+    def bind_timeout(self, seconds):
+        # The existing route timeout may only TIGHTEN the original deadline,
+        # once, BEFORE external work. Applying a returned proposal cannot adopt
+        # a later Event/deadline from mutable aliases after the wait.
+        if self._request_stop is not None or self.stage is not None:
+            raise DeliveryWithheld('graph_original_timeout_already_bound')
+        self.check_stop()
+        self.deadline = min(self._original_stop[1], self.started + seconds)
+        self._request_stop = (self._original_stop[0], self.deadline)
+
+    def bind_stage(self, conn, stage):
+        """Bind original stop values ONCE to this actual short owning stage.
+
+        The native fence consumes this tuple, never admit()/SQL/ledger callbacks.
+        Known completion retires it; UNKNOWN retains it on the exact connection.
+        """
+        p = self.fence.provider
+        if (self.stage is not None or self.native_stage is not None
+                or conn._graph_extraction_stage is not None
+                or GRAPH_EXTRACTION.get() is not self
+                or conn is not self.fence.conn or conn is not p._conn or conn is not p._owned_conn
+                or p._claim_tx_connection is not conn or p._claim_tx_graph_stage is not stage
+                or stage[0] is not conn or stage[1] != self.thread
+                or type(self.cancel) is not threading.Event
+                or type(self.deadline) is not float or not 0 < self.deadline < float('inf')):
+            raise DeliveryWithheld('graph_original_native_stage_unproven')
+        self.check_stop()
+        self.stage = stage
+        stop = self._original_stop if self._request_stop is None else self._request_stop
+        self.native_stage = (self, stop[0], stop[1], stage, stop)
+        conn._graph_extraction_stage = self.native_stage
+        return self.native_stage
+
     def owns_stage(self):
         p, c, stage = self.fence.provider, self.fence.conn, self.stage
         return (stage is not None and GRAPH_EXTRACTION.get() is self
+                and self.native_stage is not None and c._graph_extraction_stage is self.native_stage
                 and p._claim_tx_graph_stage is stage and stage[0] is c
                 and stage[1] == self.thread == threading.get_ident()
                 and p._claim_tx_connection is c and p._claim_tx_thread == self.thread
@@ -666,7 +707,8 @@ class GraphExtraction:
     def admit(self):
         self.check_stop()
         p = self.fence.provider
-        if (p._graph_effect_actor() != self.actor or not self.fence.purposes
+        if ((self.stage is not None and not self.owns_stage())
+                or p._graph_effect_actor() != self.actor or not self.fence.purposes
                 or not self.fence.finish()):
             self.fence.ok = False
             raise DeliveryWithheld('graph_original_source_changed')

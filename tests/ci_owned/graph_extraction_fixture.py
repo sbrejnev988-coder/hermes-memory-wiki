@@ -13,6 +13,8 @@ import os
 from pathlib import Path
 import sqlite3
 import sys
+import threading
+import time
 import urllib.request
 from types import SimpleNamespace
 
@@ -260,6 +262,81 @@ def schedule(case, seam, action):
         yield seen
     finally:
         sys.setprofile(prior)
+
+
+def durable_graph(case):
+    """Observe the complete durable edge write-set through an independent reader."""
+    reader = sqlite3.connect(str(case.path))
+    try:
+        result, images = {}, {}
+        for label, table in (('entities', 'entities'), ('relations', 'relations'),
+                             ('mutations', 'memory_mutations')):
+            rows = reader.execute('SELECT * FROM ' + table + ' ORDER BY rowid').fetchall()
+            result[label] = len(rows)
+            images[label] = hashlib.sha256(json.dumps(rows, separators=(',', ':')).encode()).hexdigest()
+        result['row_images'] = images
+    finally:
+        reader.close()
+    result['journal_phases'] = [e['phase'] for e in case.p._iter_journal_events()
+                                if e['op'] == 'memory_wiki_add_relation']
+    return result
+
+
+@contextmanager
+def native_apply_stop(case, mode, cancel, deadline):
+    """Exact real SQLite authorizer → existing fence; no guard/SQL/SDK patch.
+
+    Deliberately uses ONLY fields already present in pristine 2ad. The baseline
+    must reach the same seam without depending on the correction's new carrier.
+    """
+    native = sys.modules[case._namespace + '.code_knowledge_graph']
+    fence_code = native._graph_commit_fence.__code__
+    authorizer_code = native._GraphCommitConnection._graph_authorizer_result.__code__
+    admit_code = case.m._GraphExtraction.admit.__code__
+    thread = threading.get_ident()
+    previous = sys.getprofile()
+    assert previous is None
+    seen, admitted = [], []
+    def inject(frame, event, arg):
+        if threading.get_ident() != thread:
+            return
+        local = frame.f_locals
+        if event == 'return' and frame.f_code is admit_code:
+            attempt = local['self']
+            if attempt.fence.provider is case.p and attempt.stage is not None:
+                admitted[:] = [(id(attempt), id(attempt.stage))]
+        if (event != 'call' or frame.f_code is not fence_code or seen
+                or frame.f_back is None or frame.f_back.f_code is not authorizer_code):
+            return
+        c, flight = local['conn'], local['flight']
+        if c is not case.conn or c._graph_commit_flight is not flight:
+            return
+        owner, stage, image, owner_thread = flight[:4]
+        attempt = case.m._GRAPH_EXTRACTION.get()
+        if (owner is not case.p or stage is not owner._claim_tx_graph_stage
+                or stage[0] is not c or stage[1] != owner_thread or owner_thread != thread
+                or not stage[2] or not any(a[1] == CID for a in image[0])
+                or attempt is None or attempt.stage is not stage):
+            return
+        before = time.monotonic()
+        row = dict(original_event=attempt.cancel is cancel, original_deadline=attempt.deadline == deadline,
+                   after_python_admit=admitted == [(id(attempt), id(stage))], native_authorizer=True,
+                   pending_own_changes=attempt.fence.graph_changes, before_expiry=before < deadline,
+                   before_cancel=cancel.is_set(), exact_stage=True, exact_connection=True)
+        seen.append(row)  # Primitive witness only, no retained frames/provider/handle.
+        if mode == 'cancel':
+            cancel.set()
+        elif mode == 'deadline':
+            time.sleep(max(0, deadline - time.monotonic()) + .01)
+        else:
+            raise AssertionError('unregistered_native_stop')
+        row.update(stopped=cancel.is_set() if mode == 'cancel' else time.monotonic() >= deadline,
+                   actual_wait_seconds=time.monotonic() - before)
+    sys.setprofile(inject)
+    try:
+        yield seen
+    finally:
+        sys.setprofile(previous)
 
 
 def denied(out):
