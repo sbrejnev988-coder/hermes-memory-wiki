@@ -2072,6 +2072,41 @@ def _insert_graph_rows(
     return counts
 
 
+def _retire_pending_chunks_for_revision(conn, repository_id, file_path, symbol_id, new_content_hash):
+    """Withdraw old unmaterialized derivatives in the revision owner's TX.
+
+    Do not advance repository/graph provenance. Only a later authoritative
+    snapshot may restore these rows; a duplicate event cannot reinsert them.
+    A file hash describes the whole file, not each semantic chunk's hash.
+    """
+    if not conn.in_transaction:
+        raise RuntimeError("pending_revision_requires_owning_transaction")
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='code_graph_chunks'").fetchone():
+        return 0
+    where = ["c.repository_id=?", "c.embedding_claim_id=''"]
+    params = [repository_id]
+    if file_path:
+        where.append("c.file_path=?")
+        params.append(file_path)
+    if symbol_id:
+        where.append("(c.symbol_id=? OR (c.symbol_id='' AND c.chunk_id=?))")
+        params.extend((symbol_id, symbol_id))
+    if new_content_hash:
+        # Preserve exact new content, including a valid whole-file snapshot
+        # whose semantic chunks naturally have different content hashes.
+        where.append("lower(c.content_hash) NOT IN (?,?) AND NOT EXISTS ("
+                     "SELECT 1 FROM code_graph_files f WHERE f.repository_id=c.repository_id "
+                     "AND f.file_path=c.file_path AND lower(f.file_hash) IN (?,?))")
+        params.extend((new_content_hash, "sha256:" + new_content_hash,
+                       new_content_hash, "sha256:" + new_content_hash))
+    selected = "SELECT c.chunk_id FROM code_graph_chunks c WHERE " + " AND ".join(where)
+    conn.execute("DELETE FROM code_graph_chunks_fts WHERE repository_id=? AND chunk_id IN (" + selected + ")",
+                 [repository_id, *params])
+    retired = conn.execute("DELETE FROM code_graph_chunks WHERE repository_id=? AND chunk_id IN (" + selected + ")",
+                           [repository_id, *params])
+    return retired.rowcount
+
+
 def _embed_graph_chunks(
     provider: Any,
     repository_id: str,

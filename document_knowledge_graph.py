@@ -2137,6 +2137,71 @@ def _document_write_transaction(provider, conn, *, _commit_hook=None, _document_
         raise
 
 
+def _document_embedding_actor(provider):
+    return (str(getattr(provider, "home", "") or ""),
+            str(getattr(provider, "bot_id", "") or ""),
+            str(getattr(provider, "session_id", "") or ""),
+            str(getattr(provider, "project_scope", "") or ""))
+
+
+class _DocumentEmbeddingAdmission:
+    """Original derivative read-set, retained by the existing document TX stage.
+
+    This is an obligation, not a writer capability. Incomplete joined work
+    poisons the owning commit even if its caller catches the original error.
+    """
+    def __init__(self, provider, conn, item, actor):
+        self.actor = actor
+        self.source_id = item["source_id"]
+        source = conn.execute("SELECT * FROM document_sources WHERE source_id=?", (self.source_id,)).fetchone()
+        chunk = conn.execute("SELECT * FROM document_chunks WHERE chunk_id=?", (item["chunk_id"],)).fetchone()
+        if source is None or chunk is None or any(chunk[key] != item[key] for key in chunk.keys()):
+            raise RuntimeError("document_embedding_source_changed")
+        self.source = dict(source)
+        self.chunk = dict(chunk)
+        self.connectors = self._connectors(conn)
+        self.complete = False
+        self.callback = None
+
+    def _connectors(self, conn):
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='external_sources'").fetchone():
+            return ()
+        return tuple(tuple(row) for row in conn.execute(
+            "SELECT * FROM external_sources WHERE document_source_id=? ORDER BY source_key",
+            (self.source_id,),
+        ).fetchall())
+
+    def assert_current(self, provider, conn, *, before):
+        if _document_embedding_actor(provider) != self.actor:
+            raise PermissionError("document_embedding_actor_changed")
+        scope, repository = self.chunk["scope_id"], self.chunk["repository_id"]
+        if _document_access_scope(provider, scope, repository) != (scope, repository):
+            raise PermissionError("document_embedding_scope_changed")
+        source = conn.execute("SELECT * FROM document_sources WHERE source_id=?", (self.source_id,)).fetchone()
+        chunk = conn.execute("SELECT * FROM document_chunks WHERE chunk_id=?", (self.chunk["chunk_id"],)).fetchone()
+        if (source is None or dict(source) != self.source or not int(source["active"])
+                or chunk is None or dict(chunk) != self.chunk or not int(chunk["active"])
+                or chunk["source_id"] != self.source_id or chunk["revision_id"] != source["revision_id"]
+                or self._connectors(conn) != self.connectors):
+            raise RuntimeError("document_embedding_source_changed")
+        predicate, params = _connector_visibility_clause(conn, provider, "?")
+        if predicate and not conn.execute("SELECT 1 WHERE " + predicate, [self.source_id, *params]).fetchone():
+            raise PermissionError("document_embedding_connector_changed")
+        if not before:
+            if not self.complete or not self.chunk["embedding_claim_id"]:
+                raise RuntimeError("document_embedding_link_incomplete")
+            claim = conn.execute("SELECT * FROM claims WHERE id=?", (self.chunk["embedding_claim_id"],)).fetchone()
+            if claim is None or claim["status"] != "active" or not provider._claim_visible(claim):
+                raise PermissionError("document_claim_not_active_or_visible")
+
+
+def _after_document_claims_commit(provider, admissions):
+    """Called only by the actual owner after native COMMIT and stage retirement."""
+    for _source_id, admission in admissions:
+        if type(admission) is _DocumentEmbeddingAdmission and admission.callback is not None:
+            provider._after_claim_commit(*admission.callback)
+
+
 def _assert_ingest_authority(provider, conn, source_id, admission, *, before):
     """Re-read authority under the writer, never adopt a post-parser owner.
 
@@ -2144,6 +2209,11 @@ def _assert_ingest_authority(provider, conn, source_id, admission, *, before):
     not a tool argument or a capability. SQLite excludes competing writers;
     a second check catches same-transaction trigger/callback changes.
     """
+    if type(admission) is _DocumentEmbeddingAdmission:
+        if source_id != admission.source_id:
+            raise RuntimeError("document_embedding_source_binding_changed")
+        admission.assert_current(provider, conn, before=before)
+        return
     _assert_connector_owner(provider, source_id, _conn=conn)
     current = conn.execute("SELECT * FROM document_sources WHERE source_id=?", (source_id,)).fetchone()
     if admission is None:
@@ -2928,6 +2998,7 @@ def maybe_ingest_document_cache(provider: Any, *, force: bool = False) -> Dict[s
 
 
 def embed_pending_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
+    original_actor = _document_embedding_actor(provider)
     source_id = str(args.get("source_id") or "").strip()
     scope_id, repository_id = _document_access_scope(
         provider,
@@ -2935,7 +3006,15 @@ def embed_pending_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, An
         str(args.get("repository_id") or ""),
     )
     limit = max(1, min(int(args.get("limit") or 500), 10_000))
+    if not all(callable(getattr(provider, name, None)) for name in (
+            "_claim_transaction", "_prepare_claim", "_add_claim_tx")):
+        raise RuntimeError("document_embedding_owning_provider_required")
     conn = provider._connect(); install_document_graph_schema(conn)
+    joined = conn.in_transaction
+    if joined:
+        # Refuse an unregistered raw BEGIN before preparation or metadata writes.
+        with _document_write_transaction(provider, conn):
+            pass
     # Select the current derivative, not stale active flags from older revisions.
     # A retained nonempty link is authority, not new embedding work: inactive
     # and missing claims may have been intentionally retired or erased.
@@ -3030,7 +3109,9 @@ def embed_pending_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, An
             "JOIN document_graph_meta blocked ON blocked.key='embedding_block:'||c.chunk_id "
             "WHERE " + " AND ".join(clauses), params,
         ).fetchall()
-        with conn:
+        if not marked:
+            return counts
+        with _document_write_transaction(provider, conn):
             for raw in marked:
                 item = _row(raw)
                 try:
@@ -3090,38 +3171,70 @@ def embed_pending_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, An
         # Project only ACL metadata: do not load foreign claim text.
         prior = reusable_claim(item, connector_owned, evidence_key)
         try:
-            if prior:
-                claim_id = str(prior[0]); reused += 1
-            else:
-                # The document graph retains raw paths and anchors. Keep the
-                # embedding claim's evidence scanner-safe and deterministic.
-                evidence = (
-                    f"{evidence_key}; source_ref:{_evidence_ref(item['source_id'])}; "
-                    f"revision_ref:{_evidence_ref(item['revision_id'])}"
-                )
-                claim_id = provider._add_claim(
-                    str(item.get("embedding_text") or item.get("chunk_text") or ""), topic=_TOPIC,
-                    evidence=evidence, source="artifact:document-index", confidence=0.78, salience=0.42,
-                    visibility_scope="bot" if connector_owned else ("project" if project_id else "global"),
-                    project_id=project_id, revive_archived=False,
-                )
-                if str(claim_id).startswith("rq_"):
-                    raise RuntimeError(f"claim quarantined: {claim_id}")
+            admission = _DocumentEmbeddingAdmission(provider, conn, item, original_actor)
+            admission.assert_current(provider, conn, before=True)
+            # Scanner/quarantine/review preparation precedes our writer. A
+            # legal outer join already owns a writer: use the existing pure
+            # preparation mode, never let review helpers commit its stage.
+            evidence = (
+                f"{evidence_key}; source_ref:{_evidence_ref(item['source_id'])}; "
+                f"revision_ref:{_evidence_ref(item['revision_id'])}"
+            )
+            prepared = None if prior else provider._prepare_claim(
+                str(item.get("embedding_text") or item.get("chunk_text") or ""), topic=_TOPIC,
+                evidence=evidence, source="artifact:document-index", confidence=0.78, salience=0.42,
+                visibility_scope="bot" if connector_owned else ("project" if project_id else "global"),
+                project_id=project_id, _no_side_effects=joined,
+            )
+            if not prior and not isinstance(prepared, dict):
+                raise RuntimeError("document_claim_preparation_not_materialized")
+            if prepared is not None:
+                prepared["_revive_archived"] = False
+            with _document_write_transaction(provider, conn, _document_ingest=(item["source_id"], admission)):
+                admission.assert_current(provider, conn, before=True)
+                # Reuse is also decided under the owning SQLite writer.
+                current_prior = reusable_claim(item, connector_owned, evidence_key)
+                was_reused = current_prior is not None
+                if current_prior:
+                    claim_id = str(current_prior[0])
+                else:
+                    if prepared is None:
+                        raise RuntimeError("document_embedding_reuse_changed")
+                    claim_id = provider._add_claim_tx(conn, prepared, 0.78, 0.42, _compound_effects=True)
                 persisted = conn.execute(
                     "SELECT status,visibility_scope,origin_bot_id,origin_chat_hash,origin_session_id,project_id "
                     "FROM claims WHERE id=?", (claim_id,),
                 ).fetchone()
                 if persisted is None or str(persisted["status"] or "") != "active" or not provider._claim_visible(persisted):
                     raise PermissionError("document_claim_not_active_or_visible")
+                updated_at = _now()
+                linked = conn.execute(
+                    "UPDATE document_chunks SET embedding_claim_id=?,updated_at=? "
+                    "WHERE chunk_id=? AND source_id=? AND revision_id=? AND content_hash=? "
+                    "AND scope_id=? AND repository_id=? AND active=1 AND embedding_claim_id=''",
+                    (claim_id, updated_at, item["chunk_id"], item["source_id"], item["revision_id"],
+                     item["content_hash"], item["scope_id"], item["repository_id"]),
+                )
+                if linked.rowcount != 1:
+                    raise RuntimeError("document_embedding_link_superseded")
+                admission.chunk.update(embedding_claim_id=claim_id, updated_at=updated_at)
+                admission.complete = True
+                if not was_reused and not prepared.get("_no_op"):
+                    admission.callback = (claim_id, prepared["topic"], prepared["claim"])
+                admission.assert_current(provider, conn, before=False)
+            # These are staged counts for a join, explicitly labelled below;
+            # no callback or foreign COMMIT is performed by that branch.
+            if was_reused:
+                reused += 1
+            else:
                 created += 1
-            with conn:
-                conn.execute("UPDATE document_chunks SET embedding_claim_id=?,updated_at=? WHERE chunk_id=? AND active=1",
-                             (claim_id, _now(), item["chunk_id"]))
         except PermissionError as exc:
+            if joined or getattr(provider, "_transaction_quarantine", None) is not None:
+                raise
             reason = {"archived_claim_hash_collision": "archived_hash_collision",
                       "document_claim_not_active_or_visible": "claim_not_active_or_visible"}.get(str(exc))
             if reason:
-                with conn:
+                with _document_write_transaction(provider, conn):
                     conn.execute("INSERT OR REPLACE INTO document_graph_meta(key,value) VALUES(?,?)",
                                  ("embedding_block:" + item["chunk_id"],
                                   _json({"reason": reason, "binding": block_binding(item, connector_owned)})))
@@ -3129,6 +3242,8 @@ def embed_pending_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, An
                 retry_ids.append(str(item["chunk_id"]))
                 failed += 1; errors.append({"chunk_id": item.get("chunk_id"), "error": type(exc).__name__})
         except Exception as exc:
+            if joined or getattr(provider, "_transaction_quarantine", None) is not None:
+                raise
             retry_ids.append(str(item["chunk_id"]))
             failed += 1; errors.append({"chunk_id": item.get("chunk_id"), "error": type(exc).__name__})
     if retry_ids:
@@ -3139,7 +3254,7 @@ def embed_pending_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, An
             "SELECT COALESCE(MAX(c.updated_at),0) FROM document_chunks c JOIN document_sources s "
             "ON s.source_id=c.source_id WHERE " + " AND ".join(clauses), params,
         ).fetchone()[0])
-        with conn:
+        with _document_write_transaction(provider, conn):
             for index, chunk_id in enumerate(retry_ids, 1):
                 conn.execute(
                     "UPDATE document_chunks SET updated_at=? WHERE chunk_id=? AND active=1 AND embedding_claim_id=''",
@@ -3154,8 +3269,9 @@ def embed_pending_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, An
     runnable_remaining = int(pending_after) - blocked_remaining
     return {
         # Completion refers to local claim linkage, never remote vector proof.
-        "status": ("retry" if failed else "pending" if runnable_remaining > 0
+        "status": ("pending_commit" if joined else "retry" if failed else "pending" if runnable_remaining > 0
                    else "blocked" if skipped_reasons else "completed"),
+        "commit_pending": bool(joined),
         "retryable": bool(failed or runnable_remaining > 0),
         "remaining": int(pending_after),
         "blocked_remaining": blocked_remaining, "runnable_remaining": runnable_remaining,

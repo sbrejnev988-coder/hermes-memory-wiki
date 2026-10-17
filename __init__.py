@@ -14671,6 +14671,7 @@ class MemoryWikiProvider(MemoryProvider):
                 document_stage[2].append(_document_ingest)
             commit_attempted = False
             completed = False
+            document_commits = ()
             try:
                 if graph_extraction is not None and graph_extraction.fence.provider is self:
                     graph_obligation = graph_extraction.bind_stage(c, graph_stage)
@@ -14741,6 +14742,9 @@ class MemoryWikiProvider(MemoryProvider):
                     self._quarantine_claim_connection(c, "commit_transaction_still_active")
                     raise RuntimeError("claim_commit_transaction_still_active")
                 completed = True
+                # Only the actual owner can drain these callbacks. A legal
+                # child join returns above without committing or publishing.
+                document_commits = tuple(document_stage[2])
                 if _document_hook is not None:
                     _document_hook.commit_returned = True
                 if _terminal is None:
@@ -14787,6 +14791,11 @@ class MemoryWikiProvider(MemoryProvider):
                             graph_extraction.stage = None
                     self._claim_tx_connection = previous
                     self._claim_tx_thread = previous_thread
+            # Past confirmed native COMMIT, journal receipt and exact stage
+            # retirement. Rollback/UNKNOWN paths rethrow before this boundary.
+            if document_commits:
+                from .document_knowledge_graph import _after_document_claims_commit
+                _after_document_claims_commit(self, document_commits)
 
 
     def _claim_mutation_columns(self, conn) -> tuple[str, ...]:
@@ -16397,6 +16406,21 @@ class MemoryWikiProvider(MemoryProvider):
                 # Never archive a claim that already describes the new exact content.
                 where.append("m.content_hash<>?")
                 params.append(new_content_hash)
+                graph_tables = active_conn.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+                    "AND name IN ('code_graph_files','code_graph_chunks')"
+                ).fetchone()[0]
+                if graph_tables == 2:
+                    # A whole-file revision hash is not a chunk hash. Preserve
+                    # only a claim actually linked to that new file snapshot,
+                    # not an old free-standing claim sharing its path.
+                    where.append("NOT EXISTS (SELECT 1 FROM code_graph_files f "
+                                 "JOIN code_graph_chunks g ON g.repository_id=f.repository_id AND g.file_path=f.file_path "
+                                 "WHERE f.repository_id=m.repository_id AND f.file_path=m.file_path "
+                                 "AND lower(f.file_hash) IN (?,?) AND g.embedding_claim_id=c.id "
+                                 "AND g.content_hash=m.content_hash "
+                                 "AND (g.symbol_id=m.symbol_id OR (g.symbol_id='' AND g.chunk_id=m.symbol_id)))")
+                    params.extend((new_content_hash, "sha256:" + new_content_hash))
             suffix = "".join(labels)
             sql = (
                 "FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id "
@@ -16458,8 +16482,18 @@ class MemoryWikiProvider(MemoryProvider):
                         {"collection": _active_collection_name(), "reason": "revision_invalidation"},
                         conn=active_conn,
                     )
+            # Pending graph derivatives have no claim/ACL row yet. Only the
+            # existing internal revision authority may withdraw them; a model
+            # mutation must not gain graph-wide authority from reader access.
+            retired_pending = 0
+            if not model_scope:
+                from .code_knowledge_graph import _retire_pending_chunks_for_revision
+                retired_pending = _retire_pending_chunks_for_revision(
+                    active_conn, repo_id, file_path, symbol_id, new_content_hash,
+                )
             return {
                 "invalidated": len(rows),
+                "retired_pending": retired_pending,
                 "ids": [str(r["id"]) for r in rows],
                 "repository_id": repo_id,
                 "file_path": file_path,
