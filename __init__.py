@@ -14717,6 +14717,11 @@ class MemoryWikiProvider(MemoryProvider):
                     from .document_knowledge_graph import _assert_ingest_authority
                     for source_id, admission in document_stage[2]:
                         _assert_ingest_authority(self, c, source_id, admission, before=False)
+                    # Bind the ORIGINAL complete admissions to the actual native
+                    # owner, including document-only stages with no graph effects.
+                    # The connection refuses unsupported user callback lifetimes;
+                    # a late callback is never permission to recapture authority.
+                    c._document_commit_image = (document_stage, tuple(document_stage[2]), c.total_changes)
                 if graph_stage[2]:
                     if (self._claim_tx_connection is not c
                             or self._claim_tx_thread != graph_stage[1]
@@ -14770,6 +14775,9 @@ class MemoryWikiProvider(MemoryProvider):
                         c._prefetch_terminal = previous_prefetch_terminal
                     # Failed rollback/postcommit keeps owner+primary+admissions.
                     if self._claim_tx_document_stage is document_stage:
+                        if (c._document_commit_image is not None
+                                and c._document_commit_image[0] is document_stage):
+                            c._document_commit_image = None
                         document_stage[2].clear()
                         self._claim_tx_document_stage = previous_document_stage
                     if self._claim_tx_graph_stage is graph_stage:
