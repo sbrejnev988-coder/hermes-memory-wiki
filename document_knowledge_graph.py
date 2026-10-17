@@ -791,9 +791,8 @@ def _snapshot_allowed_file(path: Path, *, max_bytes: int,
         os.close(fd)
 
 
-def install_document_graph_schema(conn: sqlite3.Connection) -> None:
-    """Install schema without committing the caller's transaction."""
-    conn.execute("PRAGMA foreign_keys=ON")
+def _document_graph_schema_ready(conn: sqlite3.Connection) -> bool:
+    """Read-only readiness, shared by installation and standalone ownership."""
     try:
         row = conn.execute(
             "SELECT value FROM document_graph_meta WHERE key='schema_version'"
@@ -806,9 +805,17 @@ def install_document_graph_schema(conn: sqlite3.Connection) -> None:
                 ).fetchall()
             }
             if required.issubset(present):
-                return
+                return True
     except sqlite3.OperationalError:
         pass
+    return False
+
+
+def install_document_graph_schema(conn: sqlite3.Connection) -> None:
+    """Install schema without committing the caller's transaction."""
+    conn.execute("PRAGMA foreign_keys=ON")
+    if _document_graph_schema_ready(conn):
+        return
     schema_sql = """
         CREATE TABLE IF NOT EXISTS document_graph_meta(
             key TEXT PRIMARY KEY, value TEXT NOT NULL
@@ -2434,7 +2441,19 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
     source_id = _source_id(path)
     conn = provider._connect()
     if _commit_hook is None:
-        install_document_graph_schema(conn)
+        if callable(getattr(provider, "_claim_transaction", None)):
+            install_document_graph_schema(conn)
+        else:
+            # The schema installer never commits a caller's transaction. Own
+            # only our cold preparation, not arbitrary pre-existing SQL.
+            if conn.in_transaction:
+                raise RuntimeError("document_transaction_requires_idle_owner")
+            # SQLite ignores this PRAGMA inside BEGIN; preserve the installer's
+            # foreign-key contract before entering our idle writer lifetime.
+            conn.execute("PRAGMA foreign_keys=ON")
+            if not _document_graph_schema_ready(conn):
+                with _document_write_transaction(provider, conn):
+                    install_document_graph_schema(conn)
     else:
         # A hook requires an already installed schema and an idle bound conn.
         _validate_ingest_commit_hook(provider, conn, _commit_hook)
