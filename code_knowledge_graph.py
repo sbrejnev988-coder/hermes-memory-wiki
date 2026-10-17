@@ -2318,26 +2318,38 @@ def _embed_graph_chunks(
                         conn.rollback()
                         stats["skipped_stale"] += 1
                         continue
+                    final_prepared = provider._recanonicalize_prepared_code_claim_for_write(
+                        claim_args, prepared_code_claim, conn, trusted_opaque_graph_ids=True,
+                    )
+                    full_identity = {key: str(final_prepared.get(key) or "") for key in (
+                        "repository_id", "file_path", "symbol_id", "symbol_revision", "content_hash", "claim_type",
+                    )}
+                    prepared_value = final_prepared.get("prepared")
+
+                    def matches_identity(found):
+                        resolved = provider._lossless_code_claim_identity(found, full_identity=full_identity)
+                        return (resolved is not None and isinstance(prepared_value, dict)
+                                and all(resolved[key] == value for key, value in full_identity.items())
+                                and provider._claims_share_visibility_partition(found, prepared_value))
+
                     existing = ""
-                    if item.get("embedding_claim_id"):
-                        found = conn.execute(
-                            "SELECT c.id FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id "
-                            "WHERE c.id=? AND c.status IN ('active','current') AND m.repository_id=? "
-                            "AND m.file_path=? AND m.symbol_id=? AND m.content_hash=? "
-                            "AND m.claim_type='code_graph_chunk'",
-                            (item["embedding_claim_id"], repository_id, item["file_path"],
-                             item["symbol_id"] or item["chunk_id"], item["content_hash"]),
-                        ).fetchone()
-                        existing = str(found[0]) if found else ""
-                    if not existing:
-                        found = conn.execute(
-                            "SELECT c.id FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id "
-                            "WHERE c.status IN ('active','current') AND m.repository_id=? AND m.file_path=? "
-                            "AND m.symbol_id=? AND m.content_hash=? AND m.claim_type='code_graph_chunk' "
-                            "ORDER BY c.updated_at DESC LIMIT 1",
-                            (repository_id, item["file_path"], item["symbol_id"] or item["chunk_id"], item["content_hash"]),
-                        ).fetchone()
-                        existing = str(found[0]) if found else ""
+                    # Historical slices may discover candidates, never prove
+                    # ownership. Include revision and the original visibility
+                    # partition, and verify full canonical identity before CAS.
+                    candidates = conn.execute(
+                        "SELECT c.*,m.* FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id "
+                        "WHERE c.status IN ('active','current') AND m.repository_id=? "
+                        "AND m.file_path IN (?,?) AND m.symbol_id IN (?,?) AND m.content_hash=? "
+                        "AND m.claim_type='code_graph_chunk' "
+                        "ORDER BY CASE WHEN c.id=? THEN 0 ELSE 1 END,c.updated_at DESC,c.id",
+                        (repository_id, full_identity["file_path"], full_identity["file_path"][:512],
+                         full_identity["symbol_id"], full_identity["symbol_id"][:256], item["content_hash"],
+                         str(item.get("embedding_claim_id") or "")),
+                    ).fetchall()
+                    for found in candidates:
+                        if matches_identity(found):
+                            existing = str(found["id"])
+                            break
                     if existing:
                         linked = conn.execute(
                             "UPDATE code_graph_chunks SET embedding_claim_id=? WHERE " + " AND ".join(predicates),
@@ -2353,7 +2365,7 @@ def _embed_graph_chunks(
                         claim_args,
                         conn=conn,
                         after_commit_callbacks=callbacks,
-                        _prepared_code_claim=prepared_code_claim,
+                        _prepared_code_claim=final_prepared,
                         trusted_opaque_graph_ids=True,
                     )
                     claim_id = str(result.get("id") or "")
@@ -2362,11 +2374,12 @@ def _embed_graph_chunks(
                         stats["failed"] += 1
                         continue
                     active = conn.execute(
-                        "SELECT 1 FROM claims WHERE id=? AND status IN ('active','current')",
+                        "SELECT c.*,m.* FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id "
+                        "WHERE c.id=? AND c.status IN ('active','current')",
                         (claim_id,),
                     ).fetchone()
-                    if active is None:
-                        raise RuntimeError("embedding claim is not active")
+                    if active is None or not matches_identity(active):
+                        raise RuntimeError("embedding claim identity is not active or proven")
                     linked = conn.execute(
                         "UPDATE code_graph_chunks SET embedding_claim_id=? WHERE " + " AND ".join(predicates),
                         [claim_id, *predicate_params],

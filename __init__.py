@@ -8061,21 +8061,12 @@ class MemoryWikiProvider(MemoryProvider):
             (claim_id,),
         ).fetchone()
         if metadata is not None:
-            repository_id = str(metadata["repository_id"] or "")
-            if not repository_id:
+            identity = self._lossless_code_claim_identity({**dict(row), **dict(metadata)})
+            if identity is None:
+                raise ValueError("code claim identity is unproven")
+            if not identity["repository_id"]:
                 raise ValueError("code claim identity is incomplete")
-            return "\0".join(filter(None, (
-                "code_claim",
-                repository_id,
-                str(metadata["file_path"] or ""),
-                str(metadata["symbol_id"] or ""),
-                str(
-                    metadata["symbol_revision"]
-                    or metadata["content_hash"]
-                    or metadata["commit_sha"]
-                    or ""
-                ),
-            )))
+            return self._code_claim_identity_scope(identity)
         return self._claim_visibility_identity_scope(row)
 
     def _canonical_claim_hash_for_edit(
@@ -15908,6 +15899,96 @@ class MemoryWikiProvider(MemoryProvider):
         text = str(value or "")
         return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
+    @staticmethod
+    def _code_claim_identity_scope(identity: Dict[str, Any]) -> str:
+        return "\0".join(filter(None, (
+            "code_claim", str(identity.get("repository_id") or ""),
+            str(identity.get("file_path") or ""), str(identity.get("symbol_id") or ""),
+            str(identity.get("symbol_revision") or identity.get("content_hash")
+                or identity.get("commit_sha") or ""),
+        )))
+
+    @staticmethod
+    def _lossless_code_claim_identity(
+        row: Any, *, full_identity: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, str]]:
+        """Resolve identity without granting authority to a historical prefix.
+
+        Old writers sliced exactly at 512/256/64. Shorter values cannot have
+        lost a suffix; longer values are already lossless. At an old boundary,
+        require the full canonical scoped hash of the stored normalized claim.
+        A caller may supply a full snapshot/request candidate, but it is proof
+        only if BOTH the exact old slicing contract and the full hash match.
+        No prose parsing, guessed expansion, metadata write or status revival.
+        """
+        values = dict(row)
+        fields = ("repository_id", "file_path", "symbol_id", "symbol_revision",
+                  "content_hash", "commit_sha", "claim_type")
+        metadata = {key: str(values.get(key) or "") for key in fields}
+        limits = {"file_path": 512, "symbol_id": 256, "symbol_revision": 64}
+        if not any(len(metadata[key]) == limit for key, limit in limits.items()):
+            return metadata
+        normalized = str(values.get("_code_identity_text", values.get("normalized_claim")) or "")
+        stored_hash = str(values.get("_code_identity_hash", values.get("hash")) or "")
+
+        def proves(identity):
+            return bool(normalized and stored_hash == sha(
+                MemoryWikiProvider._code_claim_identity_scope(identity) + "\0" + normalized.lower()
+            ))
+
+        if proves(metadata):
+            return metadata
+        if full_identity is None:
+            return None
+        candidate = {key: str(full_identity.get(key, metadata[key]) or "") for key in fields}
+        if any(metadata[key] not in (candidate[key], candidate[key][:limit])
+               for key, limit in limits.items()):
+            return None
+        if any(metadata[key] != candidate[key] for key in ("repository_id", "content_hash", "claim_type")):
+            return None
+        return candidate if proves(candidate) else None
+
+    def _code_claim_retirement_identity(self, conn: sqlite3.Connection, row: Any):
+        identity = self._lossless_code_claim_identity(row)
+        if identity is not None:
+            return identity
+        values = dict(row)
+        if (values.get("claim_type") != "code_graph_chunk"
+                or values.get("source") != "tool:code_claim:code_graph_chunk"):
+            return None
+        # Historical links themselves can be false (the CSL1 early-reuse bug).
+        # Count only a live full snapshot/link whose identity also reproduces
+        # the original canonical claim hash. An unrelated B link cannot prove A.
+        supports = conn.execute(
+            "SELECT g.* FROM code_graph_chunks g "
+            "JOIN code_graph_files f ON f.repository_id=g.repository_id AND f.file_path=g.file_path "
+            "JOIN code_graph_events e ON e.event_id=g.graph_event_id AND e.repository_id=g.repository_id "
+            "AND e.payload_hash=g.graph_payload_hash AND e.status='completed' "
+            "WHERE g.embedding_claim_id=? AND g.repository_id=? AND g.content_hash=?",
+            (values["id"], values["repository_id"], values["content_hash"]),
+        ).fetchall()
+        proven = {}
+        for support in supports:
+            full = {**values, "file_path": str(support["file_path"]),
+                    "symbol_id": str(support["symbol_id"] or support["chunk_id"]),
+                    "symbol_revision": str(support["content_hash"])[:32]}
+            resolved = self._lossless_code_claim_identity(values, full_identity=full)
+            if resolved is not None:
+                proven[tuple(sorted(resolved.items()))] = resolved
+        return next(iter(proven.values())) if len(proven) == 1 else None
+
+    def _lossless_code_claim_rows(self, rows):
+        # Query projection is deliberately conservative: unresolved historical
+        # prefixes are unavailable, not relabelled as the queried short owner.
+        result = []
+        for row in rows:
+            item = dict(row)
+            if self._lossless_code_claim_identity(item) is not None:
+                item.pop("_code_identity_hash", None)
+                item.pop("_code_identity_text", None)
+                result.append(item)
+        return result
+
     def _prepare_code_claim(
         self, a: Dict[str, Any], *, trusted_opaque_graph_ids: bool = False,
     ) -> Dict[str, Any]:
@@ -15946,7 +16027,7 @@ class MemoryWikiProvider(MemoryProvider):
             str(a.get("symbol_id", "")).strip(),
             trusted_opaque_graph_ids=trusted_opaque_graph_ids,
         )
-        symbol_rev = a.get("symbol_revision", ""); content_hash_f = str(a.get("content_hash", "")).strip()
+        symbol_rev = str(a.get("symbol_revision") or ""); content_hash_f = str(a.get("content_hash", "")).strip()
         if not content_hash_f:
             raise ValueError("content_hash is required for code claims")
         import re as _hash_re
@@ -15955,7 +16036,7 @@ class MemoryWikiProvider(MemoryProvider):
         if content_hash_f.lower().startswith("sha256:"):
             content_hash_f = content_hash_f[7:]
         content_hash_f = content_hash_f.lower()
-        claim_type = a.get("claim_type", "code_claim")
+        claim_type = str(a.get("claim_type") or "code_claim")
         meta = []
         if repo_id: meta.append(f"repository: {self._code_graph_identity_display(repo_id)}")
         if commit_sha: meta.append(f"commit: {commit_sha[:12]}")
@@ -16192,6 +16273,9 @@ class MemoryWikiProvider(MemoryProvider):
             if not isinstance(prepared_value, dict):
                 raise ValueError("invalid preprepared code claim")
             prepared = dict(prepared_value)
+            if claim_type == "code_graph_chunk":
+                # A backfill is not authority to revive a withdrawn derivative.
+                prepared["_revive_archived"] = False
             _register_code_graph_identity_provenance(
                 active_conn, (repo_id, file_path, symbol_id, source_event_id),
             )
@@ -16205,9 +16289,8 @@ class MemoryWikiProvider(MemoryProvider):
                    symbol_revision=excluded.symbol_revision, content_hash=excluded.content_hash,
                    claim_type=excluded.claim_type""",
                 (
-                    cid, repo_id, commit_sha[:64], file_path[:512],
-                    symbol_id[:256], symbol_rev[:64], content_hash_f[:256],
-                    claim_type[:64],
+                    cid, repo_id, commit_sha, file_path,
+                    symbol_id, symbol_rev, content_hash_f, claim_type,
                 ),
             )
             self._mark_ingested(
@@ -16291,13 +16374,14 @@ class MemoryWikiProvider(MemoryProvider):
             params.extend([f"%{escaped}%", f"%{escaped}%"])
         sql = (
             "SELECT c.id,c.claim,c.topic,c.confidence,c.salience,c.evidence,c.updated_at,"
+            "c.hash AS _code_identity_hash,c.normalized_claim AS _code_identity_text,"
             "m.repository_id,m.file_path,m.symbol_id,m.symbol_revision,m.content_hash,m.claim_type "
             "FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id "
             "WHERE " + " AND ".join(joins) +
             " ORDER BY c.updated_at DESC LIMIT ?"
         )
         params.append(limit)
-        rows = [dict(r) for r in c.execute(sql, params).fetchall()]
+        rows = self._lossless_code_claim_rows(c.execute(sql, params).fetchall())
         self._retain_code_claim_images(disclosure, rows)
         return {"claims": rows}
 
@@ -16313,12 +16397,14 @@ class MemoryWikiProvider(MemoryProvider):
         joins = ["m.repository_id=?", "m.symbol_id=?"]
         rows = c.execute(
             "SELECT c.id, c.claim, c.topic, c.evidence, c.updated_at, c.status,"
+            " c.hash AS _code_identity_hash,c.normalized_claim AS _code_identity_text,"
             " m.repository_id, m.file_path, m.symbol_id, m.symbol_revision, m.content_hash"
             " FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id"
             " WHERE " + " AND ".join(joins) + " ORDER BY c.updated_at DESC LIMIT ?",
             (repo_id, symbol_id, limit)).fetchall()
+        rows = self._lossless_code_claim_rows(rows)
         self._retain_code_claim_images(disclosure, rows)
-        return {"repository_id": repo_id, "symbol_id": symbol_id, "history": [dict(r) for r in rows]}
+        return {"repository_id": repo_id, "symbol_id": symbol_id, "history": rows}
 
     def _repository_context(self, a: Dict[str, Any]) -> Dict[str, Any]:
         c = self._connect(); disclosure = self._retain_read_fence(c)
@@ -16328,12 +16414,14 @@ class MemoryWikiProvider(MemoryProvider):
             raise ValueError("repository_id is required for repository context")
         rows = c.execute(
             "SELECT c.id, c.claim, c.topic, c.evidence, c.confidence, c.salience, c.updated_at,"
+            " c.hash AS _code_identity_hash,c.normalized_claim AS _code_identity_text,"
             " m.repository_id, m.file_path, m.symbol_id, m.symbol_revision, m.content_hash"
             " FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id"
             " WHERE c.status='active' AND m.repository_id=? ORDER BY salience DESC LIMIT ?",
             (repo_id, limit)).fetchall()
+        rows = self._lossless_code_claim_rows(rows)
         self._retain_code_claim_images(disclosure, rows)
-        return {"repository_id": repo_id, "claims": [dict(r) for r in rows]}
+        return {"repository_id": repo_id, "claims": rows}
 
     def _invalidate_revision(
         self,
@@ -16403,32 +16491,18 @@ class MemoryWikiProvider(MemoryProvider):
             params: list = [repo_id]
             display = self._code_graph_identity_display
             if symbol_id:
-                where.append("m.symbol_id=?")
-                params.append(symbol_id)
+                # Prefixes are discovery only; full identity is proved below.
+                where.append("m.symbol_id IN (?,?)")
+                params.extend((symbol_id, symbol_id[:256]))
                 labels.insert(0, f"symbol:{display(symbol_id)}")
             if file_path:
-                where.append("m.file_path=?")
-                params.append(file_path)
+                where.append("m.file_path IN (?,?)")
+                params.extend((file_path, file_path[:512]))
                 labels.insert(0, f"file:{display(file_path)}")
             if new_content_hash:
                 # Never archive a claim that already describes the new exact content.
                 where.append("m.content_hash<>?")
                 params.append(new_content_hash)
-                graph_tables = active_conn.execute(
-                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
-                    "AND name IN ('code_graph_files','code_graph_chunks')"
-                ).fetchone()[0]
-                if graph_tables == 2:
-                    # A whole-file revision hash is not a chunk hash. Preserve
-                    # only a claim actually linked to that new file snapshot,
-                    # not an old free-standing claim sharing its path.
-                    where.append("NOT EXISTS (SELECT 1 FROM code_graph_files f "
-                                 "JOIN code_graph_chunks g ON g.repository_id=f.repository_id AND g.file_path=f.file_path "
-                                 "WHERE f.repository_id=m.repository_id AND f.file_path=m.file_path "
-                                 "AND lower(f.file_hash) IN (?,?) AND g.embedding_claim_id=c.id "
-                                 "AND g.content_hash=m.content_hash "
-                                 "AND (g.symbol_id=m.symbol_id OR (g.symbol_id='' AND g.chunk_id=m.symbol_id)))")
-                    params.extend((new_content_hash, "sha256:" + new_content_hash))
             suffix = "".join(labels)
             sql = (
                 "FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id "
@@ -16449,7 +16523,7 @@ class MemoryWikiProvider(MemoryProvider):
                 ]
                 rows = [
                     active_conn.execute(
-                        "SELECT c.*,m.file_path,m.symbol_id,m.content_hash " +
+                        "SELECT c.*,m.* " +
                         "FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id "
                         "WHERE c.id=? AND c.status='active'", (claim_id,),
                     ).fetchone()
@@ -16460,9 +16534,37 @@ class MemoryWikiProvider(MemoryProvider):
                 # Signed internal graph events and journal recovery retain their
                 # transactional lifecycle; only the model route is constrained.
                 rows = active_conn.execute(
-                    "SELECT c.*,m.file_path,m.symbol_id,m.content_hash " + sql,
+                    "SELECT c.*,m.* " + sql,
                     params,
                 ).fetchall()
+            graph_tables = active_conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' "
+                "AND name IN ('code_graph_files','code_graph_chunks')"
+            ).fetchone()[0]
+            proven_rows = []
+            for row in rows:
+                identity = self._code_claim_retirement_identity(active_conn, row)
+                if identity is None:
+                    continue  # Retain UNKNOWN legacy ownership; never guess it.
+                if (file_path and identity["file_path"] != file_path
+                        or symbol_id and identity["symbol_id"] != symbol_id):
+                    continue
+                if new_content_hash and graph_tables == 2:
+                    # Whole-file H and semantic chunk H differ. Preserve only
+                    # a full-identity link to the actual new file snapshot.
+                    support = active_conn.execute(
+                        "SELECT 1 FROM code_graph_files f JOIN code_graph_chunks g "
+                        "ON g.repository_id=f.repository_id AND g.file_path=f.file_path "
+                        "WHERE f.repository_id=? AND f.file_path=? AND lower(f.file_hash) IN (?,?) "
+                        "AND g.embedding_claim_id=? AND g.content_hash=? "
+                        "AND (g.symbol_id=? OR (g.symbol_id='' AND g.chunk_id=?)) LIMIT 1",
+                        (repo_id, identity["file_path"], new_content_hash, "sha256:" + new_content_hash,
+                         row["id"], identity["content_hash"], identity["symbol_id"], identity["symbol_id"]),
+                    ).fetchone()
+                    if support is not None:
+                        continue
+                proven_rows.append(row)
+            rows = proven_rows
             for row in rows:
                 cid = str(row["id"])
                 before = dict(row)
