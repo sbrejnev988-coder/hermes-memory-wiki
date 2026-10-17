@@ -3036,6 +3036,24 @@ def _outbox_process_scoped(batch_size=50, *, db_path: Optional[str] = None, work
                         endpoint=claim_target_endpoint,
                         manifest_hash=claim_target_manifest,
                     )
+                    target_configuration = _profile_configuration_generation()
+                    # Commit the possible location BEFORE the first canonical
+                    # raw read. Own bookkeeping must not invalidate the original
+                    # disclosure epoch, or be moved after a crash-ambiguous PUT.
+                    with sqlite3.connect(path, timeout=30.0) as target_db:
+                        target_db.execute("PRAGMA busy_timeout=30000")
+                        claim_target_payload = _record_claim_vector_target(
+                            target_db, str(row["object_id"]),
+                            collection=claim_target_collection,
+                            endpoint=claim_target_endpoint,
+                            manifest_hash=claim_target_manifest,
+                            status="write_pending",
+                        )
+                    if (target_configuration != _profile_configuration_generation()
+                            or claim_target_endpoint != _normalized_qdrant_endpoint()
+                            or claim_target_manifest != _manifest_hash(_embedding_manifest())
+                            or not _profile_target_allowed(claim_target_collection)):
+                        raise RuntimeError("Qdrant target changed during claim preparation")
                     with _DisclosureFence.claim_worker(sys.modules[__name__], path) as disclosure:
                         snapshot = disclosure.index_snapshot(str(row["object_id"]))
                         if snapshot is None:
@@ -3082,23 +3100,12 @@ def _outbox_process_scoped(batch_size=50, *, db_path: Optional[str] = None, work
                                 )
                                 if qpayload["visibility_scope"] == "invalid":
                                     raise RuntimeError("authoritative claim visibility is invalid")
-                                # Commit the possible target before remote I/O. If
-                                # the process dies after Qdrant accepts the PUT, a
-                                # later privacy operation still knows this location.
-                                with sqlite3.connect(path, timeout=30.0) as target_db:
-                                    target_db.execute("PRAGMA busy_timeout=30000")
-                                    claim_target_payload = _record_claim_vector_target(
-                                        target_db, str(row["object_id"]),
-                                        collection=claim_target_collection,
-                                        endpoint=claim_target_endpoint,
-                                        manifest_hash=manifest_hash,
-                                        status="write_pending",
-                                    )
                                 if claim_target_endpoint != _normalized_qdrant_endpoint():
                                     raise RuntimeError("Qdrant endpoint changed before claim upsert")
                                 if not _qdrant_upsert(
                                     row["object_id"], vector, qpayload,
                                     collection=claim_target_collection,
+                                    _admit=disclosure.admit_index,
                                 ):
                                     raise RuntimeError("Qdrant upsert failed")
                                 # A status, text, or ACL mutation can commit while
@@ -3212,6 +3219,7 @@ def _outbox_process_scoped(batch_size=50, *, db_path: Optional[str] = None, work
                                     if not _qdrant_upsert(
                                         row["object_id"], vector, qpayload,
                                         collection=str(latest.get("collection") or ""),
+                                        _admit=disclosure.admit_episode_index,
                                     ):
                                         raise RuntimeError("Qdrant upsert failed")
 
@@ -4474,7 +4482,8 @@ def _semantic_io_check(stage: str) -> None:
 def _semantic_io_label(exc: Exception) -> str:
     return exc.code if isinstance(exc, _SemanticIOError) else _safe_exception_label(exc)
 
-def _qdrant_req(method: str, path: str, body: Optional[dict] = None, timeout: float = 10.0) -> Optional[dict]:
+def _qdrant_req(method: str, path: str, body: Optional[dict] = None, timeout: float = 10.0,
+                *, _admit=None) -> Optional[dict]:
     """HTTP Qdrant: exact owner/ACL, whole UTF-8 admission, complete bounded JSON."""
     if not _semantic_profile_ready():
         _stage_receipt("qdrant", "not_run", "profile_fence")
@@ -4503,7 +4512,8 @@ def _qdrant_req(method: str, path: str, body: Optional[dict] = None, timeout: fl
         request_timeout = _prefetch_network_timeout(timeout)
         if request_timeout <= 0.0:
             raise TimeoutError("semantic_io_deadline")
-        with _observed_semantic_http(req, timeout=request_timeout, stage="qdrant") as (response, observation):
+        with _observed_semantic_http(req, timeout=request_timeout, stage="qdrant",
+                **({"_before_dispatch": _admit} if _admit is not None else {})) as (response, observation):
             result = _semantic_response_json(response, check=check, allow_empty=True)
             _hybrid_http_response(observation, result)
         check()
@@ -5220,7 +5230,7 @@ def _qdrant_visibility_filter(
 
 
 def _qdrant_upsert(claim_id: str, vector: List[float], payload: dict, collection: str = None,
-                   *, create_collection: bool = True, before_write=None) -> bool:
+                   *, create_collection: bool = True, before_write=None, _admit=None) -> bool:
     """Сохранить вектор в настоящем Qdrant."""
     if len(vector) != QDRANT_VECTOR_SIZE:
         _debug_log(f"qdrant vector size mismatch: expected={QDRANT_VECTOR_SIZE}, actual={len(vector)}")
@@ -5248,6 +5258,7 @@ def _qdrant_upsert(claim_id: str, vector: List[float], payload: dict, collection
                 "payload": stored_payload,
             }]
         },
+        **({"_admit": _admit} if _admit is not None else {}),
     )
     operation_status = (result or {}).get("result", {}).get("status")
     if operation_status not in {"completed", "acknowledged"}:
@@ -24937,10 +24948,36 @@ class MemoryWikiProvider(MemoryProvider):
             nonlocal ok_count, last_error
             cid = str(row["id"])
             try:
+                target_endpoint = _normalized_qdrant_endpoint()
+                target_configuration = _profile_configuration_generation()
+                # Metadata-only selection, not text admission. Prepare visible
+                # targets before the ORIGINAL epoch/visibility/raw hydration.
+                # Do not overwrite an active foreign source target before the
+                # registered-vector verifier has read it.
+                visibility, visibility_params = self._claim_visibility_sql()
+                visible_metadata = c.execute(
+                    f"SELECT {metadata_columns} FROM claims WHERE id=? AND " + visibility,
+                    (cid, *visibility_params),
+                ).fetchone()
+                target_prepared = visible_metadata is not None and tuple(visible_metadata) == tuple(row)
+                if target_prepared:
+                    _record_claim_vector_target(
+                        c, cid, collection=target_coll,
+                        endpoint=target_endpoint, manifest_hash=manifest_hash,
+                        status="write_pending",
+                    )
+                    c.commit()  # Crash-safe intent, before the original fence.
+                if (target_configuration != _profile_configuration_generation()
+                        or target_endpoint != _normalized_qdrant_endpoint()
+                        or manifest_hash != _manifest_hash(_embedding_manifest())
+                        or not _profile_target_allowed(target_coll)):
+                    raise RuntimeError("Qdrant target changed during reindex preparation")
                 # Pin owner/epoch before visibility callbacks, but do not read
                 # foreign SQL text. Foreign registered-vector copy is unchanged.
                 disclosure = _DisclosureFence(self, c)
                 if self._claim_visible(row):
+                    if not target_prepared:
+                        raise ValueError("visible claim target was not prepared")
                     disclosure.index_claim(row, 'full_reindex')
                     text = visible_document(row)
                     if text is None:
@@ -24959,17 +24996,20 @@ class MemoryWikiProvider(MemoryProvider):
                     vector, payload = verified
                 if not vector or len(vector) != QDRANT_VECTOR_SIZE:
                     raise ValueError("embedding unavailable or wrong vector size")
-                target_endpoint = _normalized_qdrant_endpoint()
                 # Record a possible target before the network request. A crash
                 # after a successful remote PUT then remains privacy-cleanable.
-                _record_claim_vector_target(
-                    c, cid, collection=target_coll,
-                    endpoint=target_endpoint, manifest_hash=manifest_hash,
-                    status="write_pending",
-                )
-                c.commit()
+                if not target_prepared:
+                    _record_claim_vector_target(
+                        c, cid, collection=target_coll,
+                        endpoint=target_endpoint, manifest_hash=manifest_hash,
+                        status="write_pending",
+                    )
+                    c.commit()
+                if target_endpoint != _normalized_qdrant_endpoint():
+                    raise RuntimeError("Qdrant endpoint changed before reindex upsert")
                 if not _qdrant_upsert(
                     cid, vector, payload, collection=target_coll,
+                    **({"_admit": disclosure.admit_index} if target_prepared else {}),
                 ):
                     raise RuntimeError("Qdrant upsert rejected")
                 _record_claim_vector_target(
