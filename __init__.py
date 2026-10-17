@@ -16402,6 +16402,13 @@ class MemoryWikiProvider(MemoryProvider):
                 active_conn, (repo_id, file_path, symbol_id, source_event_id),
             )
             cid = self._add_claim_tx(active_conn, prepared, confidence, salience)
+            # The generic writer can resolve a retained write fingerprint to
+            # a different current hash. Its actual ID, not prepared.hash, owns
+            # the producer obligation. Reject before metadata mutation; the
+            # existing owning transaction rolls back all tentative work.
+            if (claim_type != "code_graph_chunk"
+                    and self._code_claim_target_is_graph(active_conn, str(cid))):
+                raise PermissionError("protected_graph_claim_type_change")
             active_conn.execute(
                 """INSERT INTO code_claim_metadata(claim_id,repository_id,commit_sha,file_path,symbol_id,symbol_revision,content_hash,claim_type)
                    VALUES(?,?,?,?,?,?,?,?)
