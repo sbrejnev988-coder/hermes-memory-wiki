@@ -137,6 +137,37 @@ def test_original_stop_and_primary(graph_case):
         assert caught.value is primary and len(case.posts) == 1
         assert case.p._transaction_quarantine is None
 
+        # The exact binding can be published before its caller receives the
+        # return value. Known rollback must retire it despite that unwind.
+        case.failure = None
+        case.on_prepare = None
+        stage_primary = BaseException('authored_stage_bind_return_primary')
+        bind_code = case.m._GraphExtraction.bind_stage.__code__
+        prior = sys.getprofile()
+        assert prior is None
+        seen = []
+        def abort_bound_return(frame, event, arg):
+            if event == 'return' and frame.f_code is bind_code:
+                attempt = frame.f_locals['self']
+                if attempt.fence.provider is case.p:
+                    seen.append(case.conn._graph_extraction_stage is attempt.native_stage
+                                and attempt.native_stage is arg)
+                    raise stage_primary
+        sys.setprofile(abort_bound_return)
+        try:
+            with pytest.raises(BaseException) as caught:
+                case.call(apply=True, direct=True)
+        finally:
+            sys.setprofile(prior)
+        assert seen == [True] and caught.value is stage_primary
+        assert not case.conn.in_transaction and case.p._transaction_quarantine is None
+        assert case.conn._graph_extraction_stage is None
+        assert case.p._claim_tx_connection is None and case.p._claim_tx_graph_stage is None
+        assert case.conn.execute('SELECT COUNT(*) FROM relations').fetchone()[0] == 0
+        healthy = case.call(apply=True)
+        assert healthy['applied'] == 1 and len(case.posts) == 3
+        assert case.conn._graph_extraction_stage is None
+
 
 def test_primary_unknown(graph_case):
     with f.Fixture('UNKNOWN') as case:

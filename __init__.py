@@ -14773,9 +14773,16 @@ class MemoryWikiProvider(MemoryProvider):
                         graph_stage[2].clear()
                         self._claim_tx_graph_stage = previous_graph_stage
                         if graph_extraction is not None and graph_extraction.stage is graph_stage:
-                            if c._graph_extraction_stage is graph_obligation:
-                                c._graph_extraction_stage = None
-                            if graph_extraction.native_stage is graph_obligation:
+                            # bind_stage may have published our exact binding
+                            # before a BaseException on return prevents assignment
+                            # to graph_obligation. Retire the actual owned tuple,
+                            # never a foreign replacement, after proved cleanup.
+                            owned_binding = graph_extraction.native_stage
+                            if (type(owned_binding) is tuple and len(owned_binding) == 5
+                                    and owned_binding[0] is graph_extraction
+                                    and owned_binding[3] is graph_stage):
+                                if c._graph_extraction_stage is owned_binding:
+                                    c._graph_extraction_stage = None
                                 graph_extraction.native_stage = None
                             graph_extraction.stage = None
                     self._claim_tx_connection = previous
