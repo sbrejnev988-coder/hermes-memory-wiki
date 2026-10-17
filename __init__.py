@@ -6746,7 +6746,22 @@ def validate_restore_archive(zf: zipfile.ZipFile) -> List[zipfile.ZipInfo]:
     for info in infos:
         if not zip_member_safe(info.filename) or not zip_member_regular(info):
             raise ValueError(f"unsafe zip member: {info.filename}")
-        if info.filename.replace("\\", "/").lower().startswith("privacy-erasure/"):
+        # Inspect original lexical components, not Path's folded parts. These
+        # checks only reject; the raw ZipInfo filename remains the restore token.
+        parts = info.filename.replace("\\", "/").split("/")
+        for part in parts:
+            stem = part.split(".", 1)[0].rstrip(" ").upper()
+            if (not part or part in (".", "..") or part.endswith((".", " "))
+                    or any(ord(c) < 32 or c in '<>:"|?*' for c in part)
+                    or stem in {"CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"}
+                    or re.fullmatch(r"(?:COM|LPT)[1-9¹²³]", stem)
+                    or (len(stem) <= 8 and re.fullmatch(r"[^ .]+~[0-9]+(?:\.[^ .]{1,3})?", part))):
+                # Short-name-shaped components are ambiguous on existing Win32
+                # roots too; never resolve one to discover/adopt its authority.
+                raise ValueError(f"unsafe zip member: {info.filename}")
+        root_name = parts[0].upper()
+        if (root_name in {"PRIVACY-ERASURE", "PRIVACY-ERASURE.INIT.LOCK"}
+                or root_name.startswith(".PRIVACY-ERASURE-STAGE-")):
             raise ValueError("backup cannot replace the host privacy erasure ledger")
         if int(getattr(info, "flag_bits", 0) or 0) & 0x1:
             raise ValueError(f"encrypted zip member is unsupported: {info.filename}")
