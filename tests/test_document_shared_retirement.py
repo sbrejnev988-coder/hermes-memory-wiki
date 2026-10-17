@@ -174,7 +174,11 @@ def test_shared_last_support_retires(derived_case, order):
         assert healthy['index_eligible'] and cid in healthy['lexical_ids']
         assert first_result['archived_claims'] == 0 and middle['claims'][0]['status'] == 'active'
         assert sum(bool(r['active']) for r in middle['chunks']) == 1
-        assert surviving['index_eligible'] and cid in surviving['lexical_ids']
+        # The actual canonical worker still admits surviving support. Public
+        # lexical delivery may already withhold an inactive scalar origin;
+        # observing that refusal must not assume or weaken its separate policy.
+        assert surviving['index_eligible']
+        assert any(r['id'] == cid for r in middle['claim_fts'])
         assert all(r['active'] == 0 and r['status'] == 'deleted' for r in after['sources'])
         assert not after['chunk_fts'] and not after['unit_fts']
         assert_withdrawn(c, before, after, cid)

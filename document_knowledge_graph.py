@@ -1811,6 +1811,12 @@ def _archive_visible_claims(
         if chunk["embedding_claim_id"]:
             links[str(chunk["embedding_claim_id"])].append(chunk)
     authorized = []
+    # Standalone/legacy document callers may have only the scalar projection.
+    # Genuine provider materializations also retain every deduplicated support
+    # in evidence; the last writer of claims.evidence is not the sole owner.
+    has_support_rows = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='evidence'",
+    ).fetchone() is not None
     for claim_id, chunks in links.items():
         claim = conn.execute(
             "SELECT topic,source,evidence,visibility_scope,origin_bot_id,origin_chat_hash,"
@@ -1821,6 +1827,15 @@ def _archive_visible_claims(
                 or claim["topic"] != _TOPIC or claim["source"] != "artifact:document-index"
                 or claim["visibility_scope"] not in {"bot", "project", "global"}):
             continue
+        # _add_claim_tx stores sanitized, bounded full text as support from
+        # this exact producer. Other evidence kinds/sources cannot authorize a
+        # retirement, even when their text happens to contain the same refs.
+        evidence = {str(claim["evidence"] or "")}
+        if has_support_rows:
+            evidence.update(str(row[0] or "") for row in conn.execute(
+                "SELECT text FROM evidence WHERE claim_id=? AND kind='support' "
+                "AND source='artifact:document-index'", (claim_id,),
+            ))
         for chunk in chunks:
             source_id = str(chunk["source_id"] or "")
             content_hash = str(chunk["content_hash"] or "")
@@ -1833,8 +1848,7 @@ def _archive_visible_claims(
                 + "; source_ref:" + _evidence_ref(source_id)
                 + "; revision_ref:"
             )
-            evidence = str(claim["evidence"] or "")
-            if not evidence.startswith(prefix):
+            if not any(text.startswith(prefix) for text in evidence):
                 continue
             # A reused claim may cite an earlier revision of the same chunk.
             # Require that revision to actually exist for this source/content.
@@ -1844,7 +1858,7 @@ def _archive_visible_claims(
                 "WHERE c.source_id=? AND c.content_hash=?",
                 (source_id, content_hash),
             )
-            if any(evidence == prefix + _evidence_ref(row[0]) for row in revisions):
+            if any(prefix + _evidence_ref(row[0]) in evidence for row in revisions):
                 authorized.append(claim_id)
                 break
     return _archive_claims(conn, authorized)
