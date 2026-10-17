@@ -2175,6 +2175,106 @@ def _retire_pending_chunks_for_revision(conn, repository_id, file_path, symbol_i
     return retired.rowcount
 
 
+def _graph_claim_image(conn, claim_id):
+    """Exact canonical row+metadata digest; never store plaintext in the receipt."""
+    claim = conn.execute("SELECT * FROM claims WHERE id=?", (claim_id,)).fetchone()
+    metadata = conn.execute("SELECT * FROM code_claim_metadata WHERE claim_id=?", (claim_id,)).fetchone()
+    if claim is None or metadata is None:
+        return ""
+    return _sha(_json({"claim": dict(claim), "metadata": dict(metadata)}))
+
+
+def _graph_retirement_candidates(provider, conn, repository_id, file_path):
+    """Full proven *live* graph ownership before ordinary revision retirement."""
+    rows = conn.execute(
+        "SELECT c.*,m.*,g.file_path AS full_file,g.symbol_id AS full_symbol,"
+        "g.chunk_id AS full_chunk,g.content_hash AS full_hash "
+        "FROM code_graph_chunks g JOIN code_graph_files f "
+        "ON f.repository_id=g.repository_id AND f.file_path=g.file_path "
+        "JOIN code_graph_events e ON e.event_id=g.graph_event_id "
+        "AND e.repository_id=g.repository_id AND e.payload_hash=g.graph_payload_hash "
+        "AND e.status='completed' AND e.payload_hash_version=3 "
+        "JOIN claims c ON c.id=g.embedding_claim_id "
+        "JOIN code_claim_metadata m ON m.claim_id=c.id "
+        "WHERE g.repository_id=? AND g.file_path=? AND c.status='active' "
+        "AND c.source='tool:code_claim:code_graph_chunk' AND m.claim_type='code_graph_chunk'",
+        (repository_id, file_path),
+    ).fetchall()
+    proven = set()
+    for row in rows:
+        full = {**dict(row), "repository_id": repository_id, "file_path": row["full_file"],
+                "symbol_id": row["full_symbol"] or row["full_chunk"],
+                "content_hash": row["full_hash"], "symbol_revision": row["full_hash"][:32]}
+        identity = provider._lossless_code_claim_identity(row, full_identity=full)
+        if (identity is not None and all(identity[k] == full[k] for k in
+                ("repository_id", "file_path", "symbol_id", "content_hash", "symbol_revision"))
+                and provider._code_claim_erasure_allows(conn, row)):
+            proven.add(str(row["id"]))
+    return proven
+
+
+def _can_return_graph_claim(provider, conn, final):
+    """A fresh snapshot may return an ordinarily retired exact generation.
+
+    Reuse existing event stats as an additive receipt carrier: no schema or new
+    revival flag/API. Legacy events without receipts remain UNKNOWN. An exact
+    archived row image (including revision/partition) prevents manual changes
+    from borrowing an old retirement, and authenticated erasure always vetoes.
+    """
+    provider._require_claim_writer(conn, transaction=True)
+    prepared = final["prepared"]
+    row = conn.execute("SELECT c.*,m.* FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id WHERE c.hash=?",
+                       (prepared["hash"],)).fetchone()
+    if (row is None or row["status"] != "archived" or row["temporal_status"] != "historical"
+            or row["superseded_by_id"] or row["source"] != "tool:code_claim:code_graph_chunk"
+            or not provider._claims_share_visibility_partition(row, prepared)
+            or not provider._code_claim_erasure_allows(conn, row)):
+        return False
+    identity = provider._lossless_code_claim_identity(row, full_identity=final)
+    if identity is None or any(identity[k] != str(final.get(k) or "") for k in
+            ("repository_id", "file_path", "symbol_id", "symbol_revision", "content_hash", "claim_type")):
+        return False
+    snapshots = conn.execute(
+        "SELECT g.*,e.rowid AS event_order FROM code_graph_chunks g "
+        "JOIN code_graph_files f ON f.repository_id=g.repository_id AND f.file_path=g.file_path "
+        "JOIN code_graph_events e ON e.event_id=g.graph_event_id AND e.repository_id=g.repository_id "
+        "AND e.payload_hash=g.graph_payload_hash AND e.status='completed' AND e.payload_hash_version=3 "
+        "JOIN code_graph_repositories r ON r.repository_id=g.repository_id AND r.commit_sha=? "
+        "WHERE g.repository_id=? AND g.file_path=? AND g.content_hash=? AND g.embedding_claim_id='' "
+        "AND (g.symbol_id=? OR (g.symbol_id='' AND g.chunk_id=?))",
+        (final["commit_sha"], final["repository_id"], final["file_path"], final["content_hash"],
+         final["symbol_id"], final["symbol_id"]),
+    ).fetchall()
+    image = _graph_claim_image(conn, row["id"])
+    for snapshot in snapshots:
+        item = dict(snapshot)
+        source_event = "kg:" + _sha("\0".join((final["repository_id"], item["graph_event_id"], item["chunk_id"], item["content_hash"])))
+        source_event = provider._code_graph_identity(source_event, trusted_opaque_graph_ids=True, conn=conn)
+        label = item["qualified_name"] or item["symbol_id"] or "top-level"
+        text = (f"Code semantic chunk in repository {final['repository_id']}. "
+                f"File {item['file_path']} lines {item['start_line']}-{item['end_line']}; "
+                f"symbol {label}.\n{item['embedding_text']}")[:7800]
+        if (final["producer"] != "mcp-code-shrinker-knowledge-graph" or final["phase_sep_version"] != "kg-v2"
+                or final["source_event_id"] != source_event or final["claim"] != text):
+            continue
+        # Ordering is the durable event insertion order, not wall-clock seconds
+        # (two snapshots can legitimately commit in the same second).
+        prior = conn.execute(
+            "SELECT stats_json FROM code_graph_events WHERE repository_id=? AND status='completed' "
+            "AND payload_hash_version=3 AND rowid<? ORDER BY rowid DESC",
+            (final["repository_id"], item["event_order"]),
+        )
+        try:
+            for event in prior:
+                stats = json.loads(event[0])
+                if (isinstance(stats, dict) and isinstance(stats.get("revision_retirements"), dict)
+                        and stats["revision_retirements"].get(str(row["id"])) == image):
+                    return True
+        finally:
+            prior.close()
+    return False
+
+
 def _embed_graph_chunks(
     provider: Any,
     repository_id: str,
@@ -2330,7 +2430,9 @@ def _embed_graph_chunks(
                         resolved = provider._lossless_code_claim_identity(found, full_identity=full_identity)
                         return (resolved is not None and isinstance(prepared_value, dict)
                                 and all(resolved[key] == value for key, value in full_identity.items())
-                                and provider._claims_share_visibility_partition(found, prepared_value))
+                                and provider._claims_share_visibility_partition(found, prepared_value)
+                                and provider._code_claim_erasure_allows(conn, found)
+                                and provider._code_claim_erasure_allows(conn, prepared_value))
 
                     existing = ""
                     # Historical slices may discover candidates, never prove
@@ -2648,9 +2750,12 @@ def ingest_code_graph_event(
             # one SQLite transaction.  Do not fall back to a separate commit:
             # that was the divergence boundary this routine is closing.
             invalidated = 0
+            revision_retirements = {}
             invalidate_revision = getattr(provider, "_invalidate_revision", None)
             if callable(invalidate_revision):
                 for path in sorted(invalidation_paths):
+                    return_candidates = (_graph_retirement_candidates(provider, conn, repository_id, path)
+                                         if hasattr(provider, "_code_claim_erasure_allows") else set())
                     invalidate_result = invalidate_revision({
                         "repository_id": repository_id,
                         "file_path": path,
@@ -2658,6 +2763,10 @@ def ingest_code_graph_event(
                         "new_content_hash": new_hash_by_path.get(path, ""),
                     }, conn=conn, trusted_opaque_graph_ids=True)
                     invalidated += int(invalidate_result.get("invalidated") or 0)
+                    for cid in return_candidates.intersection(invalidate_result.get("ids") or []):
+                        image = _graph_claim_image(conn, cid)
+                        if image:
+                            revision_retirements[cid] = image
 
             if snapshot_mode == "full":
                 _delete_fts_for_files(conn, repository_id, [])
@@ -2679,6 +2788,7 @@ def ingest_code_graph_event(
                 "counts": counts,
                 "deleted_files": len(deleted_files),
                 "invalidated_claims": invalidated,
+                "revision_retirements": revision_retirements,
                 "embedding": {"status": "pending"},
                 "snapshot_hash": producer_snapshot_hash,
             }

@@ -15948,8 +15948,55 @@ class MemoryWikiProvider(MemoryProvider):
             return None
         return candidate if proves(candidate) else None
 
+    def _code_claim_metadata_identity(self, conn: sqlite3.Connection, row: Any):
+        """Resolve the actual producer namespace, not a caller-supplied type.
+
+        Patch metadata was never sliced. Its proof is the unique structured
+        patch link AND its patch/R/id canonical hash, not code/R/F/S/revision.
+        A code_claim with claim_type='patch_outcome' still uses code identity.
+        """
+        values = dict(row)
+        source = str(values.get("_code_identity_source", values.get("source")) or "")
+        if source != "tool:patch_outcome_add":
+            return self._lossless_code_claim_identity(values)
+        if values.get("claim_type") != "patch_outcome":
+            return None
+        links = conn.execute(
+            "SELECT * FROM patch_outcomes WHERE claim_id=? ORDER BY repository_id,patch_id LIMIT 2",
+            (values["id"],),
+        ).fetchall()
+        if len(links) != 1:
+            return None
+        link = dict(links[0])
+        normalized = str(values.get("_code_identity_text", values.get("normalized_claim")) or "")
+        stored_hash = str(values.get("_code_identity_hash", values.get("hash")) or "")
+        if (not link["patch_id"] or not link["repository_id"]
+                or link["repository_id"] != values.get("repository_id")
+                or stored_hash != sha("\0".join((
+                    "patch_outcome", link["repository_id"], link["patch_id"], normalized.lower(),
+                )))):
+            return None
+        try:
+            files = json.loads(link["changed_files_json"])
+            symbols = json.loads(link["changed_symbols_json"])
+        except (ValueError, TypeError):
+            return None
+        if any(type(items) is not list or any(type(v) is not str for v in items)
+               for items in (files, symbols)):
+            return None
+        metadata_hash = link["new_content_hash"] or hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        if (str(values.get("file_path") or "") != (files[0] if len(files) == 1 else "")
+                or str(values.get("symbol_id") or "") != (symbols[0] if len(symbols) == 1 else "")
+                or str(values.get("symbol_revision") or "")
+                or str(values.get("content_hash") or "") != metadata_hash):
+            return None
+        return {key: str(values.get(key) or "") for key in (
+            "repository_id", "file_path", "symbol_id", "symbol_revision",
+            "content_hash", "commit_sha", "claim_type",
+        )}
+
     def _code_claim_retirement_identity(self, conn: sqlite3.Connection, row: Any):
-        identity = self._lossless_code_claim_identity(row)
+        identity = self._code_claim_metadata_identity(conn, row)
         if identity is not None:
             return identity
         values = dict(row)
@@ -15977,17 +16024,56 @@ class MemoryWikiProvider(MemoryProvider):
                 proven[tuple(sorted(resolved.items()))] = resolved
         return next(iter(proven.values())) if len(proven) == 1 else None
 
-    def _lossless_code_claim_rows(self, rows):
-        # Query projection is deliberately conservative: unresolved historical
-        # prefixes are unavailable, not relabelled as the queried short owner.
-        result = []
-        for row in rows:
-            item = dict(row)
-            if self._lossless_code_claim_identity(item) is not None:
-                item.pop("_code_identity_hash", None)
-                item.pop("_code_identity_text", None)
+    def _select_code_claim_rows(self, conn, sql, params, limit):
+        """Apply identity eligibility before the result cutoff, on one cursor.
+
+        The original caller fence/owner/epoch is never refreshed. The SQL LIMIT
+        is a distinct scan budget, not the public result limit. At that budget
+        we conservatively report an incomplete scan (even if it ends exactly
+        there); no unbounded refill or guessed legacy identity is permitted.
+        """
+        scan_limit = max(200, min(4000, limit * 20))
+        result, scanned = [], 0
+        cursor = conn.execute(sql, [*params, scan_limit])
+        try:
+            while scanned < scan_limit and len(result) < limit:
+                row = cursor.fetchone()
+                if row is None:
+                    break
+                scanned += 1
+                item = dict(row)
+                if self._code_claim_metadata_identity(conn, item) is None:
+                    continue
+                for key in ("_code_identity_hash", "_code_identity_text", "_code_identity_source"):
+                    item.pop(key, None)
                 result.append(item)
-        return result
+        finally:
+            cursor.close()
+        return result, {"result_limit": limit, "scan_limit": scan_limit,
+                        "scanned": scanned, "eligible_returned": len(result),
+                        "scan_limit_reached": scanned == scan_limit and len(result) < limit}
+
+    def _code_claim_erasure_allows(self, conn, image):
+        """An authenticated tombstone is never a source-generation permission."""
+        self._require_claim_writer(conn, transaction=True)
+        ledger = self._privacy_erasure
+        if type(ledger) is not _privacy_erasure.ErasureLedger or ledger.dir != self.root / "privacy-erasure":
+            raise PermissionError("code_claim_erasure_state_unavailable")
+        entries = ledger.load()
+        applied = conn.execute("SELECT value FROM meta WHERE key='privacy_erasure_applied_seq'").fetchone()
+        if (int(applied[0]) if applied else 0) != len(entries):
+            raise PermissionError("code_claim_erasure_replay_required")
+        row = dict(image)
+        cid = str(row.get("id", row.get("cid")) or "")
+        text = normalize_claim(str(row.get("normalized_claim", row.get("normalized")) or row.get("claim") or "")).casefold()
+        for entry in entries:
+            if not ledger._owner_allows(entry["owner"], row, "claim"):
+                continue
+            if (ledger.digest("claim-id", cid) in entry["claims"]
+                    or (int(row.get("created_at", row.get("timestamp")) or 0) <= int(entry["created_at"])
+                        and ledger._contains_digest(text, entry["claim_text"], "claim-text"))):
+                return False
+        return True
 
     def _prepare_code_claim(
         self, a: Dict[str, Any], *, trusted_opaque_graph_ids: bool = False,
@@ -16207,7 +16293,7 @@ class MemoryWikiProvider(MemoryProvider):
             existing_claim_id = self._ingest_idempotent(
                 str(raw_claim or ""), source_event_id, phase_sep_version, producer, conn=conn
             )
-            if existing_claim_id:
+            if existing_claim_id and str(a.get("claim_type") or "") != "code_graph_chunk":
                 return {
                     "id": existing_claim_id,
                     "status": "deduplicated",
@@ -16256,6 +16342,10 @@ class MemoryWikiProvider(MemoryProvider):
                 producer, conn=active_conn,
             )
             if existing_claim_id:
+                if claim_type == "code_graph_chunk":
+                    existing_row = active_conn.execute("SELECT * FROM claims WHERE id=?", (existing_claim_id,)).fetchone()
+                    if existing_row is None or not self._code_claim_erasure_allows(active_conn, existing_row):
+                        raise PermissionError("erased_code_claim")
                 return ({
                     "id": existing_claim_id,
                     "status": "deduplicated",
@@ -16274,8 +16364,13 @@ class MemoryWikiProvider(MemoryProvider):
                 raise ValueError("invalid preprepared code claim")
             prepared = dict(prepared_value)
             if claim_type == "code_graph_chunk":
-                # A backfill is not authority to revive a withdrawn derivative.
-                prepared["_revive_archived"] = False
+                if not self._code_claim_erasure_allows(active_conn, prepared):
+                    raise PermissionError("erased_code_claim")
+                from .code_knowledge_graph import _can_return_graph_claim
+                # Only a durable ordinary-revision receipt and a subsequent
+                # exact authoritative snapshot may return an archived hash.
+                # No caller boolean, pathname or producer label grants this.
+                prepared["_revive_archived"] = _can_return_graph_claim(self, active_conn, final)
             _register_code_graph_identity_provenance(
                 active_conn, (repo_id, file_path, symbol_id, source_event_id),
             )
@@ -16374,54 +16469,50 @@ class MemoryWikiProvider(MemoryProvider):
             params.extend([f"%{escaped}%", f"%{escaped}%"])
         sql = (
             "SELECT c.id,c.claim,c.topic,c.confidence,c.salience,c.evidence,c.updated_at,"
-            "c.hash AS _code_identity_hash,c.normalized_claim AS _code_identity_text,"
+            "c.hash AS _code_identity_hash,c.normalized_claim AS _code_identity_text,c.source AS _code_identity_source,"
             "m.repository_id,m.file_path,m.symbol_id,m.symbol_revision,m.content_hash,m.claim_type "
             "FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id "
             "WHERE " + " AND ".join(joins) +
             " ORDER BY c.updated_at DESC LIMIT ?"
         )
-        params.append(limit)
-        rows = self._lossless_code_claim_rows(c.execute(sql, params).fetchall())
+        rows, selection = self._select_code_claim_rows(c, sql, params, limit)
         self._retain_code_claim_images(disclosure, rows)
-        return {"claims": rows}
+        return {"claims": rows, "selection": selection}
 
     def _symbol_history(self, a: Dict[str, Any]) -> Dict[str, Any]:
         c = self._connect(); disclosure = self._retain_read_fence(c)
         repo_id = self._code_graph_identity(str(a.get("repository_id", "")).strip())
         symbol_id = self._code_graph_identity(str(a.get("symbol_id", "")).strip())
-        limit = int(a.get("limit", 20))
+        limit = max(1, min(int(a.get("limit", 20)), 200))
         if not repo_id:
             raise ValueError("repository_id is required for symbol history")
         if not symbol_id:
             raise ValueError("symbol_id is required for symbol history")
-        joins = ["m.repository_id=?", "m.symbol_id=?"]
-        rows = c.execute(
-            "SELECT c.id, c.claim, c.topic, c.evidence, c.updated_at, c.status,"
-            " c.hash AS _code_identity_hash,c.normalized_claim AS _code_identity_text,"
-            " m.repository_id, m.file_path, m.symbol_id, m.symbol_revision, m.content_hash"
-            " FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id"
-            " WHERE " + " AND ".join(joins) + " ORDER BY c.updated_at DESC LIMIT ?",
-            (repo_id, symbol_id, limit)).fetchall()
-        rows = self._lossless_code_claim_rows(rows)
+        rows, selection = self._select_code_claim_rows(c,
+            "SELECT c.id,c.claim,c.topic,c.evidence,c.updated_at,c.status,"
+            "c.hash AS _code_identity_hash,c.normalized_claim AS _code_identity_text,c.source AS _code_identity_source,"
+            "m.repository_id,m.file_path,m.symbol_id,m.symbol_revision,m.content_hash,m.claim_type "
+            "FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id "
+            "WHERE m.repository_id=? AND m.symbol_id=? ORDER BY c.updated_at DESC LIMIT ?",
+            (repo_id, symbol_id), limit)
         self._retain_code_claim_images(disclosure, rows)
-        return {"repository_id": repo_id, "symbol_id": symbol_id, "history": rows}
+        return {"repository_id": repo_id, "symbol_id": symbol_id, "history": rows, "selection": selection}
 
     def _repository_context(self, a: Dict[str, Any]) -> Dict[str, Any]:
         c = self._connect(); disclosure = self._retain_read_fence(c)
         repo_id = self._code_graph_identity(str(a.get("repository_id", "")).strip())
-        limit = int(a.get("limit", 30))
+        limit = max(1, min(int(a.get("limit", 30)), 200))
         if not repo_id:
             raise ValueError("repository_id is required for repository context")
-        rows = c.execute(
-            "SELECT c.id, c.claim, c.topic, c.evidence, c.confidence, c.salience, c.updated_at,"
-            " c.hash AS _code_identity_hash,c.normalized_claim AS _code_identity_text,"
-            " m.repository_id, m.file_path, m.symbol_id, m.symbol_revision, m.content_hash"
-            " FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id"
-            " WHERE c.status='active' AND m.repository_id=? ORDER BY salience DESC LIMIT ?",
-            (repo_id, limit)).fetchall()
-        rows = self._lossless_code_claim_rows(rows)
+        rows, selection = self._select_code_claim_rows(c,
+            "SELECT c.id,c.claim,c.topic,c.evidence,c.confidence,c.salience,c.updated_at,"
+            "c.hash AS _code_identity_hash,c.normalized_claim AS _code_identity_text,c.source AS _code_identity_source,"
+            "m.repository_id,m.file_path,m.symbol_id,m.symbol_revision,m.content_hash,m.claim_type "
+            "FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id "
+            "WHERE c.status='active' AND m.repository_id=? ORDER BY c.salience DESC LIMIT ?",
+            (repo_id,), limit)
         self._retain_code_claim_images(disclosure, rows)
-        return {"repository_id": repo_id, "claims": rows}
+        return {"repository_id": repo_id, "claims": rows, "selection": selection}
 
     def _invalidate_revision(
         self,
@@ -18514,6 +18605,7 @@ class MemoryWikiProvider(MemoryProvider):
         repository_id: str = "",
         file_path: str = "",
         symbol_id: str = "",
+        code_identity: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Resolve supersession without crossing code-repository boundaries.
 
@@ -18531,24 +18623,51 @@ class MemoryWikiProvider(MemoryProvider):
             # unavailable, keep history active instead of guessing its owner.
             return {"action": "insert", "supersedes": []}
         if repository_id:
+            # The new metadata row is not inserted yet. Authenticate the full
+            # prepared identity against the row actually written by this owner;
+            # caller/discovery R/F/S labels alone cannot authorize retirement.
+            identity = dict(code_identity or {})
+            scope = self._code_claim_identity_scope(identity)
+            if new_row["source"] == "tool:patch_outcome_add":
+                patch_scope = str(identity.get("identity_scope") or "").split("\0")
+                if len(patch_scope) != 3 or patch_scope[:2] != ["patch_outcome", repository_id] or not patch_scope[2]:
+                    return {"action": "insert", "supersedes": []}
+                scope = "\0".join(patch_scope)
+            elif not str(new_row["source"] or "").startswith("tool:code_claim:"):
+                return {"action": "insert", "supersedes": []}
+            if (not (symbol_id or file_path)
+                    or any(str(identity.get(k) or "") != value for k, value in (
+                        ("repository_id", repository_id), ("file_path", file_path), ("symbol_id", symbol_id)))
+                    or new_row["hash"] != sha(scope + "\0" + str(new_row["normalized_claim"] or "").lower())):
+                return {"action": "insert", "supersedes": []}
             where = [
                 "c.topic=?", "c.id!=?", "c.status IN ('active','current')",
                 "m.repository_id=?",
             ]
             params: List[Any] = [topic, new_claim_id, repository_id]
             if symbol_id:
-                where.append("m.symbol_id=?")
-                params.append(symbol_id)
+                where.append("m.symbol_id IN (?,?)")
+                params.extend((symbol_id, symbol_id[:256]))
             elif file_path:
-                where.append("m.file_path=?")
-                params.append(file_path)
+                where.append("m.file_path IN (?,?)")
+                params.extend((file_path, file_path[:512]))
             rows = c.execute(
-                "SELECT c.* "
+                "SELECT c.*,m.* "
                 "FROM claims c JOIN code_claim_metadata m ON m.claim_id=c.id "
                 "WHERE " + " AND ".join(where) +
                 " ORDER BY c.created_at DESC LIMIT 20",
                 params,
             ).fetchall()
+            # Full identity proves group membership; the documented group is
+            # repo+symbol (even across files), otherwise repo+file. Revisions
+            # and hashes may differ: that is ordinary temporal succession.
+            proven = []
+            for row in rows:
+                peer = self._code_claim_retirement_identity(c, row)
+                if (peer is not None and peer["repository_id"] == repository_id
+                        and (peer["symbol_id"] == symbol_id if symbol_id else peer["file_path"] == file_path)):
+                    proven.append(row)
+            rows = proven
         else:
             rows = c.execute(
                 "SELECT * FROM claims "
@@ -19237,6 +19356,7 @@ class MemoryWikiProvider(MemoryProvider):
                     repository_id=str(p.get("repository_id") or ""),
                     file_path=str(p.get("file_path") or ""),
                     symbol_id=str(p.get("symbol_id") or ""),
+                    code_identity=p,
                 )
             if temporal_result.get("supersedes"):
                 self._claim_journal_mark(c, str(cid), compound=True)
