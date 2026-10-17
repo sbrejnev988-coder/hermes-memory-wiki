@@ -8,6 +8,7 @@ No profile_ready/guard/SDK substitutions, protected settings files or keys.
 """
 from __future__ import annotations
 from contextlib import contextmanager
+import contextlib
 import importlib.util
 import hashlib
 import os
@@ -198,7 +199,9 @@ def observe(f):
                 rows = list(f.conn.execute("SELECT * FROM claim_vector_targets WHERE claim_id=? AND status='write_pending'", (cid,)))
                 assert rows and not f.conn.in_transaction, 'owned_pending_not_durable_before_first_raw_binding'
                 pending.append(cid)
-        if event == 'call' and frame.f_code is dispatch:
+        if (event == 'call' and frame.f_code is dispatch
+                and frame.f_back is not None
+                and frame.f_back.f_code is contextlib._GeneratorContextManager.__enter__.__code__):
             request = frame.f_locals['request']
             if request.get_method() == 'PUT' and request.data and 'points' in json.loads(request.data):
                 bound = frame.f_locals.get('_before_dispatch')
