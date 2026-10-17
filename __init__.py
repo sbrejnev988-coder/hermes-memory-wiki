@@ -15956,16 +15956,15 @@ class MemoryWikiProvider(MemoryProvider):
         A code_claim with claim_type='patch_outcome' still uses code identity.
         """
         values = dict(row)
-        source = str(values.get("_code_identity_source", values.get("source")) or "")
-        if source != "tool:patch_outcome_add":
-            return self._lossless_code_claim_identity(values)
-        if values.get("claim_type") != "patch_outcome":
-            return None
         links = conn.execute(
             "SELECT * FROM patch_outcomes WHERE claim_id=? ORDER BY repository_id,patch_id LIMIT 2",
             (values["id"],),
         ).fetchall()
-        if len(links) != 1:
+        # Testimony/source changes during update, pin and evidence attachment.
+        # The structured link, not that mutable label, selects the namespace.
+        if not links:
+            return self._lossless_code_claim_identity(values)
+        if len(links) != 1 or values.get("claim_type") != "patch_outcome":
             return None
         link = dict(links[0])
         normalized = str(values.get("_code_identity_text", values.get("normalized_claim")) or "")
@@ -15984,7 +15983,15 @@ class MemoryWikiProvider(MemoryProvider):
         if any(type(items) is not list or any(type(v) is not str for v in items)
                for items in (files, symbols)):
             return None
-        metadata_hash = link["new_content_hash"] or hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        # The optional fallback describes the original structured outcome,
+        # not its subsequently edited claim text. Reproduce the actual writer.
+        display = self._code_graph_identity_display
+        original = normalize_claim(
+            f"Patch {display(link['patch_id'])}: {link['outcome']}. "
+            f"Files: {', '.join(display(v) for v in files[:5]) or 'none'}. "
+            f"Symbols: {', '.join(display(v) for v in symbols[:5]) or 'none'}"
+        )
+        metadata_hash = link["new_content_hash"] or hashlib.sha256(original.encode("utf-8")).hexdigest()
         if (str(values.get("file_path") or "") != (files[0] if len(files) == 1 else "")
                 or str(values.get("symbol_id") or "") != (symbols[0] if len(symbols) == 1 else "")
                 or str(values.get("symbol_revision") or "")
@@ -16264,6 +16271,15 @@ class MemoryWikiProvider(MemoryProvider):
         updated["prepared"] = prepared
         return updated
 
+    @staticmethod
+    def _code_claim_target_is_graph(conn: sqlite3.Connection, claim_id: str) -> bool:
+        """Stored producer obligations cannot be removed by a request label."""
+        return conn.execute(
+            "SELECT 1 FROM code_claim_metadata WHERE claim_id=? AND claim_type='code_graph_chunk' "
+            "UNION ALL SELECT 1 FROM code_graph_chunks WHERE embedding_claim_id=? LIMIT 1",
+            (claim_id, claim_id),
+        ).fetchone() is not None
+
     def _code_claim_add(
         self,
         a: Dict[str, Any],
@@ -16293,7 +16309,8 @@ class MemoryWikiProvider(MemoryProvider):
             existing_claim_id = self._ingest_idempotent(
                 str(raw_claim or ""), source_event_id, phase_sep_version, producer, conn=conn
             )
-            if existing_claim_id and str(a.get("claim_type") or "") != "code_graph_chunk":
+            if (existing_claim_id and str(a.get("claim_type") or "") != "code_graph_chunk"
+                    and not self._code_claim_target_is_graph(conn or self._connect(), existing_claim_id)):
                 return {
                     "id": existing_claim_id,
                     "status": "deduplicated",
@@ -16342,6 +16359,9 @@ class MemoryWikiProvider(MemoryProvider):
                 producer, conn=active_conn,
             )
             if existing_claim_id:
+                if (self._code_claim_target_is_graph(active_conn, existing_claim_id)
+                        and claim_type != "code_graph_chunk"):
+                    raise PermissionError("protected_graph_claim_type_change")
                 if claim_type == "code_graph_chunk":
                     existing_row = active_conn.execute("SELECT * FROM claims WHERE id=?", (existing_claim_id,)).fetchone()
                     if existing_row is None or not self._code_claim_erasure_allows(active_conn, existing_row):
@@ -16363,6 +16383,13 @@ class MemoryWikiProvider(MemoryProvider):
             if not isinstance(prepared_value, dict):
                 raise ValueError("invalid preprepared code claim")
             prepared = dict(prepared_value)
+            # claim_type is deliberately absent from the existing canonical
+            # hash. Inspect that exact durable target under the owning TX
+            # before generic insertion/revival or metadata reclassification.
+            stored = active_conn.execute("SELECT id FROM claims WHERE hash=?", (prepared["hash"],)).fetchone()
+            if (stored is not None and claim_type != "code_graph_chunk"
+                    and self._code_claim_target_is_graph(active_conn, str(stored["id"]))):
+                raise PermissionError("protected_graph_claim_type_change")
             if claim_type == "code_graph_chunk":
                 if not self._code_claim_erasure_allows(active_conn, prepared):
                     raise PermissionError("erased_code_claim")
@@ -16443,7 +16470,10 @@ class MemoryWikiProvider(MemoryProvider):
             claim=c.execute("SELECT * FROM claims WHERE id=?",(item.get("id"),)).fetchone()
             if claim is not None and self._claim_visible(claim):
                 visible.append(self._sanitize_row(item))
-        return {**result,field:visible}
+        # Scan work includes rows that this caller cannot see. Even counts
+        # or an exhaustion bit would disclose their existence across the ACL.
+        public = {key: value for key, value in result.items() if key != "selection"}
+        return {**public,field:visible}
 
     def _code_claim_query(self, a: Dict[str, Any]) -> Dict[str, Any]:
         c = self._connect(); disclosure = self._retain_read_fence(c)
