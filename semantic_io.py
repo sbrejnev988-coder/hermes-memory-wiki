@@ -237,7 +237,7 @@ _CURL_RETAINED = []
 
 def curl_capture(cmd, config_input, timeout, *, check=None, cleanup_remaining=None,
                  stdout_cap=RESPONSE_MAX_BYTES, stderr_cap=CURL_STDERR_MAX_BYTES,
-                 _popen=None):
+                 _popen=None, _before_factory=None):
     """Minimal curl-only binary pipe capture; never communicate/capture_output.
 
     Three direct pipe workers, cap+1 refusal, shared request deadline and bounded
@@ -306,7 +306,20 @@ def curl_capture(cmd, config_input, timeout, *, check=None, cleanup_remaining=No
 
     try:
         factory = subprocess.Popen if _popen is None else _popen
-        proc = factory(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        # Route/config, ownership and pipe preparation precede original source
+        # admission. SQL can wait: recheck the SAME cancel/deadline afterwards.
+        prepared_cmd = list(cmd)
+        if _before_factory is not None:
+            _before_factory()
+        if check is not None:
+            check()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("semantic_io_timeout")
+        if _before_factory is not None:
+            # This helper is curl-only; never reset the prepared --max-time.
+            prepared_cmd[5] = str(min(float(prepared_cmd[5]), remaining))
+        proc = factory(prepared_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                        stderr=subprocess.PIPE, shell=False, close_fds=True, bufsize=0)
         for name, target, args in (("stdout", reader, ("stdout", proc.stdout, stdout_cap)),
                                    ("stderr", reader, ("stderr", proc.stderr, stderr_cap)),

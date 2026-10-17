@@ -6,7 +6,7 @@ are conservatively withheld (data_version + total_changes + existing revisions),
 including ABA in columns not covered by the historical revision trigger.
 """
 from __future__ import annotations
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 import contextvars
 import threading
 import hashlib
@@ -91,16 +91,20 @@ def existing_ledger(module, root):
         ledger._base += 257
     return ledger
 
+_INDEX_READERS_UNKNOWN = []  # Exact retained reader/fence; never a fresh permission.
+
+
 class DisclosureFence:
     """Bounded original read set + short authoritative final SQLite snapshot."""
-    def __init__(self, provider, conn=None, *, home=None, ledger=None, foreign=False):
+    def __init__(self, provider, conn=None, *, home=None, ledger=None, foreign=False, _worker=None):
         self.provider = provider
+        self.worker = _worker
         self.conn = conn if conn is not None else getattr(provider, '_conn', None)
-        self.owner_conn = getattr(provider, '_conn', None)
+        self.owner_conn = self.conn if _worker is not None else getattr(provider, '_conn', None)
         self.source_conn = None  # exact factory reader, original images only
         self.home = Path(home if home is not None else provider.home)
         self.foreign = foreign
-        self.ledger = ledger if foreign else getattr(provider, '_privacy_erasure', None)
+        self.ledger = ledger if foreign or _worker is not None else getattr(provider, '_privacy_erasure', None)
         self.images, self.selectors, self.purposes = {}, {}, {}
         self.shared_sets = {}
         self.policy_environment = tuple(os.environ.get(k) for k in
@@ -124,6 +128,25 @@ class DisclosureFence:
             self.ok = False
 
     def _authority(self, *, terminal=False):
+        if self.worker is not None:
+            # The actual outbox namespace and retained mode=ro handle, not a
+            # made-up provider/actor. Existing authenticated erasure parser only.
+            m = self.worker
+            path = self.home / 'memory-wiki/memory_wiki.sqlite3'
+            actual = next(r[2] for r in self.conn.execute('PRAGMA database_list') if r[1] == 'main')
+            if (self.conn is not self.owner_conn or not actual or physical(actual) != physical(path)
+                    or self.conn.execute('PRAGMA query_only').fetchone()[0] != 1
+                    or m._bound_profile_home().resolve() != self.home.resolve()
+                    or not m._semantic_profile_ready()
+                    or type(self.ledger) is not m._privacy_erasure.ErasureLedger
+                    or self.ledger.dir.resolve() != (self.home / 'memory-wiki/privacy-erasure').resolve()):
+                raise PermissionError('disclosure_index_reader_unproven')
+            return (id(m), threading.get_ident(), str(self.home.resolve()), physical(path),
+                    m._REQUEST_HOME.get(), m._profile_configuration_generation(),
+                    m._embedding_cache_configuration_signature(), m._normalized_qdrant_endpoint(),
+                    config_image(self.home), config_image(self.home, '.env'),
+                    config_image(self.home, 'proxy/.env'), physical(self.ledger.key_path),
+                    physical(self.ledger.log_path), hashlib.sha256(self.ledger.key).hexdigest())
         p = self.provider
         if p._conn is not self.owner_conn or (not self.foreign and p._privacy_erasure is not self.ledger):
             raise PermissionError('disclosure_owner_replaced')
@@ -156,7 +179,7 @@ class DisclosureFence:
         meta = dict(self.conn.execute("SELECT key,value FROM meta WHERE key IN ('database_instance_id','memory_revision','cache_state_revision','privacy_erasure_applied_seq')"))
         if not meta.get('database_instance_id') or 'memory_revision' not in meta or 'cache_state_revision' not in meta:
             raise PermissionError('disclosure_revision_unproven')
-        if not self.foreign and meta['database_instance_id'] != self.provider.database_instance_id:
+        if not self.foreign and self.worker is None and meta['database_instance_id'] != self.provider.database_instance_id:
             raise PermissionError('disclosure_database_replaced')
         return (fingerprint(meta), int(self.conn.execute('PRAGMA data_version').fetchone()[0]), self.conn.total_changes)
 
@@ -331,6 +354,72 @@ class DisclosureFence:
             self.purposes[cid] = (purpose, session_id, include_all_projects)
         return current
 
+    def index_claim(self, row, purpose):
+        """Capture raw indexing input BEFORE hydration/guards; no recall policy.
+
+        Full indexing historically requires active+visible, not recall quality,
+        artifact or TTL eligibility. Scoped indexing retains its own SQL policy.
+        Worker indexing has a namespace, not an end-user visibility assertion.
+        """
+        if purpose not in {'scoped_reindex', 'full_reindex', 'outbox_index'}:
+            raise ValueError('invalid_index_purpose')
+        if (purpose == 'outbox_index') != (self.worker is not None):
+            raise DeliveryWithheld('claim_index_owner_unproven')
+        originals = self.watch('claims', 'id', [row['id']])
+        if len(originals) != 1 or any(originals[0].get(k) != v for k, v in dict(row).items()):
+            self.ok = False
+            raise DeliveryWithheld('claim_index_original_image_changed')
+        self.purposes[str(row['id'])] = (purpose, '', False)
+        self.admit_index()
+        return originals[0]
+
+    def admit_index(self):
+        if not self.purposes or not self.finish():
+            raise DeliveryWithheld('claim_index_source_changed')
+
+    def index_snapshot(self, claim_id):
+        # The worker's ORIGINAL epoch predates this first raw row read.
+        rows = self.watch('claims', 'id', [claim_id])
+        if not self.ok:
+            raise DeliveryWithheld('claim_index_source_changed')
+        if not rows or rows[0]['status'] != 'active' or not (rows[0]['normalized_claim'] or rows[0]['claim']):
+            return None
+        row = self.index_claim(rows[0], 'outbox_index')
+        return {**row, 'index_text': str(row['normalized_claim'] or row['claim'])}
+
+    @classmethod
+    @contextmanager
+    def claim_worker(cls, module, db_path):
+        """One genuine retained readonly source; never create/replay authority."""
+        if _INDEX_READERS_UNKNOWN:
+            raise DeliveryWithheld('claim_index_reader_cleanup_UNKNOWN')
+        home = module._bound_profile_home().resolve()
+        path = Path(db_path)
+        if physical(path) != physical(home / 'memory-wiki/memory_wiki.sqlite3'):
+            raise DeliveryWithheld('claim_index_reader_namespace_mismatch')
+        ledger = existing_ledger(module._privacy_erasure, home / 'memory-wiki')
+        reader = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=3.0)
+        fence, primary = None, None
+        try:
+            reader.row_factory = sqlite3.Row
+            reader.execute('PRAGMA query_only=ON')
+            fence = cls(None, reader, home=home, ledger=ledger, _worker=module)
+            if not fence.ok:
+                raise DeliveryWithheld('claim_index_reader_admission_unproven')
+            yield fence
+        except BaseException as exc:
+            primary = exc
+            raise
+        finally:
+            try:
+                reader.close()
+            except BaseException:
+                _INDEX_READERS_UNKNOWN.append((reader, fence))
+                if primary is not None:
+                    primary.add_note('claim_index_reader_cleanup_UNKNOWN')
+                else:
+                    raise
+
     def documents(self, rows):
         ids = [r.get('source_id','') for r in rows]
         sources = self.watch('document_sources','source_id',ids)
@@ -370,7 +459,10 @@ class DisclosureFence:
 
     def _eligible(self, row, purpose, session, include_projects):
         cid = str(row['id'])
-        if self.foreign:
+        if self.worker is not None:
+            if purpose != 'outbox_index' or row['status'] != 'active' or not (row['normalized_claim'] or row['claim']):
+                return False
+        elif self.foreign:
             if str(row['visibility_scope']) != 'global':
                 return False
             # Existing federation policy is stricter than diagnostic STRICT=0.
@@ -389,7 +481,8 @@ class DisclosureFence:
         for entry in self.erasure:
             if not self.ledger._owner_allows(entry['owner'],row,'claim'):
                 continue
-            text = self.provider._disclosure_normalize(str(row['normalized_claim'] or row['claim'])).casefold()
+            normalize = self.worker.normalize_claim if self.worker is not None else self.provider._disclosure_normalize
+            text = normalize(str(row['normalized_claim'] or row['claim'])).casefold()
             if (self.ledger.digest('claim-id',cid) in entry['claims'] or
                     (int(row['created_at'])<=int(entry['created_at']) and self.ledger._contains_digest(text,entry['claim_text'],'claim-text'))):
                 return False
@@ -420,12 +513,13 @@ class DisclosureFence:
                     if any(not self._unerased(r) for rows in eligible.values() for r in rows):
                         return False
                 self.policy_ids = {}
-                if not self.foreign:
+                if not self.foreign and self.worker is None:
                     for purpose in {p[0] for p in self.purposes.values()}:
                         ids = sorted(cid for cid, p in self.purposes.items() if p[0] == purpose)
                         accepted = set()
-                        policy = (_delivery.policies[(id(self), purpose)] if owned
-                                  else self.provider._claim_metadata_eligibility_sql(purpose))
+                        policy = (_delivery.policies[(id(self), purpose)] if owned else
+                                  "status='active' AND normalized_claim IS NOT NULL AND normalized_claim!=''"
+                                  if purpose == 'full_reindex' else self.provider._claim_metadata_eligibility_sql(purpose))
                         for offset in range(0, len(ids), BATCH):
                             chunk = ids[offset:offset+BATCH]
                             accepted.update(str(r[0]) for r in self.conn.execute(

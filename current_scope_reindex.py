@@ -196,6 +196,11 @@ def reindex(provider: Any, module: Any, limit: int, *, dry_run: bool) -> dict[st
         for row in selected:
             result["attempts"] += 1
             try:
+                # Capture before hydration/context callbacks. Only this SQL/
+                # ledger admission travels to embedding: current_document also
+                # prepares external target GETs and must not run at dispatch.
+                disclosure = module._DisclosureFence(provider, conn)
+                disclosure.index_claim(row, 'scoped_reindex')
                 # No registered-vector path at all: invisible vectors cannot
                 # become an alternative authority for this operation.
                 with provider._lock:
@@ -205,7 +210,9 @@ def reindex(provider: Any, module: Any, limit: int, *, dry_run: bool) -> dict[st
                     finally:
                         conn.rollback()
                 text_hash = module.sha(text.strip())
-                vector = module._validate_embedding_vector(module._embed_document(text), "scope claim")
+                vector = module._validate_embedding_vector(
+                    module._embed_document(text, _admit=disclosure.admit_index), "scope claim")
+                disclosure.admit_index()
                 if vector is None:
                     raise ValueError("scope_embedding_unavailable_or_invalid")
                 with provider._lock:

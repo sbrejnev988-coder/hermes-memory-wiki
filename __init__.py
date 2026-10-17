@@ -1401,11 +1401,11 @@ def _embedding_cache_get(text: str, input_type: str) -> Optional[List[float]]:
         return vector
 
 
-def _embedding_store_locked(state, key, input_type, vector):
+def _embedding_store_locked(state, key, input_type, vector, *, _entry=None):
     ttl = EMBED_QUERY_CACHE_TTL_SECONDS if input_type == "search_query" else EMBED_DOCUMENT_CACHE_TTL_SECONDS
     if ttl <= 0 or EMBED_CACHE_MAX_ENTRIES <= 0 or not vector:
         return
-    state["cache"][key] = (time.monotonic() + ttl, list(vector))
+    state["cache"][key] = _entry if _entry is not None else (time.monotonic() + ttl, list(vector))
     state["cache"].move_to_end(key)
     _embedding_metric(state, "stores")
     while len(state["cache"]) > EMBED_CACHE_MAX_ENTRIES:
@@ -1428,14 +1428,22 @@ def _embedding_prefetch_stop_reason() -> str:
     return reason
 
 
-def _embedding_cached_call(text: str, input_type: str, producer: Any) -> Optional[List[float]]:
+def _embedding_source_check(admit):
+    # SQL/ledger checks must never run with the shared cache lock held. They
+    # may wait; the SAME semantic owner/Event/deadline is checked afterwards.
+    if admit is not None:
+        admit()
+        _semantic_io_check("embedding")
+
+
+def _embedding_cached_call(text: str, input_type: str, producer: Any, *, _admit=None) -> Optional[List[float]]:
     if _embedding_prefetch_stop_reason():
         return None
     canonical = _normalized_embedding_input(text, input_type)
     started = time.monotonic()
+    _embedding_source_check(_admit)
+
     def produce():
-        # Capture this producer's outcome even without a request collector, so
-        # coalesced callers retain its timeout rather than a generic miss.
         receipt = _SEARCH_RECEIPT.get()
         stage = {}
         token = _SEARCH_RECEIPT.set({**(receipt or {}), "embedding": stage})
@@ -1445,6 +1453,7 @@ def _embedding_cached_call(text: str, input_type: str, producer: Any) -> Optiona
             _SEARCH_RECEIPT.reset(token)
             if receipt is not None:
                 receipt["embedding"].update(stage)
+
     if not canonical:
         _stage_receipt("embedding", "not_run", "empty_query")
         return None
@@ -1456,6 +1465,7 @@ def _embedding_cached_call(text: str, input_type: str, producer: Any) -> Optiona
         _stage_receipt("embedding", "executed" if vector else "timeout" if stage.get("status") == "timeout" else "failed",
                        "cache_disabled" if vector else stage.get("reason") or "embedding_unavailable",
                        elapsed_ms=(time.monotonic()-started)*1000)
+        _embedding_source_check(_admit)
         return vector
     with _EMBED_CACHE_LOCK:
         if _embedding_prefetch_stop_reason():
@@ -1470,19 +1480,22 @@ def _embedding_cached_call(text: str, input_type: str, producer: Any) -> Optiona
             return None
         if cached is not None:
             _embedding_metric(state, "hits", generation_metrics)
-            _hybrid_note("embedding_cache", "hit", generation=generation, elapsed_ms=(time.monotonic()-started)*1000)
-            _stage_receipt("embedding", "cache_hit", elapsed_ms=(time.monotonic()-started)*1000)
-            return cached
-        flight = state["flights"].get(key)
-        owner = flight is None
-        if owner:
-            flight = {"event": threading.Event(), "result": None, "invalidated": False}
-            state["flights"][key] = flight
-            _embedding_metric(state, "misses", generation_metrics)
         else:
-            _embedding_metric(state, "coalesced", generation_metrics)
-    _hybrid_note("embedding_cache", "producer" if owner else "waiter", generation=generation)
+            flight = state["flights"].get(key)
+            owner = flight is None
+            if owner:
+                flight = {"event": threading.Event(), "result": None, "invalidated": False}
+                state["flights"][key] = flight
+                _embedding_metric(state, "misses", generation_metrics)
+            else:
+                _embedding_metric(state, "coalesced", generation_metrics)
+    if cached is not None:
+        _hybrid_note("embedding_cache", "hit", generation=generation, elapsed_ms=(time.monotonic()-started)*1000)
+        _stage_receipt("embedding", "cache_hit", elapsed_ms=(time.monotonic()-started)*1000)
+        _embedding_source_check(_admit)
+        return cached
     if not owner:
+        _hybrid_note("embedding_cache", "waiter", generation=generation)
         wait_seconds = float(EMBED_CACHE_SINGLEFLIGHT_WAIT_SECONDS)
         if _prefetch_active():
             wait_seconds = _prefetch_network_timeout(wait_seconds, reserve=PREFETCH_FALLBACK_RESERVE_SECONDS)
@@ -1501,56 +1514,66 @@ def _embedding_cached_call(text: str, input_type: str, producer: Any) -> Optiona
                        elapsed_ms=(time.monotonic()-started)*1000)
         _hybrid_note("embedding_cache", "coalesced" if result else "generation_invalidated" if flight["invalidated"] else "not_stored",
                      elapsed_ms=(time.monotonic()-started)*1000, generation_valid=not flight["invalidated"])
-        return list(result) if result else None
+        accepted = list(result) if result else None
+        _embedding_source_check(_admit)
+        return accepted
+    stored = None
     try:
+        _hybrid_note("embedding_cache", "producer", generation=generation)
         vector, stage = produce()
-    except Exception as exc:
-        outcome = ("timeout" if isinstance(exc, TimeoutError) else "failed", _safe_exception_label(exc))
+        accepted = list(vector) if vector else None
+        outcome = ("timeout" if stage.get("status") == "timeout" else "failed",
+                   stage.get("reason") or "embedding_unavailable")
+        ttl = EMBED_QUERY_CACHE_TTL_SECONDS if input_type == "search_query" else EMBED_DOCUMENT_CACHE_TTL_SECONDS
+        # Retain exact tentative identity BEFORE the helper can publish/raise.
+        # Even an unwind at its return cannot leave an unadmitted cache entry.
+        stored = (time.monotonic() + ttl, list(accepted)) if accepted and ttl > 0 else None
+        _embedding_source_check(_admit)
+        with _EMBED_CACHE_LOCK:
+            # Do not adopt/revert a later generation or overwrite another
+            # attempt's replacement flight/cache entry with this old result.
+            stop_reason = _embedding_prefetch_stop_reason()
+            if stop_reason:
+                accepted, outcome = None, ("timeout", stop_reason)
+            elif (state["generation"] != generation or flight["invalidated"]
+                  or state["flights"].get(key) is not flight):
+                accepted, outcome = None, ("failed", "generation_invalidated")
+            elif _embedding_cache_sync_configuration_locked() != signature:
+                accepted, outcome = None, ("failed", "generation_invalidated")
+            stop_reason = _embedding_prefetch_stop_reason()
+            if stop_reason:
+                accepted, outcome = None, ("timeout", stop_reason)
+            if accepted:
+                _embedding_store_locked(state, key, input_type, accepted, _entry=stored)
+        _hybrid_note("embedding_cache", "stored" if accepted and ttl > 0 else "not_stored",
+                     generation_valid=state["generation"] == generation and not flight["invalidated"], elapsed_ms=(time.monotonic()-started)*1000)
+        _stage_receipt("embedding", "executed" if accepted else outcome[0], "" if accepted else outcome[1],
+                       elapsed_ms=(time.monotonic()-started)*1000)
+        result = list(accepted) if accepted else None
+        _embedding_source_check(_admit)
         with _EMBED_CACHE_LOCK:
             if state["flights"].get(key) is flight:
                 state["flights"].pop(key, None)
-            flight["outcome"] = outcome
+            flight["result"], flight["outcome"] = result, outcome
             flight["event"].set()
-        _stage_receipt("embedding", *outcome, elapsed_ms=(time.monotonic()-started)*1000)
+        _embedding_source_check(_admit)
+        return result
+    except BaseException as exc:
+        # No callback is retained in cache/flight. Withdraw only our tentative
+        # entry; a same-text healthy caller's replacement remains untouched.
+        try:
+            with _EMBED_CACHE_LOCK:
+                if stored is not None and state["cache"].get(key) is stored:
+                    state["cache"].pop(key, None)
+                if state["flights"].get(key) is flight:
+                    state["flights"].pop(key, None)
+                flight.update(result=None, outcome=("timeout" if isinstance(exc, TimeoutError) else "failed",
+                                                    _safe_exception_label(exc)))
+                flight["event"].set()
+            _stage_receipt("embedding", *flight["outcome"], elapsed_ms=(time.monotonic()-started)*1000)
+        except BaseException:
+            exc.add_note("embedding_flight_cleanup_unknown")
         raise
-    accepted = list(vector) if vector else None
-    outcome = ("timeout" if stage.get("status") == "timeout" else "failed",
-               stage.get("reason") or "embedding_unavailable")
-    with _EMBED_CACHE_LOCK:
-        # Check the captured generation BEFORE synchronizing. A late producer
-        # still carries old profile settings; synchronizing first would revert
-        # the new generation and invalidate its healthy cache/flights.
-        stop_reason = _embedding_prefetch_stop_reason()
-        if stop_reason:
-            accepted = None
-            outcome = ("timeout", stop_reason)
-        elif state["generation"] != generation or flight["invalidated"]:
-            accepted = None
-            outcome = ("failed", "generation_invalidated")
-        else:
-            current = _embedding_cache_sync_configuration_locked()
-            if current != signature:
-                accepted = None
-                outcome = ("failed", "generation_invalidated")
-        # Synchronization/lock acquisition can consume the remaining budget.
-        # Never publish a late producer to either the cache or its waiters.
-        stop_reason = _embedding_prefetch_stop_reason()
-        if stop_reason:
-            accepted = None
-            outcome = ("timeout", stop_reason)
-        if accepted:
-            _embedding_store_locked(state, key, input_type, accepted)
-        if state["flights"].get(key) is flight:
-            state["flights"].pop(key, None)
-        flight["result"] = accepted
-        flight["outcome"] = outcome
-        flight["event"].set()
-    ttl = EMBED_QUERY_CACHE_TTL_SECONDS if input_type == "search_query" else EMBED_DOCUMENT_CACHE_TTL_SECONDS
-    _hybrid_note("embedding_cache", "stored" if accepted and ttl > 0 else "not_stored",
-                 generation_valid=state["generation"] == generation and not flight["invalidated"], elapsed_ms=(time.monotonic()-started)*1000)
-    _stage_receipt("embedding", "executed" if accepted else outcome[0], "" if accepted else outcome[1],
-                   elapsed_ms=(time.monotonic()-started)*1000)
-    return list(accepted) if accepted else None
 
 # Fail closed when a remote model slug is accidentally routed to the local hash stub.
 # This was previously easy to miss because a healthy :4000 endpoint made the
@@ -2864,6 +2887,7 @@ def _claim_outbox_vector(
     payload: Dict[str, Any],
     document: str,
     manifest_hash: str,
+    *, _admit=None,
 ) -> Optional[List[float]]:
     """Reuse a precomputed vector only when it belongs to the current text/manifest."""
     supplied = payload.get("vector")
@@ -2875,8 +2899,9 @@ def _claim_outbox_vector(
         and str(supplied_payload.get("vector_text_hash") or "") == sha(document)
         and str(supplied_payload.get("manifest_hash") or "") == manifest_hash
     ):
+        _embedding_source_check(_admit)
         return supplied
-    return _embed_document(document)
+    return _embed_document(document, _admit=_admit)
 
 
 def _outbox_process(batch_size=50, *, db_path: Optional[str] = None, worker_id: str = "") -> dict:
@@ -2970,97 +2995,100 @@ def _outbox_process_scoped(batch_size=50, *, db_path: Optional[str] = None, work
                         endpoint=claim_target_endpoint,
                         manifest_hash=claim_target_manifest,
                     )
-                    snapshot = _load_active_claim_index_snapshot(path, str(row["object_id"]))
-                    if snapshot is None:
-                        # An inactive claim may only have a retained delivery
-                        # hint for its former target. Preserve that location
-                        # for privacy cleanup; the ledger adds any other known
-                        # targets. The profile fence rejects foreign hints.
-                        cleanup_hint = (
-                            payload if str(payload.get("collection") or "").strip()
-                            else claim_target_payload
-                        )
-                        if not _delete_claim_vector_targets(
-                            path, str(row["object_id"]), cleanup_hint,
-                        ):
-                            raise RuntimeError("inactive claim cleanup failed")
-                        performed_operation = "delete"
-                    else:
-                        document = str(snapshot.get("index_text") or "").strip()
-                        manifest_hash = claim_target_manifest
-                        vector = _claim_outbox_vector(payload, document, manifest_hash)
-                        embedded_document = not (
-                            operation == "upsert" and vector is payload.get("vector")
-                        )
-                        if not vector:
-                            raise RuntimeError("embedding generation failed")
-
-                        # Do not publish text from a snapshot that became stale
-                        # while a remote embedding request was in flight.
-                        latest = _load_active_claim_index_snapshot(path, str(row["object_id"]))
-                        if latest is None:
+                    with _DisclosureFence.claim_worker(sys.modules[__name__], path) as disclosure:
+                        snapshot = disclosure.index_snapshot(str(row["object_id"]))
+                        if snapshot is None:
+                            # An inactive claim may only have a retained delivery
+                            # hint for its former target. Preserve that location
+                            # for privacy cleanup; the ledger adds any other known
+                            # targets. The profile fence rejects foreign hints.
+                            cleanup_hint = (
+                                payload if str(payload.get("collection") or "").strip()
+                                else claim_target_payload
+                            )
                             if not _delete_claim_vector_targets(
-                                path, str(row["object_id"]), claim_target_payload,
+                                path, str(row["object_id"]), cleanup_hint,
                             ):
                                 raise RuntimeError("inactive claim cleanup failed")
                             performed_operation = "delete"
-                        elif str(latest.get("index_text") or "").strip() != document:
-                            raise RuntimeError("claim text changed during embedding; retrying")
                         else:
-                            qpayload = _qdrant_claim_payload(
-                                str(row["object_id"]), document, latest,
-                                manifest_hash=manifest_hash,
+                            document = str(snapshot.get("index_text") or "").strip()
+                            manifest_hash = claim_target_manifest
+                            vector = _claim_outbox_vector(payload, document, manifest_hash,
+                                _admit=disclosure.admit_index)
+                            disclosure.admit_index()
+                            embedded_document = not (
+                                operation == "upsert" and vector is payload.get("vector")
                             )
-                            if qpayload["visibility_scope"] == "invalid":
-                                raise RuntimeError("authoritative claim visibility is invalid")
-                            # Commit the possible target before remote I/O. If
-                            # the process dies after Qdrant accepts the PUT, a
-                            # later privacy operation still knows this location.
-                            with sqlite3.connect(path, timeout=30.0) as target_db:
-                                target_db.execute("PRAGMA busy_timeout=30000")
-                                claim_target_payload = _record_claim_vector_target(
-                                    target_db, str(row["object_id"]),
-                                    collection=claim_target_collection,
-                                    endpoint=claim_target_endpoint,
-                                    manifest_hash=manifest_hash,
-                                    status="write_pending",
-                                )
-                            if claim_target_endpoint != _normalized_qdrant_endpoint():
-                                raise RuntimeError("Qdrant endpoint changed before claim upsert")
-                            if not _qdrant_upsert(
-                                row["object_id"], vector, qpayload,
-                                collection=claim_target_collection,
-                            ):
-                                raise RuntimeError("Qdrant upsert failed")
-                            # A status, text, or ACL mutation can commit while
-                            # the remote PUT is in flight. Re-read the complete
-                            # canonical payload contract and immediately remove
-                            # the point if the just-published snapshot is stale.
-                            final_snapshot = _load_active_claim_index_snapshot(
-                                path, str(row["object_id"]),
-                            )
-                            final_qpayload = (
-                                _qdrant_claim_payload(
-                                    str(row["object_id"]),
-                                    str(final_snapshot.get("index_text") or "").strip(),
-                                    final_snapshot,
-                                    manifest_hash=manifest_hash,
-                                )
-                                if final_snapshot is not None else None
-                            )
-                            if final_qpayload != qpayload:
+                            if not vector:
+                                raise RuntimeError("embedding generation failed")
+
+                            # Do not publish text from a snapshot that became stale
+                            # while a remote embedding request was in flight.
+                            latest = _load_active_claim_index_snapshot(path, str(row["object_id"]))
+                            if latest is None:
                                 if not _delete_claim_vector_targets(
                                     path, str(row["object_id"]), claim_target_payload,
                                 ):
-                                    raise RuntimeError("raced claim cleanup failed")
+                                    raise RuntimeError("inactive claim cleanup failed")
                                 performed_operation = "delete"
+                            elif str(latest.get("index_text") or "").strip() != document:
+                                raise RuntimeError("claim text changed during embedding; retrying")
                             else:
-                                claim_index_snapshot = final_snapshot
-                                claim_index_target = claim_target_payload
-                                payload["memory_revision"] = int(
-                                    final_snapshot.get("memory_revision") or 0
+                                qpayload = _qdrant_claim_payload(
+                                    str(row["object_id"]), document, latest,
+                                    manifest_hash=manifest_hash,
                                 )
-                                payload.update(claim_target_payload)
+                                if qpayload["visibility_scope"] == "invalid":
+                                    raise RuntimeError("authoritative claim visibility is invalid")
+                                # Commit the possible target before remote I/O. If
+                                # the process dies after Qdrant accepts the PUT, a
+                                # later privacy operation still knows this location.
+                                with sqlite3.connect(path, timeout=30.0) as target_db:
+                                    target_db.execute("PRAGMA busy_timeout=30000")
+                                    claim_target_payload = _record_claim_vector_target(
+                                        target_db, str(row["object_id"]),
+                                        collection=claim_target_collection,
+                                        endpoint=claim_target_endpoint,
+                                        manifest_hash=manifest_hash,
+                                        status="write_pending",
+                                    )
+                                if claim_target_endpoint != _normalized_qdrant_endpoint():
+                                    raise RuntimeError("Qdrant endpoint changed before claim upsert")
+                                if not _qdrant_upsert(
+                                    row["object_id"], vector, qpayload,
+                                    collection=claim_target_collection,
+                                ):
+                                    raise RuntimeError("Qdrant upsert failed")
+                                # A status, text, or ACL mutation can commit while
+                                # the remote PUT is in flight. Re-read the complete
+                                # canonical payload contract and immediately remove
+                                # the point if the just-published snapshot is stale.
+                                final_snapshot = _load_active_claim_index_snapshot(
+                                    path, str(row["object_id"]),
+                                )
+                                final_qpayload = (
+                                    _qdrant_claim_payload(
+                                        str(row["object_id"]),
+                                        str(final_snapshot.get("index_text") or "").strip(),
+                                        final_snapshot,
+                                        manifest_hash=manifest_hash,
+                                    )
+                                    if final_snapshot is not None else None
+                                )
+                                if final_qpayload != qpayload:
+                                    if not _delete_claim_vector_targets(
+                                        path, str(row["object_id"]), claim_target_payload,
+                                    ):
+                                        raise RuntimeError("raced claim cleanup failed")
+                                    performed_operation = "delete"
+                                else:
+                                    claim_index_snapshot = final_snapshot
+                                    claim_index_target = claim_target_payload
+                                    payload["memory_revision"] = int(
+                                        final_snapshot.get("memory_revision") or 0
+                                    )
+                                    payload.update(claim_target_payload)
                 elif object_type == "episode" and operation in {"upsert", "embed_and_upsert"}:
                     # Retained episode JSON is never authoritative.  It can
                     # survive a delete/expiry while a remote embed is in flight,
@@ -4462,7 +4490,7 @@ def _qdrant_point_id(claim_id: str):
 
 
 # --- Embedding dispatch: provider-aware document vs query ---
-def _embed_document(text: str) -> Optional[List[float]]:
+def _embed_document(text: str, *, _admit=None) -> Optional[List[float]]:
     """Embedding для индексации документа с bounded in-process reuse."""
     if not EMBED_CONTRACT_VALID or not _semantic_profile_ready():
         return None
@@ -4479,10 +4507,11 @@ def _embed_document(text: str) -> Optional[List[float]]:
         raw,
         "search_document",
         lambda canonical: (
-            _openrouter_embed(canonical, input_type="search_document")
+            _openrouter_embed(canonical, input_type="search_document", _admit=_admit)
             if EMBED_PROVIDER in ("openrouter", "nous")
-            else _embed_for_qdrant(canonical, task_type="search_document")
+            else _embed_for_qdrant(canonical, task_type="search_document", _admit=_admit)
         ),
+        _admit=_admit,
     )
 
 
@@ -4565,7 +4594,7 @@ def _openrouter_available(*, allow_probe: bool = True) -> bool:
         return False
     return _openrouter_embed("memory-wiki embedding health probe", input_type="search_query", timeout=10.0) is not None
 
-def _embed_req(method: str, path: str, body: Optional[dict] = None, timeout: float = 6.0) -> Optional[dict]:
+def _embed_req(method: str, path: str, body: Optional[dict] = None, timeout: float = 6.0, *, _admit=None) -> Optional[dict]:
     """Local embedding HTTP remains owner-scoped; no unbounded read/encode."""
     if not _semantic_profile_ready() or not EMBED_CONTRACT_VALID:
         return None
@@ -4578,10 +4607,12 @@ def _embed_req(method: str, path: str, body: Optional[dict] = None, timeout: flo
         request_timeout = _prefetch_network_timeout(timeout)
         if request_timeout <= 0.0:
             raise TimeoutError("semantic_io_deadline")
-        with _observed_semantic_http(req, timeout=request_timeout, stage="embedding") as (response, observation):
+        with _observed_semantic_http(req, timeout=request_timeout, stage="embedding",
+                                     _before_dispatch=_admit) as (response, observation):
             result = _semantic_response_json(response, check=check)
             _hybrid_http_response(observation, result)
         check()
+        _embedding_source_check(_admit)
         return result
     except urllib.error.HTTPError as exc:
         if _semantic_close_http_error(exc, "embedding"):
@@ -4615,7 +4646,7 @@ def _validate_embedding_vector(vector: Any, source: str) -> Optional[List[float]
     return values
 
 
-def _embed_for_qdrant(text: str, task_type: str = "search_document") -> Optional[List[float]]:
+def _embed_for_qdrant(text: str, task_type: str = "search_document", *, _admit=None) -> Optional[List[float]]:
     """Embedding для Qdrant — поддерживает task_type для Qwen3-Embedding.
     
     - task_type="search_query": добавляется retrieval-инструкция
@@ -4634,18 +4665,20 @@ def _embed_for_qdrant(text: str, task_type: str = "search_document") -> Optional
     elif task_type == "search_document" and QWEN_DOCUMENT_PREFIX:
         payload["instruction"] = QWEN_DOCUMENT_PREFIX
     
-    result = _embed_req("POST", "/embeddings", payload)
+    result = _embed_req("POST", "/embeddings", payload, _admit=_admit)
     data = (result or {}).get("data")
     if not isinstance(data, list) or not data or not isinstance(data[0], dict):
         return None
     vector = data[0].get("embedding")
     if vector is None:
         return None
-    return _validate_embedding_vector(vector, "local embedding endpoint")
+    validated = _validate_embedding_vector(vector, "local embedding endpoint")
+    _embedding_source_check(_admit)
+    return validated
 
 
 def _http_json_via_curl(method: str, path: str, body: Optional[dict] = None,
-                        timeout: float = 30.0, headers: Optional[dict] = None) -> Optional[dict]:
+                        timeout: float = 30.0, headers: Optional[dict] = None, *, _admit=None) -> Optional[dict]:
     """Nous retains curl, the exact owner key/URL and bounded stdin/pipes.
 
     Successful bounded stdout EOF/exit is not an independently verified libcurl
@@ -4686,9 +4719,11 @@ def _http_json_via_curl(method: str, path: str, body: Optional[dict] = None,
         cmd[5] = str(attempt_timeout)
         raw = _semantic_curl_capture(cmd, config_input,
             attempt_timeout if _prefetch_active() else timeout + 5.0,
-            check=check, cleanup_remaining=lambda: _prefetch_time_remaining(3.0))
+            check=check, cleanup_remaining=lambda: _prefetch_time_remaining(3.0),
+            _before_factory=_admit)
         result = _semantic_json_body(raw, check=check)
         check()
+        _embedding_source_check(_admit)
         return result
     except Exception as exc:
         if (getattr(exc, "code", "") == "curl_cleanup_unknown"
@@ -4703,7 +4738,7 @@ def _http_json_via_curl(method: str, path: str, body: Optional[dict] = None,
 
 
 # --- OpenRouter/Nous Embeddings client ---
-def _openrouter_embed(text: str, *, input_type: str, timeout: float = 30.0) -> Optional[List[float]]:
+def _openrouter_embed(text: str, *, input_type: str, timeout: float = 30.0, _admit=None) -> Optional[List[float]]:
     """OpenRouter embeddings — Bearer auth, model, dimensions, retry."""
     if _embedding_prefetch_stop_reason():
         return None
@@ -4755,7 +4790,8 @@ def _openrouter_embed(text: str, *, input_type: str, timeout: float = 30.0) -> O
             if attempt_timeout <= 0.0:
                 _stage_receipt("embedding", "timeout", "deadline")
                 return None
-            result = _http_json_via_curl("POST", "/embeddings", payload, timeout=attempt_timeout, headers=headers)
+            result = _http_json_via_curl("POST", "/embeddings", payload, timeout=attempt_timeout,
+                                         headers=headers, _admit=_admit)
             if _embedding_prefetch_stop_reason():
                 return None
             if isinstance(result, dict):
@@ -4766,6 +4802,7 @@ def _openrouter_embed(text: str, *, input_type: str, timeout: float = 30.0) -> O
                         validated = _validate_embedding_vector(vector, "Nous embeddings")
                         if _embedding_prefetch_stop_reason():
                             return None
+                        _embedding_source_check(_admit)
                         return validated
                     error_info = "empty embedding in data"
                 else:
@@ -4799,10 +4836,12 @@ def _openrouter_embed(text: str, *, input_type: str, timeout: float = 30.0) -> O
                 _stage_receipt("embedding", "timeout", "deadline")
                 _debug_log("OpenRouter embeddings skipped because prefetch budget expired")
                 return None
-            with _observed_semantic_http(request, timeout=attempt_timeout, stage="embedding") as (response, observation):
+            with _observed_semantic_http(request, timeout=attempt_timeout, stage="embedding",
+                                         _before_dispatch=_admit) as (response, observation):
                 result = _semantic_response_json(response, check=lambda: _semantic_io_check("embedding"))
                 _hybrid_http_response(observation, result)
             _semantic_io_check("embedding")
+            _embedding_source_check(_admit)
             break
         except urllib.error.HTTPError as exc:
             if not _semantic_close_http_error(exc, "embedding"):
@@ -4868,6 +4907,7 @@ def _openrouter_embed(text: str, *, input_type: str, timeout: float = 30.0) -> O
         return None
     if validated is None:
         _stage_receipt("embedding", "failed", "invalid_vector")
+    _embedding_source_check(_admit)
     return validated
 
 
@@ -24852,14 +24892,19 @@ class MemoryWikiProvider(MemoryProvider):
             nonlocal ok_count, last_error
             cid = str(row["id"])
             try:
+                # Pin owner/epoch before visibility callbacks, but do not read
+                # foreign SQL text. Foreign registered-vector copy is unchanged.
+                disclosure = _DisclosureFence(self, c)
                 if self._claim_visible(row):
+                    disclosure.index_claim(row, 'full_reindex')
                     text = visible_document(row)
                     if text is None:
                         raise ValueError("visible claim changed during reindex")
-                    vector = _embed_document(text)
+                    vector = _embed_document(text, _admit=disclosure.admit_index)
                     payload = _qdrant_claim_payload(
                         cid, text, row, manifest_hash=manifest_hash,
                     )
+                    disclosure.admit_index()
                 else:
                     verified = _qdrant_registered_claim_vector_for_reindex(
                         c, cid, row, manifest_hash,
