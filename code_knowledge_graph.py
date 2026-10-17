@@ -1272,13 +1272,18 @@ def _graph_commit_fence(conn, flight):
             raise TimeoutError('graph_original_deadline_exceeded')
 
 
-def _document_commit_fence(conn, flight):
+def _document_commit_fence(conn, flight, *, check_sql_image=True):
     """Pure exact owning-stage fence, not a replacement policy/path admission.
 
     Full original document guards ran under the owning write transaction. A
     user authorizer cannot safely repeat their SQL/filesystem checks here and
     is explicitly refused AFTER its callback, before the native effect. Trace
     and progress lifetimes are refused before the native call, never disabled.
+
+    Check the frozen SQL counter at native entry and COMMIT admission. Later
+    authorizer calls can belong to SQLite's own FTS synchronization, which
+    legitimately changes total_changes. They still require this exact live
+    owner/stage/image/flight and never admit an arbitrary user callback.
     """
     owner, stage, image, thread = flight
     if (conn._document_commit_flight is not flight
@@ -1289,7 +1294,7 @@ def _document_commit_fence(conn, flight):
             or image[0] is not stage or stage[0] is not conn or stage[1] != thread
             or len(stage[2]) != len(image[1])
             or any(a is not b for a, b in zip(stage[2], image[1]))
-            or conn.total_changes != image[2]
+            or (check_sql_image and conn.total_changes != image[2])
             or owner._lifecycle_state in {'failed', 'quarantined', 'stopping'}
             or owner._transaction_quarantine is not None):
         raise PermissionError('document_native_commit_image_changed')
@@ -1392,7 +1397,9 @@ class _GraphCommitConnection(sqlite3.Connection):
             if flight is not None:
                 _graph_commit_fence(self, flight)
             if document_flight is not None:
-                _document_commit_fence(self, document_flight)
+                _document_commit_fence(
+                    self, document_flight,
+                    check_sql_image=action == sqlite3.SQLITE_TRANSACTION and a == 'COMMIT')
                 if callback is not None:
                     # Actor/SQL-delta checks alone cannot prove original scope,
                     # connector, file/path and lifecycle authority after arbitrary
