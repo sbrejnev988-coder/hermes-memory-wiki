@@ -307,7 +307,7 @@ def test_public_sdk_final_hook(graph_case):
             with openai.OpenAI(api_key='authored-header-only', base_url='https://chatgpt.com/backend-api/codex',
                                http_client=http, max_retries=0, organization='', project='') as sdk:
                 if revoke:
-                    with pytest.raises(openai.APIConnectionError):
+                    with pytest.raises(case.m._DeliveryWithheld):
                         sdk.responses.create(model='gpt-authored', input=f.TEXT, store=False)
                 else:
                     sdk.responses.create(model='gpt-authored', input=f.TEXT, store=False)
