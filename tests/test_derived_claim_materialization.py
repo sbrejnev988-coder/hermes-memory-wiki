@@ -392,15 +392,14 @@ def test_duplicate_and_review_patch_have_no_pending_effects(derived_case):
                          dict(file_path='src/auxiliary.py', new_content_hash=hashlib.sha256(b'different').hexdigest())]})
         assert duplicate['deduplicated'] and duplicate['invalidations'] == []
         assert c.durable()['images']['code_graph_chunks'] == before['images']['code_graph_chunks']
-        # One oversized path is mapped to a compact opaque identity and can
-        # legitimately pass quality. Five individually bounded ordinary paths
-        # instead retain a >420-character low-diversity outcome after the real
-        # mapper. Exercise the genuine quality/review path, never a stand-in.
+        # The generic redactor also maps long slash-only words. Dots split
+        # those runs without changing policy; repeated main tokens keep the
+        # real >420-character outcome below the unconditional quality0.34 gate.
         review_files = ['src/main.py', *[
-            'src/' + 'auxiliary/' * 9 + leaf + '.py'
-            for leaf in ('alpha', 'beta', 'gamma', 'delta')
+            'src/' + 'main.' * 20 + leaf + '.py'
+            for leaf in ('main', 'Main', 'MAIN', 'mAiN')
         ]]
-        review_event = {**original, 'event_id': 'event-plain', 'patch_id': 'plain', 'outcome': 'applied',
+        review_event = {**original, 'event_id': 'event-plain', 'patch_id': 'main', 'outcome': 'applied',
                         'changed_files': review_files,
                         'per_file': [dict(file_path=path, new_content_hash=hashlib.sha256(b'different').hexdigest())
                                      for path in review_files]}
@@ -416,7 +415,7 @@ def test_duplicate_and_review_patch_have_no_pending_effects(derived_case):
         assert '<opaque_code_graph_id>' not in row['candidate']
         lint = c.m.lint_claim_text(row['candidate'], 'patch-outcomes')
         gate = c.m.memory_gate_decision(row['candidate'], 'patch-outcomes', 'tool:patch_outcome_add')
-        assert lint['quality'] < 0.48 and gate['action'] == 'queue'
+        assert lint['quality'] < 0.34 and gate['action'] == 'queue'
         assert c.durable()['images']['code_graph_chunks'] == before['images']['code_graph_chunks']
         after_review = c.durable()
         for table in ('claims', 'patch_outcomes', 'integration_events', 'code_graph_chunks', 'code_graph_chunks_fts'):
