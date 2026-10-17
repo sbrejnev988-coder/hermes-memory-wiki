@@ -191,8 +191,8 @@ def test_healthy_user_authorizer_is_refused_only_for_critical_document_stage(der
 
 def test_only_actual_owner_can_finish_document_stage(derived_case):
     with fx.Fixture('native-shortcuts') as c:
-        for shortcut in ('commit', 'COMMIT', 'END', 'cursor', 'returned_cursor', 'context', 'script'):
-            source = c.ingest('shortcut-' + shortcut)
+        for index, shortcut in enumerate(('commit', 'COMMIT', 'END', 'cursor', 'returned_cursor', 'context', 'script')):
+            source = c.ingest('shortcut-' + str(index) + '-' + shortcut)
             before = whole_state(c)
             cursor = c.conn.cursor()  # Issued before the stage is created.
             try:
