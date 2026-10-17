@@ -379,7 +379,11 @@ def _assert_connector_owner(provider: Any, source_id: str, *, _conn=None) -> Non
 
 def _managed_connector_cache_root(provider: Any) -> Path:
     # Reserved by the record writer, NOT the configurable attachment scan root.
-    return _absolute_unresolved(Path(provider.home) / "cache" / "documents" / "connectors")
+    # Legacy standalone callers have no home. The existing profile fallback is
+    # only for classifying that reserved namespace, never a connector grant.
+    home = getattr(provider, "home", None)
+    return _absolute_unresolved(Path(home if home is not None else _hermes_home())
+                                / "cache" / "documents" / "connectors")
 
 
 def _within_managed_connector_cache(path: Path, root: Path) -> bool:
@@ -420,6 +424,8 @@ def _managed_connector_admission(provider, conn, path, source_id, scope_id, repo
     root = _managed_connector_cache_root(provider)
     if not _within_managed_connector_cache(path, root):
         return None
+    if getattr(provider, "home", None) is None:
+        raise PermissionError("document_managed_connector_home_required")
     if hook is not None:
         try:
             from .source_connectors import _managed_record_generation
@@ -452,7 +458,8 @@ def _managed_connector_admission(provider, conn, path, source_id, scope_id, repo
 
 def _assert_managed_connector_admission(provider, conn, path, source_id, scope_id, repository_id, admission, *, before):
     root, hook, file_hash, original = admission
-    if _managed_connector_cache_root(provider) != root:
+    if (getattr(provider, "home", None) is None
+            or _managed_connector_cache_root(provider) != root):
         raise PermissionError("document_managed_connector_home_changed")
     if hook is not None:
         try:
