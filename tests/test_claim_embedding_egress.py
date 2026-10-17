@@ -446,3 +446,258 @@ def test_full_indexing_policy(claim_embedding_case):
                   and fr.f_back.f_code.co_name == 'index_row', lambda: f.changed(case, 'ABA')) as seen:
             out = f.public(case, scoped=False, force=True)
         assert seen and case.calls['post'] == 1 and out['failed'] == 1
+
+
+def cache_post_store_observation(case, mode, *, cached_call=None):
+    """Shared schedule; optional exact historical function belongs to evidence only.
+
+    Ordinary shipped regressions use the genuine public query helper. No path
+    outside the candidate peer layout is needed by this module.
+    """
+    m = case.m
+    enable_cache(case)
+    m.EMBED_QUERY_CACHE_TTL_SECONDS = 60
+    query = 'needle post store generation'
+    key = m._embedding_cache_key(query, 'search_query')
+    state = m._embedding_cache_state()
+    generation = state['generation']
+    call = m._embedding_cached_call if cached_call is None else cached_call
+    captured = {}
+    replacement = (time.monotonic() + 60, [0.7] * 8)
+    replacement_flight = {'event': threading.Event(), 'result': None, 'invalidated': False}
+
+    def eligible(frame, event, arg):
+        parent = frame.f_back
+        if event != 'return' or parent is None or parent.f_code is not call.__code__:
+            return False
+        local = parent.f_locals
+        stored = local.get('stored')
+        if (stored is None or state['cache'].get(key) is not stored
+                or local.get('_admit') is not None
+                or (mode == 'sync' and frame.f_locals.get('outcome') != 'stored')):
+            return False
+        assert not m._EMBED_CACHE_LOCK._is_owned(), 'schedule_not_in_unlocked_post_store_gap'
+        captured.update(flight=local['flight'], stored=stored)
+        return True
+
+    def change():
+        # A different normal request context synchronizes its new settings;
+        # this caller then resumes with its OLD context. Never sync it back.
+        if mode == 'sync':
+            scope = dict(m._QDRANT_PROFILE_SCOPE.get())
+            scope['MEMORY_WIKI_QDRANT_COLLECTION'] = 'source_claims_next_generation'
+            token = m._QDRANT_PROFILE_SCOPE.set(scope)
+            try:
+                with m._EMBED_CACHE_LOCK:
+                    m._embedding_cache_sync_configuration_locked()
+            finally:
+                m._QDRANT_PROFILE_SCOPE.reset(token)
+        else:
+            assert mode == 'clear'
+            m._embedding_cache_clear()
+        with m._EMBED_CACHE_LOCK:
+            assert state['generation'] == generation + 1
+            assert captured['flight']['invalidated'] and captured['flight']['result'] is None
+            assert captured['flight']['event'].is_set() and not state['cache']
+            # Authored concurrent same-key replacement metadata, not authority.
+            m._embedding_store_locked(state, key, 'search_query', replacement[1], _entry=replacement)
+            state['flights'][key] = replacement_flight
+            captured.update(generation=state['generation'], signature=state['signature'])
+
+    seam = m._hybrid_note if mode == 'sync' else m._embedding_source_check
+    with f.at(case, seam.__code__, eligible, change) as seen:
+        result = (m._embed_query(query) if cached_call is None else call(
+            query, 'search_query', lambda canonical: m._embed_for_qdrant(canonical, task_type='search_query')))
+    assert seen and case.calls['post'] == 1
+    assert state['generation'] == captured['generation'] and state['signature'] == captured['signature']
+    assert state['cache'][key] is replacement and state['flights'][key] is replacement_flight
+    assert not replacement_flight['event'].is_set(), 'foreign_replacement_flight_was_finished'
+    proof = {'mode': mode, 'post_store_unlocked': True, '_admit': None,
+             'generation_advanced_once': True, 'new_signature_not_reverted': True,
+             'replacement_cache_and_flight_preserved': True,
+             'old_invalidated': captured['flight']['invalidated'],
+             'old_result_nonempty': bool(captured['flight']['result']),
+             'returned_nonempty': bool(result), 'public_query': cached_call is None}
+    case._emit({'event': 'post_store_observation', **proof})
+    return result, proof
+
+
+@pytest.mark.parametrize('mode', ['sync', 'clear'])
+def test_cache_post_store_generation(claim_embedding_case, mode):
+    with f.Fixture() as case:
+        result, proof = cache_post_store_observation(case, mode)
+        assert result is None and not proof['old_result_nonempty'], 'invalidated_success_was_resurrected'
+
+
+@pytest.mark.parametrize('mode', ['cancel', 'deadline'])
+def test_cache_post_store_stop(claim_embedding_case, mode):
+    with f.Fixture() as case:
+        enable_cache(case)
+        m = case.m
+        m.EMBED_QUERY_CACHE_TTL_SECONDS = 60
+        event = threading.Event()
+        deadline = time.monotonic() + (5 if mode == 'cancel' else 1)
+        captured = {}
+        def eligible(frame, ev, arg):
+            parent = frame.f_back
+            if (ev == 'return' and frame.f_locals.get('outcome') == 'stored'
+                    and parent is not None and parent.f_code is m._embedding_cached_call.__code__):
+                assert parent.f_locals['_admit'] is None and not m._EMBED_CACHE_LOCK._is_owned()
+                captured.update(flight=parent.f_locals['flight'], state=parent.f_locals['state'])
+                return True
+            return False
+        def stop():
+            assert m._PREFETCH_LOCAL.cancel_event is event and m._PREFETCH_LOCAL.deadline == deadline
+            if mode == 'cancel':
+                event.set()
+            else:
+                time.sleep(max(0, deadline - time.monotonic()) + .01)
+        with m._prefetch_budget(5, event, deadline=deadline):
+            with f.at(case, m._hybrid_note.__code__, eligible, stop) as seen:
+                result = m._embed_query('needle post store same owner')
+            assert m._PREFETCH_LOCAL.cancel_event is event and m._PREFETCH_LOCAL.deadline == deadline
+        assert seen and result is None and case.calls['post'] == 1
+        assert captured['flight']['result'] is None and captured['flight']['event'].is_set()
+        assert not captured['state']['cache'] and not captured['state']['flights']
+        case._emit({'event': 'post_store_stop', 'mode': mode, 'same_Event_and_absolute_deadline': True,
+                    'returned_none': True, 'own_cache_and_flight_withdrawn': True})
+
+
+def test_cache_return_tails(claim_embedding_case):
+    with f.Fixture() as case:
+        f.seed(case)
+        m = case.m
+        enable_cache(case)
+        m.EMBED_QUERY_CACHE_TTL_SECONDS = 60
+        query = 'needle normal query cache'
+        first = m._embed_query('  needle   normal query cache ')
+        second = m._embed_query(query)
+        assert first == second == f.VECTOR and first is not second and case.calls['post'] == 1
+        first[0] = 9
+        assert m._embed_query(query) == f.VECTOR and case.calls['post'] == 1
+        event = threading.Event()
+        deadline = time.monotonic() + 5
+        hit = lambda fr, ev, arg: ev == 'return' and fr.f_locals.get('status') == 'cache_hit'
+        with m._prefetch_budget(5, event, deadline=deadline):
+            with f.at(case, m._stage_receipt.__code__, hit, event.set) as stopped:
+                assert m._embed_query(query) is None
+            assert m._PREFETCH_LOCAL.cancel_event is event and m._PREFETCH_LOCAL.deadline == deadline
+        # Caller cancellation does not invalidate another healthy caller's cache.
+        assert stopped and m._embed_query(query) == f.VECTOR and case.calls['post'] == 1
+        state = m._embedding_cache_state()
+        generation, signature = state['generation'], state['signature']
+        old_instruction = m.QWEN_QUERY_INSTRUCTION
+        def unsynced_settings():
+            m.QWEN_QUERY_INSTRUCTION = old_instruction + ' changed'
+        with f.at(case, m._stage_receipt.__code__, hit, unsynced_settings) as drifted:
+            assert m._embed_query(query) is None
+        assert drifted and state['generation'] == generation and state['signature'] == signature
+        m.QWEN_QUERY_INSTRUCTION = old_instruction
+        assert m._embed_query(query) == f.VECTOR and case.calls['post'] == 1
+        with f.at(case, m._stage_receipt.__code__, hit, m._embedding_cache_clear) as cleared:
+            assert m._embed_query(query) is None
+        assert cleared and not state['cache'] and not state['flights']
+        original = f.admission(case)
+        assert m._embed_document(f.TEXT, _admit=original.admit_index) == f.VECTOR
+        def source_return(frame, ev, arg):
+            parent = frame.f_back
+            outer = parent.f_back if parent is not None else None
+            return (ev == 'return' and frame.f_locals.get('self') is original
+                    and parent is not None and parent.f_code is m._embedding_source_check.__code__
+                    and outer is not None and outer.f_code is m._embedding_cached_call.__code__
+                    and outer.f_locals.get('cached') is not None)
+        def clear_after_source():
+            assert not m._EMBED_CACHE_LOCK._is_owned(), 'source_SQL_inside_cache_lock'
+            m._embedding_cache_clear()
+        with f.at(case, m._DisclosureFence.admit_index.__code__, source_return, clear_after_source) as admitted:
+            assert m._embed_document(f.TEXT, _admit=original.admit_index) is None
+        assert admitted and not state['cache'] and not state['flights']
+        # Also retain historical None on a late disabled-cache cancellation.
+        m.EMBED_CACHE_MAX_ENTRIES = 0
+        event = threading.Event()
+        with m._prefetch_budget(5, event):
+            with f.at(case, m._stage_receipt.__code__, lambda fr, ev, arg:
+                      ev == 'return' and fr.f_locals.get('reason') == 'cache_disabled', event.set) as disabled:
+                assert m._embed_query(query) is None
+        assert disabled
+        case._emit({'event': 'return_tails', 'healthy_query_and_detached_cache': True,
+                    'late_hit_cancel_clear_unsynced_signature': True,
+                    'genuine_source_callback_outside_lock': True, 'disabled_late_cancel_none': True})
+
+
+def test_cache_waiter_return(claim_embedding_case):
+    with f.Fixture() as case:
+        m = case.m
+        enable_cache(case)
+        m.EMBED_QUERY_CACHE_TTL_SECONDS = 60
+        from agent.memory_provider import spawn_context_thread
+        for mode in ('healthy', 'invalidated', 'late-clear'):
+            m._embedding_cache_clear()
+            query = 'needle waiter ' + mode
+            key = m._embedding_cache_key(query, 'search_query')
+            state = m._embedding_cache_state()
+            started, release = threading.Event(), threading.Event()
+            results, errors, captured = [], [], {}
+            replacement = (time.monotonic() + 60, [0.7] * 8)
+            replacement_flight = {'event': threading.Event(), 'result': None, 'invalidated': False}
+            def hold():
+                started.set()
+                assert release.wait(3), 'query_POST_barrier_timeout'
+            case.on_post = hold
+            def worker_call():
+                try:
+                    with f.at(case, m._hybrid_note.__code__, lambda fr, ev, arg:
+                              mode == 'invalidated' and ev == 'return' and fr.f_locals.get('outcome') == 'stored',
+                              m._embedding_cache_clear):
+                        results.append(m._embed_query(query))
+                except BaseException as exc:
+                    errors.append(type(exc).__name__)
+            worker = spawn_context_thread(worker_call, name='source-query-waiter-' + mode)
+            worker.start()
+            def waiting(frame, ev, arg):
+                parent = frame.f_back
+                if (ev == 'return' and frame.f_locals.get('outcome') == 'waiter'
+                        and parent is not None and parent.f_code is m._embedding_cached_call.__code__):
+                    assert parent.f_locals['_admit'] is None
+                    captured['flight'] = parent.f_locals['flight']
+                    return True
+                return False
+            def replace():
+                with m._EMBED_CACHE_LOCK:
+                    m._embedding_store_locked(state, key, 'search_query', replacement[1], _entry=replacement)
+                    state['flights'][key] = replacement_flight
+            def finish_worker():
+                release.set()
+                worker.join(3)
+                assert not worker.is_alive() and errors == []
+                if mode == 'invalidated':
+                    assert results == [None] and captured['flight']['invalidated']
+                    assert captured['flight']['result'] is None
+                    # Authored stale completion on a genuinely invalidated old
+                    # flight must not win over invalidation, even if nonempty.
+                    captured['flight']['result'] = list(f.VECTOR)
+                    replace()
+            def late_clear():
+                m._embedding_cache_clear()
+                replace()
+            try:
+                assert started.wait(3)
+                with f.at(case, m._hybrid_note.__code__, waiting, finish_worker) as waited:
+                    with f.at(case, m._stage_receipt.__code__, lambda fr, ev, arg:
+                              mode == 'late-clear' and ev == 'return' and fr.f_locals.get('status') == 'coalesced',
+                              late_clear) as late:
+                        result = m._embed_query(query)
+                assert waited
+            finally:
+                release.set()
+                worker.join(5)
+            assert not worker.is_alive() and errors == []
+            assert (result == f.VECTOR if mode == 'healthy' else result is None)
+            assert results == ([None] if mode == 'invalidated' else [f.VECTOR])
+            if mode != 'healthy':
+                assert state['cache'][key] is replacement and state['flights'][key] is replacement_flight
+                assert not replacement_flight['event'].is_set()
+            assert bool(late) == (mode == 'late-clear')
+            case._emit({'event': 'waiter_return', 'mode': mode, 'returned_nonempty': bool(result),
+                        'old_invalidated': captured['flight']['invalidated'],
+                        'replacement_preserved': mode != 'healthy', 'worker_closed': True})

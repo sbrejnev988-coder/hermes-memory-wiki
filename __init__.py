@@ -1466,7 +1466,9 @@ def _embedding_cached_call(text: str, input_type: str, producer: Any, *, _admit=
                        "cache_disabled" if vector else stage.get("reason") or "embedding_unavailable",
                        elapsed_ms=(time.monotonic()-started)*1000)
         _embedding_source_check(_admit)
-        return vector
+        # Telemetry/source admission may have waited even without a claim guard.
+        return None if _prefetch_cancelled() or _prefetch_budget_expired() else vector
+    flight = None
     with _EMBED_CACHE_LOCK:
         if _embedding_prefetch_stop_reason():
             return None
@@ -1489,11 +1491,28 @@ def _embedding_cached_call(text: str, input_type: str, producer: Any, *, _admit=
                 _embedding_metric(state, "misses", generation_metrics)
             else:
                 _embedding_metric(state, "coalesced", generation_metrics)
+    def publication_refusal_locked(*, owning=False):
+        # Metadata only: never run source SQL or synchronize this caller's
+        # possibly stale settings back into a newer shared generation.
+        def invalidated():
+            return (state["generation"] != generation or state["signature"] != signature
+                    or (flight is not None and (flight["invalidated"]
+                        or (owning and state["flights"].get(key) is not flight))))
+        if invalidated():
+            return ("failed", "generation_invalidated")
+        current = _embedding_cache_configuration_signature() + _profile_configuration_generation()
+        stop = "cancelled" if _prefetch_cancelled() else "deadline" if _prefetch_budget_expired() else ""
+        # Recheck the captured identities after the metadata readers as well.
+        if invalidated() or current != signature:
+            return ("failed", "generation_invalidated")
+        return ("timeout", stop) if stop else None
+
     if cached is not None:
         _hybrid_note("embedding_cache", "hit", generation=generation, elapsed_ms=(time.monotonic()-started)*1000)
         _stage_receipt("embedding", "cache_hit", elapsed_ms=(time.monotonic()-started)*1000)
         _embedding_source_check(_admit)
-        return cached
+        with _EMBED_CACHE_LOCK:
+            return cached if publication_refusal_locked() is None else None
     if not owner:
         _hybrid_note("embedding_cache", "waiter", generation=generation)
         wait_seconds = float(EMBED_CACHE_SINGLEFLIGHT_WAIT_SECONDS)
@@ -1508,15 +1527,19 @@ def _embedding_cached_call(text: str, input_type: str, producer: Any, *, _admit=
             _stage_receipt("embedding", "timeout", "singleflight_wait", elapsed_ms=(time.monotonic()-started)*1000)
             _hybrid_note("embedding_cache", "wait_timeout", elapsed_ms=(time.monotonic()-started)*1000)
             return None
-        result = flight.get("result")
-        status, reason = ("failed", "generation_invalidated") if flight["invalidated"] else flight.get("outcome", ("failed", "embedding_unavailable"))
+        with _EMBED_CACHE_LOCK:
+            refused = publication_refusal_locked()
+            result = flight.get("result") if refused is None else None
+            status, reason = refused or flight.get("outcome", ("failed", "embedding_unavailable"))
+            accepted = list(result) if result else None
         _stage_receipt("embedding", "coalesced" if result else status, "" if result else reason,
                        elapsed_ms=(time.monotonic()-started)*1000)
         _hybrid_note("embedding_cache", "coalesced" if result else "generation_invalidated" if flight["invalidated"] else "not_stored",
                      elapsed_ms=(time.monotonic()-started)*1000, generation_valid=not flight["invalidated"])
-        accepted = list(result) if result else None
         _embedding_source_check(_admit)
-        return accepted
+        with _EMBED_CACHE_LOCK:
+            return accepted if (publication_refusal_locked() is None
+                                and flight.get("result") is result) else None
     stored = None
     try:
         _hybrid_note("embedding_cache", "producer", generation=generation)
@@ -1530,19 +1553,9 @@ def _embedding_cached_call(text: str, input_type: str, producer: Any, *, _admit=
         stored = (time.monotonic() + ttl, list(accepted)) if accepted and ttl > 0 else None
         _embedding_source_check(_admit)
         with _EMBED_CACHE_LOCK:
-            # Do not adopt/revert a later generation or overwrite another
-            # attempt's replacement flight/cache entry with this old result.
-            stop_reason = _embedding_prefetch_stop_reason()
-            if stop_reason:
-                accepted, outcome = None, ("timeout", stop_reason)
-            elif (state["generation"] != generation or flight["invalidated"]
-                  or state["flights"].get(key) is not flight):
-                accepted, outcome = None, ("failed", "generation_invalidated")
-            elif _embedding_cache_sync_configuration_locked() != signature:
-                accepted, outcome = None, ("failed", "generation_invalidated")
-            stop_reason = _embedding_prefetch_stop_reason()
-            if stop_reason:
-                accepted, outcome = None, ("timeout", stop_reason)
+            refused = publication_refusal_locked(owning=True)
+            if refused is not None:
+                accepted, outcome = None, refused
             if accepted:
                 _embedding_store_locked(state, key, input_type, accepted, _entry=stored)
         _hybrid_note("embedding_cache", "stored" if accepted and ttl > 0 else "not_stored",
@@ -1552,12 +1565,24 @@ def _embedding_cached_call(text: str, input_type: str, producer: Any, *, _admit=
         result = list(accepted) if accepted else None
         _embedding_source_check(_admit)
         with _EMBED_CACHE_LOCK:
-            if state["flights"].get(key) is flight:
-                state["flights"].pop(key, None)
+            refused = publication_refusal_locked(owning=True)
+            if refused is not None:
+                result, outcome = None, refused
+                if stored is not None and state["cache"].get(key) is stored:
+                    state["cache"].pop(key, None)
             flight["result"], flight["outcome"] = result, outcome
             flight["event"].set()
-        _embedding_source_check(_admit)
-        return result
+            # Event publication can wake other callers. Keep exact ownership
+            # until the final metadata-only return; no SQL/telemetry afterwards.
+            refused = publication_refusal_locked(owning=True)
+            if refused is not None:
+                result = None
+                flight.update(result=None, outcome=refused)
+                if stored is not None and state["cache"].get(key) is stored:
+                    state["cache"].pop(key, None)
+            if state["flights"].get(key) is flight:
+                state["flights"].pop(key, None)
+            return result
     except BaseException as exc:
         # No callback is retained in cache/flight. Withdraw only our tentative
         # entry; a same-text healthy caller's replacement remains untouched.
