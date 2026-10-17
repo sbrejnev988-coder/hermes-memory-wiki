@@ -1,6 +1,7 @@
 """Durable content-free work, ownership, budgets, and deleted-source behavior."""
 from __future__ import annotations
 
+from contextlib import closing
 import importlib.util
 import json
 import sqlite3
@@ -28,7 +29,7 @@ jobs = _module("test_memory_wiki_background_jobs", ROOT / "background_jobs.py")
 
 def _store(tmp_path, *, owner="a" * 64, profile="b" * 64):
     path = tmp_path / "queue.sqlite3"
-    with sqlite3.connect(path) as conn:
+    with closing(sqlite3.connect(path)) as conn, conn:
         jobs.install_schema(conn)
     return jobs.JobStore(path, profile, owner)
 
@@ -51,7 +52,7 @@ def test_payload_is_strictly_content_free(tmp_path):
     with pytest.raises(ValueError):
         store.enqueue("run_shell", _event(), partition)
     store.enqueue("extract_session_events", {**_event(), "high_watermark": 9}, partition)
-    with sqlite3.connect(store.db_path) as conn:
+    with closing(sqlite3.connect(store.db_path)) as conn, conn:
         serialized = conn.execute("SELECT payload_json FROM memory_jobs").fetchone()[0]
     assert json.loads(serialized) == {**_event(), "high_watermark": 9}
     assert "private text" not in serialized
@@ -126,7 +127,7 @@ def test_bounded_retry_and_dead_no_exception_text(tmp_path, monkeypatch):
     assert second and store.finish(second, worker, error_code="network", now=104)
     health = store.health(now=104)
     assert health["dead"] == 1
-    with sqlite3.connect(store.db_path) as conn:
+    with closing(sqlite3.connect(store.db_path)) as conn, conn:
         code = conn.execute("SELECT last_error_code FROM memory_jobs").fetchone()[0]
     assert code == "network"
 
