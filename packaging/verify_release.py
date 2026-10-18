@@ -38,6 +38,10 @@ def main() -> int:
         if not required.is_file():
             fail(f"required release file is missing: {required.relative_to(ROOT)}")
     version = str(tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"]["version"])
+    locked_self = [entry for entry in tomllib.loads(lock.read_text(encoding="utf-8"))["package"]
+                   if entry.get("name") == "hermes-memory-wiki"]
+    if len(locked_self) != 1 or locked_self[0].get("version") != version:
+        fail("uv.lock self-record does not match the project version")
     manifest = (ROOT / "plugin.yaml").read_text(encoding="utf-8")
     runtime = (ROOT / "__init__.py").read_text(encoding="utf-8")
     readme = (ROOT / "README.md").read_text(encoding="utf-8")

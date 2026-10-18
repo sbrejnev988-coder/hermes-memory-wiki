@@ -18,7 +18,9 @@ import types
 from typing import Any, Mapping
 import unittest
 
-ENTRY_SHA256 = "57385a9fd9e7d94658a49d1eb90106346aea0c3e052a4d7110f1a8f0f8f91cc9"
+# Historical entry binding: 57385a9fd9e7d94658a49d1eb90106346aea0c3e052a4d7110f1a8f0f8f91cc9
+# Current release binding; behavioral AST pins below remain independent.
+ENTRY_SHA256 = "bb6815f0f00f9f208f23727d5fa1c09c969eac87326fad5a29b434ac5b9bbf6f"
 EXTRACTOR_SHA256 = "6e7e9df73940c0cfd6a8eced6bc2c250d58a9f455d19a27a3caadbc62da02de2"
 BASE_FACTORY_AST = "41c0ae8690c85534f8a255c36718d5ad85e8708d731b498653249477a85089c7"
 UNCHANGED_NODES = {
@@ -29,7 +31,9 @@ UNCHANGED_NODES = {
 ENTRY_NODES = {
     "MemoryWikiProvider._prepare_claim": "2050762dbc9cad3c235133c6b165882395ce9aff56cf169e030b2e9c17c07ac3",
     "MemoryWikiProvider._add_claim_tx": "a91ee74e9f7ea49f0f1fba0c6493ee96108dfa7137e916217efb227979e3cdde",
-    "MemoryWikiProvider._auto_graph_enrich_extracted_claims": "90775af5db77f524604d8ab785d75b47949bca568743c498bc8c6b2560ecd941",
+    # Historical consumer AST: 90775af5db77f524604d8ab785d75b47949bca568743c498bc8c6b2560ecd941
+    # Accepted settings-unavailable composition; all eligibility assertions stay below.
+    "MemoryWikiProvider._auto_graph_enrich_extracted_claims": "3c011d203ff00faa76ea604651fba3ba58061290d54aca917a1b3d1461138c8a",
     "MemoryWikiProvider._graph_owner": "5f5323c344268fc6c9a74b3b7401490ffdbe9df6c78078f146ad9433070c15ef",
 }
 EXTRACTOR_NODES = {"_evidence_payload": "371091b2e2ca9993cbdd507d657bafe4504ce997806c9adf9927880da28e3aa2"}

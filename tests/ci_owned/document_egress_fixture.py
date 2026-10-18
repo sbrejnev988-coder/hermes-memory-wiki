@@ -25,7 +25,9 @@ SOURCE = Path(os.environ.get('SC2_SOURCE_ROOT', str(Path(__file__).resolve().par
 QUERY = 'needle semantic retrieval'
 SAFE = 'Verified durable navigation remains within the current source boundary.'
 SOURCE_FILES = ('__init__.py', 'background_jobs.py', 'code_knowledge_graph.py', 'collapse.py', 'current_scope_reindex.py', 'decay.py', 'disclosure_fence.py', 'document_extractors.py', 'document_knowledge_graph.py', 'document_worker.py', 'entity_relation_extractor.py', 'episodic_memory.py', 'extractor.py', 'github_source_adapter.py', 'google_drive_source_adapter.py', 'guard.py', 'http_safety.py', 'memory_events.py', 'memory_observations.py', 'migrations.py', 'online_metrics.py', 'patch_secret_context_plugin.py', 'privacy_erasure.py', 'recall_orchestrator.py', 'recall_planner.py', 'sdk.py', 'secret_context_bridge.py', 'semantic_io.py', 'setup.py', 'shared_blocks.py', 'source_connectors.py', 'vault.py', 'vault_aead.py', 'vault_registry_adapter.py', 'visual_evidence.py')
-SOURCE_INVENTORY_SHA256 = '284062dc8ce12475ec3714854e8033760d08f5166b7f8cab1dd4c79e93574b6c'
+# Historical runtime inventory: 284062dc8ce12475ec3714854e8033760d08f5166b7f8cab1dd4c79e93574b6c
+# Rebound to the complete 1.24.6 runtime source; no authority from this hash.
+SOURCE_INVENTORY_SHA256 = '8f7c7cd40277064072e897284cfcf613578bab6d98ee9d206941f10b035c2c17'
 CASE_IDS = ('sc2_healthy', 'sc2_disabled_initial', 'sc2_late_status_before_rank', 'sc2_late_status_before_http', 'sc2_late_owner_before_http', 'sc2_sql_ABA_before_http', 'sc2_session_before_http', 'sc2_generation_before_http', 'sc2_cache_healthy', 'sc2_cache_late_revoke', 'sc2_response_revoke', 'sc2_tail_false_discards_cache', 'sc2_tail_baseexception_discards_cache', 'sc2_tail_baseexception_preserves_replacement', 'sc3_healthy_cache', 'sc3_unavailable_initial', 'sc3_late_delete_before_http', 'sc3_sql_ABA_before_http', 'sc3_session_before_http', 'sc3_generation_before_http', 'sc3_cache_late_revoke', 'sc3_response_revoke')
 CASE_IDS += ('sc4_healthy_cache', 'sc4_ineligible_initial', 'sc4_late_retire_before_http',
              'sc4_sql_ABA_before_http', 'sc4_session_before_http', 'sc4_generation_before_http',

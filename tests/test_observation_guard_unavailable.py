@@ -33,7 +33,9 @@ UNCHANGED_NODES = {
     "_validated_current_version": "76e8bdfc1115aaac4380c09ea795ae6e40bb1621f77f8511df7dac1c5e9917b5",
     "_invalidate_linked_observation": "d8b877b5f12b92a52ed836cc9ba648151058ae158bbddcdcd672303ebf876011",
 }
-PEER_SHA256 = "45316361785ed197cdd096774a481a1609b760a22490b6590a725d23d48a8eb2"
+# Historical peer before graph-intent/settings oracle correspondence repair:
+# 45316361785ed197cdd096774a481a1609b760a22490b6590a725d23d48a8eb2
+PEER_SHA256 = "4fcf391415f2b1f3bb98900f9c9e9e307468f9ca86e9b58e3aebb4c2bb368bc7"
 PRODUCER_SHA256 = "f1492a666c9d648738c01009cfdba976e1610a8beec1e06c2b8b072279619fd9"
 SAFE_TEXT = "The observatory owns the violet telescope."
 

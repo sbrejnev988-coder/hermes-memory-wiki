@@ -1,6 +1,23 @@
-# Hermes Memory Wiki v1.24.5
+# Hermes Memory Wiki v1.24.6
 
-## Current plugin fixes — проверенный SOURCE checkpoint, не релиз
+## 1.24.6 — публикационный кандидат
+
+Версия manifest, Python package, runtime и SDK синхронизирована: **1.24.6**.
+В кандидат включены принятые исправления после 1.24.5: original-owner fences
+перед внешней отправкой и COMMIT, graph/background extraction, восстановление,
+обязательная редактировка секретов и сохранение primary/UNKNOWN при отказах.
+Новые roadmap-функции и изменения моделей/профильных настроек не добавлены.
+
+[Заметки 1.24.6 и порядок установки](docs/RELEASE_NOTES_1_24_6_RU.md)
+разделяют сборку, GitHub publication, native install и owner-run reload.
+Локальные SOURCE/metadata/build проверки не означают production strict,
+cross-platform FULL или загрузку всех профилей. Tag/GitHub Release и установка
+этим кандидатом не выполняются; их exact-PIN readback делает оператор выпуска.
+
+Ниже сохранена история **1.24.5**: старые execution PIN, test counts и wheel
+относятся только к указанным там bytes и не являются результатами 1.24.6.
+
+## Предыдущие plugin fixes — проверенный SOURCE checkpoint, не релиз
 
 Объединённое runtime/tests дерево проверки:
 [`37afe64af95421a735c584e71f8717976393976d`](https://github.com/sbrejnev988-coder/hermes-memory-wiki/commit/37afe64af95421a735c584e71f8717976393976d).

@@ -1,7 +1,7 @@
 {
   "schema": "memory-stack.current-source-cold-lanes/v1",
   "status": "SOURCE_CHECKPOINT_NOT_NATIVE_ADMISSION",
-  "frozen_provider_sha256": "6edf7c9bf9b8059f68495f221564a53a67801692fa5b8a4bb825ee2a820113bd",
+  "frozen_provider_sha256": "bb6815f0f00f9f208f23727d5fa1c09c969eac87326fad5a29b434ac5b9bbf6f",
   "needs_final_rebind": false,
   "input_inventory_sha256": null,
   "cold_processes": {

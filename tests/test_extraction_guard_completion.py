@@ -321,7 +321,9 @@ class ExtractionGuardCompletionTests(unittest.TestCase):
         self.assertEqual(self.invoke(), "")
         self.assertEqual(self.sink["dispatch"], [[{"role": r["role"], "content": r["content"]} for r in rows]])
         self.assertEqual(self.sink["closed"], 1)
-        self.assertEqual(self.sink["graph_settings_calls"], 1)
+        # No persisted IDs/callback: current owning-TX intent path must not read
+        # graph settings after the extractor returns (the old aggregate path).
+        self.assertEqual(self.sink["graph_settings_calls"], 0)
 
     def test_empty_retained_rows_remain_empty(self):
         self.fixture()
@@ -465,7 +467,7 @@ class ExtractionGuardCompletionTests(unittest.TestCase):
 
     def test_static_late_latch_stops_later_callbacks_after_primary(self):
         callback = qualified(self.jobs_tree, "_run_job.persist_if_current")
-        self.assertEqual(ast.unparse(callback.body[0]), "nonlocal persistence_primary, guard_deferred")
+        self.assertEqual(ast.unparse(callback.body[0]), "nonlocal persistence_primary, guard_deferred, returned_slots")
         self.assertEqual(ast.unparse(callback.body[1]), "if persistence_primary is not None:\n    raise persistence_primary")
         self.assertEqual(ast.unparse(callback.body[2]), "if guard_deferred:\n    return ''")
         late = next(n for n in ast.walk(callback) if field_guard(n, "inspected", "guard_deferred = True"))
@@ -476,22 +478,30 @@ class ExtractionGuardCompletionTests(unittest.TestCase):
     def test_static_graph_and_projection_precede_defer(self):
         run, callback = qualified(self.jobs_tree, "_run_job"), qualified(self.jobs_tree, "_run_job.persist_if_current")
         outer = next(n for n in run.body if isinstance(n, ast.Try) and calls(n, "extract_session_claims"))
-        graph = calls(outer, "enqueue_claim")[0]
+        graph = calls(callback, "enqueue_claim")[0]
         extract = calls(outer, "extract_session_claims")[0]
         guards = [n for n in outer.body if isinstance(n, ast.If) and isinstance(n.test, ast.Name) and n.test.id == "guard_deferred"]
         self.assertEqual(len(guards), 1)
         defer = guards[0]
-        self.assertLess(extract.lineno, graph.lineno)
-        self.assertLess(graph.lineno, defer.lineno)
-        self.assertIn("for claim_id in result.get('persisted_ids', [])[:4]", ast.unparse(outer))
+        # Current graph intent is in the claim's owning transaction, before
+        # its postcommit/projection callback, not aggregate rescheduling.
+        tx = next(n for n in ast.walk(callback) if isinstance(n, ast.With) and calls(n.items[0].context_expr, "_claim_transaction"))
+        self.assertIn(graph, list(ast.walk(tx)))
+        self.assertLess(calls(callback, "_add_claim_tx")[0].lineno, graph.lineno)
+        self.assertLess(graph.lineno, calls(callback, "_after_claim_commit")[0].lineno)
+        self.assertEqual(len(calls(callback, "relevant_graph_extraction_settings")), 1)
+        self.assertLess(extract.lineno, defer.lineno)
+        self.assertFalse(any(isinstance(n, ast.For) and "persisted_ids" in ast.unparse(n.iter) for n in ast.walk(outer)))
         self.assertEqual(ast.unparse(outer.body[-3].test), "result.get('error') or result.get('errors')")
         self.assertIn("return 'provider'", ast.unparse(outer.body[-3]))
         self.assertIn("return ('defer', int(time.time()) + 60)", ast.unparse(defer))
         post_commit = calls(callback, "_after_claim_commit")[0]
-        tx_try = next(n for n in callback.body if isinstance(n, ast.Try))
-        self.assertGreater(post_commit.lineno, tx_try.end_lineno)
+        # Primary-latching try now encloses postcommit too; only the owning
+        # transaction must have ended before projection/after-commit work.
+        self.assertGreater(post_commit.lineno, tx.end_lineno)
         primary = next(n for n in outer.body if isinstance(n, ast.If) and ast.unparse(n.test) == "persistence_primary is not None")
-        self.assertLess(primary.lineno, graph.lineno)
+        self.assertLess(extract.lineno, primary.lineno)
+        self.assertLess(primary.lineno, defer.lineno)
         self.assertEqual(ast.unparse(primary.body[0]), "raise persistence_primary")
 
     def test_static_existing_lease_owner_cleanup_guards_unchanged(self):

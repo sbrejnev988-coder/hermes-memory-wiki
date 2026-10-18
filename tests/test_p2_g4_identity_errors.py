@@ -52,6 +52,7 @@ URL = 'https://www.googleapis.com/drive/v3/files/'
 class Body(io.BytesIO):
     def __init__(self, raw, read_failure=False, close_failure=False):
         super().__init__(raw)
+        self.initial_bytes = len(raw)
         self.reads = []
         self.closes = 0
         self.read_failure = read_failure
@@ -222,7 +223,7 @@ class G4Tests(unittest.TestCase):
             self.assertEqual(drive._metadata(owner, FILE_B, 'authored-fixture-token')['id'], FILE_B)
         self.assertEqual(len(attempts), 2)
         self.assertFalse(hasattr(owner, '_drive_rate_limit_until'))
-        self.assertEqual(body.reads, [8193])
+        self.assertEqual(body.reads, [8193, 8193 - body.initial_bytes])
         self.assertEqual(body.closes, 1)
         self.assertTrue(body.closed and stream.closed)
 
@@ -259,7 +260,7 @@ class G4Tests(unittest.TestCase):
             self.assertEqual(len(attempts),1)
             self.assertTrue(body.closed)
             self.assertEqual(body.closes,1)
-            self.assertEqual(body.reads, [] if status==429 else [8193])
+            self.assertEqual(body.reads, [] if status==429 else [8193, 8193 - body.initial_bytes])
 
     def test_07_unknown_malformed_oversize_read_close_bounds(self):
         raws = [b'{bad', b'x'*9000, b'['*2500+b'0'+b']'*2500,
@@ -271,7 +272,11 @@ class G4Tests(unittest.TestCase):
             error, body = http_error(raw=raw)
             owner, failure = self.refused(error,'drive_http_error:403')
             self.assertFalse(hasattr(owner,'_drive_rate_limit_until'))
-            self.assertEqual(body.reads,[8193])
+            # Complete-body decoding probes EOF within the same total cap;
+            # oversize input stops after cap+1 rather than issuing another read.
+            expected_reads = ([8193, 8193 - len(raw)] if 0 < len(raw) < 8193 else [8193])
+            self.assertEqual(body.reads, expected_reads)
+            self.assertTrue(all(0 < amount <= 8193 for amount in body.reads))
             self.assertTrue(body.closed)
             self.assertEqual(body.closes,1)
         for flags in [{'read_failure':True}, {'close_failure':True}]:
@@ -310,7 +315,7 @@ class G4Tests(unittest.TestCase):
         self.assertEqual(ast.dump(protected, include_attributes=False), ast.dump(actual, include_attributes=False))
         # Raw current binding, not a claim of native provider initialization.
         self.assertEqual(hashlib.sha256((SOURCE/'__init__.py').read_bytes()).hexdigest(),
-                         '6edf7c9bf9b8059f68495f221564a53a67801692fa5b8a4bb825ee2a820113bd')
+                         'bb6815f0f00f9f208f23727d5fa1c09c969eac87326fad5a29b434ac5b9bbf6f')
         NETWORK_EXPECTED = True
         try:
             with self.assertRaises(NetworkDenied):

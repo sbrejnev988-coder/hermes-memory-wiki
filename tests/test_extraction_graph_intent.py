@@ -20,7 +20,9 @@ import tempfile
 import types
 import unittest
 
-ENTRY_SHA256 = "57385a9fd9e7d94658a49d1eb90106346aea0c3e052a4d7110f1a8f0f8f91cc9"
+# Historical entry binding: 57385a9fd9e7d94658a49d1eb90106346aea0c3e052a4d7110f1a8f0f8f91cc9
+# Current release binding; behavioral AST pins below remain independent.
+ENTRY_SHA256 = "bb6815f0f00f9f208f23727d5fa1c09c969eac87326fad5a29b434ac5b9bbf6f"
 CLOSE_AST = "eaa1a8fb0d935f2f09372447d5f1cc662031e0ecf7c8562f3f062ac4e0ef3aa1"
 RUN_ONCE_AST = "af74e0ab1e310cbcf8798840d2a9c949f6f7d605b3cf1099339a714875b9c4f8"
 PROFILE, OWNER, PARTITION = "a" * 64, "b" * 64, "c" * 64

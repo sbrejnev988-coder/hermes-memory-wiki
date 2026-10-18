@@ -1,4 +1,20 @@
-# Проверки RI-R01 / hybrid checkpoint 1.24.5
+# Проверки публикационного кандидата 1.24.6
+
+Текущий локальный release packet использует самостоятельные shipped entries
+через существующий controller: SOURCE/extracted bodies, generic SQLite,
+in-memory HTTP и canonical synthetic release metadata. Это не обычный FULL
+pytest/native SDK gate. Временный `TMPDIR` должен принадлежать исполнителю;
+для admin/restore/bootstrap entries передаётся отдельный новый `--scratch`.
+
+Current-source raw pins перепривязаны к 1.24.6. Исторические graph-aggregate
+oracles сверены с owning-TX intent, а HTTP read oracle — с bounded EOF probe.
+Исходные failed captures/gold сохраняются, safety/ACL/owner assertions не
+пропускаются и guards не отключаются. Обычная native collection дополнительно
+требует правильного standalone `make_suite`/CARRIER setup, подлинных SDK/trust
+companions и разрешённых synthetic settings fixtures. Локальный packet не
+заявляет, что эти prerequisites или cross-platform FULL уже выполнены.
+
+## Исторический RI-R01 / hybrid checkpoint 1.24.5
 
 Это SOURCE checkpoint, не новый релиз, не native SDK acceptance и не установленный/loaded runtime.
 

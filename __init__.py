@@ -1,4 +1,4 @@
-"""memory-wiki v1.24.5: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
+"""memory-wiki v1.24.6: native Hermes active-memory wiki vault — real Qdrant support, Cosine distance, env-configurable — ChaCha20 RFC 8439 AEAD vault, MW_VAULT_KEY support.
 
 Stdlib-only, Android/proot friendly. Storage: SQLite + Markdown under
 $HERMES_HOME/memory-wiki, protected by an append-only JSONL journal plus
@@ -743,7 +743,7 @@ try:
 except ImportError:
     import online_metrics as _online_metrics
 
-PLUGIN_VERSION = "1.24.5"
+PLUGIN_VERSION = "1.24.6"
 BUILTIN_PREFERENCE_RULES = (
     ("pref_current_instruction", "Fresh explicit user instruction in the current turn overrides durable memory and autonomy defaults.", 1000, "global", "system"),
     ("pref_user_correction", "Explicit user corrections supersede older inferred or assistant-written claims.", 940, "global", "system"),

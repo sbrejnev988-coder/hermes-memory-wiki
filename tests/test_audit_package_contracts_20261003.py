@@ -42,6 +42,13 @@ CURRENT_METADATA_SHA256_1_24_5 = {
     "setup.py": "cb184df928263e32fd4015c38d41dd71345979d6cb4ecad1c4d44b9090f19780",
 }
 
+# Release metadata binding only; historical maps above are not rewritten.
+CURRENT_METADATA_SHA256_1_24_6 = {
+    "pyproject.toml": "803fa94650ccfabeae6381877373baf7bf1fb65336aab5f2689b53177ea6080a",
+    "plugin.yaml": "176af92b7d82ee83f1bfbbaf3cb27f7998cbf638337a814f9a7a5df43a0c95e2",
+    "setup.py": "cb184df928263e32fd4015c38d41dd71345979d6cb4ecad1c4d44b9090f19780",
+}
+
 
 def _source(relative: str) -> Path:
     for root in PACKAGE.__path__:
@@ -89,12 +96,12 @@ def test_native_metadata_info_schemas_are_readonly(record_property):
     assert Path(inspect.getfile(tool_result)).resolve().is_relative_to(core)
     assert PACKAGE.MemoryWikiProvider.__bases__ == (MemoryProvider,)
     assert Path(PACKAGE.__file__).name == "__init__.py"
-    for relative, digest in CURRENT_METADATA_SHA256_1_24_5.items():
+    for relative, digest in CURRENT_METADATA_SHA256_1_24_6.items():
         assert sha256(_source(relative).read_bytes()).hexdigest() == digest, relative
     project = tomllib.loads(_source("pyproject.toml").read_text(encoding="utf-8"))
     assert provider.name == "memory-wiki"
     assert set(project["project"]["entry-points"]["hermes_agent.memory_providers"]) == {provider.name}
-    assert PACKAGE.PLUGIN_VERSION == project["project"]["version"] == "1.24.5"
+    assert PACKAGE.PLUGIN_VERSION == project["project"]["version"] == "1.24.6"
     # These are the actual native setup/identity introspection APIs, not get_info().
     assert provider.get_config_schema() == []
     assert provider.identity_signature() == {}

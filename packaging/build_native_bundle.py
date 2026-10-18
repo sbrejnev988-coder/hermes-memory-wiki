@@ -22,7 +22,8 @@ def main() -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
     prefix = f"memory-wiki-v{version}/"
     archive = subprocess.run(
-        ["git", "archive", "--format=zip", f"--prefix={prefix}", args.tree_ish],
+        ["git", "-c", "core.autocrlf=false", "-c", "core.sparseCheckout=false",
+         "archive", "--format=zip", f"--prefix={prefix}", args.tree_ish],
         cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
     )
     if archive.returncode:
