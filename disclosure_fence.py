@@ -24,6 +24,13 @@ except ImportError:
 
 MAX_ROWS = 4096
 BATCH = 400
+# Fixed projection for invisible full-reindex copies. SQLite evaluates the
+# nonempty predicate; neither claim nor normalized text leaves the database.
+COPY_METADATA = ('id', 'topic', 'memory_revision', 'updated_at', 'visibility_scope',
+                 'origin_bot_id', 'origin_session_id', 'origin_chat_hash', 'project_id',
+                 'event_at', 'status', 'created_at')
+COPY_TARGET = ('claim_id', 'endpoint', 'collection', 'vector_target_hash',
+               'manifest_hash', 'status', 'indexed_at', 'updated_at')
 # Only actual existing tables/identity columns; no caller-controlled SQL names.
 KEYS = {
     'claims': 'id', 'evidence': 'id', 'entities': 'id', 'relations': 'id',
@@ -108,6 +115,9 @@ class DisclosureFence:
         self.ledger = ledger if foreign or _worker is not None else getattr(provider, '_privacy_erasure', None)
         self.images, self.selectors, self.purposes = {}, {}, {}
         self.episode_indexes = {}  # Fixed episode-index purpose, never claim/recall eligibility.
+        self.claim_copy = None  # One metadata/registry image, never foreign text or visibility.
+        self.copy_targets = ()
+        self.copy_changes = 0
         self.shared_sets = {}
         # Graph writes are fixed, row-counted own effects, never a recaptured
         # post-write epoch. No authority/meta/data_version component advances.
@@ -200,7 +210,7 @@ class DisclosureFence:
 
     def _same(self, delivery=None):
         expected = (delivery.expected_epoch(self) if delivery is not None else
-                    (self.epoch[0], self.epoch[1], self.epoch[2] + self.graph_changes))
+                    (self.epoch[0], self.epoch[1], self.epoch[2] + self.graph_changes + self.copy_changes))
         return (self.ok and self.anchor == self._authority(terminal=delivery is not None) and expected == self._epoch()
                 and self.policy_environment == tuple(os.environ.get(k) for k in
                     ('MEMORY_WIKI_STRICT_RECALL', 'HERMES_SECURITY_STRICT'))
@@ -381,8 +391,103 @@ class DisclosureFence:
         return originals[0]
 
     def admit_index(self):
-        if not self.purposes or not self.finish():
+        if (not self.purposes and self.claim_copy is None) or not self.finish():
             raise DeliveryWithheld('claim_index_source_changed')
+
+    def _copy_metadata(self, claim_id):
+        rows = self.conn.execute(
+            'SELECT ' + ','.join(COPY_METADATA)
+            + ",(normalized_claim IS NOT NULL AND normalized_claim!='') AS index_nonempty"
+            + ' FROM claims WHERE id=?', (claim_id,)).fetchall()
+        return [dict(row) for row in rows]
+
+    def _copy_targets(self, claim_id):
+        rows = self.conn.execute(
+            'SELECT ' + ','.join(COPY_TARGET) + ' FROM claim_vector_targets WHERE claim_id=?'
+            + ' ORDER BY endpoint,collection,vector_target_hash LIMIT ?',
+            (claim_id, MAX_ROWS + 1)).fetchall()
+        if len(rows) > MAX_ROWS:
+            raise DeliveryWithheld('claim_copy_registry_exceeded')
+        return tuple(dict(row) for row in rows)
+
+    def index_copy(self, row):
+        """Pin an invisible copy BEFORE the source HTTP wait, without hydration.
+
+        Active/nonempty is the existing full-index policy, not recall quality.
+        Already-applied ID erasures are checked by metadata. An applicable older
+        phrase erasure cannot be disproved without text: withhold that copy.
+        No worker/federation/terminal-delivery authority is created here.
+        """
+        try:
+            if (self.claim_copy is not None or self.purposes or self.foreign
+                    or self.worker is not None or self.source_conn is not None
+                    or self.conn.in_transaction or not self._same()):
+                raise DeliveryWithheld('claim_copy_original_owner_required')
+            supplied = dict(row)
+            if not supplied or not set(supplied).issubset(COPY_METADATA):
+                raise DeliveryWithheld('claim_copy_metadata_only_required')
+            originals = self._copy_metadata(str(row['id']))
+            if (len(originals) != 1 or any(originals[0].get(k) != v for k, v in supplied.items())
+                    or originals[0]['status'] != 'active' or originals[0]['index_nonempty'] != 1):
+                raise DeliveryWithheld('claim_copy_original_image_changed')
+            original = originals[0]
+            targets = self._copy_targets(str(row['id']))
+            self.claim_copy = original
+            self.copy_targets = targets
+            self.admit_index()
+            return targets
+        except BaseException:
+            self.ok = False
+            raise
+
+    def _copy_current(self):
+        original = self.claim_copy
+        if (self._copy_metadata(str(original['id'])) != [original]
+                or self._copy_targets(str(original['id'])) != self.copy_targets):
+            return False
+        for entry in self.erasure:
+            if not self.ledger._owner_allows(entry['owner'], original, 'claim'):
+                continue
+            if (self.ledger.digest('claim-id', str(original['id'])) in entry['claims']
+                    or (int(original['created_at']) <= int(entry['created_at'])
+                        and int(entry['claim_text']['length']) > 0)):
+                return False
+        return True
+
+    def _copy_intent_targets(self, claim_id, payload, stamp):
+        # Pure prediction of the existing recorder's fixed SQL, not authority.
+        key = (str(claim_id), payload['endpoint'], payload['collection'], payload['vector_target_hash'])
+        targets = {tuple(row[k] for k in COPY_TARGET[:4]): dict(row) for row in self.copy_targets}
+        previous = targets.get(key)
+        targets[key] = dict(zip(COPY_TARGET, (*key, payload['manifest_hash'], 'write_pending',
+            max(0, int(previous['indexed_at'])) if previous else 0, stamp)))
+        return tuple(targets[k] for k in sorted(targets))
+
+    @contextmanager
+    def index_copy_intent(self, claim_id, payload, stamp):
+        """Account ONLY the existing recorder's one exact write_pending upsert.
+
+        Predict its complete after-image BEFORE SQL. Never rebase meta,
+        data_version, erasure or authority from a post-wait/post-commit read.
+        The caller still owns commit; no pending TX is licensed for dispatch.
+        """
+        try:
+            if (self.claim_copy is None or str(claim_id) != self.claim_copy['id']
+                    or self.copy_changes or type(stamp) is not int):
+                raise DeliveryWithheld('claim_copy_intent_unproven')
+            self.admit_index()
+            expected = self._copy_intent_targets(claim_id, payload, stamp)
+            before = self.conn.total_changes
+            yield
+            if self.conn.total_changes != before + 1:
+                raise DeliveryWithheld('claim_copy_unaccounted_intent_effect')
+            self.copy_changes = 1
+            self.copy_targets = expected
+            if not self._same() or not self._copy_current():
+                raise DeliveryWithheld('claim_copy_intent_image_changed')
+        except BaseException:
+            self.ok = False
+            raise
 
     def index_snapshot(self, claim_id):
         # The worker's ORIGINAL epoch predates this first raw row read.
@@ -552,6 +657,8 @@ class DisclosureFence:
         """Final synchronous read, after guards/remote waits; never fresh adoption."""
         if not self.ok:
             return False
+        if _delivery is not None and self.claim_copy is not None:
+            return False  # Metadata copy is not a terminal-disclosure capability.
         savepoint = 'memory_wiki_disclosure_' + format(id(self),'x')
         begun = False
         try:
@@ -563,6 +670,8 @@ class DisclosureFence:
                 if (self.conn.in_transaction and not owned and not graph_owned) or not self._same(_delivery):
                     return False
                 self.conn.execute('SAVEPOINT '+savepoint); begun = True
+                if self.claim_copy is not None and not self._copy_current():
+                    return False
                 current = {}
                 for key, digest in self.selectors.items():
                     current[key] = self._read(*key)

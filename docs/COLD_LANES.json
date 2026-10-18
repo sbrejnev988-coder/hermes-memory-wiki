@@ -1,9 +1,9 @@
 {
   "schema": "memory-stack.current-source-cold-lanes/v1",
   "status": "SOURCE_CHECKPOINT_NOT_NATIVE_ADMISSION",
-  "frozen_provider_sha256": "23e60da064fc7b7b0cdf195bb8608b86be2615204c4ca6f53f8a4ec904d15851",
+  "frozen_provider_sha256": "3b5318cafa62dad23870aecd515ba0786548c2502cdd82022f96093c164295fc",
   "needs_final_rebind": false,
-  "input_inventory_sha256": "22fa90420773225c51d87b1524dd15cb1c34fd404d339ea0dd8571fe64c560f6",
+  "input_inventory_sha256": "77f16553e1b2e87223c8384ce89e83e6864c1e84a9dc9902addc68c5d4825879",
   "cold_processes": {
     "strict": {
       "HERMES_SECURITY_STRICT": "1",
@@ -18,6 +18,7 @@
         "tests/test_document_native_commit_fence.py",
         "tests/test_document_shared_retirement.py",
         "tests/test_episode_embedding_egress.py",
+        "tests/test_foreign_reindex_admission.py",
         "tests/test_global_hybrid_search.py",
         "tests/test_graph_extraction_egress.py",
         "tests/test_hybrid_runtime_receipts.py",
@@ -563,6 +564,25 @@
         "tests/ci_owned/binding_cases.py"
       ],
       "reason": "CI-BIND-EXIT-01: synthetic dictionaries; no native objects or processes. Explicit stdlib suite/entry; not automatic native pytest setup."
+    },
+    {
+      "path": "tests/ci_owned/foreign_reindex_cases.py",
+      "sha256": "5aaef00b289d29fe829f39060ae21c4a8213d32867ad6d922a048329c426108c",
+      "role": "source-only",
+      "lane": "source-explicit",
+      "entry": {
+        "kind": "source-controller",
+        "invocation": "devtools/harness.py run_source entry=tests/ci_owned/foreign_reindex_cases.py; see docs/FOREIGN_REINDEX_ADMISSION.md",
+        "callables": {}
+      },
+      "requires": [
+        "exact_source_inputs",
+        "source_controller",
+        "source_stdlib"
+      ],
+      "requires_sdk_absent": false,
+      "peers": [],
+      "reason": "ADJ-REINDEX-FOREIGN-01 static forwarding and generic SQLite metadata/epoch/prediction checks; no SDK or healthy native authority/actual PUT proof. Exact compressed raw-source and independent census inputs required."
     },
     {
       "path": "tests/ci_owned/graph_extraction_fixture.py",
@@ -3310,6 +3330,27 @@
       "requires_sdk_absent": false,
       "peers": [],
       "reason": "ASTUNIT: real lexical/entry closure, not SDK/native/transport/persistence proof. Collectible declarations; full prerequisites/individual bodies NOT executed by inventory."
+    },
+    {
+      "path": "tests/test_foreign_reindex_admission.py",
+      "sha256": "fd205617614e6d3ce5b4b9652d8de9525b8d4663ac8d06316664ecca7de2e45c",
+      "role": "pytest",
+      "lane": "strict",
+      "entry": {
+        "kind": "pytest",
+        "invocation": "pytest tests/test_foreign_reindex_admission.py",
+        "callables": {}
+      },
+      "requires": [
+        "exact_source_inputs",
+        "native_strict",
+        "protected_fixture_settings"
+      ],
+      "requires_sdk_absent": false,
+      "peers": [
+        "tests/ci_owned/claim_embedding_fixture.py"
+      ],
+      "reason": "Shipped genuine-SPI foreign-copy lifetime/sole-source/unusable-vector regressions. NOT_RUN under SOURCE; requires existing peer native owner/bootstrap and owned fixture admission."
     },
     {
       "path": "tests/test_fts_security_parity_regression.py",
@@ -6326,6 +6367,7 @@
     "tests/ci_owned/doc_code_carrier_cases.py",
     "tests/ci_owned/entry_cases.py",
     "tests/ci_owned/exit_cases.py",
+    "tests/ci_owned/foreign_reindex_cases.py",
     "tests/ci_owned/test_current_sdk_bootstrap.py",
     "tests/test_ci_lifecycle_observer.py",
     "tests/test_cold_lane_partition.py",
@@ -6386,7 +6428,7 @@
       "executed_evidence": "7-case isolated packet at runtime source SHA 7ebb63ce54ea1c0fb2f56fddc2cb7a7b4aeabae3ae271fa8262c56fcc0aa51f3; not full cold native suite/fleet."
     }
   ],
-  "file_count": 320,
+  "file_count": 322,
   "requirements": {
     "native_legacy": "BLOCKED until independently admitted native cold bootstrap, genuine SDK/registry/MRO and dependency origins; trust-core genuinely absent; HERMES_SECURITY_STRICT=0. No SDK substitution or import hiding.",
     "native_strict": "BLOCKED until independently admitted native cold bootstrap, genuine SDK/registry/MRO, complete dependencies and actual public hermes_trust_core delivery/API; HERMES_SECURITY_STRICT=1.",
@@ -6416,7 +6458,7 @@
     },
     {
       "path": "__init__.py",
-      "sha256": "23e60da064fc7b7b0cdf195bb8608b86be2615204c4ca6f53f8a4ec904d15851"
+      "sha256": "3b5318cafa62dad23870aecd515ba0786548c2502cdd82022f96093c164295fc"
     },
     {
       "path": "packaging/run_native_regressions.py",

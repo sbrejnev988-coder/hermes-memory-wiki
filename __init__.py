@@ -2710,6 +2710,7 @@ def _record_claim_vector_target(
     manifest_hash: str = "",
     status: str = "write_pending",
     indexed_at: int = 0,
+    _disclosure=None,
 ) -> Dict[str, Any]:
     """Persist a possible remote write before or immediately after delivery.
 
@@ -2725,22 +2726,33 @@ def _record_claim_vector_target(
     if not payload["collection"]:
         raise ValueError("claim vector target collection is empty")
     ts = int(time.time())
-    db.execute(
-        """INSERT INTO claim_vector_targets(
-               claim_id,endpoint,collection,vector_target_hash,manifest_hash,
-               status,indexed_at,updated_at)
-           VALUES(?,?,?,?,?,?,?,?)
-           ON CONFLICT(claim_id,endpoint,collection,vector_target_hash)
-           DO UPDATE SET manifest_hash=excluded.manifest_hash,
-              status=excluded.status,
-              indexed_at=max(claim_vector_targets.indexed_at,excluded.indexed_at),
-              updated_at=excluded.updated_at""",
-        (
-            str(claim_id), payload["endpoint"], payload["collection"],
-            payload["vector_target_hash"], payload["manifest_hash"], status,
-            max(0, int(indexed_at or 0)), ts,
-        ),
-    )
+    if _disclosure is not None and (type(_disclosure) is not _DisclosureFence
+            or _disclosure.conn is not db or status != "write_pending" or indexed_at != 0):
+        raise _DeliveryWithheld("claim_copy_intent_owner_required")
+    with (_disclosure.index_copy_intent(str(claim_id), payload, ts)
+          if _disclosure is not None else nullcontext()):
+        cursor = db.execute(
+            """INSERT INTO claim_vector_targets(
+                   claim_id,endpoint,collection,vector_target_hash,manifest_hash,
+                   status,indexed_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?)
+               ON CONFLICT(claim_id,endpoint,collection,vector_target_hash)
+               DO UPDATE SET manifest_hash=excluded.manifest_hash,
+                  status=excluded.status,
+                  indexed_at=max(claim_vector_targets.indexed_at,excluded.indexed_at),
+                  updated_at=excluded.updated_at""",
+            (
+                str(claim_id), payload["endpoint"], payload["collection"],
+                payload["vector_target_hash"], payload["manifest_hash"], status,
+                max(0, int(indexed_at or 0)), ts,
+            ),
+        )
+        if _disclosure is not None:
+            try:
+                if cursor.rowcount != 1:
+                    raise _DeliveryWithheld("claim_copy_intent_count_unproven")
+            finally:
+                cursor.close()
     payload["status"] = status
     return payload
 
@@ -5517,6 +5529,7 @@ def _qdrant_claim_ids(collection: str, max_points: int = 200000) -> Optional[set
 
 def _qdrant_registered_claim_vector_for_reindex(
     db: sqlite3.Connection, claim_id: str, metadata: Any, manifest_hash: str,
+    *, _disclosure,
 ) -> Optional[Tuple[List[float], Dict[str, Any]]]:
     """Copy a foreign claim only from a verified, profile-owned active point.
 
@@ -5524,14 +5537,14 @@ def _qdrant_registered_claim_vector_for_reindex(
     only a location hint; the Qdrant point must match the current ACL/revision
     and embedding manifest before its vector can be reused.
     """
+    if (type(_disclosure) is not _DisclosureFence or _disclosure.conn is not db
+            or str(metadata['id']) != claim_id):
+        raise _DeliveryWithheld("claim_copy_original_owner_required")
+    targets = _disclosure.index_copy(metadata)
     endpoint = _normalized_qdrant_endpoint()
-    rows = db.execute(
-        """SELECT collection,endpoint,manifest_hash,vector_target_hash
-             FROM claim_vector_targets
-            WHERE claim_id=? AND endpoint=? AND manifest_hash=? AND status='active'
-            ORDER BY indexed_at DESC,updated_at DESC""",
-        (claim_id, endpoint, manifest_hash),
-    ).fetchall()
+    rows = sorted((row for row in targets if row['endpoint'] == endpoint
+                   and row['manifest_hash'] == manifest_hash and row['status'] == 'active'),
+                  key=lambda row: (row['indexed_at'], row['updated_at']), reverse=True)
     for row in rows:
         collection = str(row["collection"] or "")
         if (not collection or collection == _qdrant_alias()
@@ -5544,7 +5557,9 @@ def _qdrant_registered_claim_vector_for_reindex(
             "POST", f"/collections/{urllib.parse.quote(collection, safe='')}/points",
             {"ids": [_qdrant_point_id(claim_id)],
              "with_payload": list(_QDRANT_CLAIM_STATE_FIELDS), "with_vector": True},
+            _admit=_disclosure.admit_index,
         )
+        _disclosure.admit_index()  # Never adopt state that changed during source HTTP.
         points = response.get("result") if isinstance(response, dict) else None
         if not isinstance(points, list) or len(points) != 1 or not isinstance(points[0], dict):
             continue
@@ -25420,13 +25435,19 @@ class MemoryWikiProvider(MemoryProvider):
 
         def expected_row_state(row: sqlite3.Row) -> Optional[Dict[str, Any]]:
             cid = str(row["id"])
+            disclosure = _DisclosureFence(self, c)
             if self._claim_visible(row):
                 text = visible_document(row)
                 return (
                     _expected_qdrant_claim_state(cid, text, row, manifest_hash)
                     if text is not None else None
                 )
-            verified = _qdrant_registered_claim_vector_for_reindex(c, cid, row, manifest_hash)
+            try:
+                verified = _qdrant_registered_claim_vector_for_reindex(
+                    c, cid, row, manifest_hash, _disclosure=disclosure,
+                )
+            except _DeliveryWithheld:
+                return None
             return _qdrant_claim_reconciliation_state(verified[1]) if verified else None
 
         # A force+limit run must resume the same generated target instead of creating
@@ -25594,7 +25615,7 @@ class MemoryWikiProvider(MemoryProvider):
                         or not _profile_target_allowed(target_coll)):
                     raise RuntimeError("Qdrant target changed during reindex preparation")
                 # Pin owner/epoch before visibility callbacks, but do not read
-                # foreign SQL text. Foreign registered-vector copy is unchanged.
+                # foreign SQL text. The foreign verifier binds metadata/registry.
                 disclosure = _DisclosureFence(self, c)
                 if self._claim_visible(row):
                     if not target_prepared:
@@ -25610,7 +25631,7 @@ class MemoryWikiProvider(MemoryProvider):
                     disclosure.admit_index()
                 else:
                     verified = _qdrant_registered_claim_vector_for_reindex(
-                        c, cid, row, manifest_hash,
+                        c, cid, row, manifest_hash, _disclosure=disclosure,
                     )
                     if verified is None:
                         raise ValueError("foreign claim has no compatible registered vector")
@@ -25624,13 +25645,14 @@ class MemoryWikiProvider(MemoryProvider):
                         c, cid, collection=target_coll,
                         endpoint=target_endpoint, manifest_hash=manifest_hash,
                         status="write_pending",
+                        _disclosure=disclosure,
                     )
                     c.commit()
                 if target_endpoint != _normalized_qdrant_endpoint():
                     raise RuntimeError("Qdrant endpoint changed before reindex upsert")
                 if not _qdrant_upsert(
                     cid, vector, payload, collection=target_coll,
-                    **({"_admit": disclosure.admit_index} if target_prepared else {}),
+                    _admit=disclosure.admit_index,
                 ):
                     raise RuntimeError("Qdrant upsert rejected")
                 _record_claim_vector_target(

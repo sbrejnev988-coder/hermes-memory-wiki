@@ -11,23 +11,25 @@
 исполняемых legacy targets. Provider SHA также относился к прежним bytes.
 После настоящих последовательных merge принятых A и B перечислены все
 318 исходных baseline-файлов, `tests/test_cold_lane_partition.py` и доставленный
-`tests/ci_owned/collection_dispatch_cases.py`: **320 уникальных Python source files**.
-Это не 320 collected, executed или независимо семантически проверенных tests.
+`tests/ci_owned/collection_dispatch_cases.py`: 320 Python source files в прежнем checkpoint.
+ADJ-REINDEX-FOREIGN-01 добавляет shipped native regression и отдельный SOURCE entry:
+**322 уникальных Python source files** в текущем census. Это не 322 collected,
+executed или независимо семантически проверенных tests.
 
 | File role | Файлов | Что означает запись |
 |---|---:|---|
-| `pytest` | 267 | Есть collectible function/class declarations; реальная collection и outcomes не выполнялись |
+| `pytest` | 268 | Есть collectible function/class declarations; реальная collection и outcomes не выполнялись |
 | `unittest-explicit` | 21 | Отдельный stdlib entry / suite binding; `make_suite` или `CARRIER` не инициализируются одним pytest discovery |
 | `callable` | 2 | Реальные аргументные native packets; не pytest test bodies |
-| `source-only` | 9 | Отдельный SOURCE маршрут, исключённый из native preload; конкретные требования различаются |
+| `source-only` | 10 | Отдельный SOURCE маршрут, исключённый из native preload; конкретные требования различаются |
 | `support` | 19 | Helpers, fixture producers, conftest, reporter, cold entry; не независимые test cases |
 | `historical` | 2 | `baseline-source_connectors.py` и `primitive_guard_a9d5016e.py`: неизменные oracle inputs, не current runtime/tests |
 
-File-lane membership: legacy 243, strict 24, SOURCE-explicit 30,
+File-lane membership: legacy 243, strict 25, SOURCE-explicit 31,
 native-explicit packets 2, support 19, historical 2. Отдельный recovery entry
 повторно ссылается на существующий `recovery_cases.py`; это намеренный другой
 cold process, не ещё один уникальный файл. Не складывать этот повтор с file
-inventory или cases. У source_explicit_targets теперь полный набор 30 entries,
+inventory или cases. У source_explicit_targets теперь полный набор 31 entries,
 включая существующий doc/code SOURCE carrier.
 
 Для каждого Python-файла JSON хранит raw SHA-256, role, lane, actual entry kind,
@@ -217,3 +219,16 @@ fixture будущего недоставленного peer; исходные r
 stock pytest dispatch, native FULL/security/recovery/compatibility и release
 остаются отдельными parent gates. No guards weakened, no native grant, no новые
 Core/SDK/PM/forks/runtime/settings/data/model/network/install/restart изменения.
+
+## Узкая foreign-copy дельта
+
+`tests/test_foreign_reindex_admission.py` использует прежний genuine-SPI peer
+`tests/ci_owned/claim_embedding_fixture.py` и остаётся native-strict / NOT_RUN
+в SOURCE scope. `tests/ci_owned/foreign_reindex_cases.py` — отдельный SOURCE
+controller entry: static old/current forwarding, реальные generic SQLite
+metadata/epoch/intent prediction units, authenticated-format ledger consumer и
+actual missing-owner refusal; не здоровый native fence или actual PUT proof.
+Подробный контракт и limit применимой phrase erasure —
+`docs/FOREIGN_REINDEX_ADMISSION.md`. Перепривязаны только два новых membership,
+current provider pin и зависящие count/digest/target lists. Старые SOURCE41,
+native/FULL/runtime outcomes и отсутствующие Core/trust origins не переобъявлены.
