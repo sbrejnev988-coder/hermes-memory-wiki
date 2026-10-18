@@ -5,6 +5,9 @@ admitted existing recorder/bootstrap. Current COLD_LANES blocks all three.
 No new CI job, controller, SDK substitute, or selection filter is introduced.
 """
 from pathlib import Path
+import ast
+import re
+import stat
 import hashlib
 import importlib
 import importlib.metadata
@@ -14,10 +17,205 @@ import os
 import sys
 
 
+def _source_path(value):
+    """Validate literal repository paths; never normalize rejected tokens."""
+    if type(value) is not str or not value or '\\' in value:
+        raise ValueError('partition_path')
+    if any(ord(c) < 32 or c in ':<>"|?*' for c in value):
+        raise ValueError('partition_path')
+    for part in value.split('/'):
+        stem = part.split('.', 1)[0].upper()
+        if (part in ('', '.', '..') or part.endswith(('.', ' '))
+                or stem in {'CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$'}
+                or re.fullmatch(r'(?:COM|LPT)[1-9¹²³]', stem)):
+            raise ValueError('partition_path')
+    return value
+
+
+def _sha256(value):
+    return type(value) is str and re.fullmatch('[0-9a-f]{64}', value) is not None
+
+
+def partition_digest(rows):
+    """File identities only, not pytest node IDs or execution coverage."""
+    items = sorted([row['path'], row['sha256']] for row in rows)
+    return hashlib.sha256(json.dumps(items, ensure_ascii=True,
+                                    separators=(',', ':')).encode('utf-8')).hexdigest()
+
+
+def validate_partition(plan, source_inputs=None):
+    """Pure metadata/bytes validation. Never import tests, provider or SDK.
+
+    source_inputs is an independently enumerated complete tests/**/*.py census,
+    plus exactly source_pins. Metadata-only validation cannot attest disk bytes.
+    Success grants no bootstrap, recorder, trust or native execution authority.
+    """
+    if type(plan) is not dict or plan.get('schema') != 'memory-stack.current-source-cold-lanes/v1':
+        raise ValueError('partition_schema')
+    if (plan.get('native_sdk_execution_admitted') is not False
+            or plan.get('no_selection_filters') is not True
+            or type(plan.get('needs_final_rebind')) is not bool):
+        raise ValueError('partition_not_execution_authority')
+    rows, requirements = plan.get('partition'), plan.get('requirements')
+    if type(rows) is not list or not rows or type(requirements) is not dict or not requirements:
+        raise ValueError('partition_shape')
+    if any(type(k) is not str or not k or type(v) is not str or not v for k, v in requirements.items()):
+        raise ValueError('partition_requirements')
+    by_path = {}
+    roles = {'pytest', 'unittest-explicit', 'callable', 'source-only', 'support', 'historical'}
+    lanes = {'strict', 'legacy', 'source-explicit', 'native-explicit-packet', 'support', 'historical'}
+    for row in rows:
+        if type(row) is not dict:
+            raise ValueError('partition_row')
+        path = _source_path(row.get('path'))
+        if not path.startswith('tests/') or not path.endswith('.py') or path in by_path:
+            raise ValueError('partition_duplicate_or_non_test_path')
+        if not _sha256(row.get('sha256')):
+            raise ValueError('partition_sha256')
+        role, lane = row.get('role'), row.get('lane')
+        if type(role) is not str or role not in roles or type(lane) is not str or lane not in lanes:
+            raise ValueError('partition_role_or_lane')
+        if type(row.get('reason')) is not str or not row['reason']:
+            raise ValueError('partition_reason')
+        required, peers = row.get('requires'), row.get('peers')
+        if (type(required) is not list or not required or any(type(k) is not str or k not in requirements for k in required)
+                or len(set(required)) != len(required) or type(peers) is not list
+                or any(type(p) is not str for p in peers) or len(set(peers)) != len(peers)):
+            raise ValueError('partition_prerequisites_or_peers')
+        if type(row.get('requires_sdk_absent')) is not bool:
+            raise ValueError('partition_absence_type')
+        if (row['requires_sdk_absent'] or role == 'source-only') and lane != 'source-explicit':
+            raise ValueError('partition_source_native_intersection')
+        entry = row.get('entry')
+        if role in ('support', 'historical'):
+            if lane != role or entry is not None:
+                raise ValueError('partition_noncase_entry')
+        else:
+            if (type(entry) is not dict or type(entry.get('kind')) is not str
+                    or entry['kind'] not in ('pytest', 'unittest', 'callable', 'source-controller')
+                    or type(entry.get('invocation')) is not str or not entry['invocation']
+                    or type(entry.get('callables')) is not dict):
+                raise ValueError('partition_entry')
+            if any(type(k) is not str or not k or type(v) is not str for k, v in entry['callables'].items()):
+                raise ValueError('partition_callable')
+            expected_kind = {'pytest': 'pytest', 'unittest-explicit': 'unittest', 'callable': 'callable'}
+            if role in expected_kind and entry['kind'] != expected_kind[role]:
+                raise ValueError('partition_entry_role')
+            if lane in ('strict', 'legacy') and (role != 'pytest' or entry['kind'] != 'pytest'):
+                raise ValueError('partition_native_not_pytest')
+            if lane == 'native-explicit-packet' and role != 'callable':
+                raise ValueError('partition_native_packet_role')
+            if lane in ('support', 'historical'):
+                raise ValueError('partition_case_not_executable')
+        by_path[path] = row
+    if (type(plan.get('file_count')) is not int or plan['file_count'] != len(rows)
+            or not _sha256(plan.get('input_inventory_sha256'))
+            or plan['input_inventory_sha256'] != partition_digest(rows)):
+        raise ValueError('partition_inventory_digest_or_count')
+    for row in rows:
+        if any(_source_path(p) not in by_path or p == row['path'] for p in row['peers']):
+            raise ValueError('partition_peer_missing')
+    processes = plan.get('cold_processes')
+    if type(processes) is not dict or set(processes) != {'strict', 'legacy', 'legacy-recovery'}:
+        raise ValueError('partition_cold_processes')
+    selected = set()
+    for stage, lane in processes.items():
+        if type(lane) is not dict or lane.get('HERMES_SECURITY_STRICT') != ('1' if stage == 'strict' else '0'):
+            raise ValueError('partition_cold_mode')
+        targets = lane.get('targets')
+        if (type(targets) is not list or not targets or any(type(p) is not str for p in targets)
+                or len(set(targets)) != len(targets)):
+            raise ValueError('partition_cold_targets')
+        expected = ([row['path'] for row in rows if row['lane'] == stage]
+                    if stage != 'legacy-recovery' else ['tests/ci_owned/recovery_cases.py'])
+        if targets != expected or any(p not in by_path or by_path[p]['role'] != 'pytest' for p in targets):
+            raise ValueError('partition_cold_target_closure')
+        if any(by_path[p]['lane'] == 'source-explicit' or by_path[p]['requires_sdk_absent'] for p in targets):
+            raise ValueError('partition_source_native_intersection')
+        if stage != 'legacy-recovery':
+            if selected.intersection(targets):
+                raise ValueError('partition_cold_overlap')
+            selected.update(targets)
+    source_targets = [row['path'] for row in rows if row['lane'] == 'source-explicit']
+    if plan.get('source_explicit_targets') != source_targets:
+        raise ValueError('partition_source_target_closure')
+    if plan.get('source_entry') not in source_targets:
+        raise ValueError('partition_source_entry')
+    fixture_inputs = plan.get('source_fixture_inputs')
+    if type(fixture_inputs) is not list or any(type(p) is not str or p not in by_path or by_path[p]['role'] != 'support' for p in fixture_inputs):
+        raise ValueError('partition_source_fixture')
+    packets = plan.get('native_explicit_packets')
+    if (type(packets) is not list or any(type(p) is not dict for p in packets)
+            or [p.get('path') for p in packets] != [row['path'] for row in rows if row['lane'] == 'native-explicit-packet']):
+        raise ValueError('partition_native_packet_closure')
+    pins = plan.get('source_pins')
+    if type(pins) is not list or not pins:
+        raise ValueError('partition_source_pins')
+    pin_map = {}
+    for pin in pins:
+        if type(pin) is not dict:
+            raise ValueError('partition_source_pin')
+        path = _source_path(pin.get('path'))
+        if path in pin_map or path in by_path or not _sha256(pin.get('sha256')):
+            raise ValueError('partition_source_pin')
+        pin_map[path] = pin['sha256']
+    if pin_map.get('__init__.py') != plan.get('frozen_provider_sha256'):
+        raise ValueError('partition_provider_pin')
+    pending = plan.get('pending_peer_inputs')
+    if type(pending) is not list or any(type(p) is not dict for p in pending):
+        raise ValueError('partition_pending_peer')
+    pending_paths = []
+    for peer in pending:
+        path = _source_path(peer.get('path'))
+        if path in by_path or path in pin_map or peer.get('sha256') is not None or peer.get('status') != 'PENDING_FINAL_MERGE_REBIND':
+            raise ValueError('partition_pending_peer')
+        pending_paths.append(path)
+    if len(set(pending_paths)) != len(pending_paths) or pending and not plan['needs_final_rebind']:
+        raise ValueError('partition_pending_rebind')
+    targets = plan.get('native_targets')
+    if type(targets) is not dict or set(targets) != {'ordinary_cli', 'hosted_full', 'managed_sdk'}:
+        raise ValueError('partition_native_targets')
+    for target in targets.values():
+        if type(target) is not dict or type(target.get('entry')) is not str or target['entry'] not in pin_map:
+            raise ValueError('partition_native_target_entry')
+        revision = target.get('declared_revision')
+        if revision is not None and (type(revision) is not str or re.fullmatch('[0-9a-f]{40}', revision) is None):
+            raise ValueError('partition_native_target_revision')
+    if source_inputs is not None:
+        if (type(source_inputs) is not dict or any(type(p) is not str or type(raw) is not bytes for p, raw in source_inputs.items())
+                or set(source_inputs) != set(by_path) | set(pin_map)):
+            raise ValueError('partition_source_input_membership')
+        for path, raw in source_inputs.items():
+            expected = by_path[path]['sha256'] if path in by_path else pin_map[path]
+            if hashlib.sha256(raw).hexdigest() != expected:
+                raise ValueError('partition_stale_source:' + path)
+        for target in targets.values():
+            tree = ast.parse(source_inputs[target['entry']], filename=target['entry'])
+            revisions = [ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)
+                         and any(isinstance(t, ast.Name) and t.id == 'CORE_SHA' for t in n.targets)]
+            if revisions != ([] if target['declared_revision'] is None else [target['declared_revision']]):
+                raise ValueError('partition_native_target_pin:' + target['entry'])
+        for path, row in by_path.items():
+            tree = ast.parse(source_inputs[path], filename=path)
+            functions = {n.name: ast.unparse(n.args) for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+            entry = row['entry']
+            if entry and any(functions.get(k) != v for k, v in entry['callables'].items()):
+                raise ValueError('partition_callable_signature:' + path)
+            test_functions = any(name.startswith('test_') for name in functions)
+            test_classes = any(isinstance(n, ast.ClassDef) and any(isinstance(m, ast.FunctionDef) and m.name.startswith('test') for m in n.body) for n in tree.body)
+            if row['role'] == 'pytest' and not (test_functions or test_classes):
+                raise ValueError('partition_no_collectible_case:' + path)
+            if row['role'] in ('support', 'historical') and (test_functions or test_classes):
+                raise ValueError('partition_hidden_cases:' + path)
+    return {'file_count': len(rows), 'role_counts': {role: sum(row['role'] == role for row in rows) for role in sorted(roles)},
+            'source_inputs_verified': source_inputs is not None, 'native_sdk_execution_admitted': False}
+
+
 def cold_plan():
     # A JSON plan is NOT authority. Even a finalized plan needs separate real
     # native admission and the existing independently admitted bootstrap.
     plan = json.loads(Path(sys.argv[2]).read_text(encoding='utf-8'))
+    validate_partition(plan)
     stage = sys.argv[1]
     if stage not in ('strict', 'legacy', 'legacy-recovery'):
         raise RuntimeError('No universal FULL mode; use separate cold lanes')
@@ -59,6 +257,38 @@ def main():
     runroot = Path(os.environ['MW_CI_RUNROOT']).resolve(strict=True)
     if hashlib.sha256((source / '__init__.py').read_bytes()).hexdigest() != plan['frozen_provider_sha256']:
         raise RuntimeError('Final provider source drift; rebind before admission')
+    # Independently census physical test inputs, not just paths named by JSON.
+    # No imports/collection/SDK grants occur during this source-only check.
+    source_paths = [source / pin['path'] for pin in plan['source_pins']]
+    pending = [source / 'tests']
+    while pending:
+        directory = pending.pop()
+        for component in (directory, *directory.parents):
+            info = component.lstat()
+            if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 1024:
+                raise RuntimeError('Source input link/reparse refused')
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                path = Path(entry.path)
+                info = path.lstat()
+                if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 1024:
+                    raise RuntimeError('Source input link/reparse refused')
+                if stat.S_ISDIR(info.st_mode):
+                    pending.append(path)
+                elif path.suffix == '.py':
+                    if not stat.S_ISREG(info.st_mode):
+                        raise RuntimeError('Source input is not regular')
+                    source_paths.append(path)
+    source_inputs = {}
+    for path in source_paths:
+        for component in (path, *path.parents):
+            info = component.lstat()
+            if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 1024:
+                raise RuntimeError('Source input link/reparse refused')
+        if not stat.S_ISREG(path.lstat().st_mode):
+            raise RuntimeError('Source input is not regular')
+        source_inputs[path.relative_to(source).as_posix()] = path.read_bytes()
+    validate_partition(plan, source_inputs)
     closure = plan['cold_processes'][stage]['core']['resolved_closure']
     if not isinstance(closure, dict) or not closure:
         raise RuntimeError('Resolved import closure is missing')
