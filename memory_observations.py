@@ -562,6 +562,8 @@ def _safe_event(provider: Any, module: Any, row: Any) -> dict[str, Any] | None:
         raise _RetryableEventGuard("recall_guard_invalid_result")
     status = str(checked.get("status") or "")
     if status != "safe":
+        if status == "guard_unavailable_quarantined":
+            raise _RetryableEventGuard("recall_guard_unavailable")
         if "runtime_failure" in status or not status:
             raise _RetryableEventGuard("recall_guard_runtime_failure")
         return None
