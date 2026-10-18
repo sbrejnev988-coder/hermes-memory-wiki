@@ -174,6 +174,136 @@ class ColdPartitionTests(unittest.TestCase):
         self.refresh()
         self.reject('partition_source_native_intersection', raw=False)
 
+    def test_inherited_stage_fixture_uses_actual_absence_lane(self):
+        for path in self.module._STAGE_CONSUMERS:
+            row = self.row(path)
+            self.assertEqual(row['fixture_binding'], {'local': 'stage', 'peer': self.module._STAGE_PEER, 'fixture': 'stage'})
+            self.assertEqual((row['role'], row['lane']), ('source-only', 'source-explicit'))
+            self.assertIs(row['requires_sdk_absent'], True)
+            self.assertIn('source_pytest_absent', row['requires'])
+            self.assertIn(path, self.plan['source_explicit_targets'])
+            self.assertNotIn(path, self.plan['cold_processes']['legacy']['targets'])
+        self.module.validate_partition(self.plan, self.raw)
+
+    def test_inherited_fixture_refuses_native_metadata_even_with_false_absence(self):
+        for path in self.module._STAGE_CONSUMERS:
+            self.plan = copy.deepcopy(self.original)
+            self.row(path).update(role='pytest', lane='legacy', requires_sdk_absent=False,
+                                  requires=['exact_source_inputs', 'native_legacy'])
+            self.refresh()
+            self.reject('partition_fixture_lane:' + path, raw=False)
+            self.reject('partition_fixture_lane:' + path)
+
+    def test_inherited_fixture_binding_cannot_be_omitted_or_redirected(self):
+        path = 'tests/test_connector_legacy_schema_owner.py'
+        for binding in (None, {'local': 'stage', 'peer': 'tests/test_connector_stage_home_compat.py', 'fixture': 'stage'}):
+            self.plan = copy.deepcopy(self.original)
+            self.row(path)['fixture_binding'] = binding
+            self.reject('partition_fixture_binding:' + path, raw=False)
+
+    def test_actual_inherited_fixture_alias_drift_refused_after_rehash(self):
+        path = 'tests/test_connector_legacy_schema_owner.py'
+        self.assertIn(b'stage = peer.stage', self.raw[path])
+        self.raw[path] = self.raw[path].replace(b'stage = peer.stage', b'stage = peer.SCOPE')
+        self.row(path)['sha256'] = hashlib.sha256(self.raw[path]).hexdigest()
+        self.refresh()
+        self.reject('partition_fixture_source_binding:' + path)
+
+    def test_actual_fixture_absence_guard_drift_refused_after_rehash(self):
+        path = self.module._STAGE_PEER
+        old = b"importlib.util.find_spec('agent') is None"
+        self.assertIn(old, self.raw[path])
+        self.raw[path] = self.raw[path].replace(old, b"importlib.util.find_spec('agent') is not None")
+        self.row(path)['sha256'] = hashlib.sha256(self.raw[path]).hexdigest()
+        self.refresh()
+        self.reject('partition_fixture_source_guards')
+
+    def test_peer_input_edge_alone_does_not_inherit_fixture_absence(self):
+        # Synthetic metadata-only input edge, NOT an exported fixture binding.
+        path = 'tests/test_connector_document_domain.py'
+        row = self.row(path)
+        row['peers'].append(self.module._STAGE_PEER)
+        self.assertNotIn('fixture_binding', row)
+        self.assertFalse(row['requires_sdk_absent'])
+        self.assertEqual(row['lane'], 'legacy')
+        self.assertNotIn(b'stage = peer.stage', self.raw[path])
+        self.module.validate_partition(self.plan, self.raw)
+
+    def test_isolated_ci_invocation_binds_actual_initial_import(self):
+        for path in self.module._CI_ENTRIES:
+            row = self.row(path)
+            self.assertEqual(row['entry'], self.module.isolated_ci_entry(path))
+            self.assertEqual(row['entry']['bootstrap']['argv'][1:5], ['-I', '-B', '-S', '-c'])
+            imports = [n for n in ast.parse(self.raw[path]).body if isinstance(n, ast.ImportFrom) and n.module == 'binding_cases']
+            self.assertEqual(len(imports), 1)
+            self.assertEqual([n.name for n in imports[0].names], ['fixtures', 'load'])
+            self.assertIn(self.module._CI_PEER, row['peers'])
+            self.assertIn('isolated_ci_peer_binding', row['requires'])
+        self.module.validate_partition(self.plan, self.raw)
+
+    def test_isolated_ci_bare_and_mutated_bootstrap_refused(self):
+        for path in self.module._CI_ENTRIES:
+            self.plan = copy.deepcopy(self.original)
+            self.row(path)['entry']['invocation'] = 'python -I -B -S ' + path
+            self.reject('partition_ci_bootstrap:' + path, raw=False)
+            self.plan = copy.deepcopy(self.original)
+            self.row(path)['entry']['bootstrap']['argv'].remove('-S')
+            self.reject('partition_ci_bootstrap:' + path, raw=False)
+            self.plan = copy.deepcopy(self.original)
+            self.row(path)['entry']['bootstrap']['path_binding'] = 'fixture/SDK'
+            self.reject('partition_ci_bootstrap:' + path, raw=False)
+
+    def test_isolated_ci_missing_prerequisites_and_peer_refused(self):
+        path = 'tests/ci_owned/entry_cases.py'
+        for field, value in (('requires', ['exact_source_inputs', 'source_stdlib']), ('peers', [])):
+            self.plan = copy.deepcopy(self.original)
+            self.row(path)[field] = value
+            self.reject('partition_ci_bootstrap_prerequisites:' + path, raw=False)
+        self.plan = copy.deepcopy(self.original)
+        self.row(path)['entry']['bootstrap']['fixture_env'] = None
+        self.reject('partition_ci_bootstrap:' + path, raw=False)
+        self.plan = copy.deepcopy(self.original)
+        self.plan['source_pins'] = [p for p in self.plan['source_pins'] if p['path'] != 'scripts/ci_owned/ci_bootstrap.py']
+        self.reject('partition_ci_bootstrap_inputs', raw=False)
+
+    def test_isolated_ci_actual_initial_import_drift_refused_after_rehash(self):
+        path = 'tests/ci_owned/exit_cases.py'
+        self.raw[path] = self.raw[path].replace(b'from binding_cases import fixtures, load', b'from another_peer import fixtures, load')
+        self.row(path)['sha256'] = hashlib.sha256(self.raw[path]).hexdigest()
+        self.refresh()
+        self.reject('partition_ci_initial_import:' + path)
+
+    def test_isolated_ci_runpy_executes_path_binding_before_entry(self):
+        # Execute the actual declared stdlib bootstrap, not the old suites.
+        # The inert target resolves the byte-exact peer without importing it:
+        # non-stdlib imports remain denied by the unchanged SOURCE envelope.
+        root = Path(tempfile.mkdtemp(prefix='ci-peer-binding-', dir=os.environ['TMPDIR']))
+        peer = root / 'binding_cases.py'
+        peer.write_bytes(self.raw[self.module._CI_PEER])
+        old_argv, old_path = sys.argv, list(sys.path)
+        try:
+            for path in self.module._CI_ENTRIES:
+                entry = root / Path(path).name
+                entry.write_text(
+                    "from importlib.machinery import PathFinder\n"
+                    "from pathlib import Path\nimport sys\n"
+                    "assert sys.flags.isolated and sys.flags.no_site and sys.flags.dont_write_bytecode\n"
+                    "spec = PathFinder.find_spec('binding_cases')\n"
+                    "assert spec is not None and Path(spec.origin) == Path(__file__).with_name('binding_cases.py')\n"
+                    "assert sys.path[0] == str(Path(__file__).parent)\n"
+                    "Path(__file__).with_suffix('.witness').write_text(spec.origin, encoding='utf-8')\n",
+                    encoding='utf-8')
+                bootstrap = self.row(path)['entry']['bootstrap']
+                sys.argv = ['-c', str(entry)]
+                exec(compile(bootstrap['argv'][5], '<declared isolated stdlib bootstrap>', 'exec'), {})
+                self.assertEqual(entry.with_suffix('.witness').read_text(encoding='utf-8'), str(peer))
+                self.assertEqual(sys.path, [str(root), *old_path])
+                self.assertEqual(peer.read_bytes(), self.raw[self.module._CI_PEER])
+                sys.path[:] = old_path
+        finally:
+            sys.argv = old_argv
+            sys.path[:] = old_path
+
     def test_source_only_unittest_cannot_be_native_pytest(self):
         self.row('tests/test_p2_g3_repair01_pure.py')['lane'] = 'strict'
         self.refresh()

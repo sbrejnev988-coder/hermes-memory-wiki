@@ -43,6 +43,35 @@ def partition_digest(rows):
                                     separators=(',', ':')).encode('utf-8')).hexdigest()
 
 
+# Explicit contracts for actual bindings, NOT transitive inference from peers.
+_STAGE_PEER = 'tests/test_connector_stage_admission.py'
+_STAGE_CONSUMERS = ('tests/test_connector_legacy_schema_owner.py',
+                    'tests/test_connector_stage_home_compat.py')
+_CI_PEER = 'tests/ci_owned/binding_cases.py'
+_CI_ENTRIES = ('tests/ci_owned/entry_cases.py', 'tests/ci_owned/exit_cases.py')
+_CI_INPUTS = (_CI_PEER, 'scripts/ci_owned/ci_process.py',
+              'scripts/ci_owned/ci_bootstrap.py', 'scripts/ci_owned/memory_wiki_ci.py')
+_CI_RUNPY = ("import runpy,sys; from pathlib import Path; "
+             "entry=Path(sys.argv[1]).absolute(); sys.path.insert(0,str(entry.parent)); "
+             "runpy.run_path(str(entry),run_name='__main__')")
+
+
+def isolated_ci_entry(path):
+    """Supported stdlib invocation: bind only the entry's own peer directory.
+
+    Run from the complete source root with MW_CI_UNIT_FIXTURES pointing at an
+    existing, empty owned scratch directory. No site/SDK path is introduced.
+    binding_cases itself binds scripts/ci_owned for its existing lazy load API.
+    """
+    if path not in _CI_ENTRIES:
+        raise ValueError('partition_ci_bootstrap_path')
+    argv = ['python', '-I', '-B', '-S', '-c', _CI_RUNPY, path]
+    return {'kind': 'unittest', 'invocation': 'python -I -B -S -c "' + _CI_RUNPY + '" ' + path,
+            'callables': {}, 'bootstrap': {'argv': argv, 'path_binding': 'tests/ci_owned',
+                                         'peer': _CI_PEER, 'source_inputs': list(_CI_INPUTS),
+                                         'fixture_env': 'MW_CI_UNIT_FIXTURES'}}
+
+
 def validate_partition(plan, source_inputs=None):
     """Pure metadata/bytes validation. Never import tests, provider or SDK.
 
@@ -115,6 +144,28 @@ def validate_partition(plan, source_inputs=None):
     for row in rows:
         if any(_source_path(p) not in by_path or p == row['path'] for p in row['peers']):
             raise ValueError('partition_peer_missing')
+    # These two modules actually export stage=peer.stage and consume it as a
+    # fixture. A false absence flag cannot turn that contract into native pytest.
+    for path in (_STAGE_PEER, *_STAGE_CONSUMERS):
+        row = by_path.get(path, {})
+        if (row.get('role') != 'source-only' or row.get('lane') != 'source-explicit'
+                or row.get('requires_sdk_absent') is not True
+                or 'source_pytest_absent' not in row.get('requires', [])
+                or any(k.startswith('native_') for k in row.get('requires', []))
+                or not row.get('entry') or row['entry']['kind'] != 'pytest'):
+            raise ValueError('partition_fixture_lane:' + path)
+        if path in _STAGE_CONSUMERS:
+            binding = {'local': 'stage', 'peer': _STAGE_PEER, 'fixture': 'stage'}
+            if row.get('fixture_binding') != binding or _STAGE_PEER not in row['peers']:
+                raise ValueError('partition_fixture_binding:' + path)
+    for path in _CI_ENTRIES:
+        row = by_path.get(path, {})
+        if (row.get('role') != 'unittest-explicit' or row.get('lane') != 'source-explicit'
+                or row.get('entry') != isolated_ci_entry(path)):
+            raise ValueError('partition_ci_bootstrap:' + path)
+        if (_CI_PEER not in row['peers']
+                or not {'exact_source_inputs', 'source_stdlib', 'isolated_ci_peer_binding'}.issubset(row['requires'])):
+            raise ValueError('partition_ci_bootstrap_prerequisites:' + path)
     processes = plan.get('cold_processes')
     if type(processes) is not dict or set(processes) != {'strict', 'legacy', 'legacy-recovery'}:
         raise ValueError('partition_cold_processes')
@@ -161,6 +212,8 @@ def validate_partition(plan, source_inputs=None):
         pin_map[path] = pin['sha256']
     if pin_map.get('__init__.py') != plan.get('frozen_provider_sha256'):
         raise ValueError('partition_provider_pin')
+    if any(path not in by_path and path not in pin_map for path in _CI_INPUTS):
+        raise ValueError('partition_ci_bootstrap_inputs')
     pending = plan.get('pending_peer_inputs')
     if type(pending) is not list or any(type(p) is not dict for p in pending):
         raise ValueError('partition_pending_peer')
@@ -197,6 +250,42 @@ def validate_partition(plan, source_inputs=None):
                 raise ValueError('partition_native_target_pin:' + target['entry'])
         for path, row in by_path.items():
             tree = ast.parse(source_inputs[path], filename=path)
+            if path in _STAGE_CONSUMERS:
+                assignments = {t.id: n.value for n in tree.body if isinstance(n, ast.Assign)
+                               for t in n.targets if isinstance(t, ast.Name)}
+                expected = {'stage': 'peer.stage',
+                            '_SPEC': "importlib.util.spec_from_file_location(PEER_NAME, Path(__file__).with_name('test_connector_stage_admission.py'))",
+                            'peer': 'importlib.util.module_from_spec(_SPEC)'}
+                spec = assignments.get('_SPEC')
+                # The private module name differs; the exact peer path does not.
+                if isinstance(spec, ast.Call) and spec.args and isinstance(spec.args[0], ast.Constant):
+                    expected['_SPEC'] = expected['_SPEC'].replace('PEER_NAME', repr(spec.args[0].value))
+                actual = {k: ast.unparse(assignments[k]) for k in expected if k in assignments}
+                loaded = any(isinstance(n, ast.Expr) and ast.unparse(n.value) == '_SPEC.loader.exec_module(peer)' for n in tree.body)
+                consumed = any(isinstance(n, ast.FunctionDef) and n.name.startswith('test_')
+                               and any(a.arg == 'stage' for a in n.args.args) for n in tree.body)
+                if actual != expected or not loaded or not consumed:
+                    raise ValueError('partition_fixture_source_binding:' + path)
+            if path == _STAGE_PEER:
+                fixtures = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'stage']
+                guards = {"importlib.util.find_spec('agent') is None",
+                          "importlib.util.find_spec('hermes_trust_core') is None",
+                          'module.MemoryProvider.__module__ == module.__name__'}
+                if (len(fixtures) != 1 or not any(ast.unparse(d) == 'pytest.fixture' for d in fixtures[0].decorator_list)
+                        or not guards.issubset({ast.unparse(n.test) for n in fixtures[0].body if isinstance(n, ast.Assert)})):
+                    raise ValueError('partition_fixture_source_guards')
+            if path in _CI_ENTRIES:
+                imports = [n for n in tree.body if isinstance(n, ast.ImportFrom) and n.module == 'binding_cases']
+                if (len(imports) != 1 or imports[0].level != 0
+                        or [(n.name, n.asname) for n in imports[0].names] != [('fixtures', None), ('load', None)]):
+                    raise ValueError('partition_ci_initial_import:' + path)
+            if path == _CI_PEER:
+                functions = {n.name: ast.unparse(n.args) for n in tree.body if isinstance(n, ast.FunctionDef)}
+                statements = {ast.unparse(n) for n in tree.body}
+                if (functions.get('fixtures') != '' or functions.get('load') != 'name'
+                        or "SCRIPTS = Path(__file__).resolve().parents[2] / 'scripts/ci_owned'" not in statements
+                        or 'sys.path.insert(0, str(SCRIPTS))' not in statements):
+                    raise ValueError('partition_ci_peer_source_binding')
             functions = {n.name: ast.unparse(n.args) for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
             entry = row['entry']
             if entry and any(functions.get(k) != v for k, v in entry['callables'].items()):

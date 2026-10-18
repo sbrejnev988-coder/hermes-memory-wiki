@@ -15,18 +15,18 @@
 
 | File role | Файлов | Что означает запись |
 |---|---:|---|
-| `pytest` | 268 | Есть collectible function/class declarations; реальная collection и outcomes не выполнялись |
+| `pytest` | 267 | Есть collectible function/class declarations; реальная collection и outcomes не выполнялись |
 | `unittest-explicit` | 20 | Отдельный stdlib entry / suite binding; `make_suite` или `CARRIER` не инициализируются одним pytest discovery |
 | `callable` | 2 | Реальные аргументные native packets; не pytest test bodies |
-| `source-only` | 8 | Отдельный SOURCE маршрут, исключённый из native preload; конкретные требования различаются |
+| `source-only` | 9 | Отдельный SOURCE маршрут, исключённый из native preload; конкретные требования различаются |
 | `support` | 19 | Helpers, fixture producers, conftest, reporter, cold entry; не независимые test cases |
 | `historical` | 2 | `baseline-source_connectors.py` и `primitive_guard_a9d5016e.py`: неизменные oracle inputs, не current runtime/tests |
 
-File-lane membership: legacy 244, strict 24, SOURCE-explicit 28,
+File-lane membership: legacy 243, strict 24, SOURCE-explicit 29,
 native-explicit packets 2, support 19, historical 2. Отдельный recovery entry
 повторно ссылается на существующий `recovery_cases.py`; это намеренный другой
 cold process, не ещё один уникальный файл. Не складывать этот повтор с file
-inventory или cases. У source_explicit_targets теперь полный набор 28 entries,
+inventory или cases. У source_explicit_targets теперь полный набор 29 entries,
 включая существующий doc/code SOURCE carrier.
 
 Для каждого Python-файла JSON хранит raw SHA-256, role, lane, actual entry kind,
@@ -51,8 +51,14 @@ invocation, сигнатуры объявленных explicit functions, при
   identity. Их нельзя запускать после native SDK preload. Исторический
   `g4_original_boundary_gold.txt`, BEFORE oracle и security expectations не менялись.
 - `test_connector_stage_admission.py` требует genuine `agent` и trust absence и
-  настоящую standalone fallback class; `test_connector_stage_home_compat.py`
-  использует тот же peer. Оба имеют отдельный SOURCE-only pytest маршрут.
+  настоящую standalone fallback class; `test_connector_stage_home_compat.py` и
+  `test_connector_legacy_schema_owner.py` **реально экспортируют `stage=peer.stage`**
+  и используют эту fixture в cases. Все три имеют отдельный SOURCE-only pytest
+  маршрут. Для двух consumers задан явный `fixture_binding`, проверяемый по actual
+  top-level peer loader/alias/fixture argument; producer сохраняет genuine absence
+  и standalone guards. `requires_sdk_absent=false` не разрешает native metadata.
+  Это узкий actual-binding контракт, не новый import resolver и не распространение
+  absence по любому `peers` edge: AST/input reading само по себе не fixture import.
   **In-tree native autouse conftest несовместим с этим маршрутом.** Для будущего
   настоящего pytest требуется byte-exact полный peer layout в own non-package
   tree без native ancestor conftest; здесь такого процесса/копии/допуска нет.
@@ -65,6 +71,22 @@ invocation, сигнатуры объявленных explicit functions, при
   инертное `python file.py` как якобы выполненный набор.
 - `tests/ci_owned/test_current_sdk_bootstrap.py` требует явного `CARRIER` для его
   UNIT-only API; вызов worker/component не разрешён этим binding.
+- `tests/ci_owned/entry_cases.py` и `exit_cases.py` до первого case импортируют
+  `binding_cases`. Bare `python -I -B -S <file>` не добавляет script directory и
+  здесь не поддержан. Их exact structured bootstrap/argv и invocation используют
+  **stdlib `-c` + `runpy`**, добавляя только собственный `tests/ci_owned` до этого
+  import. Из complete source root (пример для entry; exit заменяет только operand):
+
+  ```text
+  python -I -B -S -c "import runpy,sys; from pathlib import Path; entry=Path(sys.argv[1]).absolute(); sys.path.insert(0,str(entry.parent)); runpy.run_path(str(entry),run_name='__main__')" tests/ci_owned/entry_cases.py
+  ```
+
+  Prerequisites: проверенный полный source layout, byte-exact peer
+  `tests/ci_owned/binding_cases.py`, существующий пустой own scratch через
+  `MW_CI_UNIT_FIXTURES`, credential-free home/temp. Сам peer штатно добавляет только
+  `scripts/ci_owned` для lazy `load(name)`; `ci_process.py`, `ci_bootstrap.py` и
+  `memory_wiki_ci.py` явно SHA-bound. Ни SDK path, ни site/PYTHONPATH, ни новый
+  runner не добавлены; `-I/-B/-S` сохранены, historical bodies не изменены.
 - `test_runtime_lifecycle_handoff.py`: `run_lifecycle_packet(provider, root)`.
   `test_fts_transaction_handoff.py`: `run_fts_packet(provider, manager, root,
   checkpoint)`, `run_negative_packet(...)`, `run_retained_fts_unknown(home,
@@ -102,6 +124,10 @@ unique file paths, literal safe paths/hashes, file count/digest, prerequisites,
 peers, exact source/native target lists, допустимую recovery overlap и explicit
 packet membership. SOURCE-only/SDK-absence targets не допускаются в native lanes;
 noncases не становятся исполняемыми targets. Native permission из JSON не выдаётся.
+Actual stage consumers проверяются независимо от заявленного boolean: подмена lane,
+пропуск/перенаправление fixture binding и отсутствие prerequisites отвергаются.
+Два CI entry требуют exact supported bootstrap argv/invocation, own peer path,
+fixture ENV и SHA-bound source-input closure; descriptive promise не заменяет их.
 
 Если передан independently enumerated `{repo_path: raw_bytes}`, проверяются exact
 membership всего current test Python census плюс named source pins, все raw SHA,
@@ -134,6 +160,15 @@ intersections, target loss/duplication, support hidden cases, exact callable
 signature, factory/CARRIER setup declarations, peer/prerequisite loss, provider /
 entry pin drift, pending hash/rebind, distinct native revisions и actual ранние
 cold-plan refusals. Native/pytest assertions и исторические tests не менялись.
+Correction A-SOURCE-01/02 добавляет negative controls ложной native metadata даже
+с `requires_sdk_absent=false`, alias/guard drift после rehash, сохранённый
+non-inheriting input edge, bare/изменённый bootstrap и потерю peer/prerequisites.
+В том же packet actual declared `runpy` bootstrap исполняется на инертных own
+targets и через stdlib `PathFinder` разрешает byte-exact `binding_cases.py` до
+первого import. Historical CI suites и сам peer не исполняются: SOURCE envelope
+по-прежнему запрещает non-stdlib imports; это bootstrap/source-binding control,
+не новый запуск тех suite или native/pytest proof. Старый SOURCE27 сохранён как
+исторический; весь affected validator cohort проверяется заново, без переноса PASS.
 
 Для этого bounded packet полный независимый byte census упакован в два
 lossless UTF-8 JSON+zlib inputs (tests и entry pins): у permanent harness не более

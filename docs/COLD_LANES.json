@@ -3,7 +3,7 @@
   "status": "SOURCE_CHECKPOINT_NOT_NATIVE_ADMISSION",
   "frozen_provider_sha256": "23e60da064fc7b7b0cdf195bb8608b86be2615204c4ca6f53f8a4ec904d15851",
   "needs_final_rebind": true,
-  "input_inventory_sha256": "1ecf6609af9b3261e05875a73be13f84acf7ce064d93e6e090859326dd603c1a",
+  "input_inventory_sha256": "acb14241a11775ec7c4cfe946aa1399d46e4ae925ceac9489dd36411cf55e721",
   "cold_processes": {
     "strict": {
       "HERMES_SECURITY_STRICT": "1",
@@ -89,7 +89,6 @@
         "tests/test_code_shrinker_bridge.py",
         "tests/test_code_shrinker_state_machine_fault_matrix.py",
         "tests/test_connector_document_domain.py",
-        "tests/test_connector_legacy_schema_owner.py",
         "tests/test_connector_local_transaction.py",
         "tests/test_continuation_code_boundary.py",
         "tests/test_continuation_context_boundary.py",
@@ -452,12 +451,33 @@
       "lane": "source-explicit",
       "entry": {
         "kind": "unittest",
-        "invocation": "python -I -B -S tests/ci_owned/entry_cases.py",
-        "callables": {}
+        "invocation": "python -I -B -S -c \"import runpy,sys; from pathlib import Path; entry=Path(sys.argv[1]).absolute(); sys.path.insert(0,str(entry.parent)); runpy.run_path(str(entry),run_name='__main__')\" tests/ci_owned/entry_cases.py",
+        "callables": {},
+        "bootstrap": {
+          "argv": [
+            "python",
+            "-I",
+            "-B",
+            "-S",
+            "-c",
+            "import runpy,sys; from pathlib import Path; entry=Path(sys.argv[1]).absolute(); sys.path.insert(0,str(entry.parent)); runpy.run_path(str(entry),run_name='__main__')",
+            "tests/ci_owned/entry_cases.py"
+          ],
+          "path_binding": "tests/ci_owned",
+          "peer": "tests/ci_owned/binding_cases.py",
+          "source_inputs": [
+            "tests/ci_owned/binding_cases.py",
+            "scripts/ci_owned/ci_process.py",
+            "scripts/ci_owned/ci_bootstrap.py",
+            "scripts/ci_owned/memory_wiki_ci.py"
+          ],
+          "fixture_env": "MW_CI_UNIT_FIXTURES"
+        }
       },
       "requires": [
         "exact_source_inputs",
-        "source_stdlib"
+        "source_stdlib",
+        "isolated_ci_peer_binding"
       ],
       "requires_sdk_absent": false,
       "peers": [
@@ -488,12 +508,33 @@
       "lane": "source-explicit",
       "entry": {
         "kind": "unittest",
-        "invocation": "python -I -B -S tests/ci_owned/exit_cases.py",
-        "callables": {}
+        "invocation": "python -I -B -S -c \"import runpy,sys; from pathlib import Path; entry=Path(sys.argv[1]).absolute(); sys.path.insert(0,str(entry.parent)); runpy.run_path(str(entry),run_name='__main__')\" tests/ci_owned/exit_cases.py",
+        "callables": {},
+        "bootstrap": {
+          "argv": [
+            "python",
+            "-I",
+            "-B",
+            "-S",
+            "-c",
+            "import runpy,sys; from pathlib import Path; entry=Path(sys.argv[1]).absolute(); sys.path.insert(0,str(entry.parent)); runpy.run_path(str(entry),run_name='__main__')",
+            "tests/ci_owned/exit_cases.py"
+          ],
+          "path_binding": "tests/ci_owned",
+          "peer": "tests/ci_owned/binding_cases.py",
+          "source_inputs": [
+            "tests/ci_owned/binding_cases.py",
+            "scripts/ci_owned/ci_process.py",
+            "scripts/ci_owned/ci_bootstrap.py",
+            "scripts/ci_owned/memory_wiki_ci.py"
+          ],
+          "fixture_env": "MW_CI_UNIT_FIXTURES"
+        }
       },
       "requires": [
         "exact_source_inputs",
-        "source_stdlib"
+        "source_stdlib",
+        "isolated_ci_peer_binding"
       ],
       "requires_sdk_absent": false,
       "peers": [
@@ -607,7 +648,7 @@
     },
     {
       "path": "tests/cold_lane_entry.py",
-      "sha256": "7795dfbf276b871c6b2b0a2f695b0e11eed324ae822e26268eeec040ddb36eb6",
+      "sha256": "54ce504610f2788653e629cd903495abc8ad621b1533d9cd7300ffed9f9ed485",
       "role": "support",
       "lane": "support",
       "entry": null,
@@ -1643,7 +1684,7 @@
     },
     {
       "path": "tests/test_cold_lane_partition.py",
-      "sha256": "3d6af670565b404180feb1a5437e63c64005fa6eb896cd6ba2423cc728dcbf32",
+      "sha256": "eb03ec0207dd02dbc87b22c7e533497f97846b36bd62e11ce96c03d448d02c7e",
       "role": "unittest-explicit",
       "lane": "source-explicit",
       "entry": {
@@ -1715,22 +1756,27 @@
     {
       "path": "tests/test_connector_legacy_schema_owner.py",
       "sha256": "66cac6721dea303d950a542e4e8fe78237dc2660a4900ff81e160cf7eeb6821b",
-      "role": "pytest",
-      "lane": "legacy",
+      "role": "source-only",
+      "lane": "source-explicit",
       "entry": {
         "kind": "pytest",
-        "invocation": "tests/cold_lane_entry.py legacy docs/COLD_LANES.json -> pytest.main([\"tests/test_connector_legacy_schema_owner.py\"]) via existing admitted recorder",
+        "invocation": "pytest.main([byte-exact isolated non-package tests/test_connector_legacy_schema_owner.py]); NO native conftest/preload",
         "callables": {}
       },
       "requires": [
         "exact_source_inputs",
-        "native_legacy"
+        "source_pytest_absent"
       ],
-      "requires_sdk_absent": false,
+      "requires_sdk_absent": true,
       "peers": [
         "tests/test_connector_stage_admission.py"
       ],
-      "reason": "Own standalone cold schema preparation, never a caller's pending SQL. Collectible declarations; full prerequisites/individual bodies NOT executed by inventory."
+      "reason": "Own standalone cold schema preparation; actual stage=peer.stage fixture requires genuine agent/trust absence and standalone provider. Separate SOURCE pytest; never native preload.",
+      "fixture_binding": {
+        "local": "stage",
+        "peer": "tests/test_connector_stage_admission.py",
+        "fixture": "stage"
+      }
     },
     {
       "path": "tests/test_connector_local_transaction.py",
@@ -1791,7 +1837,12 @@
       "peers": [
         "tests/test_connector_stage_admission.py"
       ],
-      "reason": "R3-SOURCE-L1: legacy home-less callers, not a managed-cache capability. Separate SOURCE process; never native preload."
+      "reason": "R3-SOURCE-L1: legacy home-less callers, not a managed-cache capability. Separate SOURCE process; never native preload.",
+      "fixture_binding": {
+        "local": "stage",
+        "peer": "tests/test_connector_stage_admission.py",
+        "fixture": "stage"
+      }
     },
     {
       "path": "tests/test_continuation_code_boundary.py",
@@ -6256,6 +6307,7 @@
     "tests/test_ci_lifecycle_observer.py",
     "tests/test_cold_lane_partition.py",
     "tests/test_collection_evidence.py",
+    "tests/test_connector_legacy_schema_owner.py",
     "tests/test_connector_stage_admission.py",
     "tests/test_connector_stage_home_compat.py",
     "tests/test_episode_projection_guard.py",
@@ -6326,7 +6378,8 @@
     "historical_only": "Preserved historical source oracle/fixture; not current runtime, not a pytest case. Do not rebind its historical bytes.",
     "exact_source_inputs": "Current full checkout/declared readonly sources and transitive shipped test peers required. Static filename/import peers are layout dependencies, not a complete native dependency or semantic body audit.",
     "mixed_security_modes": "File contains multiple security-mode paths; future FULL must prove actual per-case cold mode and no unsupported skip/xfail. This file-level declaration is not per-node execution admission.",
-    "protected_fixture_settings": "Some existing cases can write synthetic protected settings or spawn workers. Current no-config/env/native-child scope does not admit those effects; future own fixture/resource admission required."
+    "protected_fixture_settings": "Some existing cases can write synthetic protected settings or spawn workers. Current no-config/env/native-child scope does not admit those effects; future own fixture/resource admission required.",
+    "isolated_ci_peer_binding": "Before the initial from binding_cases import, use the exact stdlib -I -B -S -c/runpy bootstrap and only the entry own tests/ci_owned path. Genuine peer then binds scripts/ci_owned; all declared source_inputs SHA-bound. Run from the complete source root with existing empty owned MW_CI_UNIT_FIXTURES and clean home/temp. No SDK path, site or PYTHONPATH; no new runner."
   },
   "pending_peer_inputs": [
     {
@@ -6352,6 +6405,14 @@
     {
       "path": "packaging/run_native_regressions.py",
       "sha256": "5222f1ac2edc98eb2eb79a8079b5f8ded5e2ab68c9cfb2bfa30dd9dc426c2d49"
+    },
+    {
+      "path": "scripts/ci_owned/ci_bootstrap.py",
+      "sha256": "37bd539048cf9da0ceed411ac0fe5ecaf9f8bf576cc71d2a3739746be8f5f9a7"
+    },
+    {
+      "path": "scripts/ci_owned/ci_process.py",
+      "sha256": "4d6297452e42ea164bc7dea7ab0dc5fc35fb6dd5384b215a6f4cf5d8beab5385"
     },
     {
       "path": "scripts/ci_owned/current_sdk_bootstrap.py",
