@@ -55,7 +55,11 @@ def collection_reporter(source: Path, evidence_root: Path):
     if spec is None or spec.loader is None:
         raise RuntimeError('Collection evidence reporter source loader unavailable')
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # Execute the exact declared source, without implicit reads or writes of a
+    # bytecode-cache file outside a closed offline fixture's admitted inputs.
+    path = source / 'tests/helpers/collection_evidence.py'
+    exec(compile(path.read_bytes(), str(path), 'exec', dont_inherit=True),
+         module.__dict__)
     return module.CollectionEvidence(evidence_root)
 
 

@@ -16,7 +16,7 @@ import os
 from pathlib import Path
 import stat
 import tempfile
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 import unittest
 
 ROOT = Path(globals().get('COLLECTION_SOURCE_ROOT', Path(__file__).parent.parent))
@@ -26,9 +26,13 @@ COLD = ROOT / 'tests/cold_lane_entry.py'
 
 
 def load_reporter():
-    spec = importlib.util.spec_from_file_location('_collection_evidence_fixture', REPORTER)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # This test-owned whole-module loader uses only the declared source file.
+    # SourceFileLoader.exec_module also probes a bytecode-cache path, which is
+    # intentionally outside the closed SOURCE packet's read allowlist.
+    module = ModuleType('_collection_evidence_fixture')
+    module.__file__ = str(REPORTER)
+    exec(compile(REPORTER.read_bytes(), str(REPORTER), 'exec', dont_inherit=True),
+         module.__dict__)
     return module
 
 
