@@ -7801,6 +7801,10 @@ class MemoryWikiProvider(MemoryProvider):
             row = self._connect().execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
             return str(row["value"] if row else default)
         except Exception:
+            # Missing optional metadata may use its default; a retained native
+            # transaction refusal may not become a plausible owner identity.
+            if getattr(self, "_transaction_quarantine", None) is not None:
+                raise
             return default
 
     def _meta_int(self, key: str, default: int = 0) -> int:

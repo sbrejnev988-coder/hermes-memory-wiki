@@ -477,14 +477,63 @@ def _final_visible_nonclaims(
     }
     if not expected:
         return set()
+    # Identity/ACL callbacks may legitimately read provider metadata through
+    # _connect(). A raw SAVEPOINT on its shared handle is NOT a registered
+    # provider transaction. Use the existing query-only factory lifetime, not
+    # a claim-writer grant or a second, independently adopted source image.
     try:
-        conn = provider._connect()
+        from .code_knowledge_graph import (
+            _open_graph_reader_connection, _close_graph_writer_connection,
+            _code_disclosure,
+        )
+    except ImportError:
+        from code_knowledge_graph import (
+            _open_graph_reader_connection, _close_graph_writer_connection,
+            _code_disclosure,
+        )
+    try:
+        conn, owned = _open_graph_reader_connection(provider, disclosure=True)
     except Exception:
+        if getattr(provider, "_transaction_quarantine", None) is not None:
+            raise
         return set()
-    # A cached fingerprint is not authoritative proof of current visibility.
-    # Reject unsupported connections; tests must not bypass this boundary.
-    if not isinstance(conn, sqlite3.Connection):
-        return set()
+    try:
+        # A shared/in-memory fallback has no independent read lifetime. Never
+        # turn it into a writer or open an unowned transaction on the provider.
+        if not owned:
+            return set()
+        disclosure = _code_disclosure(provider, conn)
+        valid = _final_visible_nonclaims_on_connection(
+            provider, expected, conn, episodic_backend=episodic_backend,
+            event_backend=event_backend, observation_backend=observation_backend,
+            event_scope=event_scope, runtime_module=runtime_module,
+        )
+        # Original provider anchor is checked AFTER the private snapshot ends.
+        # The recall entry's earlier read set also survives until terminal
+        # delivery; neither callback drift nor a later DB identity is adopted.
+        return valid if disclosure.finish() else set()
+    except BaseException as primary:
+        if owned:
+            conn._graph_read_primary = primary
+        raise
+    finally:
+        # The owning factory positively closes/retires this exact reader. Its
+        # primary/UNKNOWN cleanup failure must reach the actual upper caller.
+        _close_graph_writer_connection(conn, owned)
+
+
+def _final_visible_nonclaims_on_connection(
+    provider: Any,
+    expected: dict[tuple[str, str, str], str],
+    conn: sqlite3.Connection,
+    *,
+    episodic_backend: Any,
+    event_backend: Any,
+    observation_backend: Any,
+    event_scope: str,
+    runtime_module: Any,
+) -> set[tuple[str, str, str]]:
+    """One authoritative nonclaim snapshot on the factory-issued reader."""
 
     valid: set[tuple[str, str, str]] = set()
     stamp = int(time.time())
@@ -876,14 +925,20 @@ def _final_visible_nonclaims(
                 key = ("graph", raw_id, graph_kind)
                 if _graph_snapshot_fingerprint(graph_kind, rendered) == expected.get(key):
                     valid.add(key)
-    except Exception:
+    except Exception as primary:
+        conn._graph_read_primary = primary
+        if getattr(provider, "_transaction_quarantine", None) is not None:
+            raise
         return set()
     finally:
         try:
             conn.execute(f"RELEASE {savepoint}")
-        except Exception:
+        except Exception as primary:
             # A failed snapshot completion cannot authorize returned evidence,
             # even when the best-effort savepoint cleanup subsequently succeeds.
+            # Retain its first cause if owning close subsequently becomes UNKNOWN.
+            if conn._graph_read_primary is None:
+                conn._graph_read_primary = primary
             valid.clear()
             try:
                 conn.execute(f"ROLLBACK TO {savepoint}")
