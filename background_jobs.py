@@ -33,6 +33,10 @@ _ERROR_CODES = frozenset({
 })
 
 
+class GraphSettingsUnavailable(Exception):
+    """Temporary own settings read failure, not a consent or writer grant."""
+
+
 def enabled() -> bool:
     return os.environ.get("MEMORY_WIKI_BACKGROUND_JOBS_ENABLED", "0").strip().lower() in {
         "1", "true", "yes", "on",
@@ -711,11 +715,13 @@ def _run_job(
             tuple(dict(job).items()), lease_valid, lease_valid_in_transaction)
         primary = None
         try:
-            result = worker._auto_graph_enrich_extracted_claims([payload["claim_id"]])
+            result = worker._auto_graph_enrich_extracted_claims([payload["claim_id"]], _require_settings=True)
             if int(result.get("errors") or 0) > 0:
                 return "provider"
             if int(result.get("deadline_exhausted") or 0) > 0:
                 return "timeout"
+        except GraphSettingsUnavailable:
+            return ("defer", int(time.time()) + 60)
         except BaseException as exc:
             primary = exc
             raise

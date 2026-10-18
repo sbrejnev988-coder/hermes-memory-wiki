@@ -9866,7 +9866,7 @@ class MemoryWikiProvider(MemoryProvider):
                 f"session_hash={self._chat_hash(self.session_id)}: {type(exc).__name__}",
             )
 
-    def relevant_graph_extraction_settings(self) -> tuple[bool, bool]:
+    def relevant_graph_extraction_settings(self, *, _raise_unavailable: bool = False) -> tuple[bool, bool]:
         """Call-time own-profile gates; unknown ambient origin cannot enable work."""
         names = ("MEMORY_WIKI_GRAPH_AUTO_EXTRACT", "MEMORY_WIKI_GRAPH_EXTRACT_ENABLED")
         scope = _QDRANT_PROFILE_SCOPE.get() or {}
@@ -9886,17 +9886,26 @@ class MemoryWikiProvider(MemoryProvider):
         try:
             settings = self._graph_extraction_settings()
             return enabled(names[0]), settings.enabled if settings is not None else enabled(names[1])
+        except OSError as exc:
+            # Only an already queued consumer needs to retain unknown consent.
+            # A known auto opt-out is still a lawful no-op, not a dependency.
+            if _raise_unavailable and enabled(names[0]):
+                raise _background_jobs.GraphSettingsUnavailable('graph_settings_unavailable') from exc
+            return False, False
         except Exception:
             return False, False
 
-    def _auto_graph_enrich_extracted_claims(self, claim_ids: Iterable[str]) -> Dict[str, int]:
+    def _auto_graph_enrich_extracted_claims(self, claim_ids: Iterable[str], *, _require_settings: bool = False) -> Dict[str, int]:
         """Optionally enrich newly extracted grounded claims with graph edges.
 
         The remote extractor receives only the already bounded claim text. Raw
         session messages never enter this path. Every applied edge still flows
         through ``_graph_extract_claim`` and its journaled add-relation writes.
         """
-        enabled, graph_enabled = self.relevant_graph_extraction_settings()
+        if _require_settings:
+            enabled, graph_enabled = self.relevant_graph_extraction_settings(_raise_unavailable=True)
+        else:
+            enabled, graph_enabled = self.relevant_graph_extraction_settings()
         stats = {
             "received": 0, "eligible": 0, "attempted": 0, "relations_applied": 0,
             "skipped_ineligible": 0, "skipped_unrelated": 0, "skipped_existing": 0,
