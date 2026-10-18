@@ -125,7 +125,11 @@ def test_checkpoint_rebuild_preserves_or_reports_pending_semantic_upsert(tmp_pat
         assert provider._claim_tx_connection is None and provider._claim_tx_thread is None
         assert provider._transaction_quarantine is None
         assert provider._lifecycle_state == "ready" and not provider._conn.in_transaction
-        public = provider.handle_tool_call("memory_wiki_query", {"query": "Atlas gateway", "limit": 5})
+        # Recovery enables semantic only for local outbox work. The public
+        # visibility check is lexical: stub availability still probes HTTP.
+        with monkeypatch.context() as offline_read:
+            offline_read.setattr(module, "SEMANTIC_ENABLED", False)
+            public = provider.handle_tool_call("memory_wiki_query", {"query": "Atlas gateway", "limit": 5})
         public = json.loads(public) if isinstance(public, str) else public
         assert claim_id in [row["id"] for row in public.get("claims", [])], public
     finally:
@@ -691,7 +695,7 @@ def test_checkpoint_with_failed_claim_serialization_refuses_outbox_rebuild(recov
 
 def test_native_checkpoint_apply_owns_nested_reads_through_full_rebuild(recovery, monkeypatch):
     sdk = pytest.importorskip("agent.memory_provider")
-    _, provider, unexpected_io, _ = recovery
+    module, provider, unexpected_io, _ = recovery
     assert provider.__class__.__bases__ == (sdk.MemoryProvider,)
     claim_id, _ = _pending_claim(provider)
     checkpoint = provider._journal_checkpoint("checkpoint-apply-owner-correction")
@@ -723,7 +727,11 @@ def test_native_checkpoint_apply_owns_nested_reads_through_full_rebuild(recovery
     assert not provider._conn.in_transaction and provider._transaction_quarantine is None
     assert provider._claim_tx_connection is None and provider._claim_tx_thread is None
     assert provider._lifecycle_state == "ready"
-    public = provider.handle_tool_call("memory_wiki_query", {"query": "Atlas gateway", "limit": 5})
+    # Local outbox recovery above stays semantic-enabled. Do not probe an
+    # external embedding health endpoint for the real public lexical read.
+    with monkeypatch.context() as offline_read:
+        offline_read.setattr(module, "SEMANTIC_ENABLED", False)
+        public = provider.handle_tool_call("memory_wiki_query", {"query": "Atlas gateway", "limit": 5})
     public = json.loads(public) if isinstance(public, str) else public
     assert claim_id in [row["id"] for row in public.get("claims", [])], public
     assert not unexpected_io
@@ -900,9 +908,9 @@ def test_native_reader_issuance_registry_excludes_concurrent_rebuild(recovery, m
     assert not unexpected_io
 
 
-def test_native_healthy_private_reader_then_rebuild_and_public_read(recovery):
+def test_native_healthy_private_reader_then_rebuild_and_public_read(recovery, monkeypatch):
     sdk = pytest.importorskip("agent.memory_provider")
-    _, provider, unexpected_io, _ = recovery
+    module, provider, unexpected_io, _ = recovery
     assert provider.__class__.__bases__ == (sdk.MemoryProvider,)
     graph = sys.modules[provider.__class__.__module__ + ".code_knowledge_graph"]
     claim_id, _ = _pending_claim(provider)
@@ -922,7 +930,11 @@ def test_native_healthy_private_reader_then_rebuild_and_public_read(recovery):
     assert provider._transaction_quarantine is None and provider._lifecycle_state == "ready"
     result = provider._rebuild_from_journal(apply=True, checkpoint=checkpoint["path"])
     assert result["applied"] and result["recovered_claim_upserts"] == 1
-    public = provider.handle_tool_call("memory_wiki_query", {"query": "Atlas gateway", "limit": 5})
+    # Local outbox recovery above stays semantic-enabled. Do not probe an
+    # external embedding health endpoint for the real public lexical read.
+    with monkeypatch.context() as offline_read:
+        offline_read.setattr(module, "SEMANTIC_ENABLED", False)
+        public = provider.handle_tool_call("memory_wiki_query", {"query": "Atlas gateway", "limit": 5})
     public = json.loads(public) if isinstance(public, str) else public
     assert claim_id in [row["id"] for row in public.get("claims", [])], public
     assert provider._transaction_quarantine is None and not unexpected_io
