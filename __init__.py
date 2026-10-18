@@ -13196,15 +13196,19 @@ class MemoryWikiProvider(MemoryProvider):
         return cps[0] if cps else None
 
     def _apply_checkpoint_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        c = self._connect(); applied: Dict[str, int] = {}
+        applied: Dict[str, int] = {}
         table_payload = payload.get("tables") or {}
-        existing = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         # Checkpoints are JSON-serialized with sorted keys, so dictionary order
         # cannot safely encode foreign-key dependencies. Restore the canonical
         # producer order instead, then append any forward-compatible extras.
         ordered_tables = [table for table in self._checkpoint_tables() if table in table_payload]
         ordered_tables.extend(sorted(table for table in table_payload if table not in ordered_tables))
-        with c:
+        # Migration has already retired its owner. Own this separate recovery
+        # stage through all inserts, nested _cols/_connect calls and provenance
+        # scrub, including commit/rollback. A raw native context does not
+        # register that lifetime and must not adopt an existing pending TX.
+        with self._migration_connection() as c:
+            existing = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
             c.execute("PRAGMA defer_foreign_keys=ON")
             for table in ordered_tables:
                 rows = table_payload.get(table) or []
@@ -13330,7 +13334,58 @@ class MemoryWikiProvider(MemoryProvider):
     def _rebuild_from_journal(self, apply: bool = False, checkpoint: str = "", max_events: int = 0) -> Dict[str, Any]:
         """Read/rebuild only after any open journal operation has completed."""
         with self._journal_operation_scope():
-            return self._rebuild_from_journal_locked(apply, checkpoint, max_events)
+            if not apply:
+                return self._rebuild_from_journal_locked(apply, checkpoint, max_events)
+            if not self._lifecycle_lock.acquire(blocking=False):
+                raise RuntimeError("provider_lifecycle_busy")
+            try:
+                with self._lock:
+                    c = self._connect()
+                    self._require_claim_writer(c)
+                    if (c.in_transaction or self._claim_tx_connection is not None
+                            or self._claim_tx_thread is not None
+                            or self._claim_tx_document_stage is not None
+                            or self._claim_tx_graph_stage is not None
+                            or self._claim_tx_event_job_stage is not None):
+                        raise RuntimeError("journal_rebuild_requires_idle_owner")
+                return self._rebuild_from_journal_locked(apply, checkpoint, max_events)
+            finally:
+                self._lifecycle_lock.release()
+
+    def _close_journal_rebuild_connection(self, primary=None) -> None:
+        """Detach only a proved idle, exact shared owner after native close."""
+        with self._lock:
+            if (self._lifecycle_state in {"failed", "quarantined", "stopping"}
+                    or self._transaction_quarantine is not None):
+                raise RuntimeError("provider_lifecycle_not_ready")
+            if self._conn is None:
+                if self._owned_conn is not None:
+                    raise RuntimeError("provider_connection_ownership_unknown")
+                return
+            c = self._connect()  # Retains the ordinary pending/UNKNOWN guards.
+            self._require_claim_writer(c)
+            if (c is not self._owned_conn or c.in_transaction
+                    or self._claim_tx_connection is not None
+                    or self._claim_tx_thread is not None
+                    or self._claim_tx_document_stage is not None
+                    or self._claim_tx_graph_stage is not None
+                    or self._claim_tx_event_job_stage is not None
+                    or getattr(self, "_graph_writer_connections", {})
+                    or self._graph_reader_connections
+                    or self._background_worker is not None
+                    or self._prefetch_admission.locked()):
+                raise RuntimeError("journal_rebuild_connection_owner_pending")
+            try:
+                c.close()
+            except BaseException as cleanup:
+                self._quarantine_claim_connection(
+                    c, "journal_rebuild_close_" + type(cleanup).__name__,
+                    primary if primary is not None else cleanup)
+                (primary if primary is not None else cleanup).add_note(
+                    "memory_wiki_rebuild_cleanup:close; outcome=UNKNOWN")
+                raise
+            self._conn = None
+            self._owned_conn = None
 
     def _rebuild_from_journal_locked(self, apply: bool = False, checkpoint: str = "", max_events: int = 0) -> Dict[str, Any]:
         """Rebuild SQLite from the latest logical checkpoint plus JSONL after-events."""
@@ -13605,7 +13660,6 @@ class MemoryWikiProvider(MemoryProvider):
         claim_upsert_ids = sorted(set(claim_upsert_ids) | newer_ids)
         safety = self._backup("pre-journal-rebuild safety backup") if self.db_path.exists() else {}
         original_db = self.db_path
-        original_conn = self._conn
         stamp = time.strftime('%Y%m%d_%H%M%S', time.localtime(now()))
         rebuilt = self.recovery_dir / f"memory_wiki.rebuilt.{stamp}.sqlite3"
         for suffix in ("", "-wal", "-shm"):
@@ -13682,16 +13736,18 @@ class MemoryWikiProvider(MemoryProvider):
                 raise RuntimeError("journal rebuild rollback could not restore the pre-swap database")
 
         background_worker_was_active = self._background_worker is not None
+        rebuild_lock_held = False
         self._journal_recovery_active = True
         try:
             if self._background_worker is not None:
-                if not self._background_worker.stop():
+                if self._background_worker.stop() is not True:
                     raise RuntimeError("background worker did not quiesce for journal recovery")
                 self._background_worker = None
-            if original_conn is not None:
-                try: original_conn.close()
-                except Exception: pass
-            self._conn = None
+            # Stop/join precedes the DB lock. Keep readers/writers out of the
+            # temporary path, migration, swap and entire error-cleanup tail.
+            self._lock.acquire()
+            rebuild_lock_held = True
+            self._close_journal_rebuild_connection()
             self.db_path = rebuilt
             self._connect(); self._migrate()
             if checkpoint_payload:
@@ -13735,6 +13791,8 @@ class MemoryWikiProvider(MemoryProvider):
                     else:
                         replayed += 1
                 except Exception as e:
+                    if self._transaction_quarantine is not None:
+                        raise
                     failed += 1; errors.append({"seq": ev.get("seq"), "op": op, "error": _safe_exception_label(e)})
             if failed:
                 raise RuntimeError(
@@ -13750,9 +13808,7 @@ class MemoryWikiProvider(MemoryProvider):
                 raise sqlite3.DatabaseError(f"rebuilt DB quick_check failed: {qc}")
             try: self._checkpoint_wal('FULL')
             except Exception: pass
-            if self._conn is not None:
-                self._conn.close()
-            self._conn = None
+            self._close_journal_rebuild_connection()
             self.db_path = original_db
             self._preserve_db_files("pre_journal_rebuild_swap")
             if not original_db.exists():
@@ -13790,10 +13846,9 @@ class MemoryWikiProvider(MemoryProvider):
                         os.replace(source, Path(str(original_db) + suffix))
                 if not original_db.exists():
                     raise RuntimeError("rebuilt database disappeared during journal rebuild swap")
-            except Exception:
-                if pre_swap_root_staged:
-                    _restore_pre_swap_bundle()
-                    pre_swap_root_staged = False
+            except BaseException:
+                # The outer owner closes any opened rebuilt handle and then
+                # restores this bundle, preserving the original swap failure.
                 raise
             self._connect(); self._migrate(); self._rebuild_fts(); self._render_all(); self._render_active_dashboard()
             self._journal_recovery_active = previous_recovery_active
@@ -13840,26 +13895,33 @@ class MemoryWikiProvider(MemoryProvider):
             audit_status = "ok" if not derived_reindex_failures and not outbox_recovery_error else "partial"
             self._audit("journal_rebuild", audit_status, f"checkpoint={cp_path} replayed={replayed} failed={failed} deferred_reindex={len(deferred_reindex_refs)}")
             return {**plan, "applied": True, "safety_backup": safety, "rebuilt_db": str(original_db), "replayed": replayed, "failed": failed, "skipped": skipped, "errors": errors[:20], "recovered_claim_upserts": recovered_claim_upserts, "derived_reindex": derived_reindex, "derived_reindex_failures": derived_reindex_failures, "outbox_recovery_error": outbox_recovery_error, "background_recovery": background_recovery}
-        except Exception:
+        except BaseException as primary:
             try:
-                if self._conn is not None:
-                    self._conn.close()
-            except Exception:
-                pass
-            self._conn = None
-            self.db_path = original_db
-            # A failure after the temporary rebuilt DB has been installed
-            # (including the second render/migration) must never reconnect to
-            # that DB.  Restore the old root plus its WAL/SHM bundle first.
-            if pre_swap_root_staged:
-                _restore_pre_swap_bundle()
-                pre_swap_root_staged = False
-            self._journal_recovery_active = previous_recovery_active
-            self._connect(); self._migrate()
-            if background_worker_was_active and self._background_worker is None and _background_jobs.enabled():
-                self._background_worker = _background_jobs.Worker(self, sys.modules[__name__])
-                self._background_worker.start()
+                # UNKNOWN/failed close must not detach the exact owner, move
+                # its SQLite bundle, rebind db_path or reopen another handle.
+                self._close_journal_rebuild_connection(primary)
+                self.db_path = original_db
+                if pre_swap_root_staged:
+                    _restore_pre_swap_bundle()
+                    pre_swap_root_staged = False
+                self._journal_recovery_active = previous_recovery_active
+                self._connect(); self._migrate()
+                if background_worker_was_active and self._background_worker is None and _background_jobs.enabled():
+                    self._background_worker = _background_jobs.Worker(self, sys.modules[__name__])
+                    self._background_worker.start()
+            except BaseException as cleanup:
+                primary.add_note("memory_wiki_rebuild_cleanup:" + type(cleanup).__name__ + "; outcome=UNKNOWN")
+                if self._conn is not None or self._owned_conn is not None or self._background_worker is not None:
+                    self._quarantine_claim_connection(
+                        self._conn if self._conn is not None else self._owned_conn,
+                        "journal_rebuild_cleanup_" + type(cleanup).__name__, primary)
+                else:
+                    self._lifecycle_state = "failed"
+                    self._degraded = True
             raise
+        finally:
+            if rebuild_lock_held:
+                self._lock.release()
 
     def _checkpoint_wal(self, mode: str = "FULL") -> str:
         c = self._connect()
@@ -13872,10 +13934,62 @@ class MemoryWikiProvider(MemoryProvider):
                 return "passive " + (str(tuple(row)) if row is not None else "ok")
             raise
 
+    @contextmanager
+    def _migration_connection(self):
+        """Own the exact shared handle across recovery schema/checkpoint SQL.
+
+        Schema installers use executescript (which can end an implicit TX), so
+        this is not one claim transaction and must not join a caller's stage.
+        Checkpoint apply owns a separate instance of this scope, not the retired
+        migration owner. Both retain the same connection/thread registry and
+        UNKNOWN rollback policy, without changing _connect or lifecycle.
+        """
+        with self._lock:
+            c = self._connect()
+            self._require_claim_writer(c)
+            if (c is not self._owned_conn or c.in_transaction
+                    or self._claim_tx_connection is not None
+                    or self._claim_tx_thread is not None
+                    or self._claim_tx_document_stage is not None
+                    or self._claim_tx_graph_stage is not None
+                    or self._claim_tx_event_job_stage is not None):
+                raise RuntimeError("migration_requires_idle_owner")
+            self._claim_tx_connection = c
+            self._claim_tx_thread = threading.get_ident()
+            completed = commit_attempted = False
+            try:
+                yield c
+                self._require_claim_writer(c)
+                if (self._conn is not c or self._owned_conn is not c
+                        or self._claim_tx_connection is not c
+                        or self._claim_tx_thread != threading.get_ident()):
+                    self._quarantine_claim_connection(c, "migration_owner_changed")
+                    raise RuntimeError("migration_connection_owner_changed")
+                commit_attempted = True
+                c.commit()
+                if c.in_transaction:
+                    self._quarantine_claim_connection(c, "migration_commit_still_active")
+                    raise RuntimeError("migration_commit_still_active")
+                self._require_claim_writer(c)
+                if (self._conn is not c or self._owned_conn is not c
+                        or self._claim_tx_connection is not c
+                        or self._claim_tx_thread != threading.get_ident()):
+                    self._quarantine_claim_connection(c, "migration_owner_changed")
+                    raise RuntimeError("migration_connection_owner_changed")
+                completed = True
+            except BaseException as primary:
+                completed = self._rollback_claim_transaction(c, primary, commit_attempted=commit_attempted)
+                raise
+            finally:
+                if (completed and self._transaction_quarantine is None
+                        and self._claim_tx_connection is c
+                        and self._claim_tx_thread == threading.get_ident()):
+                    self._claim_tx_connection = None
+                    self._claim_tx_thread = None
+
     def _migrate(self) -> None:
-        c = self._connect()
-        _assert_schema_compatible(c)
-        with c:
+        with self._migration_connection() as c:
+            _assert_schema_compatible(c)
             c.execute("CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)")
             c.execute("""CREATE TABLE IF NOT EXISTS recovery_artifacts(
                 sha256 TEXT PRIMARY KEY,
@@ -14430,7 +14544,6 @@ class MemoryWikiProvider(MemoryProvider):
                 c.execute("UPDATE project_profiles SET last_verified_at=0 WHERE source='project_profile'")
                 c.execute("INSERT INTO meta(key,value) VALUES('model_curated_provenance_downgrade_v1',?)", (str(now()),))
             _record_schema_version(c, PLUGIN_VERSION)
-            self._connect().commit()
 
     def _cols(self, table: str) -> set[str]: return {r[1] for r in self._connect().execute(f"PRAGMA table_info({table})").fetchall()}
     def _rowdict(self, r: sqlite3.Row) -> Dict[str, Any]:

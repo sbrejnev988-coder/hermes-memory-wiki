@@ -360,7 +360,11 @@ def test_native_primary_known_rollback_and_reentrant_completion(derived_case):
             with pytest.raises(Cancel) as caught:
                 with c.p._claim_transaction(c.conn):
                     assert c.embed(source['source_id'])['created'] == 1
-            assert caught.value is primary and c.conn._graph_commit_error is primary
+            assert caught.value is primary
+            # JRO-C02: identity is delivered once, before owning rollback.
+            # A retained buffer would leak this cancellation into later SQL.
+            assert c.conn._graph_commit_error is None
+            assert c.conn._graph_native_operation is None
         finally:
             cursor.close()
             c.conn.set_authorizer(None)
