@@ -680,3 +680,284 @@ def test_checkpoint_with_failed_claim_serialization_refuses_outbox_rebuild(recov
         "SELECT status FROM index_outbox WHERE id=?", (job["id"],),
     ).fetchone()[0] == "pending"
     assert not unexpected_io and not worker_paths
+
+
+# Genuine SDK/provider/native correction regressions: prepared, NOT_RUN in SOURCE.
+
+
+def test_native_checkpoint_apply_owns_nested_reads_through_full_rebuild(recovery, monkeypatch):
+    sdk = pytest.importorskip("agent.memory_provider")
+    _, provider, unexpected_io, _ = recovery
+    assert provider.__class__.__bases__ == (sdk.MemoryProvider,)
+    claim_id, _ = _pending_claim(provider)
+    checkpoint = provider._journal_checkpoint("checkpoint-apply-owner-correction")
+    original_apply, original_cols = provider._apply_checkpoint_payload, provider._cols
+    applying, observed = [], []
+
+    def observe_apply(payload):
+        applying.append(True)
+        try:
+            return original_apply(payload)
+        finally:
+            applying.pop()
+
+    def observe_cols(table):
+        result = original_cols(table)  # Real pending/identity/owner admission.
+        c = provider._conn
+        if applying and c.in_transaction:
+            assert provider._owned_conn is c and provider._claim_tx_connection is c
+            assert provider._claim_tx_thread == threading.get_ident()
+            observed.append(table)
+        return result
+
+    monkeypatch.setattr(provider, "_apply_checkpoint_payload", observe_apply)
+    monkeypatch.setattr(provider, "_cols", observe_cols)
+    result = provider._rebuild_from_journal(apply=True, checkpoint=checkpoint["path"])
+    assert result["applied"] and result["recovered_claim_upserts"] == 1
+    assert "claims" in observed and "evidence" in observed
+    assert provider._conn is provider._owned_conn
+    assert not provider._conn.in_transaction and provider._transaction_quarantine is None
+    assert provider._claim_tx_connection is None and provider._claim_tx_thread is None
+    assert provider._lifecycle_state == "ready"
+    public = provider.handle_tool_call("memory_wiki_query", {"query": "Atlas gateway", "limit": 5})
+    public = json.loads(public) if isinstance(public, str) else public
+    assert claim_id in [row["id"] for row in public.get("claims", [])], public
+    assert not unexpected_io
+
+
+@pytest.mark.parametrize("rollback_unknown", [False, True])
+def test_native_migrate_implicit_script_commit_delivers_original_cancellation(recovery, rollback_unknown):
+    sdk = pytest.importorskip("agent.memory_provider")
+    module, provider, unexpected_io, _ = recovery
+    assert provider.__class__.__bases__ == (sdk.MemoryProvider,)
+    c = provider._connect()
+    assert type(c) is module._GraphCommitConnection
+    original = KeyboardInterrupt("JRO actual authorizer COMMIT cancellation")
+    observed = []
+
+    def authorizer(action, first, second, database, trigger):
+        if action == sqlite3.SQLITE_TRANSACTION and first == "COMMIT":
+            observed.append("commit")
+            raise original
+        if rollback_unknown and action == sqlite3.SQLITE_TRANSACTION and first == "ROLLBACK":
+            observed.append("rollback-denied")
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    c.set_authorizer(authorizer)  # Real callback, never disabled during the call.
+    with pytest.raises(KeyboardInterrupt) as caught:
+        provider._migrate()  # Genuine migration up to its actual implicit batch COMMIT.
+    assert caught.value is original and observed[0] == "commit"
+    assert isinstance(original.__cause__, sqlite3.DatabaseError)
+    assert c._graph_commit_error is None  # Delivered once, before owner cleanup.
+    assert provider._conn is c and provider._owned_conn is c
+    if rollback_unknown:
+        assert observed == ["commit", "rollback-denied"]
+        assert provider._transaction_primary is original and provider._transaction_quarantine is c
+        assert provider._claim_tx_connection is c and provider._claim_tx_thread == threading.get_ident()
+        assert c.in_transaction and provider._lifecycle_state == "quarantined"
+        with pytest.raises(RuntimeError):
+            provider._close_journal_rebuild_connection(original)
+        assert not provider._release_connection_for_retry(original)
+    else:
+        assert not c.in_transaction and provider._transaction_quarantine is None
+        assert provider._claim_tx_connection is None and provider._claim_tx_thread is None
+        healthy = []
+
+        def allow(action, first, second, database, trigger):
+            if action == sqlite3.SQLITE_TRANSACTION and first == "COMMIT":
+                healthy.append(first)
+            return sqlite3.SQLITE_OK
+
+        c.set_authorizer(allow)
+        provider._migrate()
+        assert healthy and c._graph_user_authorizer is allow
+        assert provider._connect().execute("SELECT 1").fetchone()[0] == 1
+        c.set_authorizer(None)
+        assert provider._lifecycle_state == "ready"
+    assert not unexpected_io
+
+
+def test_native_batch_cancellation_keeps_prior_committed_prefix_only(recovery):
+    sdk = pytest.importorskip("agent.memory_provider")
+    module, provider, unexpected_io, _ = recovery
+    assert provider.__class__.__bases__ == (sdk.MemoryProvider,)
+    c = provider._connect()
+    assert type(c) is module._GraphCommitConnection
+    original = KeyboardInterrupt("JRO second batch cancellation")
+    commits = []
+
+    def authorizer(action, first, second, database, trigger):
+        if action == sqlite3.SQLITE_TRANSACTION and first == "COMMIT":
+            commits.append(first)
+            if len(commits) == 2:
+                raise original
+        return sqlite3.SQLITE_OK
+
+    c.set_authorizer(authorizer)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        with provider._migration_connection() as owned:
+            owned.execute("CREATE TABLE jro_partial_batches(value TEXT)")
+            owned.execute("INSERT INTO jro_partial_batches VALUES('prefix')")
+            owned.executescript("SELECT 1;")  # Real first implicit COMMIT.
+            owned.execute("INSERT INTO jro_partial_batches VALUES('suffix')")
+            owned.executescript("SELECT 2;")
+    assert caught.value is original and len(commits) == 2
+    assert provider._claim_tx_connection is None and provider._claim_tx_thread is None
+    assert provider._transaction_quarantine is None and not c.in_transaction
+    assert c._graph_commit_error is None
+    c.set_authorizer(None)
+    other = sqlite3.connect(str(provider.db_path))
+    try:
+        assert other.execute("SELECT value FROM jro_partial_batches").fetchall() == [("prefix",)]
+    finally:
+        other.close()
+    assert provider._connect() is c and not unexpected_io
+
+
+@pytest.mark.parametrize("disclosure", [False, True])
+def test_native_reader_issuance_registry_excludes_concurrent_rebuild(recovery, monkeypatch, disclosure):
+    sdk = pytest.importorskip("agent.memory_provider")
+    _, provider, unexpected_io, _ = recovery
+    assert provider.__class__.__bases__ == (sdk.MemoryProvider,)
+    graph = sys.modules[provider.__class__.__module__ + ".code_knowledge_graph"]
+    checkpoint = provider._journal_checkpoint("reader-issuance-exclusion")
+    shared, original_path = provider._connect(), provider.db_path
+    original_connect = provider._connect
+    connected, release, issued, close_reader = (threading.Event() for _ in range(4))
+    rebuilding, rebuilt = threading.Event(), threading.Event()
+    reader_ids, handles, reader_errors, rebuild_errors = [], [], [], []
+
+    def observe_connect():
+        result = original_connect()
+        if reader_ids == [threading.get_ident()] and not connected.is_set():
+            connected.set()  # Actual _connect returned; registry is still empty.
+            assert release.wait(10), "reader issuance barrier expired"
+        return result
+
+    monkeypatch.setattr(provider, "_connect", observe_connect)
+
+    def read():
+        try:
+            reader_ids.append(threading.get_ident())
+            reader, owned = graph._open_graph_reader_connection(provider, disclosure=disclosure)
+            handles.append(reader)
+            assert owned and graph._owns_graph_reader(provider, reader)
+            assert reader._graph_read_shared is shared
+            assert reader.execute("PRAGMA query_only").fetchone()[0] == 1
+            issued.set()
+            assert close_reader.wait(30), "reader cleanup barrier expired"
+            graph._close_graph_writer_connection(reader, owned)
+            assert reader._graph_read_state == "closed"
+        except BaseException as error:
+            reader_errors.append(error)
+            issued.set()
+
+    def rebuild():
+        rebuilding.set()
+        try:
+            provider._rebuild_from_journal(apply=True, checkpoint=checkpoint["path"])
+        except BaseException as error:
+            rebuild_errors.append(error)
+        finally:
+            rebuilt.set()
+
+    reader_thread = sdk.spawn_context_thread(read, name="jro-actual-reader", daemon=False)
+    rebuild_thread = None
+    try:
+        assert connected.wait(10)
+        acquired = provider._lock.acquire(blocking=False)
+        if acquired:
+            provider._lock.release()
+        assert not acquired, "factory released lock before reader publication"
+        assert not provider._graph_reader_connections
+        rebuild_thread = sdk.spawn_context_thread(rebuild, name="jro-actual-rebuild", daemon=False)
+        assert rebuilding.wait(10)
+        release.set()
+        assert issued.wait(10) and not reader_errors
+        assert rebuilt.wait(20), "actual rebuild did not finish its refusal"
+        # It sees the exact live reader, refuses close and never rebinds path or
+        # strands a reader against a stale shared handle. Cleanup is still owned.
+        assert len(rebuild_errors) == 1
+        assert str(rebuild_errors[0]) == "journal_rebuild_connection_owner_pending"
+        assert provider._conn is shared and provider._owned_conn is shared
+        assert provider.db_path == original_path and handles[0] in provider._graph_reader_connections
+        assert provider._transaction_primary is rebuild_errors[0]
+        assert provider._transaction_quarantine is shared
+    finally:
+        release.set()
+        close_reader.set()
+        reader_thread.join(20)
+        if rebuild_thread is not None:
+            rebuild_thread.join(20)
+    assert not reader_thread.is_alive() and rebuild_thread is not None and not rebuild_thread.is_alive()
+    assert not reader_errors and not provider._graph_reader_connections
+    assert provider._conn is shared and provider._transaction_primary is rebuild_errors[0]
+    assert not unexpected_io
+
+
+def test_native_healthy_private_reader_then_rebuild_and_public_read(recovery):
+    sdk = pytest.importorskip("agent.memory_provider")
+    _, provider, unexpected_io, _ = recovery
+    assert provider.__class__.__bases__ == (sdk.MemoryProvider,)
+    graph = sys.modules[provider.__class__.__module__ + ".code_knowledge_graph"]
+    claim_id, _ = _pending_claim(provider)
+    checkpoint = provider._journal_checkpoint("healthy-reader-then-rebuild")
+    shared = provider._connect()
+    for disclosure in (False, True):
+        reader, owned = graph._open_graph_reader_connection(provider, disclosure=disclosure)
+        try:
+            assert owned and graph._owns_graph_reader(provider, reader)
+            assert reader._graph_read_shared is shared
+            assert reader.execute("SELECT status FROM claims WHERE id=?", (claim_id,)).fetchone()[0] == "active"
+            if disclosure:
+                assert reader._graph_read_fence.source_conn is reader
+        finally:
+            graph._close_graph_writer_connection(reader, owned)
+        assert not provider._graph_reader_connections
+    assert provider._transaction_quarantine is None and provider._lifecycle_state == "ready"
+    result = provider._rebuild_from_journal(apply=True, checkpoint=checkpoint["path"])
+    assert result["applied"] and result["recovered_claim_upserts"] == 1
+    public = provider.handle_tool_call("memory_wiki_query", {"query": "Atlas gateway", "limit": 5})
+    public = json.loads(public) if isinstance(public, str) else public
+    assert claim_id in [row["id"] for row in public.get("claims", [])], public
+    assert provider._transaction_quarantine is None and not unexpected_io
+
+
+@pytest.mark.parametrize("operation", ["execute", "executemany", "executescript"])
+def test_native_direct_sql_keeps_restricting_authorizer_and_healthy_positive(recovery, operation):
+    sdk = pytest.importorskip("agent.memory_provider")
+    module, provider, unexpected_io, _ = recovery
+    assert provider.__class__.__bases__ == (sdk.MemoryProvider,)
+    c = provider._connect()
+    assert type(c) is module._GraphCommitConnection
+    c.execute("CREATE TABLE jro_direct_authorizer(value TEXT)")
+    denied = []
+
+    def authorizer(action, first, second, database, trigger):
+        if action == sqlite3.SQLITE_INSERT and first == "jro_direct_authorizer":
+            denied.append(first)
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    def insert(owned):
+        if operation == "execute":
+            owned.execute("INSERT INTO jro_direct_authorizer VALUES(?)", ("positive",))
+        elif operation == "executemany":
+            owned.executemany("INSERT INTO jro_direct_authorizer VALUES(?)", [("positive",)])
+        else:
+            owned.executescript("INSERT INTO jro_direct_authorizer VALUES('positive');")
+
+    c.set_authorizer(authorizer)
+    with pytest.raises(sqlite3.DatabaseError):
+        with provider._migration_connection() as owned:
+            insert(owned)
+    assert denied == ["jro_direct_authorizer"] and c._graph_user_authorizer is authorizer
+    assert c._graph_commit_error is None and provider._transaction_quarantine is None
+    assert provider._claim_tx_connection is None and not c.in_transaction
+    assert c.execute("SELECT value FROM jro_direct_authorizer").fetchall() == []
+    c.set_authorizer(None)
+    with provider._migration_connection() as owned:
+        insert(owned)
+    assert [row[0] for row in c.execute("SELECT value FROM jro_direct_authorizer")] == ["positive"]
+    assert provider._transaction_quarantine is None and not unexpected_io

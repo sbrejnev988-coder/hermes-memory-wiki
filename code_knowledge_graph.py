@@ -1396,6 +1396,41 @@ class _GraphCommitConnection(sqlite3.Connection):
         self._graph_progress = callback if n > 0 else None
         return super().set_progress_handler(callback, n)
 
+    def _graph_native_return(self, operation, *args, **kwargs):
+        """Deliver a retained authorizer primary at this native call's return.
+
+        In particular, executescript's implicit COMMIT does not call our
+        Python commit override. Consume the cause here, before owner rollback
+        can run another callback or a later commit can clear the buffer.
+        This does not arm a commit flight or bypass any authorizer fence.
+        """
+        with _provider_claim_lock(self._graph_effect_owner):
+            try:
+                result = operation(*args, **kwargs)
+            except BaseException as native:
+                primary = self._graph_commit_error
+                self._graph_commit_error = None
+                if primary is not None:
+                    raise primary from native
+                raise
+            primary = self._graph_commit_error
+            self._graph_commit_error = None
+            if primary is not None:
+                raise primary
+            return result
+
+    def execute(self, *args, **kwargs):
+        return self._graph_native_return(super().execute, *args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        return self._graph_native_return(super().executemany, *args, **kwargs)
+
+    def executescript(self, *args, **kwargs):
+        return self._graph_native_return(super().executescript, *args, **kwargs)
+
+    def rollback(self):
+        return self._graph_native_return(super().rollback)
+
     def _graph_authorizer_result(self, action, a, b, database, source):
         flight = self._graph_commit_flight
         document_flight = self._document_commit_flight
@@ -1539,12 +1574,7 @@ class _GraphCommitConnection(sqlite3.Connection):
                 self._prefetch_commit_flight = terminal
             try:
                 self._graph_start_commit()
-                try:
-                    return super().commit()
-                except BaseException:
-                    if self._graph_commit_error is not None:
-                        raise self._graph_commit_error
-                    raise
+                return self._graph_native_return(super().commit)
             finally:
                 self._graph_commit_flight = None
                 self._document_commit_flight = None
@@ -1936,49 +1966,54 @@ def _open_graph_reader_connection(provider: Any, *, disclosure=False) -> Tuple[s
     a script.  A private reader also keeps ordinary queries available against
     the last committed WAL snapshot while a graph writer is in progress.
     """
-    shared = provider._connect()
-    if shared is not provider._owned_conn:
-        raise RuntimeError('graph_reader_parent_owner_unproven')
-    anchor = provider._retain_read_fence(shared) if disclosure else None
-    raw_path = getattr(provider, "db_path", "")
-    path = str(raw_path or "")
-    if not path:
+    # Share one admission boundary with rebuild close/path/swap. Publishing
+    # the exact reader registry happens before releasing this lock, including
+    # opening/setup failure cleanup. An empty snapshot can no longer miss an
+    # already admitted factory holding the old shared handle/path.
+    with _provider_claim_lock(provider):
+        shared = provider._connect()
+        if shared is not provider._owned_conn:
+            raise RuntimeError('graph_reader_parent_owner_unproven')
+        anchor = provider._retain_read_fence(shared) if disclosure else None
+        raw_path = getattr(provider, "db_path", "")
+        path = str(raw_path or "")
+        if not path:
+            try:
+                for row in shared.execute("PRAGMA database_list").fetchall():
+                    if str(row[1] or "") == "main":
+                        path = str(row[2] or "")
+                        break
+            except sqlite3.Error:
+                path = ""
+        if not path or path == ":memory:" or path.startswith("file::memory:"):
+            return shared, False
+        reader = sqlite3.connect(path, check_same_thread=False, timeout=30.0, factory=_GraphReaderConnection)
+        reader._graph_read_owner = provider
+        reader._graph_read_shared = shared
+        reader._graph_read_fence = anchor
+        reader._graph_read_lifetime = object()
+        reader._graph_read_thread = threading.get_ident()
+        reader._graph_read_state = 'opening'
+        reader._graph_read_primary = None
+        owners = getattr(provider, '_graph_reader_connections', None)
+        if owners is None:
+            owners = provider._graph_reader_connections = {}
+        owners[reader] = reader._graph_read_lifetime
+        reader.row_factory = sqlite3.Row
         try:
-            for row in shared.execute("PRAGMA database_list").fetchall():
-                if str(row[1] or "") == "main":
-                    path = str(row[2] or "")
-                    break
-        except sqlite3.Error:
-            path = ""
-    if not path or path == ":memory:" or path.startswith("file::memory:"):
-        return shared, False
-    reader = sqlite3.connect(path, check_same_thread=False, timeout=30.0, factory=_GraphReaderConnection)
-    reader._graph_read_owner = provider
-    reader._graph_read_shared = shared
-    reader._graph_read_fence = anchor
-    reader._graph_read_lifetime = object()
-    reader._graph_read_thread = threading.get_ident()
-    reader._graph_read_state = 'opening'
-    reader._graph_read_primary = None
-    owners = getattr(provider, '_graph_reader_connections', None)
-    if owners is None:
-        owners = provider._graph_reader_connections = {}
-    owners[reader] = reader._graph_read_lifetime
-    reader.row_factory = sqlite3.Row
-    try:
-        reader.execute("PRAGMA busy_timeout=30000")
-        reader.execute("PRAGMA foreign_keys=ON")
-        reader.execute("PRAGMA temp_store=MEMORY")
-        reader.execute("PRAGMA query_only=ON")
-        reader.execute("SELECT 1").fetchone()
-        reader._graph_read_state = 'issued'
-        if anchor is not None:
-            anchor.bind_reader(reader)
-    except BaseException as primary:
-        reader._graph_read_primary = primary
-        _close_graph_writer_connection(reader, True)
-        raise
-    return reader, True
+            reader.execute("PRAGMA busy_timeout=30000")
+            reader.execute("PRAGMA foreign_keys=ON")
+            reader.execute("PRAGMA temp_store=MEMORY")
+            reader.execute("PRAGMA query_only=ON")
+            reader.execute("SELECT 1").fetchone()
+            reader._graph_read_state = 'issued'
+            if anchor is not None:
+                anchor.bind_reader(reader)
+        except BaseException as primary:
+            reader._graph_read_primary = primary
+            _close_graph_writer_connection(reader, True)
+            raise
+        return reader, True
 
 
 def _close_graph_writer_connection(conn: sqlite3.Connection, owned: bool) -> None:

@@ -13192,15 +13192,19 @@ class MemoryWikiProvider(MemoryProvider):
         return cps[0] if cps else None
 
     def _apply_checkpoint_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        c = self._connect(); applied: Dict[str, int] = {}
+        applied: Dict[str, int] = {}
         table_payload = payload.get("tables") or {}
-        existing = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         # Checkpoints are JSON-serialized with sorted keys, so dictionary order
         # cannot safely encode foreign-key dependencies. Restore the canonical
         # producer order instead, then append any forward-compatible extras.
         ordered_tables = [table for table in self._checkpoint_tables() if table in table_payload]
         ordered_tables.extend(sorted(table for table in table_payload if table not in ordered_tables))
-        with c:
+        # Migration has already retired its owner. Own this separate recovery
+        # stage through all inserts, nested _cols/_connect calls and provenance
+        # scrub, including commit/rollback. A raw native context does not
+        # register that lifetime and must not adopt an existing pending TX.
+        with self._migration_connection() as c:
+            existing = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
             c.execute("PRAGMA defer_foreign_keys=ON")
             for table in ordered_tables:
                 rows = table_payload.get(table) or []
@@ -13928,12 +13932,13 @@ class MemoryWikiProvider(MemoryProvider):
 
     @contextmanager
     def _migration_connection(self):
-        """Own the exact shared handle across additive migration's SQL batches.
+        """Own the exact shared handle across recovery schema/checkpoint SQL.
 
         Schema installers use executescript (which can end an implicit TX), so
         this is not one claim transaction and must not join a caller's stage.
-        It uses the same connection/thread registry and UNKNOWN rollback policy
-        as claim writers, without weakening _connect or changing lifecycle.
+        Checkpoint apply owns a separate instance of this scope, not the retired
+        migration owner. Both retain the same connection/thread registry and
+        UNKNOWN rollback policy, without changing _connect or lifecycle.
         """
         with self._lock:
             c = self._connect()

@@ -3,6 +3,9 @@
 Only exact selected bodies are compiled: no plugin, SDK, pytest or host boot.
 The receiver and file-backed SQLite are explicitly generic fixtures. These
 checks do NOT execute _migrate, journal replay/swap, privacy/ACL or native SPI.
+Checkpoint controls execute actual apply and graph scrub on a small generic
+schema with an empty graph. Native callback/factory controls stay NOT_RUN;
+AST checks and a synthetic buffered-error seam are not native-return proof.
 The shipped companion pytest file retains those separate, NOT_RUN controls.
 """
 from __future__ import annotations
@@ -26,6 +29,7 @@ METHODS = (
     '_quarantine_claim_connection', '_rollback_claim_transaction',
     '_release_connection_for_retry', '_shutdown_lifecycle',
     '_migration_connection', '_close_journal_rebuild_connection',
+    '_checkpoint_tables', '_apply_checkpoint_payload',
 )
 
 
@@ -35,15 +39,15 @@ def source_contract(provider_raw=None, graph_raw=None):
     pt, gt = ast.parse(provider_raw), ast.parse(graph_raw)
     cls = next(n for n in pt.body if isinstance(n, ast.ClassDef) and n.name == 'MemoryWikiProvider')
     methods = {n.name: n for n in cls.body if isinstance(n, ast.FunctionDef)}
-    graph_names = {'_GraphCommitConnection', '_GraphWriterConnection',
-                   '_graph_writer_identity', '_owns_graph_writer'}
-    graph_nodes = [n for n in gt.body if isinstance(n, (ast.ClassDef, ast.FunctionDef)) and n.name in graph_names]
-    assert len(graph_nodes) == len(graph_names)
     ns = dict(sqlite3=sqlite3, threading=threading, Path=Path, sys=sys, ModuleType=ModuleType,
               contextmanager=contextmanager, __name__='source_generic_sqlite',
               __file__=str(ROOT / '__init__.py'))
-    exec(compile(ast.Module(body=copy.deepcopy(graph_nodes), type_ignores=[]),
-                 'declared-graph-source.py', 'exec', flags=__import__('__future__').annotations.compiler_flag), ns)
+    # This module has only stdlib imports and definition/constant initialization.
+    # Execute its exact bytes to retain the full real scrub closure, not a
+    # permissive stand-in. Its native connection classes are NEVER instantiated.
+    exec(compile(graph_raw, 'declared-graph-source.py', 'exec', dont_inherit=True), ns)
+    ns['_scrub_code_graph_storage'] = ns['scrub_code_graph_storage']
+    ns['_source_graph_ast'] = gt
     # The real source predicate rejects this generic, non-factory connection by
     # exact type. No authorizer, owner validator or SQL admission is replaced.
     ns['_owns_private_graph_writer'] = ns['_owns_graph_writer']
@@ -320,6 +324,195 @@ class TestJournalRebuildOwnerSource(unittest.TestCase):
         self.assertNotIn("self._lifecycle_state = 'ready'", body_text)
         self.assertNotIn('self._transaction_quarantine = None', body_text)
         self.assertIn('self._lock.release()', ast.unparse(outer.finalbody[0]))
+
+
+    def checkpoint(self):
+        # Small generic schema, NOT the provider's actual migration/installers.
+        # The real graph scrub runs against an empty graph and real provenance
+        # tables; neither its return value nor its admission is substituted.
+        self.c.executescript('''
+            CREATE TABLE meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
+            CREATE TABLE claims(id TEXT PRIMARY KEY,claim TEXT NOT NULL);
+            CREATE TABLE evidence(id TEXT PRIMARY KEY,claim_id TEXT REFERENCES claims(id));
+            CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY);
+            INSERT INTO schema_migrations VALUES(2);
+            CREATE TABLE code_graph_identity_provenance(
+                opaque_id TEXT PRIMARY KEY,provenance_version INTEGER,created_at INTEGER);
+            CREATE TABLE code_graph_identity_migrations(
+                migration_version INTEGER PRIMARY KEY,completed_at INTEGER);
+        ''')
+        self.c.execute('PRAGMA foreign_keys=ON')
+        return {'journal_seq': 7, 'tables': {
+            # JSON key order deliberately differs from canonical FK order.
+            'evidence': [{'id': 'ev-own', 'claim_id': 'c-own'}],
+            'claims': [{'id': 'c-own', 'claim': 'generic checkpoint row'}],
+            'meta': [{'key': 'memory_revision', 'value': '7'},
+                     {'key': 'database_instance_id', 'value': 'generic-fixture'}],
+            'schema_migrations': [{'version': 1}],
+        }}
+
+    def test_generic_checkpoint_apply_keeps_owner_through_nested_cols_and_real_scrub(self):
+        payload = self.checkpoint()
+        witnessed = []
+
+        def observe(sql):
+            if sql.startswith('PRAGMA table_info') and self.c.in_transaction:
+                witnessed.append((sql, self.p._claim_tx_connection is self.c,
+                                  self.p._claim_tx_thread == threading.get_ident()))
+
+        self.c.set_trace_callback(observe)
+        result = self.p._apply_checkpoint_payload(payload)
+        self.c.set_trace_callback(None)
+        self.assertEqual(result['applied_tables'], {'meta': 2, 'claims': 1, 'evidence': 1})
+        self.assertEqual(result['journal_seq'], 7)
+        self.assertEqual(result['code_graph_provenance']['rows'], 0)
+        self.assertTrue(any('claims' in row[0] for row in witnessed))
+        self.assertTrue(all(row[1:] == (True, True) for row in witnessed))
+        self.assertIdle()
+        other = sqlite3.connect(str(self.db))
+        try:
+            self.assertEqual(other.execute('SELECT id,claim FROM claims').fetchall(),
+                             [('c-own', 'generic checkpoint row')])
+            self.assertEqual(other.execute('SELECT id,claim_id FROM evidence').fetchall(), [('ev-own', 'c-own')])
+            self.assertEqual(other.execute('SELECT version FROM schema_migrations').fetchall(), [(2,)])
+            self.assertEqual(other.execute('SELECT migration_version FROM code_graph_identity_migrations').fetchall(), [(2,)])
+        finally:
+            other.close()
+
+    def apply_denial(self, unknown):
+        payload = self.checkpoint()
+        denied = []
+
+        def authorizer(action, first, second, database, trigger):
+            if action == sqlite3.SQLITE_INSERT and first == 'evidence':
+                denied.append('insert')
+                return sqlite3.SQLITE_DENY
+            if unknown and action == sqlite3.SQLITE_TRANSACTION and first == 'ROLLBACK':
+                denied.append('rollback')
+                return sqlite3.SQLITE_DENY
+            return sqlite3.SQLITE_OK
+
+        self.c.set_authorizer(authorizer)
+        with self.assertRaises(sqlite3.DatabaseError) as caught:
+            self.p._apply_checkpoint_payload(payload)
+        self.assertEqual(denied, ['insert', 'rollback'] if unknown else ['insert'])
+        return caught.exception
+
+    def test_generic_checkpoint_apply_known_rollback_retires_its_owner(self):
+        self.apply_denial(False)
+        self.c.set_authorizer(None)
+        self.assertIdle()
+        self.assertEqual(self.c.execute('SELECT * FROM meta').fetchall(), [])
+        self.assertEqual(self.c.execute('SELECT * FROM claims').fetchall(), [])
+        self.assertIs(self.p._connect(), self.c)
+
+    def test_generic_checkpoint_apply_rollback_denial_retains_primary_and_path(self):
+        primary = self.apply_denial(True)
+        self.assertIs(self.p._transaction_primary, primary)
+        self.assertIs(self.p._transaction_quarantine, self.c)
+        self.assertIs(self.p._claim_tx_connection, self.c)
+        self.assertEqual(self.p._claim_tx_thread, threading.get_ident())
+        self.assertTrue(self.c.in_transaction)
+        self.assertEqual(self.p._lifecycle_state, 'quarantined')
+        self.assertEqual(self.p.db_path, self.db)
+        self.assertIn('rollback_DatabaseError', self.p._transaction_cleanup_notes)
+        for action in (self.p._connect, self.p._close_journal_rebuild_connection):
+            with self.assertRaises(RuntimeError):
+                action()
+        self.assertIs(self.p._conn, self.c)
+        self.assertIs(self.p._owned_conn, self.c)
+        self.assertIs(self.p._transaction_primary, primary)
+
+    def test_generic_checkpoint_apply_does_not_adopt_unregistered_pending_tx(self):
+        payload = self.checkpoint()
+        self.c.execute('BEGIN IMMEDIATE')
+        with self.assertRaisesRegex(RuntimeError, '^provider_transaction_owner_pending$'):
+            self.p._apply_checkpoint_payload(payload)
+        self.assertIs(self.p._transaction_quarantine, self.c)
+        self.assertIsNone(self.p._claim_tx_connection)
+        self.assertTrue(self.c.in_transaction)
+        self.assertEqual(self.c.execute('SELECT * FROM meta').fetchall(), [])
+
+    def test_buffered_primary_native_return_seam_consumes_cause_once(self):
+        # Exact delivery method, synthetic buffered-error producer. This is
+        # NOT an actual _GraphCommitConnection/native authorizer invocation.
+        class Buffered:
+            _graph_effect_owner = self.p
+            _graph_commit_error = KeyboardInterrupt('buffered-source-cancel')
+
+        receiver = Buffered()
+        original = receiver._graph_commit_error
+        denial = sqlite3.DatabaseError('synthetic native-return denial')
+
+        def fail():
+            raise denial
+
+        invoke = self.ns['_GraphCommitConnection']._graph_native_return
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            invoke(receiver, fail)
+        self.assertIs(caught.exception, original)
+        self.assertIs(caught.exception.__cause__, denial)
+        self.assertIsNone(receiver._graph_commit_error)
+        self.assertEqual(invoke(receiver, lambda: 'healthy'), 'healthy')
+        ordinary = ValueError('unbuffered-primary')
+
+        def fail_ordinary():
+            raise ordinary
+
+        with self.assertRaises(ValueError) as caught:
+            invoke(receiver, fail_ordinary)
+        self.assertIs(caught.exception, ordinary)
+        self.assertIsNone(receiver._graph_commit_error)
+
+    def test_static_checkpoint_scope_encloses_data_cols_and_provenance(self):
+        apply = self.methods['_apply_checkpoint_payload']
+        scopes = [n for n in ast.walk(apply) if isinstance(n, ast.With)]
+        self.assertEqual(len(scopes), 1)
+        scope = scopes[0]
+        self.assertEqual(ast.unparse(scope.items[0].context_expr), 'self._migration_connection()')
+        text = ast.unparse(scope)
+        for token in ('SELECT name FROM sqlite_master', 'PRAGMA defer_foreign_keys=ON',
+                      'self._cols(table)', 'INSERT OR REPLACE', '_scrub_code_graph_storage('):
+            self.assertIn(token, text)
+        self.assertFalse(any(isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                             and n.func.attr in {'commit', 'rollback'} for n in ast.walk(apply)))
+
+    def test_static_direct_sql_boundaries_deliver_callback_primary_without_arming_flights(self):
+        cls = next(n for n in self.ns['_source_graph_ast'].body
+                   if isinstance(n, ast.ClassDef) and n.name == '_GraphCommitConnection')
+        methods = {n.name: n for n in cls.body if isinstance(n, ast.FunctionDef)}
+        for name in ('execute', 'executemany', 'executescript', 'rollback'):
+            text = ast.unparse(methods[name])
+            self.assertIn('self._graph_native_return(super().' + name, text)
+            self.assertNotIn('_graph_start_commit', text)
+        commit = ast.unparse(methods['commit'])
+        self.assertIn('self._graph_start_commit()', commit)
+        self.assertIn('self._graph_native_return(super().commit)', commit)
+        self.assertIn('self._graph_commit_flight = None', commit)
+        delivery = ast.unparse(methods['_graph_native_return'])
+        self.assertIn('except BaseException as native:', delivery)
+        self.assertIn('raise primary from native', delivery)
+        self.assertNotIn('_graph_start_commit', delivery)
+        authorizer = ast.unparse(methods['_graph_authorizer_result'])
+        self.assertIn('except BaseException as primary:', authorizer)
+        self.assertIn('self._graph_commit_error = primary', authorizer)
+        self.assertIn('return sqlite3.SQLITE_DENY', authorizer)
+
+    def test_static_private_reader_issuance_and_cleanup_share_rebuild_lock(self):
+        factory = next(n for n in self.ns['_source_graph_ast'].body
+                       if isinstance(n, ast.FunctionDef) and n.name == '_open_graph_reader_connection')
+        self.assertEqual(len(factory.body), 2)  # docstring + one encompassing admission
+        scope = factory.body[1]
+        self.assertIsInstance(scope, ast.With)
+        self.assertEqual(ast.unparse(scope.items[0].context_expr), '_provider_claim_lock(provider)')
+        text = ast.unparse(scope)
+        self.assertLess(text.index('shared = provider._connect()'), text.index('reader = sqlite3.connect('))
+        self.assertLess(text.index('owners[reader] = reader._graph_read_lifetime'), text.index('anchor.bind_reader(reader)'))
+        self.assertIn('_close_graph_writer_connection(reader, True)', text)
+        self.assertEqual(ast.unparse(scope.body[-1]), 'return (reader, True)')
+        close = self.methods['_close_journal_rebuild_connection']
+        self.assertEqual(ast.unparse(close.body[1].items[0].context_expr), 'self._lock')
+        self.assertIn('self._graph_reader_connections', ast.unparse(close))
 
 
 if __name__ == '__main__':
