@@ -138,7 +138,11 @@ def test_checkpoint_rebuild_preserves_or_reports_pending_semantic_upsert(tmp_pat
 
 
 @pytest.fixture
-def recovery(tmp_path, monkeypatch):
+def recovery(tmp_path_factory, monkeypatch, request):
+    # Own explicit non-numbered root: pytest's optional current symlink is not
+    # part of this isolated no-links native packet or its resource contract.
+    token = hashlib.sha256(request.node.nodeid.encode()).hexdigest()[:16]
+    tmp_path = tmp_path_factory.mktemp('journal-recovery-' + token, numbered=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_SECURITY_STRICT", "0")
     monkeypatch.setenv("MEMORY_WIKI_SEMANTIC", "0")

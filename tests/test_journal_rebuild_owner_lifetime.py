@@ -434,17 +434,21 @@ class TestJournalRebuildOwnerSource(unittest.TestCase):
         self.assertEqual(self.c.execute('SELECT * FROM meta').fetchall(), [])
 
     def test_buffered_primary_native_return_seam_consumes_cause_once(self):
-        # Exact delivery method, synthetic buffered-error producer. This is
-        # NOT an actual _GraphCommitConnection/native authorizer invocation.
+        # Exact delivery method, synthetic per-operation producer, NOT a
+        # native authorizer. A detached buffer is NOT this operation's cause.
         class Buffered:
             _graph_effect_owner = self.p
-            _graph_commit_error = KeyboardInterrupt('buffered-source-cancel')
+            _graph_commit_error = None
+            _graph_native_operation = None
+            _graph_authorizer_depth = 0
 
         receiver = Buffered()
-        original = receiver._graph_commit_error
+        original = KeyboardInterrupt('buffered-source-cancel')
         denial = sqlite3.DatabaseError('synthetic native-return denial')
 
         def fail():
+            receiver._graph_native_operation[0] = original
+            receiver._graph_commit_error = original
             raise denial
 
         invoke = self.ns['_GraphCommitConnection']._graph_native_return
@@ -453,7 +457,11 @@ class TestJournalRebuildOwnerSource(unittest.TestCase):
         self.assertIs(caught.exception, original)
         self.assertIs(caught.exception.__cause__, denial)
         self.assertIsNone(receiver._graph_commit_error)
+        self.assertIsNone(receiver._graph_native_operation)
+        # An explicitly synthetic stale buffer cannot poison later cleanup.
+        receiver._graph_commit_error = original
         self.assertEqual(invoke(receiver, lambda: 'healthy'), 'healthy')
+        self.assertIsNone(receiver._graph_commit_error)
         ordinary = ValueError('unbuffered-primary')
 
         def fail_ordinary():
@@ -462,6 +470,21 @@ class TestJournalRebuildOwnerSource(unittest.TestCase):
         with self.assertRaises(ValueError) as caught:
             invoke(receiver, fail_ordinary)
         self.assertIs(caught.exception, ordinary)
+        self.assertIsNone(receiver._graph_commit_error)
+
+        def nested():
+            outer = receiver._graph_native_operation
+            outer[0] = original
+            receiver._graph_commit_error = original
+            self.assertEqual(invoke(receiver, lambda: 'inner-healthy'), 'inner-healthy')
+            self.assertIs(receiver._graph_native_operation, outer)
+            self.assertIs(receiver._graph_commit_error, original)
+            raise denial
+
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            invoke(receiver, nested)
+        self.assertIs(caught.exception, original)
+        self.assertIsNone(receiver._graph_native_operation)
         self.assertIsNone(receiver._graph_commit_error)
 
     def test_static_checkpoint_scope_encloses_data_cols_and_provenance(self):
@@ -481,10 +504,22 @@ class TestJournalRebuildOwnerSource(unittest.TestCase):
         cls = next(n for n in self.ns['_source_graph_ast'].body
                    if isinstance(n, ast.ClassDef) and n.name == '_GraphCommitConnection')
         methods = {n.name: n for n in cls.body if isinstance(n, ast.FunctionDef)}
-        for name in ('execute', 'executemany', 'executescript', 'rollback'):
+        for name in ('execute', 'executemany', 'executescript'):
             text = ast.unparse(methods[name])
-            self.assertIn('self._graph_native_return(super().' + name, text)
+            self.assertIn('self.cursor().' + name, text)
             self.assertNotIn('_graph_start_commit', text)
+        for name in ('rollback', '__exit__'):
+            self.assertIn('self._graph_native_return(super().' + name, ast.unparse(methods[name]))
+        cursor = next(n for n in self.ns['_source_graph_ast'].body
+                      if isinstance(n, ast.ClassDef) and n.name == '_GraphCommitCursor')
+        for method in cursor.body:
+            if isinstance(method, ast.FunctionDef):
+                self.assertIn('self.connection._graph_native_return(super().' + method.name,
+                              ast.unparse(method))
+        private = next(n for n in self.ns['_source_graph_ast'].body
+                       if isinstance(n, ast.ClassDef) and n.name == '_GraphWriterConnection')
+        call = next(n for n in private.body if isinstance(n, ast.FunctionDef) and n.name == '_graph_call')
+        self.assertIn('self._graph_native_return(operation,', ast.unparse(call))
         commit = ast.unparse(methods['commit'])
         self.assertIn('self._graph_start_commit()', commit)
         self.assertIn('self._graph_native_return(super().commit)', commit)

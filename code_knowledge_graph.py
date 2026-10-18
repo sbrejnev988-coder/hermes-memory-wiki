@@ -1355,6 +1355,7 @@ class _GraphCommitConnection(sqlite3.Connection):
         self._graph_extraction_stage = None
         self._graph_commit_flight = None
         self._graph_commit_error = None
+        self._graph_native_operation = None
         self._graph_user_authorizer = None
         self._graph_authorizer_depth = 0
         self._graph_trace = None
@@ -1397,39 +1398,60 @@ class _GraphCommitConnection(sqlite3.Connection):
         return super().set_progress_handler(callback, n)
 
     def _graph_native_return(self, operation, *args, **kwargs):
-        """Deliver a retained authorizer primary at this native call's return.
+        """Deliver only this native operation's callback cause, exactly once.
 
-        In particular, executescript's implicit COMMIT does not call our
-        Python commit override. Consume the cause here, before owner rollback
-        can run another callback or a later commit can clear the buffer.
-        This does not arm a commit flight or bypass any authorizer fence.
+        The identity of the local cell binds the authorizer to its particular
+        call, including nested shared SQL and the private writer's base-class
+        commit/rollback dispatch. A later cleanup must never drain a preceding
+        cursor's cause. This delivery scope grants no writer/commit authority.
         """
         with _provider_claim_lock(self._graph_effect_owner):
-            try:
-                result = operation(*args, **kwargs)
-            except BaseException as native:
-                primary = self._graph_commit_error
-                self._graph_commit_error = None
-                if primary is not None:
-                    raise primary from native
-                raise
-            primary = self._graph_commit_error
+            previous = self._graph_native_operation
+            # Depth distinguishes a wrapped nested operation from an explicit
+            # raw sqlite3 descriptor reentered inside the same authorizer.
+            current = [None, self._graph_authorizer_depth]
+            self._graph_native_operation = current
             self._graph_commit_error = None
-            if primary is not None:
-                raise primary
-            return result
+            try:
+                try:
+                    result = operation(*args, **kwargs)
+                except BaseException as native:
+                    primary = current[0]
+                    if primary is not None:
+                        if primary is native:
+                            raise
+                        raise primary from native
+                    raise
+                primary = current[0]
+                if primary is not None:
+                    raise primary
+                return result
+            finally:
+                # Restore the outer call's own cause, not a connection-wide
+                # queue. Reentrant SQL cannot consume or replace that cause.
+                self._graph_native_operation = previous
+                self._graph_commit_error = None if previous is None else previous[0]
+
+    def cursor(self, factory=None):
+        return super().cursor(factory=_GraphCommitCursor if factory is None else factory)
 
     def execute(self, *args, **kwargs):
-        return self._graph_native_return(super().execute, *args, **kwargs)
+        return self.cursor().execute(*args, **kwargs)
 
     def executemany(self, *args, **kwargs):
-        return self._graph_native_return(super().executemany, *args, **kwargs)
+        return self.cursor().executemany(*args, **kwargs)
 
     def executescript(self, *args, **kwargs):
-        return self._graph_native_return(super().executescript, *args, **kwargs)
+        # Its implicit native COMMIT does not call our Python commit override.
+        return self.cursor().executescript(*args, **kwargs)
 
     def rollback(self):
         return self._graph_native_return(super().rollback)
+
+    def __exit__(self, *args):
+        # sqlite3's context manager calls native commit/rollback descriptors,
+        # not the Python overrides. The original authorizer fences still run.
+        return self._graph_native_return(super().__exit__, *args)
 
     def _graph_authorizer_result(self, action, a, b, database, source):
         flight = self._graph_commit_flight
@@ -1510,9 +1532,15 @@ class _GraphCommitConnection(sqlite3.Connection):
                     raise RuntimeError('prefetch_terminal_attempt_expired')
             return result
         except BaseException as primary:
-            # SQLite suppresses authorizer exceptions. Deliver the actual
-            # cancellation/refusal at native return, before owner cleanup.
-            if self._graph_commit_error is None:
+            # SQLite suppresses authorizer exceptions. Bind the first cause to
+            # this exact native call, not the next commit/rollback. Explicit
+            # sqlite3 base-descriptor/custom-cursor bypasses retain SQLite's
+            # ordinary DatabaseError semantics, not a detached pending cause;
+            # they still have to pass the same native authority fences.
+            current = self._graph_native_operation
+            if (current is not None and current[1] == self._graph_authorizer_depth
+                    and current[0] is None):
+                current[0] = primary
                 self._graph_commit_error = primary
             return sqlite3.SQLITE_DENY
 
@@ -1527,7 +1555,6 @@ class _GraphCommitConnection(sqlite3.Connection):
         stage = getattr(owner, '_claim_tx_graph_stage', None)
         document_stage = getattr(owner, '_claim_tx_document_stage', None)
         event_job_stage = getattr(owner, '_claim_tx_event_job_stage', None)
-        self._graph_commit_error = None
         if event_job_stage is not None and event_job_stage[2]:
             image = self._event_job_commit_image
             if image is None or image[0] is not event_job_stage:
@@ -1580,6 +1607,30 @@ class _GraphCommitConnection(sqlite3.Connection):
                 self._document_commit_flight = None
                 self._event_job_commit_flight = None
                 self._prefetch_commit_flight = None
+
+
+class _GraphCommitCursor(sqlite3.Cursor):
+    """Shared default/returned cursors deliver causes at their own return."""
+    def execute(self, *args, **kwargs):
+        return self.connection._graph_native_return(super().execute, *args, **kwargs)
+
+    def executemany(self, *args, **kwargs):
+        return self.connection._graph_native_return(super().executemany, *args, **kwargs)
+
+    def executescript(self, *args, **kwargs):
+        return self.connection._graph_native_return(super().executescript, *args, **kwargs)
+
+    def fetchone(self):
+        return self.connection._graph_native_return(super().fetchone)
+
+    def fetchmany(self, *args, **kwargs):
+        return self.connection._graph_native_return(super().fetchmany, *args, **kwargs)
+
+    def fetchall(self):
+        return self.connection._graph_native_return(super().fetchall)
+
+    def __next__(self):
+        return self.connection._graph_native_return(super().__next__)
 
 
 class _GraphWriterConnection(_GraphCommitConnection):
@@ -1659,7 +1710,10 @@ class _GraphWriterConnection(_GraphCommitConnection):
             self._graph_inflight = flight
             try:
                 try:
-                    result = operation(*args, **kwargs)
+                    # Cursor operations bypass the base connection shortcuts.
+                    # Deliver their cause BEFORE this owning handler/cleanup;
+                    # inherited commit/rollback may nest another delivery scope.
+                    result = self._graph_native_return(operation, *args, **kwargs)
                 finally:
                     # Native return/raise has happened. A subsequent cleanup
                     # call gets its OWN admission, never this operation's lease.
