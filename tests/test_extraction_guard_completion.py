@@ -503,7 +503,10 @@ class ExtractionGuardCompletionTests(unittest.TestCase):
         self.assertEqual(len(calls(callback, "memory_gate_decision")), 1)
         self.assertIn("_no_side_effects=True", ast.unparse(callback))
         self.assertIn("persistence_primary = exc", ast.unparse(callback))
-        self.assertIn("except _EventClaimLeaseLost:\n    return ''", ast.unparse(callback))
+        lost_handlers = [n for n in ast.walk(callback) if isinstance(n, ast.ExceptHandler)
+                         and isinstance(n.type, ast.Name) and n.type.id == "_EventClaimLeaseLost"]
+        self.assertEqual(len(lost_handlers), 1)
+        self.assertEqual([ast.unparse(n) for n in lost_handlers[0].body], ["return ''"])
 
     def test_static_caller_routes_existing_defer_and_fenced_finish(self):
         once = qualified(self.jobs_tree, "run_once")
