@@ -168,8 +168,6 @@ class JobStore:
             raise ValueError("graph jobs require a claim ID alone")
         stamp = int(time.time() if now is None else now)
         due = max(stamp, int(available_at)) if available_at is not None else stamp
-        key = _digest(self.profile, self.owner, job_type, partition,
-                      payload["claim_id"] if job_type == "enrich_claim_graph" else "")
         with closing(self._connect()) as conn, conn:
             conn.execute("BEGIN IMMEDIATE")
             retention = _limit("MEMORY_WIKI_BACKGROUND_HISTORY_DAYS", 30, 1, 365)
@@ -183,33 +181,49 @@ class JobStore:
                 "DELETE FROM memory_job_budgets WHERE profile_key=? AND day_utc<?",
                 (self.profile, stamp // 86400 - retention),
             )
-            old = conn.execute(
-                "SELECT job_id,status,payload_json FROM memory_jobs WHERE coalesce_key=? "
-                "AND status IN ('pending','leased')", (key,),
-            ).fetchone()
-            if old:
-                if job_type == "extract_session_events":
-                    previous = json.loads(old["payload_json"])
-                    if int(previous["high_watermark"]) > payload["high_watermark"]:
-                        canonical = str(old["payload_json"])
-                conn.execute(
-                    "UPDATE memory_jobs SET payload_json=?,generation=generation+1,"
-                    "updated_at=?,available_at=CASE WHEN status='pending' THEN MIN(available_at,?) "
-                    "ELSE available_at END WHERE job_id=?",
-                    (canonical, stamp, due, old["job_id"]),
-                )
-                return str(old["job_id"])
-            identifier = "job_" + uuid.uuid4().hex
+            return self._enqueue_in_transaction(conn, job_type, payload, partition,
+                canonical=canonical, stamp=stamp, due=due,
+                owner_chat_hash=owner_chat_hash, owner_session_hash=owner_session_hash)
+
+    def _enqueue_in_transaction(
+        self, conn: sqlite3.Connection, job_type: str, payload: dict[str, Any],
+        partition: str, *, canonical: str, stamp: int, due: int,
+        owner_chat_hash: str = "", owner_session_hash: str = "",
+    ) -> str:
+        """Upsert prevalidated fields; caller owns admission/schema/TX lifetime.
+
+        This helper is NOT provider writer authority. No connection creation,
+        BEGIN/commit/close or unrelated history pruning belongs in participation.
+        """
+        key = _digest(self.profile, self.owner, job_type, partition,
+                      payload["claim_id"] if job_type == "enrich_claim_graph" else "")
+        old = conn.execute(
+            "SELECT job_id,status,payload_json FROM memory_jobs WHERE coalesce_key=? "
+            "AND status IN ('pending','leased')", (key,),
+        ).fetchone()
+        if old:
+            if job_type == "extract_session_events":
+                previous = json.loads(old["payload_json"])
+                if int(previous["high_watermark"]) > payload["high_watermark"]:
+                    canonical = str(old["payload_json"])
             conn.execute(
-                """INSERT INTO memory_jobs(job_id,profile_key,owner_key,partition_key,
-                    owner_chat_hash,owner_session_hash,
-                    job_type,payload_json,coalesce_key,status,available_at,created_at,updated_at)
-                   VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?,?)""",
-                (identifier, self.profile, self.owner, partition,
-                 owner_chat_hash, owner_session_hash, job_type,
-                 canonical, key, due, stamp, stamp),
+                "UPDATE memory_jobs SET payload_json=?,generation=generation+1,"
+                "updated_at=?,available_at=CASE WHEN status='pending' THEN MIN(available_at,?) "
+                "ELSE available_at END WHERE job_id=?",
+                (canonical, stamp, due, old["job_id"]),
             )
-            return identifier
+            return str(old["job_id"])
+        identifier = "job_" + uuid.uuid4().hex
+        conn.execute(
+            """INSERT INTO memory_jobs(job_id,profile_key,owner_key,partition_key,
+                owner_chat_hash,owner_session_hash,
+                job_type,payload_json,coalesce_key,status,available_at,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,'pending',?,?,?)""",
+            (identifier, self.profile, self.owner, partition,
+             owner_chat_hash, owner_session_hash, job_type,
+             canonical, key, due, stamp, stamp),
+        )
+        return identifier
 
     def lease(self, worker: str, *, now: int | None = None) -> dict[str, Any] | None:
         if not re.fullmatch(r"[0-9a-f]{32}", worker):
@@ -825,9 +839,11 @@ def _run_job(
 
         persistence_primary = None
         guard_deferred = False
+        returned_slots = 0
+        graph_intents: set[str] = set()
 
         def persist_if_current(*args: Any, **kwargs: Any) -> str:
-            nonlocal persistence_primary, guard_deferred
+            nonlocal persistence_primary, guard_deferred, returned_slots
             if persistence_primary is not None:
                 raise persistence_primary
             if guard_deferred:
@@ -870,7 +886,44 @@ def _run_job(
             # validation and the claim write. The callback cannot resurrect
             # an event erased while the remote extractor was running.
             try:
+                graph_allowed, graph_available = worker.relevant_graph_extraction_settings()
+                intent_job = None
                 with worker._claim_transaction(conn, _event_job=event_obligation):
+                    claim_stage = worker._claim_tx_event_job_stage
+
+                    def enqueue_claim(provider, claim_id):
+                        """Private TX-bound enqueue, NOT the standalone writer.
+
+                        The stage is the one captured from THIS actual owner
+                        before _add_claim_tx, not a reconstructed permission.
+                        """
+                        provider._require_claim_writer(conn, transaction=True)
+                        row = conn.execute("SELECT * FROM claims WHERE id=?", (claim_id,)).fetchone()
+                        if row is None or str(row["origin_bot_id"]) != str(provider.bot_id):
+                            return None
+                        if (provider is not worker or conn is not provider._conn
+                                or conn is not provider._owned_conn
+                                or conn is not provider._claim_tx_connection
+                                or provider._claim_tx_thread != threading.get_ident()
+                                or provider._claim_tx_event_job_stage is not claim_stage
+                                or type(claim_stage) is not tuple or len(claim_stage) != 4
+                                or claim_stage[0] is not conn
+                                or claim_stage[1] != provider._claim_tx_thread
+                                or type(claim_stage[2]) is not list or claim_stage[3] is not True
+                                or not any(item is event_obligation for item in claim_stage[2])
+                                or provider.bot_id != event_obligation[1]
+                                or provider.home is not event_obligation[2]
+                                or provider.db_path is not event_obligation[3]):
+                            raise RuntimeError("event_job_intent_owner_stage_unproven")
+                        original_job = dict(event_obligation[0])
+                        partition = _digest(str(row["origin_bot_id"]), str(row["origin_chat_hash"]), claim_id)
+                        stamp = int(time.time())
+                        canonical = validate_payload("enrich_claim_graph", {"claim_id": claim_id})
+                        return JobStore(provider.db_path, original_job["profile_key"], original_job["owner_key"])._enqueue_in_transaction(
+                            conn, "enrich_claim_graph", {"claim_id": claim_id}, partition,
+                            canonical=canonical, stamp=stamp, due=stamp,
+                        )
+
                     live = conn.execute(
                         f"""SELECT event_id,content_hash,owner_bot_id,owner_chat_hash,
                                owner_session_hash,visibility_scope,project_id,event_type,role
@@ -907,40 +960,50 @@ def _run_job(
                         conn, prepared, float(kwargs.get("confidence", .72)),
                         float(kwargs.get("salience", .70)),
                     )
+                    if (graph_allowed and graph_available and returned_slots < 4
+                            and isinstance(claim_id, str) and claim_id not in preexisting
+                            and _CLAIM_ID.fullmatch(claim_id) and claim_id not in graph_intents):
+                        intent_job = enqueue_claim(worker, claim_id)
                     if (lease_valid_in_transaction is not None
                             and not lease_valid_in_transaction(conn)) or (
                             lease_valid_in_transaction is None
                             and lease_valid is not None and not lease_valid()):
                         raise _EventClaimLeaseLost
+                # Every nonempty would-return ID consumes its producer slot,
+                # including preexisting/invalid/duplicate IDs, BEFORE postcommit.
+                # A confirmed commit whose postcommit return fails keeps that
+                # slot and its intent; rollback consumes neither. No more than
+                # four distinct intents, and no aggregate rescheduling later.
+                if claim_id:
+                    returned_slots += 1
+                if intent_job is not None:
+                    graph_intents.add(claim_id)
+                if claim_id and not prepared.get("_no_op"):
+                    worker._after_claim_commit(claim_id, prepared["topic"], prepared["claim"])
+                return str(claim_id or "")
             except _EventClaimLeaseLost:
                 return ""
             except BaseException as exc:
-                # extract_session_claims catches ordinary Exceptions. Keep the
-                # actual primary until its caller returns; never report an
-                # empty/persisted ID as successful recovery from UNKNOWN.
+                # Include escaped postcommit failures, not the normally collected
+                # derivative failures. The extractor may swallow Exception, but
+                # must not replace this original primary or turn UNKNOWN into ACK.
                 persistence_primary = exc
                 raise
-            if claim_id and not prepared.get("_no_op"):
-                worker._after_claim_commit(claim_id, prepared["topic"], prepared["claim"])
-            return str(claim_id or "")
 
-        result = module.extract_session_claims(
-            messages, session_id=worker.session_id,
-            add_claim_callback=persist_if_current,
-            redact_secret_callback=module.redact_secrets,
-            secret_scan_callback=module.secret_scan,
-            extraction_settings=module.read_extraction_settings(worker.home),
-        )
+        try:
+            result = module.extract_session_claims(
+                messages, session_id=worker.session_id,
+                add_claim_callback=persist_if_current,
+                redact_secret_callback=module.redact_secrets,
+                secret_scan_callback=module.secret_scan,
+                extraction_settings=module.read_extraction_settings(worker.home),
+            )
+        except BaseException:
+            if persistence_primary is not None:
+                raise persistence_primary
+            raise
         if persistence_primary is not None:
             raise persistence_primary
-        # Graph jobs only refer to new, still active claims; execution repeats
-        # full graph eligibility checks against authoritative current rows.
-        graph_allowed, graph_available = worker.relevant_graph_extraction_settings()
-        if source_scope == "chat" and graph_allowed and graph_available:
-            for claim_id in result.get("persisted_ids", [])[:4]:
-                if isinstance(claim_id, str) and claim_id not in preexisting \
-                        and _CLAIM_ID.fullmatch(claim_id):
-                    enqueue_claim(worker, claim_id)
         if result.get("error") or result.get("errors"):
             return "provider"
         if guard_deferred:

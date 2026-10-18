@@ -22,7 +22,7 @@ ENTRY_SHA256 = "57385a9fd9e7d94658a49d1eb90106346aea0c3e052a4d7110f1a8f0f8f91cc9
 EXTRACTOR_SHA256 = "6e7e9df73940c0cfd6a8eced6bc2c250d58a9f455d19a27a3caadbc62da02de2"
 BASE_FACTORY_AST = "41c0ae8690c85534f8a255c36718d5ad85e8708d731b498653249477a85089c7"
 UNCHANGED_NODES = {
-    "_run_job": "eb3d26ec598af0cdab50164defc1466acae5687c47855b3cac3eac7eaa2df9c2",
+    "_run_job": "4ee2147d24ec1c5f9cd67c92ba5a8aeb11f694c2f4a701560396633310483651",
     "profile_key": "48162afa7fc717204643778b3278b68f3d093a6e581db777c4d90c63cb26be19",
     "owner_key": "8acb57d03805871e873db147b588cda75123f81c777b6cfb3c1ba60697a694cf",
 }
@@ -315,7 +315,7 @@ def make_suite(source_raw, source_path, entry_raw, entry_path, extractor_raw,
     # Hash a full original-rest AST rather than requiring any external baseline
     # peer. This frozen pin includes every unchanged JobStore/lifecycle guard.
     cls.other_source_ast = digest("\n".join(cls.other_source_ast).encode("utf-8"))
-    cls.baseline_other_source_ast = "0507344a02cda83bfc5ce3f519f2e814b98e99ceab4a6a4f8ef25da9b266d489"
+    cls.baseline_other_source_ast = "cbe50eb4a79edea9615e3de4630cca1aa4f90f215f36e28969641b0e477f1109"
     suite = (unittest.defaultTestLoader.loadTestsFromTestCase(cls) if cases is None
              else unittest.TestSuite(cls(name) for name in cases))
     bindings = []
