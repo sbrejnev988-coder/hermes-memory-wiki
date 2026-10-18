@@ -389,7 +389,7 @@ def make_suite(source_raw, source_path, entry_raw, entry_path, peer_raw, peer_pa
     namespace = {"__name__": "genuine_settings_consumer_source", "__builtins__": {**vars(builtins), "__import__": no_host_import},
         "Path": Path, "os": os, "json": json, "time": clock, "_QDRANT_PROFILE_SCOPE": scope,
         "_IMPORT_HERMES_HOME": Path(witness_root or source_path.parent), "_background_jobs": module,
-        "_profile_public_env": lambda home, names: dict(public),
+        "_profile_public_env": lambda home, names, **kwargs: dict(public),
         "_env_int": lambda name, default, low, high: default,
         "secret_scan": lambda text: {}, "tokens": lambda text: text.split(),
         "GRAPH_AUTO_RELATION_HINT_RE": re.compile(r"depends on")}

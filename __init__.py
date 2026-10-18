@@ -1705,12 +1705,13 @@ _GLOBAL_SEARCH_PUBLIC_ENV = {
 }
 
 
-def _profile_public_env(home: Path, names: Iterable[str]) -> Dict[str, str]:
+def _profile_public_env(home: Path, names: Iterable[str], *, _raise_unavailable: bool = False) -> Dict[str, str]:
     """Read a small allowlist of non-secret settings from one profile .env.
 
     The desktop can host several profiles in one process, so the ambient process
     environment is not authoritative for a foreign profile.  This reader never
     returns credentials and intentionally accepts only the supplied allowlist.
+    Queued consumers may retain a transient read failure instead of absence.
     """
     wanted = {str(name) for name in names}
     selected: Dict[str, str] = {}
@@ -1728,7 +1729,11 @@ def _profile_public_env(home: Path, names: Iterable[str]) -> Dict[str, str]:
                 if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
                     value = value[1:-1]
                 selected[key] = value
-    except (OSError, UnicodeError):
+    except OSError:
+        if _raise_unavailable:
+            raise
+        return {}
+    except UnicodeError:
         return {}
     return selected
 
@@ -9870,7 +9875,13 @@ class MemoryWikiProvider(MemoryProvider):
         """Call-time own-profile gates; unknown ambient origin cannot enable work."""
         names = ("MEMORY_WIKI_GRAPH_AUTO_EXTRACT", "MEMORY_WIKI_GRAPH_EXTRACT_ENABLED")
         scope = _QDRANT_PROFILE_SCOPE.get() or {}
-        public = _profile_public_env(Path(self.home), names)
+        public_error = None
+        try:
+            public = _profile_public_env(Path(self.home), names, _raise_unavailable=_raise_unavailable)
+        except (OSError,) as exc:
+            # Unknown own flags cannot borrow lower-precedence ambient consent
+            # or opt-out. An independent, healthy graph YAML OFF still suffices.
+            public, public_error = {}, exc
         allow_environment = False
         try:
             import hermes_constants as core
@@ -9885,15 +9896,20 @@ class MemoryWikiProvider(MemoryProvider):
             return str(raw).strip().lower() in {"1", "true", "yes", "on"}
         try:
             settings = self._graph_extraction_settings()
-            return enabled(names[0]), settings.enabled if settings is not None else enabled(names[1])
+            graph_enabled = settings.enabled if settings is not None else enabled(names[1])
         except OSError as exc:
             # Only an already queued consumer needs to retain unknown consent.
             # A known auto opt-out is still a lawful no-op, not a dependency.
-            if _raise_unavailable and enabled(names[0]):
-                raise _background_jobs.GraphSettingsUnavailable('graph_settings_unavailable') from exc
+            if public_error is not None or (_raise_unavailable and enabled(names[0])):
+                raise _background_jobs.GraphSettingsUnavailable('graph_settings_unavailable') from (public_error if public_error is not None else exc)
             return False, False
         except Exception:
             return False, False
+        if public_error is not None:
+            if settings is not None and not graph_enabled:
+                return False, False
+            raise _background_jobs.GraphSettingsUnavailable('graph_settings_unavailable') from public_error
+        return enabled(names[0]), graph_enabled
 
     def _auto_graph_enrich_extracted_claims(self, claim_ids: Iterable[str], *, _require_settings: bool = False) -> Dict[str, int]:
         """Optionally enrich newly extracted grounded claims with graph edges.
