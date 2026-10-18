@@ -877,6 +877,7 @@ def test_native_reader_issuance_registry_excludes_concurrent_rebuild(recovery, m
     reader_thread = sdk.spawn_context_thread(read, name="jro-actual-reader", daemon=False)
     rebuild_thread = None
     try:
+        reader_thread.start()  # SDK factory captures context; it does not start.
         assert connected.wait(10)
         acquired = provider._lock.acquire(blocking=False)
         if acquired:
@@ -884,6 +885,7 @@ def test_native_reader_issuance_registry_excludes_concurrent_rebuild(recovery, m
         assert not acquired, "factory released lock before reader publication"
         assert not provider._graph_reader_connections
         rebuild_thread = sdk.spawn_context_thread(rebuild, name="jro-actual-rebuild", daemon=False)
+        rebuild_thread.start()
         assert rebuilding.wait(10)
         release.set()
         assert issued.wait(10) and not reader_errors
