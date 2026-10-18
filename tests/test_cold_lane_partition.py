@@ -96,6 +96,14 @@ class ColdPartitionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, '^' + code):
             self.module.validate_partition(self.plan, self.raw if raw else None)
 
+    def pending_peer_fixture(self):
+        # Current B is delivered. These negative controls need a genuinely
+        # unbound future input, not a stale claim about the current checkout.
+        self.plan['pending_peer_inputs'] = [{
+            'path': 'tests/ci_owned/future_unbound_peer.py', 'sha256': None,
+            'status': 'PENDING_FINAL_MERGE_REBIND', 'owner': 'owned pending negative fixture'}]
+        self.plan['needs_final_rebind'] = True
+
     def test_current_full_file_and_entry_closure(self):
         result = self.module.validate_partition(self.plan, self.raw)
         self.assertEqual(result['file_count'], len([p for p in self.raw if p.startswith('tests/') and p.endswith('.py')]))
@@ -121,6 +129,7 @@ class ColdPartitionTests(unittest.TestCase):
         self.reject('partition_source_input_membership')
 
     def test_unexpected_new_peer_is_not_hidden_by_pending_metadata(self):
+        self.pending_peer_fixture()
         pending = self.plan['pending_peer_inputs'][0]['path']
         self.raw[pending] = b'# actual new peer requires final merge rebind\n'
         self.reject('partition_source_input_membership')
@@ -425,9 +434,11 @@ class ColdPartitionTests(unittest.TestCase):
         self.reject('partition_provider_pin', raw=False)
 
     def test_peer_hash_is_null_until_actual_delivery(self):
+        self.pending_peer_fixture()
         self.plan['pending_peer_inputs'][0]['sha256'] = '0' * 64
         self.reject('partition_pending_peer', raw=False)
         self.plan = copy.deepcopy(self.original)
+        self.pending_peer_fixture()
         self.plan['needs_final_rebind'] = False
         self.reject('partition_pending_rebind', raw=False)
 
@@ -449,6 +460,7 @@ class ColdPartitionTests(unittest.TestCase):
         self.reject('partition_native_target_pin:packaging/run_native_regressions.py')
 
     def test_existing_cold_plan_refuses_pending_rebind_and_missing_origins(self):
+        self.pending_peer_fixture()
         root = Path(tempfile.mkdtemp(prefix='cold-plan-', dir=os.environ['TMPDIR']))
         path = root / 'plan.json'
         old_argv = sys.argv
@@ -464,6 +476,23 @@ class ColdPartitionTests(unittest.TestCase):
                 self.module.cold_plan()
         finally:
             sys.argv = old_argv
+
+    def test_current_delivered_ci_dispatch_peer_is_bound(self):
+        path = 'tests/ci_owned/collection_dispatch_cases.py'
+        row = self.row(path)
+        self.assertEqual((row['role'], row['lane']), ('unittest-explicit', 'source-explicit'))
+        self.assertEqual(row['sha256'], hashlib.sha256(self.raw[path]).hexdigest())
+        self.assertIn(path, self.plan['source_explicit_targets'])
+        self.assertIn('tests/helpers/collection_evidence.py', row['peers'])
+        self.assertEqual(row['entry']['callables']['run_fixture'], 'kind, *, source, root')
+        for lane in ('strict', 'legacy'):
+            self.assertNotIn(path, self.plan['cold_processes'][lane]['targets'])
+        pins = {pin['path']: pin['sha256'] for pin in self.plan['source_pins']}
+        for source in ('scripts/ci_owned/ci_child.py', 'scripts/ci_owned/ci_output_admission.py'):
+            self.assertEqual(pins[source], hashlib.sha256(self.raw[source]).hexdigest())
+        self.assertEqual(self.plan['pending_peer_inputs'], [])
+        self.assertFalse(self.plan['needs_final_rebind'])
+        self.assertFalse(self.module.validate_partition(self.plan, self.raw)['native_sdk_execution_admitted'])
 
     def test_native_and_trust_admission_remain_genuinely_unresolved(self):
         self.assertFalse(self.plan['native_sdk_execution_admitted'])

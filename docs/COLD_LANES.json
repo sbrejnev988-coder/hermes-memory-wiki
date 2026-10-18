@@ -2,8 +2,8 @@
   "schema": "memory-stack.current-source-cold-lanes/v1",
   "status": "SOURCE_CHECKPOINT_NOT_NATIVE_ADMISSION",
   "frozen_provider_sha256": "23e60da064fc7b7b0cdf195bb8608b86be2615204c4ca6f53f8a4ec904d15851",
-  "needs_final_rebind": true,
-  "input_inventory_sha256": "39d8fb0261a3c436dbcd5f170ba1694a166a2912b2230b9ae71af578a90da504",
+  "needs_final_rebind": false,
+  "input_inventory_sha256": "22fa90420773225c51d87b1524dd15cb1c34fd404d339ea0dd8571fe64c560f6",
   "cold_processes": {
     "strict": {
       "HERMES_SECURITY_STRICT": "1",
@@ -373,6 +373,28 @@
         "tests/ci_owned/llm_pack_egress_fixture.py"
       ],
       "reason": "Stored-claim peer: real direct SPI/SQLite, authored external HTTP only. Support/fixture/entry module, not a test case."
+    },
+    {
+      "path": "tests/ci_owned/collection_dispatch_cases.py",
+      "sha256": "baf11b491806eff033828c542da8ab7ff569e01843d7a56da6931363a2d0d847",
+      "role": "unittest-explicit",
+      "lane": "source-explicit",
+      "entry": {
+        "kind": "unittest",
+        "invocation": "python -I -B -S tests/ci_owned/collection_dispatch_cases.py",
+        "callables": {
+          "run_fixture": "kind, *, source, root"
+        }
+      },
+      "requires": [
+        "exact_source_inputs",
+        "source_stdlib"
+      ],
+      "requires_sdk_absent": false,
+      "peers": [
+        "tests/helpers/collection_evidence.py"
+      ],
+      "reason": "Delivered B tooling: explicit stdlib unittest main controls and separately callable actual pytest reporting fixtures. Requires complete owned source layout and scratch; file membership does not execute either entry or qualify native SDK."
     },
     {
       "path": "tests/ci_owned/contract_cases.py",
@@ -1684,7 +1706,7 @@
     },
     {
       "path": "tests/test_cold_lane_partition.py",
-      "sha256": "973d6e660e1b75ae5984aa50b08ccd7a5d57b950746cbb6b1784946a8eca355f",
+      "sha256": "96097117a11b6c2ca94183e32fe012b08598eebcaa59d889b3bf7f6d8af54669",
       "role": "unittest-explicit",
       "lane": "source-explicit",
       "entry": {
@@ -6299,6 +6321,7 @@
   ],
   "source_explicit_targets": [
     "tests/ci_owned/binding_cases.py",
+    "tests/ci_owned/collection_dispatch_cases.py",
     "tests/ci_owned/contract_cases.py",
     "tests/ci_owned/doc_code_carrier_cases.py",
     "tests/ci_owned/entry_cases.py",
@@ -6363,7 +6386,7 @@
       "executed_evidence": "7-case isolated packet at runtime source SHA 7ebb63ce54ea1c0fb2f56fddc2cb7a7b4aeabae3ae271fa8262c56fcc0aa51f3; not full cold native suite/fleet."
     }
   ],
-  "file_count": 319,
+  "file_count": 320,
   "requirements": {
     "native_legacy": "BLOCKED until independently admitted native cold bootstrap, genuine SDK/registry/MRO and dependency origins; trust-core genuinely absent; HERMES_SECURITY_STRICT=0. No SDK substitution or import hiding.",
     "native_strict": "BLOCKED until independently admitted native cold bootstrap, genuine SDK/registry/MRO, complete dependencies and actual public hermes_trust_core delivery/API; HERMES_SECURITY_STRICT=1.",
@@ -6381,18 +6404,11 @@
     "protected_fixture_settings": "Some existing cases can write synthetic protected settings or spawn workers. Current no-config/env/native-child scope does not admit those effects; future own fixture/resource admission required.",
     "isolated_ci_peer_binding": "Before the initial from binding_cases import, use the exact stdlib -I -B -S -c/runpy bootstrap and only the entry own tests/ci_owned path. Genuine peer then binds scripts/ci_owned; all declared source_inputs SHA-bound. Run from the complete source root with existing empty owned MW_CI_UNIT_FIXTURES and clean home/temp. No SDK path, site or PYTHONPATH; no new runner."
   },
-  "pending_peer_inputs": [
-    {
-      "path": "tests/ci_owned/collection_dispatch_cases.py",
-      "sha256": null,
-      "status": "PENDING_FINAL_MERGE_REBIND",
-      "owner": "writer B; absent in this frozen baseline, actual final bytes required"
-    }
-  ],
+  "pending_peer_inputs": [],
   "source_pins": [
     {
       "path": ".github/workflows/memory-wiki-synthetic.yml",
-      "sha256": "7827abf6998a695a4bdb36c97ac1b3002efb90504c3f8ebd43560e751641594c"
+      "sha256": "85909009e6ea56cf91821df200c4dc1f12f0ff2f39f0ead8570b1998485cbcb3"
     },
     {
       "path": ".github/workflows/test.yml",
@@ -6409,6 +6425,14 @@
     {
       "path": "scripts/ci_owned/ci_bootstrap.py",
       "sha256": "37bd539048cf9da0ceed411ac0fe5ecaf9f8bf576cc71d2a3739746be8f5f9a7"
+    },
+    {
+      "path": "scripts/ci_owned/ci_child.py",
+      "sha256": "de53a5f95ca2814929d884acfdf9d2161ce42ba29ce0ccd9205ed3b6dd7aeab4"
+    },
+    {
+      "path": "scripts/ci_owned/ci_output_admission.py",
+      "sha256": "1c702ed28975b07ac24570ddffbd6448f765119ef4aa7a68a6e49e4f377a971d"
     },
     {
       "path": "scripts/ci_owned/ci_process.py",

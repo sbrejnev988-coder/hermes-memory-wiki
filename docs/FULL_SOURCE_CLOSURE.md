@@ -9,24 +9,25 @@
 Старый partition содержал 256 строк при 318 tracked `tests/**/*.py`: отсутствовали
 62 файла; часть helpers/conftest/historical inputs ошибочно стояла в списке
 исполняемых legacy targets. Provider SHA также относился к прежним bytes.
-Теперь перечислены все 318 baseline-файлов и новый
-`tests/test_cold_lane_partition.py`: **319 уникальных Python source files**.
-Это не 319 collected, executed или независимо семантически проверенных tests.
+После настоящих последовательных merge принятых A и B перечислены все
+318 исходных baseline-файлов, `tests/test_cold_lane_partition.py` и доставленный
+`tests/ci_owned/collection_dispatch_cases.py`: **320 уникальных Python source files**.
+Это не 320 collected, executed или независимо семантически проверенных tests.
 
 | File role | Файлов | Что означает запись |
 |---|---:|---|
 | `pytest` | 267 | Есть collectible function/class declarations; реальная collection и outcomes не выполнялись |
-| `unittest-explicit` | 20 | Отдельный stdlib entry / suite binding; `make_suite` или `CARRIER` не инициализируются одним pytest discovery |
+| `unittest-explicit` | 21 | Отдельный stdlib entry / suite binding; `make_suite` или `CARRIER` не инициализируются одним pytest discovery |
 | `callable` | 2 | Реальные аргументные native packets; не pytest test bodies |
 | `source-only` | 9 | Отдельный SOURCE маршрут, исключённый из native preload; конкретные требования различаются |
 | `support` | 19 | Helpers, fixture producers, conftest, reporter, cold entry; не независимые test cases |
 | `historical` | 2 | `baseline-source_connectors.py` и `primitive_guard_a9d5016e.py`: неизменные oracle inputs, не current runtime/tests |
 
-File-lane membership: legacy 243, strict 24, SOURCE-explicit 29,
+File-lane membership: legacy 243, strict 24, SOURCE-explicit 30,
 native-explicit packets 2, support 19, historical 2. Отдельный recovery entry
 повторно ссылается на существующий `recovery_cases.py`; это намеренный другой
 cold process, не ещё один уникальный файл. Не складывать этот повтор с file
-inventory или cases. У source_explicit_targets теперь полный набор 29 entries,
+inventory или cases. У source_explicit_targets теперь полный набор 30 entries,
 включая существующий doc/code SOURCE carrier.
 
 Для каждого Python-файла JSON хранит raw SHA-256, role, lane, actual entry kind,
@@ -187,16 +188,29 @@ actual cold entry module со stdlib imports и новый focused test, не pr
 без внешнего carrier. Actual exits/capture/audit/ownership и main unittest case
 counts находятся в lane RESULT и primary logs; FILE counts не testcase coverage.
 
-## Pending peer и окончательная композиция
+## Доставленный peer и окончательная SOURCE-композиция
 
-В frozen baseline отсутствует writer B файл
-`tests/ci_owned/collection_dispatch_cases.py`. Его SHA намеренно `null`, status
-`PENDING_FINAL_MERGE_REBIND`; он не добавлен как якобы существующий partition row.
-`needs_final_rebind=true` не скрывает закрытый **текущий** census: оно удерживает
-будущий combined composition. После настоящего merge parent должен перечислить
-весь final census, внести фактический peer role/entry/bytes и перепривязать изменённые
-entry/workflow pins. Самостоятельное появление нового файла уже отвергается как
-unpartitioned input, даже если его имя есть в pending metadata.
+Принятые inputs A `39abfd5bb468d16deb88902fd062f45caae74789` и B
+`e14456fde89b3052857810a8eb2fa41126b71007` действительно merged в собственный
+combined worktree от `a208e12a03ab1d290372ce059a7a7ab8d711bfd3`, без conflicts.
+Доставленный `tests/ci_owned/collection_dispatch_cases.py` получил фактический
+SHA и SOURCE-explicit unittest role, direct stdlib invocation и actual
+`run_fixture(kind, *, source, root)` callable signature. Его shipped helper
+`tests/helpers/collection_evidence.py` указан как layout peer. Перепривязаны
+current test census и все source pins, включая изменённый workflow; отдельно
+добавлены реальные `ci_child.py` и `ci_output_admission.py` — всего 11 named pins.
+B tooling не добавлен в native pytest targets и не исполняется этим SOURCE packet.
+
+`pending_peer_inputs=[]` и `needs_final_rebind=false` означают только эту
+фактическую SOURCE-композицию, не native admission или закрытый FULL. Core,
+trust и resolved dependency origins всё ещё `null/BLOCKED`. Новый positive
+проверяет current B role/hash/callable/helper/pins и отсутствие native grant.
+Прежние три pending-negative controls теперь явно создают собственную metadata
+fixture будущего недоставленного peer; исходные refusal assertions сохранены.
+Это in-memory clone, не ложный pending статус уже доставленного B. Появление
+будущего файла в raw input по-прежнему отвергается как unpartitioned membership,
+даже если имя есть в pending metadata. Все affected SOURCE controls проверяются
+свежим отдельным packet; прежние A40 и B14 outcomes не выдаются за его результаты.
 
 `docs/TEST_CONTRACT.md` принадлежит другому контракту и здесь не редактируется;
 его прежние checkpoint counts остаются историческими. State/acceptance/merge,
