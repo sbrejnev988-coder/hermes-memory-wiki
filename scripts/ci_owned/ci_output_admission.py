@@ -1,9 +1,11 @@
-"""Bound owned post-job artifacts by metadata only, before upload/parse.
+"""Bound owned post-job artifacts before upload/parse.
 
 This is one owned, quiescent snapshot: not an atomic concurrent-writer fence,
 not a producer disk/RSS limit, and never native/source/SDK acceptance proof.
+All metadata admission precedes the bounded collection-status/transfer parse.
 """
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path, PureWindowsPath
@@ -15,6 +17,11 @@ DEFAULT_LIMITS = {"lane_total": 24000000, "json_member": 4000000,
 NATIVE_NAMES = ("receipt.json", "execution.json", "source-inventory.json",
     "native-origins.json", "bindings.json", "launches.json", "binding-coverage.json",
     "phases.json", "junit.xml", "pytest.log", "pytest-detail.log", "recovery-observations.json")
+COLLECTION_DIRECTORY = "collection-evidence"
+# Mirror the accepted reporter's caps, never the larger generic JSON cap.
+COLLECTION_CAPS = {"errors.jsonl": 2000000, "status.json": 8192,
+    "refusal.json": 8192, "complete.json": 1024, "pending.json": 1024}
+COLLECTION_TOTAL = sum(COLLECTION_CAPS.values())
 AGGREGATE_NAMES = ("matrix-coverage.json", "receipt.json")
 # The unchanged aggregate also writes this local, non-uploaded product.
 AGGREGATE_LOCAL_EXTRA = ("source-inventory.json",)
@@ -91,17 +98,108 @@ def _caps(limits):
     return caps
 
 
-def _members(root, allowed, required, total_cap, caps, identities, receiver=False):
-    entries = _entries(root, len(allowed) + (1 if receiver else 0))
+def _collection_metadata(root, identities, receiver):
+    entries = _entries(root, len(COLLECTION_CAPS) + 1)
+    total, files, names = 0, 0, set()
+    for entry in entries:
+        names.add(entry.name)
+        if entry.name == "complete":
+            _directory(entry.path)
+            _entries(entry.path, 0)  # Local helper's exclusively empty marker.
+            continue
+        if entry.name not in COLLECTION_CAPS:
+            raise AdmissionError("unknown_collection_member")
+        info = os.lstat(entry.path)
+        if _linked(info) or not stat.S_ISREG(info.st_mode):
+            raise AdmissionError("nonregular_member")
+        identity = (info.st_dev, info.st_ino)
+        if info.st_nlink != 1 or identity in identities:
+            raise AdmissionError("duplicate_or_linked_member")
+        identities.add(identity)
+        if not 0 <= info.st_size <= COLLECTION_CAPS[entry.name]:
+            raise AdmissionError("collection_member_too_large")
+        files += 1
+        total += info.st_size
+    if total > COLLECTION_TOTAL:
+        raise AdmissionError("collection_total_too_large")
+    if "refusal.json" in names:
+        raise AdmissionError("collection_refused")
+    required = {"errors.jsonl", "status.json", "complete.json"}
+    if not receiver:
+        required.add("complete")
+    if not required <= names or "pending.json" in names:
+        raise AdmissionError("collection_incomplete")
+    return {"files": files, "bytes": total}
+
+
+def _pairs(items):
+    result = {}
+    for key, value in items:
+        if key in result:
+            raise ValueError("duplicate_key")
+        result[key] = value
+    return result
+
+
+def _collection_complete(root):
+    # Only AFTER the complete lane/matrix metadata/cap/ownership pass.
+    try:
+        raw = {}
+        for name in ("errors.jsonl", "status.json", "complete.json"):
+            with (Path(root) / name).open("rb") as stream:
+                raw[name] = stream.read(COLLECTION_CAPS[name] + 1)
+            if len(raw[name]) > COLLECTION_CAPS[name]:
+                raise AdmissionError("collection_member_too_large")
+        status = json.loads(raw["status.json"], object_pairs_hook=_pairs)
+        seal = json.loads(raw["complete.json"], object_pairs_hook=_pairs)
+        members = {name: {"bytes": len(raw[name]), "sha256": hashlib.sha256(raw[name]).hexdigest()}
+                   for name in ("errors.jsonl", "status.json")}
+        if (type(seal) is not dict or seal.get("complete") is not True
+                or seal != {"schema": "memory-stack.collection-transfer/v1", "complete": True, "members": members}):
+            raise ValueError("transfer_mismatch")
+        if (status["schema"] != "memory-stack.collection-evidence/v1"
+                or status["complete"] is not True or status["cleanup_complete"] is not True
+                or status["session_finished"] is not True or status["phase_evidence"] != "complete"
+                or status["primary_type"] is not None or status["refusals"] != []):
+            raise ValueError("status_incomplete")
+        counts = ("failed_collect_reports", "saved_collect_reports", "uncaptured_collect_reports",
+                  "exception_details", "refusal_count", "refusals_omitted", "session_exitstatus",
+                  "returned_exitstatus", "journal_bytes_confirmed_written", "journal_bytes_fsynced")
+        if any(type(status[key]) is not int or status[key] < 0 for key in counts):
+            raise ValueError("status_count_type")
+        if (status["failed_collect_reports"] != status["saved_collect_reports"]
+                or status["uncaptured_collect_reports"] != 0 or status["refusal_count"] != 0
+                or status["refusals_omitted"] != 0
+                or status["session_exitstatus"] != status["returned_exitstatus"]
+                or status["journal_bytes_confirmed_written"] != len(raw["errors.jsonl"])
+                or status["journal_bytes_fsynced"] != len(raw["errors.jsonl"])):
+            raise ValueError("status_counts_mismatch")
+    except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+        raise AdmissionError("collection_invalid_status_or_transfer") from None
+
+
+def _members(root, allowed, required, total_cap, caps, identities, receiver=False, collections=None):
+    has_collection = collections is not None
+    entries = _entries(root, len(allowed) + (1 if receiver else 0) + int(has_collection))
     names = {entry.name for entry in entries}
     if receiver and REFUSAL_NAME in names:
         raise AdmissionError("producer_refused")  # No JSON open, even for a tiny refusal.
-    if names - set(allowed):
+    if names - set(allowed) - ({COLLECTION_DIRECTORY} if has_collection else set()):
         raise AdmissionError("unknown_member")
     if not set(required) <= names:
         raise AdmissionError("missing_required")
-    total = 0
+    total, files = 0, 0
+    if has_collection and "phases.json" in names and COLLECTION_DIRECTORY not in names:
+        raise AdmissionError("collection_missing")
     for entry in entries:
+        if has_collection and entry.name == COLLECTION_DIRECTORY:
+            product = _collection_metadata(entry.path, identities, receiver)
+            total += product["bytes"]
+            files += product["files"]
+            collections.append(Path(entry.path))
+            if total > total_cap:
+                raise AdmissionError("total_too_large")
+            continue
         # Windows DirEntry.stat() caches zero inode/nlink; lstat supplies
         # actual no-follow identity/link metadata without reading payload.
         info = os.lstat(entry.path)
@@ -113,20 +211,26 @@ def _members(root, allowed, required, total_cap, caps, identities, receiver=Fals
         identities.add(identity)
         limit = caps["junit_member" if entry.name == "junit.xml" else
             "log_member" if entry.name.endswith(".log") else "json_member"]
+        if has_collection and entry.name == "phases.json":
+            limit = min(limit, 1000000)
         if info.st_size < 0 or info.st_size > limit:
             raise AdmissionError("member_too_large")
         total += info.st_size
+        files += 1
         if total > total_cap:
             raise AdmissionError("total_too_large")
-    return {"files": len(entries), "bytes": total}
+    return {"files": files, "bytes": total}
 
 
 def admit(root, mode, limits=None):
-    """Stat the complete allowlisted product; never read/parse any payload."""
-    caps, identities = _caps(limits), set()
+    """Stat the whole product before the small collection-status/transfer read."""
+    caps, identities, collections = _caps(limits), set(), []
     if mode == "native":
-        return _members(root, NATIVE_NAMES, ("receipt.json", "source-inventory.json"),
-            caps["lane_total"], caps, identities)
+        result = _members(root, NATIVE_NAMES, ("receipt.json", "source-inventory.json"),
+            caps["lane_total"], caps, identities, collections=collections)
+        for directory in collections:
+            _collection_complete(directory)
+        return {**result, "collection_complete": bool(collections)}
     if mode == "aggregate":
         return _members(root, AGGREGATE_NAMES + AGGREGATE_LOCAL_EXTRA, AGGREGATE_NAMES,
             caps["aggregate_total"], caps, identities)
@@ -139,12 +243,15 @@ def admit(root, mode, limits=None):
     required = ("receipt.json", "source-inventory.json", "launches.json", "bindings.json", "native-origins.json")
     for entry in entries:
         product = _members(entry.path, NATIVE_NAMES, required, caps["lane_total"],
-            caps, identities, receiver=True)
+            caps, identities, receiver=True, collections=collections)
         total += product["bytes"]
         count += product["files"]
         if total > len(GROUPS) * caps["lane_total"]:
             raise AdmissionError("total_too_large")
-    return {"groups": len(entries), "files": count, "bytes": total}
+    for directory in collections:
+        _collection_complete(directory)
+    return {"groups": len(entries), "files": count, "bytes": total,
+            "collection_complete": len(collections) == len(GROUPS)}
 
 
 def _write_new_refusal(path, mode, code):

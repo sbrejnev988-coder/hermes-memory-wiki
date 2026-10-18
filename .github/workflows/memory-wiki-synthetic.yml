@@ -144,6 +144,10 @@ jobs:
             ${{ runner.temp }}/memory-wiki-synthetic/gate/public/pytest.log
             ${{ runner.temp }}/memory-wiki-synthetic/gate/public/pytest-detail.log
             ${{ runner.temp }}/memory-wiki-synthetic/gate/public/recovery-observations.json
+            ${{ runner.temp }}/memory-wiki-synthetic/gate/public/collection-evidence/errors.jsonl
+            ${{ runner.temp }}/memory-wiki-synthetic/gate/public/collection-evidence/status.json
+            ${{ runner.temp }}/memory-wiki-synthetic/gate/public/collection-evidence/complete.json
+            ${{ runner.temp }}/memory-wiki-synthetic/gate/public/collection-evidence/refusal.json
       - name: Retain tiny refusal instead of withheld native evidence
         if: ${{ always() && steps.native_output_gate.outcome == 'failure' && steps.native_output_gate.outputs.refusal == 'true' }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
