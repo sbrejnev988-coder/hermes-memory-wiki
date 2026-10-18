@@ -22,6 +22,7 @@ EVENT_CAP = 256_000
 PHASE_CAP = 1_000_000
 STATUS_CAP = 8_192
 TAIL_RESERVE = 1_024
+UNAVAILABLE_TYPE = '<unavailable>'
 
 
 class EvidenceRefusal(Exception):
@@ -68,8 +69,18 @@ def json_bytes(value, limit):
 
 
 def _type_name(value):
-    cls = type(value)
-    return cls.__module__ + '.' + cls.__qualname__
+    # Exception/report metadata is user-controlled, including a metaclass's
+    # attribute access. Never call str/repr of the value or concatenate a
+    # foreign string subclass during failure reporting.
+    try:
+        cls = type(value)
+        module, name = cls.__module__, cls.__qualname__
+        if (type(module) is str and type(name) is str and module and name
+                and len(module) + len(name) + 1 <= 200):
+            return module + '.' + name
+    except BaseException:
+        pass
+    return UNAVAILABLE_TYPE
 
 
 def _linked(info):
@@ -370,6 +381,8 @@ class CollectionEvidence:
             return outcome
         except BaseException as primary:
             self.primary_type = _type_name(primary)
+            if self.primary_type == UNAVAILABLE_TYPE:
+                self._problem('primary_type', EvidenceRefusal('type_metadata_unavailable'))
             raise
         finally:
             if finalize is not None:

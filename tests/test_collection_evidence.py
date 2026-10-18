@@ -387,6 +387,92 @@ class TestCollectionEvidence(unittest.TestCase):
         self.assertEqual(value['saved_collect_reports'], 0)
         self.assertEqual(value['refusals'][0]['type'], 'builtins.OSError')
 
+    def test_missing_or_oversized_type_metadata_preserves_exact_primary(self):
+        for label, module in (('missing', None), ('oversized', 'x' * 201)):
+            reporter = self.reporter(label)
+            calls = []
+            class Primary(BaseException):
+                def __str__(self):
+                    calls.append('str')
+                    raise AssertionError('foreign primary formatting')
+                def __repr__(self):
+                    calls.append('repr')
+                    raise AssertionError('foreign primary formatting')
+            Primary.__module__ = module
+            primary = Primary()
+            def dispatch(*args, **kwargs):
+                reporter.pytest_collectreport(SyntheticReport())
+                raise primary
+            with self.assertRaises(BaseException) as caught:
+                reporter.run(dispatch, [])
+            self.assertIs(caught.exception, primary)
+            self.assertEqual(calls, [])
+            value = self.status(reporter, complete=False)
+            self.assertEqual(value['primary_type'], self.module.UNAVAILABLE_TYPE)
+            self.assertEqual(value['refusals'][0]['stage'], 'primary_type')
+            self.assertEqual(value['refusals'][0]['code'], 'type_metadata_unavailable')
+            self.assertEqual(value['saved_collect_reports'], 1)
+            self.assertTrue(value['cleanup_complete'])
+
+    def test_refusing_metaclass_type_metadata_preserves_exact_primary(self):
+        reporter = self.reporter()
+        class MetadataRefusal(BaseException):
+            pass
+        class Refusing(type):
+            def __getattribute__(cls, name):
+                if name in ('__module__', '__qualname__'):
+                    raise MetadataRefusal()
+                return super().__getattribute__(name)
+        class Primary(BaseException, metaclass=Refusing):
+            pass
+        primary = Primary()
+        def dispatch(*args, **kwargs):
+            raise primary
+        with self.assertRaises(BaseException) as caught:
+            reporter.run(dispatch, [])
+        self.assertIs(caught.exception, primary)
+        value = self.status(reporter, complete=False)
+        self.assertEqual(value['primary_type'], self.module.UNAVAILABLE_TYPE)
+        self.assertEqual(value['refusals'][0]['code'], 'type_metadata_unavailable')
+        self.assertTrue(value['cleanup_complete'])
+
+    def test_malformed_finalizer_type_preserves_original_return(self):
+        reporter = self.reporter()
+        class ExitStatus(IntEnum):
+            COLLECTION_FAILED = 2
+        class DiagnosticFailure(BaseException):
+            __module__ = None
+        outcome = ExitStatus.COLLECTION_FAILED
+        def finalize():
+            raise DiagnosticFailure()
+        self.assertIs(reporter.run(lambda *a, **kw: outcome, [], finalize=finalize), outcome)
+        value = self.status(reporter, complete=False)
+        self.assertEqual(value['returned_exitstatus'], 2)
+        self.assertIsNone(value['primary_type'])
+        self.assertEqual(value['refusals'][0]['stage'], 'finalize')
+        self.assertEqual(value['refusals'][0]['type'], self.module.UNAVAILABLE_TYPE)
+        self.assertTrue(value['cleanup_complete'])
+
+    def test_malformed_console_type_during_finish_never_masks_primary(self):
+        reporter = self.reporter()
+        class DiagnosticFailure(BaseException):
+            __module__ = None
+        class RefusingConsole(io.StringIO):
+            def write(self, text):
+                raise DiagnosticFailure()
+        reporter.stderr = RefusingConsole()
+        primary = KeyboardInterrupt('original cancellation')
+        def dispatch(*args, **kwargs):
+            raise primary
+        with self.assertRaises(BaseException) as caught:
+            reporter.run(dispatch, [])
+        self.assertIs(caught.exception, primary)
+        value = self.status(reporter, complete=False)
+        self.assertEqual(value['primary_type'], 'builtins.KeyboardInterrupt')
+        self.assertEqual(value['refusals'][0]['stage'], 'stderr')
+        self.assertEqual(value['refusals'][0]['type'], self.module.UNAVAILABLE_TYPE)
+        self.assertTrue(value['cleanup_complete'])
+
     def test_close_refusals_distinguish_retained_unknown_from_closed_error(self):
         for mode, known in (('close_before', False), ('close_after', True)):
             reporter = self.reporter(mode)
