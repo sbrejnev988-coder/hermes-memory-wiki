@@ -528,7 +528,7 @@ def reenqueue_after_logical_restore(provider: Any, module: Any) -> dict[str, int
 
 
 def _worker_provider(provider: Any, source: Mapping[str, Any]) -> Any:
-    """Separate connection and synthetic session with the original hash identity."""
+    """Separate connection with the source's original session and chat identity."""
     worker = copy.copy(provider)
     worker._conn = None
     worker._lock = threading.RLock()
@@ -538,8 +538,12 @@ def _worker_provider(provider: Any, source: Mapping[str, Any]) -> Any:
     worker._job_chat_hash = str(source["owner_chat_hash"] if "owner_chat_hash" in columns else source["origin_chat_hash"])
     worker._job_session_hash = str(source["owner_session_hash"] if "owner_session_hash" in columns else "")
     worker.session_id = "job_" + worker._job_session_hash if worker._job_session_hash else "job_" + worker._job_chat_hash
-    # The override is scoped to this private instance. A raw session ID is
-    # neither stored nor needed for the original chat ACL partition.
+    if "owner_session_hash" not in columns and "origin_session_id" in columns:
+        origin_session_id = source["origin_session_id"]
+        if isinstance(origin_session_id, str) and origin_session_id:
+            worker.session_id = origin_session_id
+    # Preserve stored claim origins for literal evidence matching. This private
+    # chat override does not grant event-session or capture authority.
     from types import MethodType
     worker._chat_hash = MethodType(
         lambda self, session_id="": self._job_chat_hash if not session_id or session_id == self.session_id
