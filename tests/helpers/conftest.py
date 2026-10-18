@@ -32,6 +32,8 @@ def _metadata(provider):
 
 
 def _emit(event, node, **values):
+    # Collection can finish before any fixture/provider creates the home.
+    _EVENTS.parent.mkdir(parents=True, exist_ok=True)
     with _EVENTS.open('a', encoding='utf-8') as stream:
         stream.write(json.dumps({'event': event, 'node': node,
                                  'monotonic': time.monotonic(), **values}) + '\n')
