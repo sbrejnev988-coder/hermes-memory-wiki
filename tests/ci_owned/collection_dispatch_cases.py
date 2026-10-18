@@ -19,7 +19,9 @@ SOURCE = Path(__file__).absolute().parents[2]
 PHASE_KEYS = {'collected', 'phases', 'collection_errors', 'session_finished', 'exitstatus'}
 FIXTURE_SOURCES = {
     'collection_error': 'raise RuntimeError("owned collection dispatch failure")\n',
-    'syntax_error': 'def broken(:\n    pass\n',
+    # Keep a real parser SyntaxError without exercising CPython's optional
+    # generic-keyword-typo compiler probes on pseudo filenames under this fence.
+    'syntax_error': 'value = "unterminated\n',
     'healthy': 'def test_first():\n    assert 2 > 1\n\ndef test_second():\n    assert "owned".upper() == "OWNED"\n',
 }
 
