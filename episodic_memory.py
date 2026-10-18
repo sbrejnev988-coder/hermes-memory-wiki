@@ -40,21 +40,29 @@ def _bounded_env(name: str, default: int, minimum: int, maximum: int) -> int:
 
 
 _CAPTURE_MAX_CHARS = 1200
-_TRUNCATION_MARKER = "\n… [middle omitted] …\n"
+_TRUNCATION_MARKER = "\n... [middle omitted] ...\n"
 
 
 def _balanced_excerpt(value: str, max_chars: int) -> tuple[str, bool, int]:
-    """Keep comparable head/tail evidence inside one deterministic bound."""
+    """Budget NFKC head/tail evidence; count the stripped input, not its projection.
+
+    The trust guard normalizes again before its final prefix cap. Normalize
+    before selecting either end, including the omission marker, so that pass
+    cannot expand an already budgeted excerpt and silently remove its tail.
+    ``truncated`` means projected text was omitted, not merely normalized.
+    """
     text = str(value or "").strip()
     source_chars = len(text)
+    text = unicodedata.normalize("NFKC", text)
     cap = max(1, int(max_chars))
-    if source_chars <= cap:
+    if len(text) <= cap:
         return text, False, source_chars
     if cap <= len(_TRUNCATION_MARKER) + 2:
         # This branch is unreachable for configured capture/recall bounds, but
         # remains balanced for direct callers and future lower limits.
         head_chars = (cap + 1) // 2
-        return text[:head_chars] + text[-(cap - head_chars):], True, source_chars
+        tail_chars = cap - head_chars
+        return text[:head_chars] + (text[-tail_chars:] if tail_chars else ""), True, source_chars
     available = cap - len(_TRUNCATION_MARKER)
     head_chars = (available + 1) // 2
     tail_chars = available - head_chars
@@ -817,7 +825,11 @@ def query_episodes(provider: Any, module: Any, query: str, limit: int = 2,
             return False
         row_keys = set(row.keys())
         original_chars = int(row["source_chars"] or 0) if "source_chars" in row_keys else 0
-        original_chars = max(original_chars, len(stored_content))
+        # Capture counts the stripped, redacted source before NFKC. Expansion
+        # can legitimately make retained content longer than that source; only
+        # legacy rows without a count fall back to their stored length.
+        if original_chars <= 0:
+            original_chars = len(stored_content)
         capture_truncated = bool(row["truncated"]) if "truncated" in row_keys else False
         output.append({
             "id": row_id, "role": row["role"], "content": content,
