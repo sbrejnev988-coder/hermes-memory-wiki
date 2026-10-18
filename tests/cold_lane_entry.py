@@ -106,7 +106,14 @@ def main():
         raise RuntimeError('CI fixture home mismatch')
     (out / 'native-origins.json').write_text(json.dumps({'modules': origins, 'plugin_origin': str(Path(plugin.__file__).resolve()), 'native_MRO': True, 'executable': sys.executable}, indent=2) + '\n', encoding='utf-8')
     (fixture_home / 'native-origins.json').write_text(json.dumps({'origins': {name: row['origin'] for name, row in origins.items()}}, indent=2) + '\n', encoding='utf-8')
+    reporter = contract.collection_reporter(source, out)
     import pytest
+    return run_tests(pytest.main, targets, runroot, reporter)
+
+
+def run_tests(pytest_main, targets, runroot, reporter):
+    """Existing recorder with causal diagnostics; not native launch admission."""
+    out = runroot / 'public'
     class Recorder:
         def __init__(self):
             self.nodes, self.phases, self.collection_errors = [], [], []
@@ -123,10 +130,12 @@ def main():
             self.exitstatus = int(exitstatus)
     recorder = Recorder()
     args = ['-q', *targets, '--basetemp=' + str(runroot / 'pytest-temp'), '--junitxml=' + str(out / 'junit.xml'), '-o', 'cache_dir=' + str(runroot / 'pytest-cache'), '-o', 'log_file=' + str(out / 'pytest-detail.log')]
-    try:
-        return int(pytest.main(args, plugins=[recorder]))
-    finally:
-        (out / 'phases.json').write_text(json.dumps({'collected': recorder.nodes, 'phases': recorder.phases, 'collection_errors': recorder.collection_errors, 'session_finished': recorder.finished, 'exitstatus': getattr(recorder, 'exitstatus', None)}, indent=2) + '\n', encoding='utf-8')
+    def save_phases():
+        reporter.write_phases({'collected': recorder.nodes, 'phases': recorder.phases,
+                               'collection_errors': recorder.collection_errors,
+                               'session_finished': recorder.finished,
+                               'exitstatus': getattr(recorder, 'exitstatus', None)})
+    return int(reporter.run(pytest_main, args, plugins=[recorder], finalize=save_phases))
 
 if __name__ == '__main__':
     raise SystemExit(main())

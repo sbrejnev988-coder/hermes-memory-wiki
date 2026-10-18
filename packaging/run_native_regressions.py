@@ -47,6 +47,18 @@ EXPORTS = {
 }
 
 
+def collection_reporter(source: Path, evidence_root: Path):
+    """Load only the shared stdlib reporter, never tests/conftest or a package."""
+    spec = importlib.util.spec_from_file_location(
+        '_memory_wiki_collection_evidence', source / 'tests/helpers/collection_evidence.py',
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError('Collection evidence reporter source loader unavailable')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.CollectionEvidence(evidence_root)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--core", type=Path, required=True)
@@ -119,9 +131,10 @@ def main() -> int:
     if receipt_path.read_bytes() != raw:
         raise RuntimeError("Native origin receipt readback mismatch")
     print(f"Native Hermes contract verified: NousResearch/hermes-agent@{sha}", flush=True)
+    reporter = collection_reporter(root, fixture_home)
     import pytest
     # Explicit plugin test directory prevents discovery of the core's own tests.
-    return pytest.main(["-q", "tests", *pytest_args])
+    return reporter.run(pytest.main, ["-q", "tests", *pytest_args])
 
 
 if __name__ == "__main__":
