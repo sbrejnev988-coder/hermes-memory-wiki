@@ -791,6 +791,9 @@ def _run_job(
                 "event_type", "role",
             ))
 
+        transient_guard_statuses = {
+            "guard_unavailable_quarantined", "runtime_failure_quarantined",
+        }
         originals: dict[str, tuple[str, ...]] = {}
         messages: list[dict[str, str]] = []
         for row in rows:
@@ -802,6 +805,10 @@ def _run_job(
                 raw, source="host:background_event", mem_type="event", audit=False,
                 max_len=max(4000, len(raw)),
             )
+            if checked.get("status") in transient_guard_statuses:
+                # This is incomplete guarded input, not authoritative empty
+                # work. Do not extract a partial conversation in either order.
+                return ("defer", int(time.time()) + 60)
             if checked.get("status") != "safe" or str(checked.get("content") or "") != raw:
                 continue
             originals[str(row["event_id"])] = source_identity(row)
@@ -813,11 +820,14 @@ def _run_job(
             """Roll back this claim transaction on lost ownership."""
 
         persistence_primary = None
+        guard_deferred = False
 
         def persist_if_current(*args: Any, **kwargs: Any) -> str:
-            nonlocal persistence_primary
+            nonlocal persistence_primary, guard_deferred
             if persistence_primary is not None:
                 raise persistence_primary
+            if guard_deferred:
+                return ""
             # Guard after the remote response and immediately before every
             # claim write. A deleted/edited event invalidates this extraction.
             ids = list(originals)
@@ -877,6 +887,11 @@ def _run_job(
                             mem_type="event", audit=False,
                             max_len=max(4000, len(original["content"])),
                         )
+                        if inspected.get("status") in transient_guard_statuses:
+                            # Empty IDs are not extractor errors. Retain this
+                            # dependency outcome across later callback calls.
+                            guard_deferred = True
+                            return ""
                         if inspected.get("status") != "safe" or inspected.get("content") != original["content"]:
                             return ""
                     if (lease_valid_in_transaction is not None
@@ -924,6 +939,10 @@ def _run_job(
                     enqueue_claim(worker, claim_id)
         if result.get("error") or result.get("errors"):
             return "provider"
+        if guard_deferred:
+            # Earlier lawful writes keep their normal post-commit/projection
+            # and graph handling above; deferral does not roll them back.
+            return ("defer", int(time.time()) + 60)
         return ""
     except BaseException as exc:
         primary = exc
