@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -315,5 +316,122 @@ def test_episode_checkpoint_rebuild_restores_index_without_journaling_turn_text(
         assert provider._connect().execute("SELECT COUNT(*) FROM episodic_turns").fetchone()[0] == 1
         assert len(_call(provider, "amber lens")["episodes"]) == 1
         assert _call(provider, "Nadir comet")["episodes"] == []
+    finally:
+        provider.shutdown()
+
+
+_PROJECTION_HEAD = "Headquartz count is 17. "
+_PROJECTION_TAIL = " Tailquartz count is 731."
+
+
+def _projection_text(size, fill):
+    available = size - len(_PROJECTION_HEAD) - len(_PROJECTION_TAIL)
+    return (_PROJECTION_HEAD + (fill * (available // len(fill) + 1))[:available]
+            + _PROJECTION_TAIL)
+
+
+def _nfkc_episode_provider(tmp_path, monkeypatch):
+    # These are genuine-provider regressions, deliberately NOT executed by the
+    # SOURCE packet. A missing native trust dependency is not a permissive fake.
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("MEMORY_WIKI_SEMANTIC", "0")
+    monkeypatch.setenv("MEMORY_WIKI_EPISODIC_ENABLED", "1")
+    monkeypatch.setenv("MEMORY_WIKI_EPISODIC_SCOPE", "chat")
+    monkeypatch.setenv("HERMES_SECURITY_STRICT", "1")
+    module = _module()
+    if not module._INJECTION_GUARD_AVAILABLE or not module._sanitize_recalled:
+        pytest.skip("genuine native trust guard required for NFKC episode composition")
+    return module, _provider(module, tmp_path, "alice", "chat-a")
+
+
+@pytest.mark.parametrize("size,fill", [
+    (1199, "ordinary filler "), (1200, "ordinary filler "), (1201, "ordinary filler "),
+    (1199, "звезда "), (1200, "звезда "), (1201, "звезда "),
+    (1100, "㍿ "), (1100, "ﬃ "), (8192, "ordinary filler "),
+], ids=["ascii-below", "ascii-exact", "ascii-plus-one", "unicode-below", "unicode-exact",
+        "unicode-plus-one", "nfkc-expander", "nfkc-ligature", "ascii-long"])
+def test_native_nfkc_capture_and_public_tail(tmp_path, monkeypatch, size, fill):
+    _module_instance, provider = _nfkc_episode_provider(tmp_path, monkeypatch)
+    monkeypatch.setenv("MEMORY_WIKI_EPISODIC_RECALL_MAX_CHARS", "220")
+    text = _projection_text(size, fill)
+    normalized = unicodedata.normalize("NFKC", text)
+    try:
+        provider.sync_turn(text, "")
+        row = provider._connect().execute(
+            "SELECT content,truncated,source_chars FROM episodic_turns",
+        ).fetchone()
+        assert row
+        assert len(row["content"]) <= 1200
+        assert row["content"].startswith(_PROJECTION_HEAD)
+        assert row["content"].endswith(_PROJECTION_TAIL)
+        assert row["source_chars"] == len(text)
+        assert bool(row["truncated"]) is (len(normalized) > 1200)
+        if len(normalized) <= 1200:
+            assert row["content"] == normalized
+        recalled, = _call(provider, "Tailquartz", limit=1)["episodes"]
+        assert len(recalled["content"]) <= 220
+        assert recalled["content"].startswith(_PROJECTION_HEAD)
+        assert recalled["content"].endswith(_PROJECTION_TAIL)
+        assert recalled["truncated"] is True
+        assert recalled["source_chars"] == len(text)
+        assert recalled["trust_level"] == "untrusted"
+        assert _call(provider, "Absentquartz", limit=1)["episodes"] == []
+    finally:
+        provider.shutdown()
+
+
+@pytest.mark.parametrize("kind", ["expansion-fits", "contraction-fits"])
+def test_native_nfkc_no_omission_has_honest_metadata(tmp_path, monkeypatch, kind):
+    _module_instance, provider = _nfkc_episode_provider(tmp_path, monkeypatch)
+    monkeypatch.setenv("MEMORY_WIKI_EPISODIC_RECALL_MAX_CHARS", "1200")
+    text = (_PROJECTION_HEAD + ("㍿ ﬃ Ａ" if kind == "expansion-fits" else "e\u0301 " * 420)
+            + _PROJECTION_TAIL)
+    normalized = unicodedata.normalize("NFKC", text)
+    assert len(normalized) <= 1200
+    try:
+        provider.sync_turn(text, "")
+        row = provider._connect().execute(
+            "SELECT content,truncated,source_chars FROM episodic_turns",
+        ).fetchone()
+        assert row and row["content"] == normalized
+        assert row["truncated"] == 0
+        assert row["source_chars"] == len(text)
+        recalled, = _call(provider, "Tailquartz", limit=1)["episodes"]
+        assert recalled["content"] == normalized
+        assert recalled["truncated"] is False
+        assert recalled["source_chars"] == len(text)
+    finally:
+        provider.shutdown()
+
+
+@pytest.mark.parametrize("size,fill", [
+    (219, "ordinary filler "), (220, "ordinary filler "), (221, "ordinary filler "),
+    (180, "㍿ "), (180, "ﬃ "),
+], ids=["below", "exact", "plus-one", "legacy-expander", "legacy-ligature"])
+def test_native_legacy_recall_projection_keeps_tail_without_rewriting_source(tmp_path, monkeypatch, size, fill):
+    module, provider = _nfkc_episode_provider(tmp_path, monkeypatch)
+    monkeypatch.setenv("MEMORY_WIKI_EPISODIC_RECALL_MAX_CHARS", "220")
+    text = _projection_text(size, fill)
+    normalized = unicodedata.normalize("NFKC", text)
+    try:
+        episode_id = module._episodic_memory.capture_turn(provider, module, "user", "Legacy fixture placeholder.")
+        assert episode_id
+        conn = provider._connect()
+        # Own synthetic legacy row, using the real provider transaction owner.
+        # The fix must not rewrite or pretend to recover historical text.
+        with provider._claim_transaction(conn):
+            conn.execute("UPDATE episodic_turns SET content=?,truncated=0,source_chars=? WHERE id=?",
+                         (text, len(text), episode_id))
+        recalled, = _call(provider, "Tailquartz", limit=1)["episodes"]
+        assert len(recalled["content"]) <= 220
+        assert recalled["content"].startswith(_PROJECTION_HEAD)
+        assert recalled["content"].endswith(_PROJECTION_TAIL)
+        assert recalled["truncated"] is (len(normalized) > 220)
+        assert recalled["source_chars"] == len(text)
+        if len(normalized) <= 220:
+            assert recalled["content"] == normalized
+        unchanged = conn.execute("SELECT content,truncated,source_chars FROM episodic_turns WHERE id=?",
+                                 (episode_id,)).fetchone()
+        assert tuple(unchanged) == (text, 0, len(text))
     finally:
         provider.shutdown()
