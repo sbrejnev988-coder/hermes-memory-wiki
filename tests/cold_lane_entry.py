@@ -52,7 +52,7 @@ _CI_ENTRIES = ('tests/ci_owned/entry_cases.py', 'tests/ci_owned/exit_cases.py')
 _CI_INPUTS = (_CI_PEER, 'scripts/ci_owned/ci_process.py',
               'scripts/ci_owned/ci_bootstrap.py', 'scripts/ci_owned/memory_wiki_ci.py')
 _CI_RUNPY = ("import runpy,sys; from pathlib import Path; "
-             "entry=Path(sys.argv[1]).absolute(); sys.path.insert(0,str(entry.parent)); "
+             "entry=Path(sys.argv.pop(1)).absolute(); sys.path.insert(0,str(entry.parent)); "
              "runpy.run_path(str(entry),run_name='__main__')")
 
 

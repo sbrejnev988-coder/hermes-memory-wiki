@@ -304,6 +304,63 @@ class ColdPartitionTests(unittest.TestCase):
             sys.argv = old_argv
             sys.path[:] = old_path
 
+    def test_isolated_ci_runpy_preserves_exact_target_argv(self):
+        # The operand selects the script, not a unittest test name. Remaining
+        # literal selectors/options must reach the target without coercion.
+        old_argv, old_path = sys.argv, list(sys.path)
+        try:
+            for path in self.module._CI_ENTRIES:
+                for tail in ([], ['-q'], ['OwnedCli.test_selected', '-v']):
+                    root = Path(tempfile.mkdtemp(prefix='ci-target-argv-', dir=os.environ['TMPDIR']))
+                    entry = root / Path(path).name
+                    entry.write_text(
+                        "import json,sys\nfrom pathlib import Path\n"
+                        "assert sys.flags.isolated and sys.flags.no_site and sys.flags.dont_write_bytecode\n"
+                        "Path(__file__).with_suffix('.witness').write_text(json.dumps(sys.argv), encoding='utf-8')\n",
+                        encoding='utf-8')
+                    sys.argv = ['-c', str(entry), *tail]
+                    bootstrap = self.row(path)['entry']['bootstrap']['argv'][5]
+                    exec(compile(bootstrap, '<declared isolated stdlib bootstrap>', 'exec'), {})
+                    self.assertEqual(json.loads(entry.with_suffix('.witness').read_text(encoding='utf-8')),
+                                     [str(entry), *tail])
+                    self.assertEqual(sys.argv, ['-c', *tail])
+                    self.assertEqual(sys.path, [str(root), *old_path])
+                    sys.path[:] = old_path
+        finally:
+            sys.argv = old_argv
+            sys.path[:] = old_path
+
+    def test_isolated_ci_runpy_selects_actual_stdlib_unittest_suite(self):
+        # Exercise genuine unittest.main on an inert own module, never the
+        # historical CI suites/peer. A lingering script operand selects a
+        # failed-name case instead and cannot create this selected witness.
+        old_argv, old_path = sys.argv, list(sys.path)
+        try:
+            for path in self.module._CI_ENTRIES:
+                for tail in ([], ['-q'], ['OwnedCli.test_selected', '-q']):
+                    root = Path(tempfile.mkdtemp(prefix='ci-unittest-argv-', dir=os.environ['TMPDIR']))
+                    entry = root / Path(path).name
+                    entry.write_text(
+                        "from pathlib import Path\nimport sys,unittest\n"
+                        "class OwnedCli(unittest.TestCase):\n"
+                        "    def test_selected(self):\n"
+                        "        self.assertEqual(sys.argv, [str(Path(__file__)), *" + repr(tail) + "])\n"
+                        "        with Path(__file__).with_suffix('.witness').open('a', encoding='utf-8') as stream:\n"
+                        "            stream.write('selected\\n')\n"
+                        "unittest.main()\n", encoding='utf-8')
+                    sys.argv = ['-c', str(entry), *tail]
+                    bootstrap = self.row(path)['entry']['bootstrap']['argv'][5]
+                    with self.assertRaises(SystemExit) as caught:
+                        exec(compile(bootstrap, '<declared isolated stdlib bootstrap>', 'exec'), {})
+                    self.assertEqual(caught.exception.code, 0)
+                    self.assertEqual(entry.with_suffix('.witness').read_text(encoding='utf-8'), 'selected\n')
+                    self.assertEqual(sys.argv, ['-c', *tail])
+                    self.assertEqual(sys.path, [str(root), *old_path])
+                    sys.path[:] = old_path
+        finally:
+            sys.argv = old_argv
+            sys.path[:] = old_path
+
     def test_source_only_unittest_cannot_be_native_pytest(self):
         self.row('tests/test_p2_g3_repair01_pure.py')['lane'] = 'strict'
         self.refresh()

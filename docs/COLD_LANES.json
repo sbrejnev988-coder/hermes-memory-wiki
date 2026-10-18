@@ -3,7 +3,7 @@
   "status": "SOURCE_CHECKPOINT_NOT_NATIVE_ADMISSION",
   "frozen_provider_sha256": "23e60da064fc7b7b0cdf195bb8608b86be2615204c4ca6f53f8a4ec904d15851",
   "needs_final_rebind": true,
-  "input_inventory_sha256": "acb14241a11775ec7c4cfe946aa1399d46e4ae925ceac9489dd36411cf55e721",
+  "input_inventory_sha256": "39d8fb0261a3c436dbcd5f170ba1694a166a2912b2230b9ae71af578a90da504",
   "cold_processes": {
     "strict": {
       "HERMES_SECURITY_STRICT": "1",
@@ -451,7 +451,7 @@
       "lane": "source-explicit",
       "entry": {
         "kind": "unittest",
-        "invocation": "python -I -B -S -c \"import runpy,sys; from pathlib import Path; entry=Path(sys.argv[1]).absolute(); sys.path.insert(0,str(entry.parent)); runpy.run_path(str(entry),run_name='__main__')\" tests/ci_owned/entry_cases.py",
+        "invocation": "python -I -B -S -c \"import runpy,sys; from pathlib import Path; entry=Path(sys.argv.pop(1)).absolute(); sys.path.insert(0,str(entry.parent)); runpy.run_path(str(entry),run_name='__main__')\" tests/ci_owned/entry_cases.py",
         "callables": {},
         "bootstrap": {
           "argv": [
@@ -460,7 +460,7 @@
             "-B",
             "-S",
             "-c",
-            "import runpy,sys; from pathlib import Path; entry=Path(sys.argv[1]).absolute(); sys.path.insert(0,str(entry.parent)); runpy.run_path(str(entry),run_name='__main__')",
+            "import runpy,sys; from pathlib import Path; entry=Path(sys.argv.pop(1)).absolute(); sys.path.insert(0,str(entry.parent)); runpy.run_path(str(entry),run_name='__main__')",
             "tests/ci_owned/entry_cases.py"
           ],
           "path_binding": "tests/ci_owned",
@@ -508,7 +508,7 @@
       "lane": "source-explicit",
       "entry": {
         "kind": "unittest",
-        "invocation": "python -I -B -S -c \"import runpy,sys; from pathlib import Path; entry=Path(sys.argv[1]).absolute(); sys.path.insert(0,str(entry.parent)); runpy.run_path(str(entry),run_name='__main__')\" tests/ci_owned/exit_cases.py",
+        "invocation": "python -I -B -S -c \"import runpy,sys; from pathlib import Path; entry=Path(sys.argv.pop(1)).absolute(); sys.path.insert(0,str(entry.parent)); runpy.run_path(str(entry),run_name='__main__')\" tests/ci_owned/exit_cases.py",
         "callables": {},
         "bootstrap": {
           "argv": [
@@ -517,7 +517,7 @@
             "-B",
             "-S",
             "-c",
-            "import runpy,sys; from pathlib import Path; entry=Path(sys.argv[1]).absolute(); sys.path.insert(0,str(entry.parent)); runpy.run_path(str(entry),run_name='__main__')",
+            "import runpy,sys; from pathlib import Path; entry=Path(sys.argv.pop(1)).absolute(); sys.path.insert(0,str(entry.parent)); runpy.run_path(str(entry),run_name='__main__')",
             "tests/ci_owned/exit_cases.py"
           ],
           "path_binding": "tests/ci_owned",
@@ -648,7 +648,7 @@
     },
     {
       "path": "tests/cold_lane_entry.py",
-      "sha256": "54ce504610f2788653e629cd903495abc8ad621b1533d9cd7300ffed9f9ed485",
+      "sha256": "a9d8ac4fe753b1e0f34c15d3c95b48cdc36f469990449f6fd15c823e75f4cba6",
       "role": "support",
       "lane": "support",
       "entry": null,
@@ -1684,7 +1684,7 @@
     },
     {
       "path": "tests/test_cold_lane_partition.py",
-      "sha256": "eb03ec0207dd02dbc87b22c7e533497f97846b36bd62e11ce96c03d448d02c7e",
+      "sha256": "973d6e660e1b75ae5984aa50b08ccd7a5d57b950746cbb6b1784946a8eca355f",
       "role": "unittest-explicit",
       "lane": "source-explicit",
       "entry": {

@@ -78,8 +78,15 @@ invocation, сигнатуры объявленных explicit functions, при
   import. Из complete source root (пример для entry; exit заменяет только operand):
 
   ```text
-  python -I -B -S -c "import runpy,sys; from pathlib import Path; entry=Path(sys.argv[1]).absolute(); sys.path.insert(0,str(entry.parent)); runpy.run_path(str(entry),run_name='__main__')" tests/ci_owned/entry_cases.py
+  python -I -B -S -c "import runpy,sys; from pathlib import Path; entry=Path(sys.argv.pop(1)).absolute(); sys.path.insert(0,str(entry.parent)); runpy.run_path(str(entry),run_name='__main__')" tests/ci_owned/entry_cases.py
   ```
+
+  Operand потребляется через `pop(1)` до `runpy`: target получает обычный
+  `sys.argv=[absolute_entry, *remaining_args]`, а не имя script как test selector.
+  Остальные literal unittest selectors/options сохраняются без преобразования.
+  SOURCE-контроли проверяют exact argv и настоящий `unittest.main()` на инертных
+  собственных модулях: оба entry, default suite, `-q` и явный test selector.
+  Historical CI suites/peer от этого не считаются исполненными.
 
   Prerequisites: проверенный полный source layout, byte-exact peer
   `tests/ci_owned/binding_cases.py`, существующий пустой own scratch через
