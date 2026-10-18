@@ -17,14 +17,14 @@ PLUGIN = Path(__file__).resolve().parents[1] / "__init__.py"
 RETAINED_UNKNOWN = []  # Native negative controls retain owners to interpreter exit.
 
 
-def test_checkpoint_rebuild_preserves_or_reports_pending_semantic_upsert(tmp_path, monkeypatch):
+def test_checkpoint_rebuild_preserves_or_reports_pending_semantic_upsert(tmp_path_factory, monkeypatch):
+    tmp_path = tmp_path_factory.mktemp("checkpoint-pending-upsert", numbered=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_SECURITY_STRICT", "0")
     monkeypatch.setenv("MEMORY_WIKI_SEMANTIC", "0")  # No bootstrap/network activity.
     monkeypatch.setenv("MEMORY_WIKI_BACKGROUND_JOBS_ENABLED", "0")
     monkeypatch.setenv("MEMORY_WIKI_QDRANT_URL", "http://127.0.0.1:6333")
     monkeypatch.setenv("MEMORY_WIKI_QDRANT_COLLECTION", "memory_wiki_claims_recovery_test")
-
     name = "memory_wiki_pending_upsert_checkpoint_test"
     spec = importlib.util.spec_from_file_location(
         name, PLUGIN, submodule_search_locations=[str(PLUGIN.parent)],
