@@ -14,6 +14,102 @@ oracles сверены с owning-TX intent, а HTTP read oracle — с bounded E
 companions и разрешённых synthetic settings fixtures. Локальный packet не
 заявляет, что эти prerequisites или cross-platform FULL уже выполнены.
 
+## Причинная диагностика collection (SOURCE-блок 2026-10-18)
+
+`tests/helpers/collection_evidence.py` — общий **тестовый reporter**, не новый
+controller/bootstrap. Оба existing entries загружают этот stdlib-модуль напрямую,
+не импортируя `tests/conftest.py`. Native preflight/origin/MRO/ownership guards,
+`cold_plan`, SDK/trust prerequisites и исходные pytest arguments сохранены.
+
+- `packaging/run_native_regressions.py`: root — уже объявленный isolated
+  `.hermes-ci` либо `.hermes-release`; evidence — `<home>/collection-evidence/`.
+- `tests/cold_lane_entry.py`: root — `<runroot>/public`; тот же evidence namespace.
+  Existing `phases.json` остаётся в `public`, с прежними полями `collected`,
+  `phases`, `collection_errors` (список nodeid), `session_finished`, `exitstatus`.
+  Его bounded/exclusive persistence теперь проходит через тот же reporter.
+- `pytest_collectreport(report)` сохраняет каждый failed report, включая повторный
+  nodeid, целиком: literal `nodeid`, `longreprtext` как `longrepr`, полный qualified
+  `report_type` и `longrepr_type`, `when=collect`, исходный `outcome`. Никакой
+  реконструкции исторических ошибок и парсинга предполагаемого exception type.
+- `pytest_exception_interact(node, call, report)` отдельно сохраняет настоящие
+  qualified type и message из `call.excinfo.value` для collection. Этот hook
+  передаёт CallInfo до collectreport в проверенном pytest source. Если он не
+  вызван, точный Python exception type **неизвестен**; representation type и
+  полный предоставленный pytest текст всё равно сохраняются. Source-тесты
+  используют явно synthetic reports/CallInfo, не исполняют pytest renderer.
+
+### Durable/UTF-8 контракт и refusal
+
+`errors.jsonl` создаётся эксклюзивно, первым идёт `started` с `complete=false`.
+Каждый целый event записывается binary write-loop → flush → fsync **до возврата
+hook**, без ожидания sessionfinish. `collection_error`/`collection_exception`
+также полностью отражаются в stderr с префиксом
+`MEMORY_WIKI_COLLECTION_EVIDENCE `: будущий обычный CI сохраняет причинный текст
+в console log даже без нового artifact uploader. `sessionfinish` — отдельное
+наблюдение, а `returned_exitstatus` и `primary_type` — фактический выход wrapper;
+они не выдаются друг за друга.
+
+JSON — UTF-8, `ensure_ascii=True`, без нормализации, усечения или замены invalid
+Unicode: round-trip сохраняет в том числе astral characters, literal escapes,
+NUL и lone surrogates. Лимиты считают **сериализованные bytes вместе с newline**:
+2,000,000 B journal, 256,000 B/event, 1,024 B journal reserve для первого refusal
+и sessionfinish, 1,000,000 B phases, по 8,192 B для status/refusal. До encoder
+действуют также bounded primitive/cardinality/character/depth проверки. Верхняя
+граница новых файлов reporter — 3,016,384 B; отражение stderr считается отдельно.
+Формирование самого pytest `longreprtext` не является bounded работой reporter.
+
+`status.json` схемы `memory-stack.collection-evidence/v1` содержит counts
+failed/saved/uncaptured reports, type-detail count, раздельные session/return/
+primary facts, подтверждённые written/fsynced bytes, phase status, cleanup и
+первые восемь точных diagnostic refusals плюс `refusal_count/refusals_omitted`.
+Первая callback-refusal по возможности fsync-ится в reserved journal tail сразу;
+при повреждённом journal он не «ремонтируется» правдоподобной JSON-строкой.
+
+**Complete reporting требует одновременно** валидный `status.json` с
+`complete=true`, исключительно созданный `complete/` и отсутствие `refusal.json`.
+Commit-marker создаётся только после закрытия всех файлов, успешного final
+status fsync/close и console reporting. Это означает полноту диагностики, **не
+pytest PASS**: допустимы сохранённые exit2 либо original exception. Missing,
+partial, overflow, I/O/console/close failures — INCOMPLETE/REFUSED, не ноль ошибок
+и не truncated-success. Late status/commit refusal сохраняется отдельно в
+`refusal.json` и stderr; если сам root/I/O недоступен, fallback — явный stderr
+refusal, отсутствие complete marker, сохранённые partial bytes. Невозможность
+записать ни файл, ни stderr остаётся неполной доставкой, а не успехом.
+
+Reporter не меняет session/testsfailed/exitstatus, не бросает diagnostic exception
+поверх исходного pytest return/primary (включая BaseException) и не превращает
+telemetry refusal в новый test exit. Consumers должны оценивать test outcome и
+reporting integrity **раздельно**. Старый `classify_phases` сам по себе не является
+валидатором нового terminal collection evidence. Новые diagnostic names ещё не
+включены в allowlist hosted artifact collector; его будущая приёмка отдельна.
+
+Root должен быть явно объявленным, quiescent, exclusively owned fixture root;
+допускается создать только сам отсутствующий root при существующих ancestors.
+Lexical traversal/Win32 aliases/ADS/devices, symlink/reparse ancestors, changed
+no-follow directory identity и collisions отказывают. Files создаются только
+`xb`, чужие bytes не перезаписываются/не удаляются; закрытие descriptors
+проверяется на всех путях, неподтверждённый close остаётся UNKNOWN в evidence. Проверки не
+обещают атомарную OS containment против враждебной concurrent подмены ancestors.
+
+### Проверка и сохранённые non-goals
+
+Новый применимый packet исполняет `tests/test_collection_evidence.py` (exact
+stdlib module + extracted actual `collection_reporter`/`run_tests` bodies),
+реальные fixture files и synthetic callbacks/metadata/fault actors. Guards и
+actual callable bodies не подменяются; symlink/reparse negatives — явно
+synthetic no-follow stat data под неизменным guard, не native link proof.
+Физический peer layout: этот test, `tests/helpers/collection_evidence.py`,
+`tests/cold_lane_entry.py`, `packaging/run_native_regressions.py`. Обычная
+discovery нового test не требует отсутствия чужого global provider singleton.
+
+В `COLD_LANES.json` добавлены **только** SOURCE-explicit записи для уже принятого
+`tests/test_ci_lifecycle_observer.py` и нового `tests/test_collection_evidence.py`.
+Это не повтор observer9 и не исправление прежних 44 unpartitioned baseline
+файлов, binder/routing или FULL union. Все прежние rows, native/core/trust null
+bindings и blockers остаются. Historical Ubuntu/release6 и Windows7 node IDs /
+longrepr не восстановлены. Native/pytest/cold/FULL/CI, SDK/provider/SQL/host,
+network/models/install/restart/publication в этом SOURCE-блоке **NOT_RUN**.
+
 ## Исторический RI-R01 / hybrid checkpoint 1.24.5
 
 Это SOURCE checkpoint, не новый релиз, не native SDK acceptance и не установленный/loaded runtime.
