@@ -105,21 +105,44 @@ refusal CLI и буквальный workflow allowlist. Synthetic UNIT callbacks
 
 ## Фактический ограниченный qualification packet
 
-Первый standalone child остановился до controls на отсутствующем в envelope
-pytest compatibility import `py` (это настоящий pinned `py.py` из test target,
-не новый пакет); его exit1 и отказной capture сохранены. После source-bound
-carrier correction настоящие pytest fixtures дали healthy exit0 (2 main cases,
-6 phases, audit0) и RuntimeError collection exit2 (реальные exception/report/
-longrepr hooks, audit0). Syntax fixture сохранил настоящий CollectError/SyntaxError
-и pytest return2, но outer child exit3 из-за 14 `unsafe_token` audit refusals.
-Их caller не установлен полным witness; они не прощены и не стали PASS.
+Первоначальный packet сохранён как **BLOCKED**: standalone import `py` отказал
+до controls; healthy выполнил только два обычных cases; generic SyntaxError
+дал pytest return2, но child exit3 и 14 `unsafe_token` audit refusals. Поздняя
+test-only correction directory/file arguments тогда лишь компилировалась.
+Этот исторический результат не переименован в PASS.
 
-Ни один из 12 authored controls фактически не исполнился: pytest9.1.1
-`normalize_collection_arguments` убрал nested explicit non-test_* file при
-одновременном указании его parent directory. В fixture исправлены аргументы на
-непересекающиеся literal files и добавлена exact roster/phase проверка; эта
-последняя test-only correction только скомпилирована, не запускалась. Все
-3 fixture children и 1 standalone child израсходованы. Поэтому текущий frozen
-candidate **не квалифицирован**, artifact admission/primary identity controls
-остаются NOT_RUN, общий RESULT — BLOCKED. Требуется отдельный допуск на
-affected qualification, а не автоматический replay или ослабление fence.
+В отдельном родительском continuation на frozen `80286a4` действительно прошли
+**12/12 standalone stdlib UNIT controls**, child/controller0, audit0. Новый
+bounded passive witness установил caller всех 14 повторённых Syntax DENY:
+CPython3.14 `traceback._find_keyword_typos` → `codeop.compile_command`/`tokenize`
+пытаются читать pseudo filenames `<input>`/`<string>`. Исторический caller без
+такого witness остаётся неизвестным; новый диагностический child exit3 не PASS.
+
+Исправлен только producer syntax fixture: вместо generic `invalid syntax`
+использован **настоящий parser SyntaxError об unterminated string literal**.
+Он сохраняет реальную pytest collection/exception/longrepr ветвь, но не включает
+необязательный keyword-typo compiler. Guards, pytest/SDK/Core, helper и CI
+runtime bytes не менялись. Все 38 assertion subtrees и остальной AST тестового
+модуля сохранены (кроме единственного syntax payload и сдвига comment locations).
+Generic keyword-typo formatting под этим строгим envelope остаётся unqualified.
+
+После shared argument/roster correction свежо исполнены **все три affected
+fixture kinds** на execution commit
+`bfe45ece8b3053a83e66ab1618738f2d719228a7`:
+- healthy: **14 main cases, 42 setup/call/teardown reports PASS**, child0;
+  из них два обычных pytest controls и 12 synthetic-callback tooling UNIT;
+- RuntimeError collection: один настоящий failed CollectReport с exception
+  details и longrepr, ожидаемый child/pytest exit2;
+- parser SyntaxError collection: один настоящий failed CollectReport с
+  CollectError/SyntaxError details и longrepr, ожидаемый child/pytest exit2.
+
+Все три controller exits0, audit0, complete capture/reap/ownership и пустые
+supervisor errors с primary=null; все diagnostics seals/status проверены.
+Отдельные 12 standalone UNIT пересекаются с healthy14 и не прибавляются к14.
+Фактически создано **9 children** за весь блок, exits
+`[1,0,2,3,0,3,0,2,2]`; прежние bootstrap/capture/audit отказы сохранены отдельно.
+Последующая doc-only qualification note не является новым тестовым запуском.
+
+Это проверка reporting/artifact **tooling component**, не Memory Wiki behavior,
+SDK origin/MRO/bootstrap, stock JUnit, hosted CI, FULL, installed или loaded
+runtime. Независимая source review и parent acceptance/integration отдельны.
