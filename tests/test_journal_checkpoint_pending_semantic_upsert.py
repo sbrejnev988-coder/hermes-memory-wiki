@@ -6,6 +6,7 @@ import importlib.util
 import json
 import sqlite3
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -13,6 +14,7 @@ import pytest
 
 
 PLUGIN = Path(__file__).resolve().parents[1] / "__init__.py"
+RETAINED_UNKNOWN = []  # Native negative controls retain owners to interpreter exit.
 
 
 def test_checkpoint_rebuild_preserves_or_reports_pending_semantic_upsert(tmp_path, monkeypatch):
@@ -119,10 +121,19 @@ def test_checkpoint_rebuild_preserves_or_reports_pending_semantic_upsert(tmp_pat
         assert retryable[0]["attempts"] == 0
         assert retryable[0]["next_retry_at"] <= int(time.time())
         assert not result.get("outbox_recovery_error"), result
+        assert provider._owned_conn is provider._conn
+        assert provider._claim_tx_connection is None and provider._claim_tx_thread is None
+        assert provider._transaction_quarantine is None
+        assert provider._lifecycle_state == "ready" and not provider._conn.in_transaction
+        public = provider.handle_tool_call("memory_wiki_query", {"query": "Atlas gateway", "limit": 5})
+        public = json.loads(public) if isinstance(public, str) else public
+        assert claim_id in [row["id"] for row in public.get("claims", [])], public
     finally:
-        if provider._conn is not None:
-            provider._conn.close()
-            provider._conn = None
+        if provider._transaction_quarantine is not None:
+            RETAINED_UNKNOWN.append(provider)
+        else:
+            provider.shutdown()
+            assert provider._conn is None and provider._owned_conn is None
         sys.modules.pop(name, None)
 
 
@@ -168,9 +179,11 @@ def recovery(tmp_path, monkeypatch):
             c.execute("UPDATE meta SET value='1' WHERE key='semantic_enabled'")
         yield module, provider, unexpected_io, worker_paths
     finally:
-        if provider._conn is not None:
-            provider._conn.close()
-            provider._conn = None
+        if provider._transaction_quarantine is not None:
+            RETAINED_UNKNOWN.append(provider)
+        else:
+            provider.shutdown()
+            assert provider._conn is None and provider._owned_conn is None
         sys.modules.pop(name, None)
 
 
@@ -390,6 +403,93 @@ def test_requeue_failure_on_temporary_database_aborts_without_swapping(recovery,
     assert provider._connect().execute(
         "SELECT id,status FROM index_outbox WHERE id=?", (job["id"],),
     ).fetchone()["status"] == "pending"
+    assert not unexpected_io and not worker_paths
+
+
+def test_native_ready_migration_reenters_connect_under_exact_owner(recovery, monkeypatch):
+    """Prepared native control; SOURCE must not execute or substitute this SDK."""
+    sdk = pytest.importorskip("agent.memory_provider")
+    _, provider, unexpected_io, _ = recovery
+    assert provider.__class__.__bases__ == (sdk.MemoryProvider,)
+    c = provider._connect()
+    original_cols = provider._cols
+    witnessed = []
+
+    def observe_cols(table):
+        result = original_cols(table)  # Real nested _connect/identity admission.
+        if c.in_transaction:
+            assert provider._conn is c and provider._owned_conn is c
+            assert provider._claim_tx_connection is c
+            assert provider._claim_tx_thread == threading.get_ident()
+            witnessed.append(table)
+        return result
+
+    monkeypatch.setattr(provider, "_cols", observe_cols)
+    provider._migrate()
+    assert witnessed
+    assert provider._conn is c and provider._owned_conn is c
+    assert not c.in_transaction and provider._transaction_quarantine is None
+    assert provider._claim_tx_connection is None and provider._claim_tx_thread is None
+    assert provider._lifecycle_state == "ready" and not unexpected_io
+
+
+@pytest.mark.parametrize("rollback_unknown", [False, True])
+def test_native_rebuild_migration_failure_preserves_primary_and_exact_owner(recovery, monkeypatch, rollback_unknown):
+    """Prepared real rebuild/rollback controls, not generic SQLite authority."""
+    sdk = pytest.importorskip("agent.memory_provider")
+    _, provider, unexpected_io, worker_paths = recovery
+    assert provider.__class__.__bases__ == (sdk.MemoryProvider,)
+    claim_id, job = _pending_claim(provider)
+    worker_paths.clear()
+    checkpoint = provider._journal_checkpoint("migration-owner-fault")
+    original_path = provider.db_path
+    original_cols = provider._cols
+    primary = ValueError("owned migration primary")
+    observed = []
+
+    def deny_rollback(action, first, second, database, trigger):
+        return sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_TRANSACTION and first == "ROLLBACK" else sqlite3.SQLITE_OK
+
+    def fail_after_owned_write(table):
+        result = original_cols(table)
+        c = provider._conn
+        if provider.db_path != original_path and c.in_transaction and not observed:
+            assert provider._claim_tx_connection is c
+            assert provider._claim_tx_thread == threading.get_ident()
+            observed.append(c)
+            if rollback_unknown:
+                c.set_authorizer(deny_rollback)
+            raise primary
+        return result
+
+    monkeypatch.setattr(provider, "_cols", fail_after_owned_write)
+    with pytest.raises(ValueError) as caught:
+        provider._rebuild_from_journal(apply=True, checkpoint=checkpoint["path"])
+    assert caught.value is primary and len(observed) == 1
+    temp = observed[0]
+    if rollback_unknown:
+        assert provider._conn is temp and provider._owned_conn is temp
+        assert provider._transaction_quarantine is temp
+        assert provider._transaction_primary is primary
+        assert provider._claim_tx_connection is temp
+        assert provider._claim_tx_thread == threading.get_ident()
+        assert provider.db_path != original_path and temp.in_transaction
+        assert provider._lifecycle_state == "quarantined"
+        for action in (provider._connect, provider.shutdown):
+            with pytest.raises(RuntimeError):
+                action()
+        assert not provider._release_connection_for_retry(primary)
+        assert provider._conn is temp and provider._transaction_primary is primary
+    else:
+        assert provider.db_path == original_path
+        assert provider._owned_conn is provider._conn
+        assert provider._transaction_quarantine is None
+        assert provider._claim_tx_connection is None and provider._claim_tx_thread is None
+        assert not provider._conn.in_transaction and provider._lifecycle_state == "ready"
+        with pytest.raises(sqlite3.ProgrammingError):
+            temp.execute("SELECT 1")
+        assert provider._connect().execute("SELECT status FROM claims WHERE id=?", (claim_id,)).fetchone()[0] == "active"
+        assert provider._connect().execute("SELECT status FROM index_outbox WHERE id=?", (job["id"],)).fetchone()[0] == "pending"
     assert not unexpected_io and not worker_paths
 
 
