@@ -238,5 +238,101 @@ class TestEpisodeProjectionGuard(unittest.TestCase):
         self.assertEqual(self.ns["_CAPTURE_MAX_CHARS"], 1200)
 
 
+class TestNativeTrustPrerequisite(unittest.TestCase):
+    """STATIC test-admission controls; no trust/product/provider import."""
+
+    @classmethod
+    def setUpClass(cls):
+        path = PEERS.get("native_tests", str(ROOT / "tests/test_episodic_memory.py"))
+        cls.native_tree = ast.parse(READ(path), filename=path)
+        cls.helper = _function(cls.native_tree.body, "_nfkc_episode_provider")
+        cls.prerequisite, = [node for node in cls.helper.body if isinstance(node, ast.Try)]
+
+    def test_static_prerequisite_precedes_strict_product_import(self):
+        body = self.helper.body
+        home, = [node for node in body if isinstance(node, ast.Expr)
+                 and isinstance(node.value, ast.Call)
+                 and ast.unparse(node.value.func) == "monkeypatch.setenv"
+                 and ast.literal_eval(node.value.args[0]) == "HERMES_HOME"]
+        strict, = [node for node in body if isinstance(node, ast.Expr)
+                   and isinstance(node.value, ast.Call)
+                   and ast.unparse(node.value.func) == "monkeypatch.setenv"
+                   and ast.literal_eval(node.value.args[0]) == "HERMES_SECURITY_STRICT"]
+        product, = [node for node in body if isinstance(node, ast.Assign)
+                    and isinstance(node.value, ast.Call)
+                    and ast.unparse(node.value.func) == "_module"]
+        self.assertLess(body.index(home), body.index(self.prerequisite))
+        self.assertLess(body.index(self.prerequisite), body.index(strict))
+        self.assertLess(body.index(strict), body.index(product))
+        self.assertEqual(ast.literal_eval(strict.value.args[1]), "1")
+        imported, = self.prerequisite.body
+        self.assertIsInstance(imported, ast.ImportFrom)
+        self.assertEqual(imported.module, "hermes_trust_core")
+        self.assertEqual([(a.name, a.asname) for a in imported.names],
+                         [("sanitize_recalled", "native_sanitizer")])
+
+    def test_static_only_missing_top_level_trust_skips(self):
+        handler, = self.prerequisite.handlers
+        self.assertEqual(ast.unparse(handler.type), "ModuleNotFoundError")
+        self.assertEqual(handler.name, "exc")
+        refusal, skip = handler.body
+        self.assertIsInstance(refusal, ast.If)
+        self.assertEqual(ast.unparse(refusal.test), "exc.name != 'hermes_trust_core'")
+        self.assertEqual(len(refusal.body), 1)
+        self.assertIsInstance(refusal.body[0], ast.Raise)
+        self.assertIsNone(refusal.body[0].exc)
+        self.assertEqual(refusal.orelse, [])
+        self.assertEqual(ast.unparse(skip.value.func), "pytest.skip")
+        skips = [node for node in ast.walk(self.helper) if isinstance(node, ast.Call)
+                 and ast.unparse(node.func) == "pytest.skip"]
+        self.assertEqual(skips, [skip.value])
+        self.assertEqual(self.prerequisite.orelse, [])
+        self.assertEqual(self.prerequisite.finalbody, [])
+
+    def test_static_broken_trust_cannot_be_a_permissive_positive(self):
+        checks = [ast.unparse(node.test) for node in self.helper.body if isinstance(node, ast.Assert)]
+        self.assertIn("callable(native_sanitizer)", checks)
+        self.assertIn("module._INJECTION_GUARD_AVAILABLE and callable(module._sanitize_recalled)", checks)
+        self.assertFalse(any(isinstance(node, (ast.Lambda, ast.FunctionDef, ast.ClassDef))
+                             for statement in self.helper.body for node in ast.walk(statement)))
+        self.assertFalse(any(isinstance(node, ast.Assign)
+                             and any(isinstance(target, ast.Attribute)
+                                     and target.attr in {"_INJECTION_GUARD_AVAILABLE", "_sanitize_recalled"}
+                                     for target in node.targets)
+                             for node in ast.walk(self.helper)))
+
+    def test_static_healthy_path_keeps_the_actual_provider_factory(self):
+        returned, = [node for node in self.helper.body if isinstance(node, ast.Return)]
+        expected = ast.parse("return module, _provider(module, tmp_path, 'alice', 'chat-a')").body[0]
+        self.assertEqual(ast.dump(returned, include_attributes=False), ast.dump(expected, include_attributes=False))
+        calls = [node for node in ast.walk(self.helper) if isinstance(node, ast.Call)]
+        self.assertEqual(sum(ast.unparse(node.func) == "_module" for node in calls), 1)
+        self.assertEqual(sum(ast.unparse(node.func) == "_provider" for node in calls), 1)
+        self.assertFalse(any(isinstance(node, ast.ExceptHandler)
+                             and ast.unparse(node.type) != "ModuleNotFoundError"
+                             for node in ast.walk(self.helper)))
+
+    def test_static_complete_native_consumer_roster_is_retained(self):
+        users = [node for node in self.native_tree.body if isinstance(node, ast.FunctionDef)
+                 and any(isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                         and call.func.id == "_nfkc_episode_provider" for call in ast.walk(node))]
+        self.assertEqual([node.name for node in users], [
+            "test_native_nfkc_capture_and_public_tail",
+            "test_native_nfkc_no_omission_has_honest_metadata",
+            "test_native_legacy_recall_projection_keeps_tail_without_rewriting_source",
+        ])
+        count = 0
+        for node in users:
+            parameterization, = [d for d in node.decorator_list if isinstance(d, ast.Call)
+                                 and ast.unparse(d.func) == "pytest.mark.parametrize"]
+            count += len(ast.literal_eval(parameterization.args[1]))
+            call, = [call for call in ast.walk(node) if isinstance(call, ast.Call)
+                     and isinstance(call.func, ast.Name) and call.func.id == "_nfkc_episode_provider"]
+            self.assertEqual([ast.unparse(a) for a in call.args], ["tmp_path", "monkeypatch"])
+            self.assertTrue(any(isinstance(call, ast.Call) and ast.unparse(call.func) == "provider.shutdown"
+                                for call in ast.walk(node)))
+        self.assertEqual(count, 16)  # Prepared native parametrizations, NOT executed here.
+
+
 if __name__ == "__main__":
     unittest.main()

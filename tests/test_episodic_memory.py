@@ -332,15 +332,22 @@ def _projection_text(size, fill):
 
 def _nfkc_episode_provider(tmp_path, monkeypatch):
     # These are genuine-provider regressions, deliberately NOT executed by the
-    # SOURCE packet. A missing native trust dependency is not a permissive fake.
+    # SOURCE packet. Check the optional prerequisite BEFORE strict product import;
+    # a missing transitive dependency or a broken trust module must still fail.
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("MEMORY_WIKI_SEMANTIC", "0")
     monkeypatch.setenv("MEMORY_WIKI_EPISODIC_ENABLED", "1")
     monkeypatch.setenv("MEMORY_WIKI_EPISODIC_SCOPE", "chat")
+    try:
+        from hermes_trust_core import sanitize_recalled as native_sanitizer
+    except ModuleNotFoundError as exc:
+        if exc.name != "hermes_trust_core":
+            raise
+        pytest.skip("genuine native trust guard required for NFKC episode composition")
+    assert callable(native_sanitizer), "genuine native trust sanitizer must be callable"
     monkeypatch.setenv("HERMES_SECURITY_STRICT", "1")
     module = _module()
-    if not module._INJECTION_GUARD_AVAILABLE or not module._sanitize_recalled:
-        pytest.skip("genuine native trust guard required for NFKC episode composition")
+    assert module._INJECTION_GUARD_AVAILABLE and callable(module._sanitize_recalled)
     return module, _provider(module, tmp_path, "alice", "chat-a")
 
 
