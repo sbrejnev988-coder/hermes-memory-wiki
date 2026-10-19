@@ -781,11 +781,13 @@ class NativeReviewQueueOwner(unittest.TestCase):
             "SELECT op,status,detail FROM audit_log WHERE op='scrub_secrets' ORDER BY rowid").fetchall()]
 
     @contextmanager
-    def maintenance_observer(self, after_update=None):
+    def maintenance_observer(self, after_update=None, *, handoff_target=None, after_retirement=None):
         """Passive native-return/exception witnesses; fault callback is separate.
 
         Exact primary objects are held test-locally only for identity assertions,
         never serialized. Closure is explicit; this does not test GC lifetime.
+        The optional handoff stops only at the real owning generator's NORMAL
+        final return, after its with-RLock exit, never at native COMMIT return.
         """
         execute = self.graph._GraphCommitConnection.execute.__code__
         rollback = self.graph._GraphCommitConnection.rollback.__code__
@@ -797,7 +799,33 @@ class NativeReviewQueueOwner(unittest.TestCase):
         witness = {"updates": [], "commits": [], "rollbacks": [],
                    "calls": dict.fromkeys((*methods.values(), "graph"), 0),
                    "errors": {"admin": [], "graph": []}}
+        observer_thread = threading.get_ident()
+        stage_names = ("document_stage", "graph_stage", "event_job_stage")
+        target_stages, target_commit_seen, retirement_seen = None, False, False
+        transaction = exit_code = None
+        return_offsets = frozenset()
+        if after_retirement is not None:
+            import dis
+            import inspect
+            from contextlib import _GeneratorContextManager
+            transaction = unwrapped(self.p._claim_transaction).__code__
+            self.assertTrue(transaction.co_flags & inspect.CO_GENERATOR)
+            exit_code = _GeneratorContextManager.__exit__.__code__
+            # YIELD_VALUE and exception-unwind profile 'return' are NOT a
+            # completed owner. Resolve opcodes, not guessed source line hooks.
+            return_offsets = frozenset(i.offset for i in dis.get_instructions(transaction)
+                                       if i.opname in {"RETURN_VALUE", "RETURN_CONST"})
+            self.assertTrue(return_offsets, "claim_transaction_normal_return_unavailable")
+            witness["retirements"] = []
+        def target_owner(frame):
+            return (target_stages is not None and frame is not None
+                    and frame.f_code is transaction and frame.f_locals.get("self") is self.p
+                    and frame.f_locals.get("c") is self.conn and frame.f_locals.get("owns") is True
+                    and tuple(id(frame.f_locals.get(name)) for name in stage_names) == target_stages)
         def observe(frame, event, arg):
+            nonlocal target_stages, target_commit_seen, retirement_seen
+            if threading.get_ident() != observer_thread:
+                return
             if frame.f_locals.get("self") is self.conn and event == "return":
                 if frame.f_code is execute and isinstance(arg, sqlite3.Cursor) and arg.connection is self.conn:
                     args = frame.f_locals.get("args", ())
@@ -806,12 +834,44 @@ class NativeReviewQueueOwner(unittest.TestCase):
                     if table in (*GRAPH_TABLES, "review_queue"):
                         row = {"table": table, "rows": arg.rowcount, "state": self.state()}
                         witness["updates"].append(row)
+                        if (after_retirement is not None and table == handoff_target
+                                and target_stages is None
+                                and all(row["state"][key] for key in
+                                        ("owner_exact", "owner_same_thread", "in_transaction", "owned_shared"))):
+                            # Only primitive IDs survive the callback; the three
+                            # real stage tuples remain alive in their generator.
+                            target_stages = tuple(id(getattr(self.p, "_claim_tx_" + name))
+                                                  for name in stage_names)
                         if after_update is not None:
                             after_update(row)
                 elif frame.f_code is commit:
-                    witness["commits"].append(self.state())
+                    state = self.state()
+                    witness["commits"].append(state)
+                    if (target_owner(frame.f_back) and arg is None
+                            and not state["in_transaction"] and state["owner_exact"]
+                            and state["owner_same_thread"] and not state["quarantined"]):
+                        target_commit_seen = True  # Observe only: RLock is STILL held here.
                 elif frame.f_code is rollback:
                     witness["rollbacks"].append(self.state())
+            if (after_retirement is not None and not retirement_seen and event == "return"
+                    and arg is None and target_owner(frame) and frame.f_lasti in return_offsets
+                    and frame.f_back is not None and frame.f_back.f_code is exit_code
+                    and target_commit_seen and frame.f_locals.get("completed") is True
+                    and frame.f_locals.get("commit_attempted") is True
+                    and frame.f_locals.get("previous") is None
+                    and frame.f_locals.get("previous_thread") is None
+                    and self.p._claim_tx_thread != observer_thread
+                    and all(id(getattr(self.p, "_claim_tx_" + name)) != stage
+                            for name, stage in zip(stage_names, target_stages))):
+                retirement_seen = True
+                row = {"normal_generator_return": True, "target_native_commit_seen": True,
+                       "target_owner_retired": True, "calls": dict(witness["calls"]),
+                       "writer_commits": len(witness["commits"])}
+                witness["retirements"].append(row)
+                # A reader may already own the released lock. The parent proves
+                # current retired/idle state under that lock after reader_done.
+                # No SQL, frame retention, fault or scheduling exception here.
+                after_retirement(row)
             if event == "call":
                 name = methods.get(frame.f_code) if frame.f_locals.get("self") is self.p else None
                 if frame.f_code is graph_code and frame.f_locals.get("provider") is self.p:
@@ -862,37 +922,96 @@ class NativeReviewQueueOwner(unittest.TestCase):
             self.assertEqual(self.conn.execute(f"SELECT {column} FROM {table}").fetchone()[0], value)
         self.assertEqual(self.conn.execute("PRAGMA foreign_key_check").fetchall(), [])
 
+    def maintenance_delivery_witness(self, answer):
+        """Bounded first-public-delivery metadata, never payloads or exceptions."""
+        metadata = {"public_returned": answer is not None, "terminal_calls": None,
+                    "phase": "NOT_OBSERVED", "reason": "NOT_OBSERVED",
+                    "reason_recognized": False, "disclosure_status": "NOT_OBSERVED",
+                    "public_error_present": None, "commit_returned": None, "native_idle": None}
+        if answer is None:
+            return metadata
+        result, deliveries = answer
+        metadata.update(terminal_calls=len(deliveries), public_error_present="error" in result,
+                        disclosure_status=("withheld" if result.get("disclosure_status") == "withheld"
+                                           else "absent" if "disclosure_status" not in result else "UNRECOGNIZED"))
+        if not deliveries or type(deliveries[0]) is not self.m._TerminalDelivery:
+            return metadata
+        delivery = deliveries[0]
+        phase, reason = delivery.phase, delivery.reason
+        if type(phase) is str and phase in {"prepare", "owned", "verify", "committed", "withheld", "unknown"}:
+            metadata["phase"] = phase
+        else:
+            metadata["phase"] = "UNRECOGNIZED"
+        # Do not serialize arbitrary str(exc), even if a future implementation
+        # puts source text there. Unknown values remain explicit, not a PASS.
+        known_reasons = {
+            "terminal_prefetch_attempt_expired", "terminal_original_carrier_missing",
+            "terminal_writer_transition_unavailable", "terminal_reader_cleanup_unproven",
+            "terminal_protected_drift", "terminal_protected_effect_drift",
+            "detached_audit_attempt_cancelled", "terminal_commit_unavailable", "terminal_error_response",
+            "terminal_prefetch_owner_pending", "terminal_transaction_owner_unproven",
+            "terminal_active_journal_postcommit_required_BLOCKED", "terminal_commit_provenance_unproven",
+        }
+        if reason is None or (type(reason) is str and reason in known_reasons):
+            metadata.update(reason=reason, reason_recognized=True)
+        else:
+            metadata["reason"] = "UNRECOGNIZED"
+        if type(delivery.measurement) is dict:
+            for key in ("commit_returned", "native_idle"):
+                value = delivery.measurement.get(key)
+                if type(value) is bool:
+                    metadata[key] = value
+        return metadata
+
     def maintenance_handoff(self, target):
         from agent.memory_provider import spawn_context_thread
         before = self.seed()
         inserted, release, entry_seen, reader_done = [threading.Event() for _ in range(4)]
-        errors, answers, results, observations, pauses = [], [], [], [], []
+        retired, resume_writer = threading.Event(), threading.Event()
+        errors, answers, results, observations, pauses, pause_releases = [], [], [], [], [], []
         def pause(row):
             if row["table"] == target and not pauses:
                 pauses.append(row)
                 inserted.set()
-                if not release.wait(15):
-                    raise RuntimeError("maintenance_writer_release_timeout")
+                pause_releases.append(release.wait(15))
+        def stable_window(row):
+            retired.set()
+            # The parent resumes only after the ORIGINAL reader completes and
+            # its cross-thread lock witness. finally also releases on refusal.
+            row["resume_received"] = resume_writer.wait(15)
+            row["reader_done_before_resume"] = reader_done.is_set()
         def write():
             try:
-                with self.scope(), self.maintenance_observer(pause) as witness:
+                with self.scope(), self.maintenance_observer(
+                        pause, handoff_target=target, after_retirement=stable_window) as witness:
                     observations.append(witness)
                     results.append(self.p._scrub_secrets(apply=True, limit=200))
             except BaseException as error:
                 errors.append(error)
                 inserted.set()
         def read():
+            answer = None
             try:
-                answers.append(self.recall(entry_seen))
+                answer = self.recall(entry_seen)
+                answers.append(answer)
             except BaseException as error:
                 errors.append(error)
             finally:
-                reader_done.set()
+                try:
+                    # Persist BEFORE any post-schedule assertion, including the
+                    # original healthy/accounting oracle; no full result log.
+                    self.record("maintenance_first_public_delivery", **self.maintenance_delivery_witness(answer))
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    reader_done.set()
         with self.scope():
             writer = spawn_context_thread(write, name="maintenance-writer", daemon=False)
             reader = spawn_context_thread(read, name="maintenance-public-reader", daemon=False)
         writer.start()
         lock_held = reader_early = None
+        retirement_reached = reader_in_window = outside_writer_lock = False
+        idle_state = window_calls = window_commits = writer_unfinished = None
         try:
             self.assertTrue(inserted.wait(5), "actual_maintenance_UPDATE_not_reached")
             acquired = self.p._lock.acquire(blocking=False)
@@ -902,17 +1021,65 @@ class NativeReviewQueueOwner(unittest.TestCase):
             reader.start()
             self.assertTrue(entry_seen.wait(5), "public_reader_entry_not_reached")
             reader_early = reader_done.wait(.08)  # Bounded Event, no sleep/poll loop.
+            release.set()
+            retirement_reached = retired.wait(10)
+            if retirement_reached:
+                reader_in_window = reader_done.wait(10)
+                # Writer is still parked at generator final-return, BEFORE the
+                # next maintenance stage. Acquiring from this parent thread
+                # proves the full RLock is released, not merely reentrant here.
+                acquired = self.p._lock.acquire(timeout=2)
+                outside_writer_lock = acquired
+                if acquired:
+                    try:
+                        idle_state = self.state()  # Primitive metadata; no SQL.
+                    finally:
+                        self.p._lock.release()
+                window_calls = dict(observations[0]["calls"])
+                window_commits = len(observations[0]["commits"])
+                writer_unfinished = writer.is_alive() and not results
         finally:
             release.set()
+            resume_writer.set()
             writer.join(10)
             if reader.ident is not None:
                 reader.join(10)
         self.record("maintenance_writer_reader_schedule", target=target, paused=pauses,
                     full_writer_lock=lock_held, reader_returned_before_release=reader_early,
                     errors=[type(e).__name__ for e in errors], state=self.state())
+        self.record("maintenance_stable_reader_window", target=target,
+                    checkpoint_reached=retirement_reached, reader_done_in_window=reader_in_window,
+                    outside_writer_lock=outside_writer_lock, idle_state=idle_state,
+                    writer_unfinished=writer_unfinished, calls_before_resume=window_calls,
+                    commits_before_resume=window_commits,
+                    retirements=observations[0].get("retirements", []) if observations else [])
         self.assertFalse(writer.is_alive())
         self.assertFalse(reader.is_alive())
         self.assertEqual(errors, [])
+        self.assertEqual(pause_releases, [True])
+        self.assertIs(retirement_reached, True, "post_target_owner_final_return_not_reached")
+        self.assertIs(reader_in_window, True, "original_reader_did_not_finish_in_stable_window")
+        self.assertIs(outside_writer_lock, True, "post_target_full_RLock_not_released")
+        self.assertIs(writer_unfinished, True, "handoff_was_not_pre_next_stage")
+        self.assertIsNotNone(idle_state)
+        self.assertIs(idle_state["in_transaction"], False)
+        self.assertIs(idle_state["owner_retired"], True)
+        self.assertIs(idle_state["owned_shared"], True)
+        self.assertIs(idle_state["quarantined"], False)
+        self.assertEqual(idle_state["lifecycle"], "ready")
+        self.assertIsNone(idle_state["primary_type"])
+        retirements = observations[0]["retirements"]
+        self.assertEqual(len(retirements), 1)
+        retirement = retirements[0]
+        for key in ("normal_generator_return", "target_native_commit_seen", "target_owner_retired",
+                    "resume_received", "reader_done_before_resume"):
+            self.assertIs(retirement[key], True)
+        expected_calls = {"admin": 1, "graph": 0 if target == "review_queue" else 1,
+                          "terminal": 0, "rebuild": 0, "render": 0}
+        self.assertEqual(retirement["calls"], expected_calls)
+        self.assertEqual(window_calls, expected_calls)
+        self.assertEqual(window_commits, retirement["writer_commits"])
+        self.assertEqual(window_commits, 1 if target == "review_queue" else 2)
         self.assertEqual(len(pauses), 1)
         self.assertEqual(pauses[0]["rows"], 1)
         for key in ("owner_exact", "owner_same_thread", "in_transaction", "owned_shared"):
