@@ -682,6 +682,13 @@ def _redact_graph_storage_value(
     try:
         parsed = json.loads(original)
     except (TypeError, ValueError):
+        # Scalar SQL columns need the same field + digest check as JSON strings.
+        # Do not let the predicate's coercion/strip exempt non-text or padding.
+        lower_key = str(key or "").lower()
+        if (isinstance(value, str) and original == original.strip()
+                and lower_key in _GRAPH_INTEGRITY_FIELDS
+                and _is_graph_integrity_digest(lower_key, original)):
+            return original
         return _redact_graph_text(original, 40_000, redactor)
     root_key = str(key or "value")
     safe, changed = _sanitize_graph_event_for_storage(

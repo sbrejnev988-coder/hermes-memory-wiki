@@ -27,7 +27,7 @@ import sys
 import tempfile
 import time
 import types
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import unittest
 import urllib.error
 
@@ -51,9 +51,10 @@ METHODS = (
     "_scrub_code_graph_terminal_artifacts", "_scrub_secrets",
 )
 GRAPH_FUNCTIONS = (
-    "_sha", "_opaque_graph_id_v1", "_clean_text", "_redact_graph_text",
+    "_sha", "_json", "_opaque_graph_id_v1", "_clean_text", "_redact_graph_text",
     "_redact_graph_identity", "_is_graph_integrity_digest",
     "_provider_graph_redactor", "sanitize_code_graph_event_for_recovery",
+    "_sanitize_graph_event_for_storage", "_redact_graph_storage_value",
 )
 GRAPH_CONSTANTS = (
     "_PEM_BLOCK_RE", "_SENSITIVE_EVENT_KEY_RE", "_OPAQUE_GRAPH_ID_RE",
@@ -130,7 +131,7 @@ def selected_ast(raw, kind):
 
 def load_functions(raw, source, graph_raw, graph_source):
     common = {"__builtins__": builtins.__dict__, "Path": Path, "Any": Any,
-              "Callable": Callable, "Dict": Dict, "List": List, "Optional": Optional,
+              "Callable": Callable, "Dict": Dict, "List": List, "Optional": Optional, "Tuple": Tuple,
               "hashlib": hashlib, "json": json, "os": os, "re": re,
               "tempfile": tempfile, "time": time, "urllib": urllib}
     graph = {**common, "__name__": "mandatory_redactor_source_graph"}
@@ -369,6 +370,83 @@ class MandatoryRedactorAdminTests(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(self.sink_counts, {"write_open": 0, "rename": 0, "remove": 0})
         self.assert_no_success()
+
+    def test_graph_scalar_integrity_digests_preserved_exact(self):
+        redact = self.graph["_redact_graph_storage_value"]
+        full = self.provider._redact_code_graph_text
+        # The native counterexample is this exact b*64 scalar, not JSON text.
+        self.assertNotEqual(full("b" * 64), "b" * 64)
+        for key in sorted(self.graph["_GRAPH_INTEGRITY_FIELDS"]):
+            values = ("b" * 64, "A1" * 32, "1" * 64)
+            if key == "commit_sha":
+                values += ("abc1234", "A1" * 20)
+            else:
+                values += ("sha256:" + "b" * 64,)
+            for value in values:
+                self.assertTrue(self.graph["_is_graph_integrity_digest"](key, value))
+                self.assertEqual(redact(value, full, key=key), value)
+        self.assertEqual(redact("b" * 64, full, key="SNAPSHOT_HASH"), "b" * 64)
+        self.assertEqual(redact("ordinary note exact", full, key="notes"), "ordinary note exact")
+
+    def test_graph_scalar_integrity_names_do_not_exempt_invalid_or_secret_values(self):
+        redact = self.graph["_redact_graph_storage_value"]
+        full = self.provider._redact_code_graph_text
+        for key in sorted(self.graph["_GRAPH_INTEGRITY_FIELDS"]):
+            for value in (BARE, MIXED, "b" * 65, "g" * 64, "sha256:" + "b" * 63):
+                self.assertFalse(self.graph["_is_graph_integrity_digest"](key, value))
+                safe = redact(value, full, key=key)
+                self.assertEqual(safe, self.graph["_redact_graph_text"](value, 40_000, full))
+                self.assertNotEqual(safe, value)
+                self.assertFalse(BARE in safe or ASSIGNMENT in safe)
+        for value in ("abc123", "b" * 65, "sha256:" + "b" * 64):
+            self.assertFalse(self.graph["_is_graph_integrity_digest"]("commit_sha", value))
+            self.assertEqual(redact(value, full, key="commit_sha"),
+                             self.graph["_redact_graph_text"](value, 40_000, full))
+
+    def test_graph_scalar_digest_unknown_key_padding_type_and_size_keep_policy(self):
+        redact = self.graph["_redact_graph_storage_value"]
+        full = self.provider._redact_code_graph_text
+
+        class NonTextDigest:
+            def __str__(self):
+                return "b" * 64
+
+        controls = [(key, "b" * 64) for key in
+                    ("value", "notes", "snapshot_hash_extra", "_is_graph_integrity_digest")]
+        controls += [("snapshot_hash", value) for value in
+                     (" " + "b" * 64 + "\n", " " * 40_001 + "b" * 64,
+                      "b" * 40_001, NonTextDigest())]
+        for key, value in controls:
+            original = str(value)
+            safe = redact(value, full, key=key)
+            self.assertEqual(safe, self.graph["_redact_graph_text"](original, 40_000, full))
+            self.assertNotEqual(safe, original)
+            self.assertLessEqual(len(safe), 40_000)
+        for value, expected in ((None, ""), (False, ""), (17, "17")):
+            self.assertEqual(redact(value, full, key="snapshot_hash"), expected)
+        benign = "ordinary " * 5_000
+        self.assertEqual(redact(benign, full, key="snapshot_hash"), benign[:40_000])
+
+    def test_graph_storage_nested_json_keeps_digest_and_redacts_other_values(self):
+        redact = self.graph["_redact_graph_storage_value"]
+        full = self.provider._redact_code_graph_text
+        data = {"snapshot_hash": "b" * 64, "commit_sha": "abc1234",
+                "content_hash": "sha256:" + "A1" * 32, "unknown_hash": "b" * 64,
+                "notes": [MIXED, {"snapshot_hash": BARE, "api_key": "tiny"}]}
+        original = json.dumps(data, indent=2)
+        safe = redact(original, full, key="snapshot_hash")
+        parsed = json.loads(safe)
+        self.assertNotEqual(safe, original)
+        for key in ("snapshot_hash", "commit_sha", "content_hash"):
+            self.assertEqual(parsed[key], data[key])
+        self.assertNotEqual(parsed["unknown_hash"], data["unknown_hash"])
+        self.assertFalse(BARE in safe or ASSIGNMENT in safe)
+        self.assertEqual(parsed["notes"][1]["api_key"], "<REDACTED_KEYED_VALUE>")
+        self.assertNotEqual(parsed["notes"][1]["snapshot_hash"], BARE)
+        self.assertEqual(json.loads(original), data)
+        for raw in (json.dumps({"snapshot_hash": "b" * 64}, indent=2),
+                    json.dumps("b" * 64), '{ "notes": ["ordinary", 17, null] }'):
+            self.assertEqual(redact(raw, full, key="snapshot_hash"), raw)
 
     def test_admin_required_none_stops_before_terminal(self):
         self.fixture()
