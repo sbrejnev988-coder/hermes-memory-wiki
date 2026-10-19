@@ -15725,7 +15725,10 @@ class MemoryWikiProvider(MemoryProvider):
 
     def _quarantine_secret(self, table: str, row_id: str, field: str, original: str, reason: str = "secret_scan") -> str:
         red = redact_secrets(original); fingerprint = _secret_fingerprint(original, f"{table}:{row_id}:{field}"); qid = "sq_" + sha(f"{table}:{row_id}:{field}:{fingerprint}")[:12]; ts = now()
-        with self._connect() as c:
+        # Standalone metadata grain; a caller TX must not be committed here.
+        # Audit keeps its existing best-effort, post-commit grain below. Joining
+        # would need an outer audit/rollback contract that this API does not have.
+        with self._claim_transaction() as c:
             c.execute("""INSERT OR IGNORE INTO secret_quarantine(id,table_name,row_id,field,redacted_value,original_hash,reason,status,created_at)
                          VALUES(?,?,?,?,?,?,?,?,?)""", (qid, table, row_id, field, short(red, 2000), fingerprint, reason, "active", ts))
         self._audit("secret_quarantine", "ok", f"{table}.{field}:{row_id}:{reason}")
@@ -22491,26 +22494,41 @@ class MemoryWikiProvider(MemoryProvider):
         # Stable sec_* identity excludes the secret value, so rotations do not break references.
         h=sha(chr(0).join(['secret',owner['identity'],subject.lower(),scope.lower(),typ,locator.lower()]))
         sid="sec_"+h[:12]
-        store=self._get_secret_store()
-        previous=store.wrapped_snapshot(sid)
-        vault_ref=f"vaultref:v1:{sid}" if previous else ""
-        if raw_value:
-            vault_ref=store.put_secret(sid, raw_value)
-        try:
-            with self._connect() as c:
-                c.execute("""INSERT INTO secret_index(id,subject,scope,secret_type,locator,value,purpose,source,confidence,salience,status,last_verified_at,created_at,updated_at,hash,vault_ref,aliases_json,metadata_json,visibility_scope,origin_bot_id,origin_session_id,origin_chat_hash,project_id)
+        # The external value store and post-commit callbacks cannot join a
+        # caller TX: there is no outer rollback/publication hook for them.
+        # Enter the existing idle-only SQL owner BEFORE even opening the store,
+        # and serialize compensation with it. Do not touch a caller's TX.
+        with self._lock:
+            vault_write_attempted = False
+            try:
+                with self._claim_transaction() as c:
+                    store=self._get_secret_store()
+                    previous=store.wrapped_snapshot(sid)
+                    vault_ref=f"vaultref:v1:{sid}" if previous else ""
+                    if raw_value:
+                        vault_write_attempted = True
+                        vault_ref=store.put_secret(sid, raw_value)
+                    c.execute("""INSERT INTO secret_index(id,subject,scope,secret_type,locator,value,purpose,source,confidence,salience,status,last_verified_at,created_at,updated_at,hash,vault_ref,aliases_json,metadata_json,visibility_scope,origin_bot_id,origin_session_id,origin_chat_hash,project_id)
                              VALUES(?,?,?,?,?,'',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                              ON CONFLICT(hash) DO UPDATE SET subject=excluded.subject,scope=excluded.scope,secret_type=excluded.secret_type,
                                locator=excluded.locator,purpose=excluded.purpose,source=excluded.source,confidence=excluded.confidence,
                                salience=excluded.salience,status='active',updated_at=excluded.updated_at,
                                vault_ref=CASE WHEN excluded.vault_ref<>'' THEN excluded.vault_ref ELSE secret_index.vault_ref END,
                                aliases_json=excluded.aliases_json,metadata_json=excluded.metadata_json,value=''""",
-                          (sid,subject,scope,typ,locator,purpose,source,clamp(float(a.get("confidence",.85))),clamp(float(a.get("salience",.85))),'active',ts,ts,ts,h,vault_ref,json.dumps(aliases,ensure_ascii=False),json.dumps(metadata,ensure_ascii=False,sort_keys=True),owner['visibility_scope'],owner['origin_bot_id'],owner['origin_session_id'],owner['origin_chat_hash'],owner['project_id']))
-        except Exception:
-            if raw_value:
-                try: store.restore_wrapped(sid, previous)
-                except Exception as rollback_exc: _debug_log(f"secret vault compensation failed: {_safe_exception_label(rollback_exc)}")
-            raise
+                              (sid,subject,scope,typ,locator,purpose,source,clamp(float(a.get("confidence",.85))),clamp(float(a.get("salience",.85))),'active',ts,ts,ts,h,vault_ref,json.dumps(aliases,ensure_ascii=False),json.dumps(metadata,ensure_ascii=False,sort_keys=True),owner['visibility_scope'],owner['origin_bot_id'],owner['origin_session_id'],owner['origin_chat_hash'],owner['project_id']))
+            except BaseException:
+                # Only confirmed SQL rollback permits compensation. UNKNOWN
+                # retains the real owner/primary; restoring the vault could
+                # otherwise undo a value already referenced by committed SQL.
+                if vault_write_attempted and getattr(self, "_transaction_quarantine", None) is None:
+                    try:
+                        store.restore_wrapped(sid, previous)
+                    except BaseException as rollback_exc:
+                        # Neither compensation nor its diagnostic may replace
+                        # the original SQL/store exception (including cancel).
+                        try: _debug_log(f"secret vault compensation failed: {_safe_exception_label(rollback_exc)}")
+                        except BaseException: pass
+                raise
         claim=f"Secret index: {subject} / {scope} ({typ}) locator={locator or 'n/a'} purpose={purpose or 'n/a'} value=<stored in Hermes Vault>"
         cid=""; post_commit_errors=[]
         try:
