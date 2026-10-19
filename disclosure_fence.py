@@ -419,7 +419,7 @@ class DisclosureFence:
         No worker/federation/terminal-delivery authority is created here.
         """
         try:
-            if (self.claim_copy is not None or self.purposes or self.foreign
+            if (not self.ok or self.claim_copy is not None or self.purposes or self.foreign
                     or self.worker is not None or self.source_conn is not None
                     or self.conn.in_transaction or not self._same()):
                 raise DeliveryWithheld('claim_copy_original_owner_required')

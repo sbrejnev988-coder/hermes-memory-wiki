@@ -21,6 +21,7 @@ import ipaddress
 import json
 import os
 from pathlib import Path
+import re
 import sqlite3
 import sys
 import time
@@ -87,7 +88,7 @@ FENCE = fencing.DisclosureFence
 UNIT_NAMES = ('_validated_http_endpoint', '_normalized_qdrant_endpoint',
               '_claim_vector_target_hash', '_claim_target_payload', '_record_claim_vector_target')
 units = {'__name__': '_foreign_sql_units', 'hashlib': hashlib, 'json': json,
-         'ipaddress': ipaddress, 'urllib': urllib, 'time': time, 'sqlite3': sqlite3,
+         'ipaddress': ipaddress, 'urllib': urllib, 're': re, 'time': time, 'sqlite3': sqlite3,
          'contextmanager': contextmanager, 'nullcontext': nullcontext,
          '_DisclosureFence': FENCE, '_DeliveryWithheld': fencing.DeliveryWithheld}
 for name in ('QDRANT_CLAIM_PAYLOAD_VERSION', '_CLAIM_VECTOR_TARGETS_TABLE'):

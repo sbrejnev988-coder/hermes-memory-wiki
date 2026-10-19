@@ -3,7 +3,7 @@
   "status": "SOURCE_CHECKPOINT_NOT_NATIVE_ADMISSION",
   "frozen_provider_sha256": "3b5318cafa62dad23870aecd515ba0786548c2502cdd82022f96093c164295fc",
   "needs_final_rebind": false,
-  "input_inventory_sha256": "77f16553e1b2e87223c8384ce89e83e6864c1e84a9dc9902addc68c5d4825879",
+  "input_inventory_sha256": "a6ad7bf1d859e31a1a708912d5d5a036334c5b32aa42c64dd2797d965b627228",
   "cold_processes": {
     "strict": {
       "HERMES_SECURITY_STRICT": "1",
@@ -567,7 +567,7 @@
     },
     {
       "path": "tests/ci_owned/foreign_reindex_cases.py",
-      "sha256": "5aaef00b289d29fe829f39060ae21c4a8213d32867ad6d922a048329c426108c",
+      "sha256": "d40e9041048708a143b69e5f458cb20894bb5a535efd6cfc881e584a20438cdd",
       "role": "source-only",
       "lane": "source-explicit",
       "entry": {
