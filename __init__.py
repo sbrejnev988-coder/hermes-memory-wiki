@@ -14784,14 +14784,22 @@ class MemoryWikiProvider(MemoryProvider):
 
 
     @contextmanager
-    def _claim_transaction(self, conn=None, *, join=False, adopt=False, begin="IMMEDIATE", _terminal=None, _document_hook=None, _document_ingest=None, _graph_effect=None, _event_job=None):
+    def _claim_transaction(self, conn=None, *, join=False, adopt=False, begin="IMMEDIATE", _terminal=None, _document_hook=None, _document_ingest=None, _graph_effect=None, _event_job=None, _rollback_receipt=None):
         """One SQLite owner stage; joined callers never commit another owner's TX.
 
         Used by claim/ledger owners and the private writer's native context API.
         This is process-local bookkeeping, not permission or a recovery service.
+        An optional empty plain list observes only this standalone shared
+        owner's confirmed rollback; it never grants writer/cleanup authority.
         """
         if begin not in {"", "IMMEDIATE", "EXCLUSIVE"} or (join and adopt):
             raise ValueError("invalid_claim_transaction_mode")
+        if _rollback_receipt is not None and (
+                type(_rollback_receipt) is not list or _rollback_receipt
+                or join or adopt or begin != "IMMEDIATE"
+                or any(value is not None for value in (
+                    _terminal, _document_hook, _document_ingest, _graph_effect, _event_job))):
+            raise ValueError("invalid_claim_rollback_receipt_mode")
         with self._lock:
             c = self._connect() if conn is None else conn
             self._require_claim_writer(c)
@@ -14823,6 +14831,12 @@ class MemoryWikiProvider(MemoryProvider):
                 raise RuntimeError("claim_transaction_owner_pending")
             if previous is not None and (previous is not c or previous_thread != threading.get_ident()):
                 raise RuntimeError("claim_transaction_owner_pending")
+            if _rollback_receipt is not None and (
+                    c is not self._conn or c is not self._owned_conn
+                    or previous is not None or previous_thread is not None
+                    or previous_document_stage is not None or previous_graph_stage is not None
+                    or previous_event_job_stage is not None or previous_prefetch_terminal is not None):
+                raise RuntimeError("claim_rollback_receipt_requires_standalone_owner")
             owns = not active or adopt
             if _terminal is not None:
                 if (type(_terminal) is not _TerminalDelivery or _current_delivery(self) is not _terminal
@@ -15010,6 +15024,13 @@ class MemoryWikiProvider(MemoryProvider):
             except BaseException as primary:
                 rolled_back = self._rollback_claim_transaction(c, primary, commit_attempted=commit_attempted)
                 completed = rolled_back
+                if _rollback_receipt is not None and rolled_back is True:
+                    try:
+                        # Publish only AFTER the existing rollback positively
+                        # returned. Retirement is still required by the reader.
+                        _rollback_receipt.append((c, document_stage[1], primary))
+                    except BaseException:
+                        pass  # Lost observation must not replace the primary.
                 if (_document_hook is not None and _document_hook.started
                         and not _document_hook.commit_returned):
                     _document_hook.rollback_completed = rolled_back
@@ -22500,8 +22521,9 @@ class MemoryWikiProvider(MemoryProvider):
         # and serialize compensation with it. Do not touch a caller's TX.
         with self._lock:
             vault_write_attempted = False
+            rollback_receipt = []  # Fresh observation for this exact attempt.
             try:
-                with self._claim_transaction() as c:
+                with self._claim_transaction(_rollback_receipt=rollback_receipt) as c:
                     store=self._get_secret_store()
                     previous=store.wrapped_snapshot(sid)
                     vault_ref=f"vaultref:v1:{sid}" if previous else ""
@@ -22516,11 +22538,27 @@ class MemoryWikiProvider(MemoryProvider):
                                vault_ref=CASE WHEN excluded.vault_ref<>'' THEN excluded.vault_ref ELSE secret_index.vault_ref END,
                                aliases_json=excluded.aliases_json,metadata_json=excluded.metadata_json,value=''""",
                               (sid,subject,scope,typ,locator,purpose,source,clamp(float(a.get("confidence",.85))),clamp(float(a.get("salience",.85))),'active',ts,ts,ts,h,vault_ref,json.dumps(aliases,ensure_ascii=False),json.dumps(metadata,ensure_ascii=False,sort_keys=True),owner['visibility_scope'],owner['origin_bot_id'],owner['origin_session_id'],owner['origin_chat_hash'],owner['project_id']))
-            except BaseException:
+            except BaseException as primary:
                 # Only confirmed SQL rollback permits compensation. UNKNOWN
                 # retains the real owner/primary; restoring the vault could
                 # otherwise undo a value already referenced by committed SQL.
-                if vault_write_attempted and getattr(self, "_transaction_quarantine", None) is None:
+                try:
+                    rollback_proven = (
+                        vault_write_attempted and len(rollback_receipt) == 1
+                        and type(rollback_receipt[0]) is tuple and len(rollback_receipt[0]) == 3
+                        and rollback_receipt[0][0] is c
+                        and type(rollback_receipt[0][1]) is int
+                        and rollback_receipt[0][1] == threading.get_ident()
+                        and rollback_receipt[0][2] is primary
+                        and c is self._conn and c is self._owned_conn
+                        and self._lifecycle_state not in {"failed", "quarantined", "stopping"}
+                        and self._transaction_quarantine is None and self._transaction_primary is None
+                        and self._claim_tx_connection is None and self._claim_tx_thread is None
+                        and self._claim_tx_document_stage is None and self._claim_tx_graph_stage is None
+                        and self._claim_tx_event_job_stage is None and not c.in_transaction)
+                except BaseException:
+                    rollback_proven = False  # An unreadable proof proves nothing.
+                if rollback_proven:
                     try:
                         store.restore_wrapped(sid, previous)
                     except BaseException as rollback_exc:

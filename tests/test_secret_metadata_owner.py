@@ -371,6 +371,170 @@ class SyntheticCancel(BaseException):
     pass
 
 
+# Primitive SOURCE witnesses only. Test-local manager/primary references in the
+# observer below are intentional identity oracles, not a GC/lifetime proof.
+F1_WITNESSES = []
+
+
+def f1_observe(p, callback, *, label, primary, seam=None, injected=None, mutate=None):
+    """Observe real extracted owner/stdlib exit; never replace either callable.
+
+    A throwing profile disables itself. A separate passive trace observes the
+    actual rollback, consumer unwind and compensation after that injection.
+    The optional mutator only invalidates the test-local observation list.
+    """
+    base = type(p).__mro__[1]
+    owner_code = base._claim_transaction.__wrapped__.__code__
+    add_code = base._add_secret.__code__
+    rollback_code = base._rollback_claim_transaction.__code__
+    restore_code = SyntheticStore.restore_wrapped.__code__
+    pending_code = type(p)._claim_journal_pending_commit.__code__
+    manager_type = contextmanager.__globals__["_GeneratorContextManager"]
+    enter_code, exit_code = manager_type.__enter__.__code__, manager_type.__exit__.__code__
+    instructions = list(dis.get_instructions(owner_code))
+    # The first return AFTER the document-postcommit tail is the owning normal
+    # fallthrough. Neither the earlier join return nor the RLock exception-
+    # suppression handler's later return is this boundary.
+    tail = next(i.offset for i in instructions if i.argval == "_after_document_claims_commit")
+    owner_return = next(i.offset for i in instructions if i.offset > tail and i.opname == "RETURN_VALUE")
+    exit_return = next(i.offset for i in dis.get_instructions(exit_code) if i.opname == "RETURN_VALUE")
+    proof_offset = next(i.offset for i in dis.get_instructions(add_code)
+                        if i.opname.startswith("LOAD_FAST") and i.argval == "vault_write_attempted")
+    opnames = {i.offset: i.opname for i in instructions}
+    thread = threading.get_ident()
+    binding, events, injections = {}, [], []
+    old_profile, old_trace = sys.getprofile(), sys.gettrace()
+
+    def record(event, **fields):
+        row = {"case": label, "event": event, **fields}
+        F1_WITNESSES.append(row)
+        return row
+
+    def retired():
+        return (p._claim_tx_connection is None and p._claim_tx_thread is None
+                and p._claim_tx_document_stage is None and p._claim_tx_graph_stage is None
+                and p._claim_tx_event_job_stage is None)
+
+    def positive(receipt):
+        return (type(receipt) is list and len(receipt) == 1
+                and type(receipt[0]) is tuple and len(receipt[0]) == 3
+                and receipt[0][0] is p.sql and receipt[0][1] == thread
+                and receipt[0][2] is primary)
+
+    def observe(frame, event, arg):
+        if threading.get_ident() != thread:
+            return None
+        code = frame.f_code
+        if code is restore_code and event == "call" and frame.f_locals.get("self") is p.store:
+            caller = frame.f_back
+            events.append("restore")
+            record("restore_after_proof", rollback_true_seen="rollback_true" in events,
+                   receipt_matches=caller.f_code is add_code and positive(caller.f_locals.get("rollback_receipt")),
+                   retired=retired(), idle=not p.sql.in_transaction,
+                   quarantine_absent=p._transaction_quarantine is None)
+            return None
+        if code is rollback_code and frame.f_locals.get("self") is p:
+            if event == "return" and arg is True:
+                events.append("rollback_true")
+                record("actual_rollback_return_true", connection_matches=frame.f_locals.get("conn") is p.sql,
+                       primary_matches=frame.f_locals.get("primary") is primary,
+                       idle=not p.sql.in_transaction)
+            return observe
+        if code is add_code and frame.f_locals.get("self") is p:
+            if event == "call" and mutate is not None:
+                frame.f_trace_opcodes = True
+            if event == "exception" and arg[1] is primary:
+                events.append("consumer_primary")
+                record("consumer_original_primary", retired=retired(), idle=not p.sql.in_transaction)
+            if (event == "opcode" and frame.f_lasti == proof_offset and mutate is not None
+                    and "mutated" not in events):
+                receipt = frame.f_locals["rollback_receipt"]
+                assert positive(receipt) and retired() and not p.sql.in_transaction
+                record("invalidate_observation_before_read", original_receipt_matches=True,
+                       rollback_true_seen="rollback_true" in events)
+                mutate(receipt)
+                events.append("mutated")
+            return observe
+        return None
+
+    def profile(frame, event, arg):
+        if threading.get_ident() != thread:
+            return
+        code, local = frame.f_code, frame.f_locals
+        if code is owner_code and local.get("self") is p:
+            if event == "call" and frame.f_back.f_code is enter_code:
+                manager = frame.f_back.f_locals["self"]
+                assert type(manager) is manager_type and manager.gen.gi_code is owner_code
+                assert manager.gen.gi_frame is frame and "manager" not in binding
+                binding["manager"] = manager
+            if event == "return" and frame.f_lasti == owner_return:
+                assert arg is None and opnames[frame.f_lasti] == "RETURN_VALUE"
+                assert binding["manager"].gen.gi_frame is frame
+                events.append("owner_normal_return")
+                if seam == "owner_return":
+                    inject(frame, "owner_return", normal_return=True, exact_manager=True,
+                           return_opcode="RETURN_VALUE", return_offset=owner_return,
+                           completed=local.get("completed") is True,
+                           commit_attempted=local.get("commit_attempted") is True,
+                           connection_matches=local.get("c") is p.sql,
+                           receipt_empty=local.get("_rollback_receipt") == [])
+            receipt = local.get("_rollback_receipt")
+            if (seam in {"publish_call", "publish_return"} and event ==
+                    ("c_call" if seam == "publish_call" else "c_return")
+                    and getattr(arg, "__self__", None) is receipt
+                    and getattr(arg, "__name__", None) == "append"):
+                assert local.get("primary") is primary and local.get("rolled_back") is True
+                inject(frame, seam, rollback_returned_true="rollback_true" in events,
+                       receipt_matches=positive(receipt), publication_before_retirement=not retired())
+        elif (code is exit_code and event == "return" and frame.f_lasti == exit_return
+              and local.get("self") is binding.get("manager") and seam == "context_exit"):
+            assert local.get("typ") is None and arg is False
+            assert local["self"].gen.gi_frame is None and "owner_normal_return" in events
+            inject(frame, "context_exit", normal_return=True, generator_completed=True,
+                   return_opcode="RETURN_VALUE", return_offset=exit_return,
+                   same_manager=True, owner_normal_return_seen=True)
+        elif (code is pending_code and event == "return" and local.get("self") is p
+              and seam == "pending"):
+            assert p.sql.pending and p._claim_tx_connection is p.sql and p.sql.in_transaction
+            inject(frame, "pending_after_body", body_finished=True, commit_not_attempted=p.sql.commits == 0)
+        elif (code is add_code and event == "c_call" and arg is builtins.len and seam == "read"
+              and local.get("self") is p and local.get("primary") is primary):
+            assert positive(local["rollback_receipt"]) and retired()
+            inject(frame, "proof_read", positive_before_fault=True)
+
+    def inject(frame, event, **fields):
+        assert not injections
+        rows = p.sql.rows("secret_index")
+        row = record("BEFORE_" + event, exact_thread=threading.get_ident() == thread,
+                     exact_code=frame.f_code in {owner_code, exit_code, pending_code, add_code},
+                     commit_events=p.sql.events.count("commit"), commits=p.sql.commits,
+                     rollbacks=p.sql.rollbacks, idle=not p.sql.in_transaction,
+                     retired=retired(), quarantine_absent=p._transaction_quarantine is None,
+                     metadata_rows=len(rows), value_present=bool(p.store.values), **fields)
+        if event in {"owner_return", "context_exit"}:
+            assert row["commits"] == 1 and row["rollbacks"] == 0
+            assert row["idle"] and row["retired"] and row["quarantine_absent"]
+            assert len(rows) == 1 and rows[0][14] == "vaultref:v1:" + rows[0][0]
+        injections.append(event)  # Witness is saved BEFORE raising the fault.
+        raise injected if injected is not None else primary
+
+    result, error = None, None
+    try:
+        sys.settrace(observe)
+        sys.setprofile(profile)
+        try:
+            result = callback()
+        except BaseException as escaped:
+            error = escaped
+    finally:
+        sys.setprofile(old_profile)
+        sys.settrace(old_trace)
+    assert sys.getprofile() is old_profile and sys.gettrace() is old_trace
+    if seam is not None:
+        assert len(injections) == 1, "required_exact_fault_boundary_not_observed"
+    return result, error, events
+
+
 class SecretMetadataOwnerTests(unittest.TestCase):
     namespace = None
 
@@ -688,6 +852,227 @@ class SecretMetadataOwnerTests(unittest.TestCase):
         self.assertEqual(p.callbacks, [])
         self.assertEqual((p.sql.commits, p.sql.rollbacks), (0, 1))
         p.assert_idle()
+
+
+    def assert_f1_committed(self, p, error, primary):
+        self.assertIs(error, primary)
+        sid = self.sid()
+        self.assertEqual(p.store.values[sid], "synthetic-wrapped:" + digest(VALUE.encode()))
+        self.assertEqual(p.store.events, ["snapshot", "put"])
+        self.assertNotIn("restore", p.store.events)
+        self.assertEqual(len(p.sql.rows("secret_index")), 1)
+        self.assertEqual(p.sql.rows("secret_index")[0][0], sid)
+        self.assertEqual(p.sql.rows("secret_index")[0][14], "vaultref:v1:" + sid)
+        self.assertEqual(p.sql.pending, [])
+        self.assertEqual((p.sql.commits, p.sql.rollbacks), (1, 0))
+        self.assertEqual(p.callbacks, [])
+        p.assert_idle()
+
+    def test_17_F1_actual_owner_normal_final_return_keeps_new_and_rotated_value(self):
+        for previous in (None, "synthetic-old-wrapped"):
+            p = receiver_class(self.namespace)()
+            if previous is not None:
+                p.store.values[self.sid()] = previous
+            primary = SyntheticCancel("actual owner normal final return")
+            result, error, events = f1_observe(p, lambda: p._add_secret(self.arguments()),
+                label=self._testMethodName + (".rotation" if previous else ".new"),
+                primary=primary, seam="owner_return")
+            self.assertIsNone(result)
+            self.assert_f1_committed(p, error, primary)
+            self.assertIn("consumer_primary", events)  # Separate trace survived the profile fault.
+            self.assertNotIn("rollback_true", events)
+            healthy = p._add_secret(self.arguments(value="invented-next-value"))
+            self.assertEqual(healthy["id"], self.sid())
+            p.assert_idle()
+
+    def test_18_F1_actual_contextlib_normal_exit_keeps_new_and_rotated_value(self):
+        for previous in (None, "synthetic-old-wrapped"):
+            p = receiver_class(self.namespace)()
+            if previous is not None:
+                p.store.values[self.sid()] = previous
+            primary = SyntheticCancel("actual contextlib normal exit return")
+            result, error, events = f1_observe(p, lambda: p._add_secret(self.arguments()),
+                label=self._testMethodName + (".rotation" if previous else ".new"),
+                primary=primary, seam="context_exit")
+            self.assertIsNone(result)
+            self.assert_f1_committed(p, error, primary)
+            self.assertIn("owner_normal_return", events)
+            self.assertIn("consumer_primary", events)
+            self.assertNotIn("rollback_true", events)
+
+    def test_19_F1_body_finished_precommit_and_commit_before_effect_still_compensate(self):
+        for phase in ("pending", "commit_before_effect"):
+            p = receiver_class(self.namespace)()
+            previous = "synthetic-old-wrapped"
+            p.store.values[self.sid()] = previous
+            primary = SyntheticCancel("body finished but owner not committed")
+            if phase == "commit_before_effect":
+                p.sql.commit_primary = primary
+            result, error, events = f1_observe(p, lambda: p._add_secret(self.arguments()),
+                label=self._testMethodName + "." + phase, primary=primary,
+                seam="pending" if phase == "pending" else None)
+            self.assertIsNone(result)
+            self.assertIs(error, primary)
+            self.assertEqual(p.store.values[self.sid()], previous)
+            self.assertEqual(p.store.events, ["snapshot", "put", "restore"])
+            self.assertEqual(p.sql.committed, [])
+            self.assertEqual(p.sql.pending, [])
+            self.assertEqual(p.sql.events, ["begin", "insert:secret_index"] +
+                             (["commit"] if phase == "commit_before_effect" else []) + ["rollback"])
+            self.assertLess(events.index("rollback_true"), events.index("restore"))
+            self.assertEqual(p.callbacks, [])
+            p.assert_idle()
+            p.sql.commit_primary = None
+            p._add_secret(self.arguments())
+            p.assert_idle()
+
+    def test_20_F1_receipt_refusals_before_effects_and_default_None_join_compatibility(self):
+        class NotPlainList(list):
+            pass
+
+        variants = [(value, {}) for value in ({}, (), [None], NotPlainList())]
+        variants += [([], {key: True}) for key in ("join", "adopt")]
+        variants += [([], {"begin": "EXCLUSIVE"}), ([], {"_terminal": object()})]
+        for receipt, options in variants:
+            p = receiver_class(self.namespace)()
+            with self.assertRaisesRegex(ValueError, "^invalid_claim_rollback_receipt_mode$"):
+                with p._claim_transaction(_rollback_receipt=receipt, **options):
+                    self.fail("receipt_refusal_entered_body")
+            self.assertEqual(p.sql.events, [])
+            self.assertEqual(p.store_open, 0)
+            self.assertEqual(p.store.events, [])
+            p.assert_idle()
+        p = self.p
+        with p._claim_transaction() as c:
+            c.execute("INSERT synthetic_caller", ("default-owner",))
+            with p._claim_transaction(c, join=True, _rollback_receipt=None) as joined:
+                self.assertIs(joined, c)
+                self.assertEqual((c.commits, c.rollbacks), (0, 0))
+            with self.assertRaisesRegex(RuntimeError, "^claim_transaction_requires_idle_owner$"):
+                with p._claim_transaction(_rollback_receipt=[]):
+                    self.fail("receipt_adopted_caller")
+            self.assertIs(p._claim_tx_connection, c)
+            self.assertEqual(c.pending, [("synthetic_caller", ("default-owner",))])
+        self.assertEqual((p.sql.commits, p.sql.rollbacks), (1, 0))
+        p.assert_idle()
+
+    def test_21_F1_receipt_positive_exact_owner_only_never_COMMITTED_or_UNKNOWN(self):
+        for phase in ("rollback", "commit", "rollback_unknown", "commit_unknown", "journal_unknown"):
+            p = receiver_class(self.namespace)()
+            receipt, primary = [], SyntheticCancel("receipt owner primary")
+            if phase == "rollback_unknown":
+                p.sql.rollback_primary = RuntimeError("synthetic rollback refusal")
+            if phase == "commit_unknown":
+                p.sql.commit_primary, p.sql.commit_then_raise = primary, True
+            if phase == "journal_unknown":
+                p.journal_primary = primary
+            error = None
+            try:
+                with p._claim_transaction(_rollback_receipt=receipt) as c:
+                    c.execute("INSERT synthetic_caller", (phase,))
+                    if phase in {"rollback", "rollback_unknown"}:
+                        raise primary
+            except BaseException as escaped:
+                error = escaped
+            if phase == "rollback":
+                self.assertIs(error, primary)
+                self.assertEqual(len(receipt), 1)
+                self.assertIs(type(receipt[0]), tuple)
+                self.assertIs(receipt[0][0], p.sql)
+                self.assertEqual(receipt[0][1], threading.get_ident())
+                self.assertIs(receipt[0][2], primary)
+                self.assertEqual(p.sql.committed, [])
+                p.assert_idle()
+                with self.assertRaisesRegex(ValueError, "^invalid_claim_rollback_receipt_mode$"):
+                    with p._claim_transaction(_rollback_receipt=receipt):
+                        self.fail("nonempty_receipt_reused")
+                self.assertEqual((p.sql.commits, p.sql.rollbacks), (0, 1))
+            else:
+                self.assertEqual(receipt, [])
+                if phase == "commit":
+                    self.assertIsNone(error)
+                    self.assertEqual(p.sql.committed, [("synthetic_caller", (phase,))])
+                    p.assert_idle()
+                else:
+                    self.assertIs(error, primary)
+                    self.assertIs(p._transaction_quarantine, p.sql)
+                    self.assertIs(p._transaction_primary, primary)
+                    self.assertIs(p._claim_tx_connection, p.sql)
+                    before = list(p.sql.events)
+                    with self.assertRaisesRegex(RuntimeError, "^provider_lifecycle_not_ready$"):
+                        with p._claim_transaction(_rollback_receipt=[]):
+                            self.fail("UNKNOWN_retried")
+                    self.assertEqual(p.sql.events, before)
+
+    def test_22_F1_receipt_publication_fault_preserves_primary_and_observed_effect(self):
+        for seam in ("publish_call", "publish_return"):
+            p = receiver_class(self.namespace)()
+            primary, secondary = SyntheticCancel("original SQL failure"), SyntheticCancel("publication fault")
+            p.sql.insert_primary = primary
+            result, error, events = f1_observe(p, lambda: p._add_secret(self.arguments()),
+                label=self._testMethodName + "." + seam, primary=primary, seam=seam, injected=secondary)
+            self.assertIsNone(result)
+            self.assertIs(error, primary)
+            self.assertIsNot(error, secondary)
+            self.assertIn("consumer_primary", events)
+            self.assertIn("rollback_true", events)
+            self.assertEqual(p.sql.committed, [])
+            self.assertEqual(p.sql.pending, [])
+            self.assertEqual((p.sql.commits, p.sql.rollbacks), (0, 1))
+            if seam == "publish_call":
+                self.assertEqual(p.store.events, ["snapshot", "put"])
+                self.assertIn(self.sid(), p.store.values)  # No invented proof/unsafe deletion.
+                self.assertNotIn("restore", events)
+            else:
+                self.assertEqual(p.store.events, ["snapshot", "put", "restore"])
+                self.assertEqual(p.store.values, {})  # Actual appended positive proof remains valid.
+            p.assert_idle()
+
+    def test_23_F1_receipt_read_fault_keeps_original_primary_without_compensation(self):
+        p = self.p
+        primary, secondary = SyntheticCancel("original SQL failure"), SyntheticCancel("proof read fault")
+        p.sql.insert_primary = primary
+        result, error, events = f1_observe(p, lambda: p._add_secret(self.arguments()),
+            label=self._testMethodName, primary=primary, seam="read", injected=secondary)
+        self.assertIsNone(result)
+        self.assertIs(error, primary)
+        self.assertIsNot(error, secondary)
+        self.assertIn("rollback_true", events)
+        self.assertNotIn("restore", events)
+        self.assertEqual(p.store.events, ["snapshot", "put"])
+        self.assertIn(self.sid(), p.store.values)
+        self.assertEqual(p.sql.committed, [])
+        self.assertEqual(p.sql.pending, [])
+        p.assert_idle()
+
+    def test_24_F1_nonmatching_or_missing_observation_never_authorizes_compensation(self):
+        for mismatch in ("connection", "thread", "primary", "shape", "missing"):
+            p = receiver_class(self.namespace)()
+            primary = SyntheticCancel("original SQL failure")
+            p.sql.insert_primary = primary
+
+            def invalidate(receipt):
+                connection, thread, error = receipt[0]
+                if mismatch == "connection": connection = object()
+                elif mismatch == "thread": thread += 1
+                elif mismatch == "primary": error = SyntheticCancel("foreign primary")
+                receipt[:] = ([] if mismatch == "missing" else
+                              [[connection, thread, error]] if mismatch == "shape" else
+                              [(connection, thread, error)])
+
+            result, error, events = f1_observe(p, lambda: p._add_secret(self.arguments()),
+                label=self._testMethodName + "." + mismatch, primary=primary, mutate=invalidate)
+            self.assertIsNone(result)
+            self.assertIs(error, primary)
+            self.assertIn("mutated", events)
+            self.assertIn("rollback_true", events)
+            self.assertNotIn("restore", events)
+            self.assertEqual(p.store.events, ["snapshot", "put"])
+            self.assertIn(self.sid(), p.store.values)
+            self.assertEqual(p.sql.committed, [])
+            self.assertEqual(p.sql.pending, [])
+            self.assertEqual((p.sql.commits, p.sql.rollbacks), (0, 1))
+            p.assert_idle()
 
 
 def make_suite(raw, source, scratch, case_names):
