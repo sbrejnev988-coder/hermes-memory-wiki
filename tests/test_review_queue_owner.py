@@ -293,9 +293,9 @@ class NativeReviewQueueOwner(unittest.TestCase):
             if event != "call":
                 return
             if (frame.f_code is public_wrapper and frame.f_locals.get("self") is self.p
-                    and frame.f_locals.get("__name") == "handle_tool_call" and entry_seen is not None):
-                # Public wrapper precedes _new_recall_request's real identity
-                # PRAGMA (it may wait on the SAME provider writer lock first).
+                    and frame.f_locals.get("tool_name") == "memory_wiki_recall" and entry_seen is not None):
+                # Actual outer bounded_scope_dispatch has tool_name, not the
+                # inner scoped wrapper's __name; observe before identity SQL.
                 entry_seen.set()
             if frame.f_code is terminal and frame.f_locals["self"].provider is self.p:
                 deliveries.append(frame.f_locals["self"])
