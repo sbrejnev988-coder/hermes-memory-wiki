@@ -1,13 +1,14 @@
-"""Genuine-native offline review writer lifetime regressions (stdlib unittest).
+"""Genuine-native offline review/maintenance writer regressions (unittest).
 
 Fresh per-case plugin namespace/home before import, real SDK/registry/trust and
 SQLite. No Connection/execute/gate replacements. Exact-code profile observers
-pause only after the production review INSERT has actually returned. UNKNOWN
+pause only after production INSERT/UPDATE has actually returned. UNKNOWN
 is asserted and recorded before fixture-owned physical close, never reset.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
+import hashlib
 import importlib.util
 import json
 import os
@@ -33,6 +34,29 @@ CASE_NAMES = (
     "test_08_foreign_thread_begin_remains_unknown_after_owner_rollback",
     "test_09_queue_rollback_denied_retains_exact_primary_and_owner",
 )
+MAINTENANCE_CASE_NAMES = (
+    "test_10_admin_ordinary_writer_public_reader_handoff",
+    "test_11_admin_populated_graph_writer_public_reader_handoff",
+    "test_12_admin_late_primary_rolls_back_graph_not_committed_ordinary_prefix",
+)
+CASE_NAMES += MAINTENANCE_CASE_NAMES
+
+# Canonical offline legacy fixture (7 graph rows + 3 FTS rows); deliberately
+# shipped here, with no import from evidence or another checkout. All seed
+# connections close before the genuine provider constructor/initialize.
+BARE = "ghp_" + "SYNTHETIC0123456789ABCD"
+ASSIGNMENT = "OWNED_FIXTURE_0123456789"
+MIXED = "ordinary note " + BARE + " password=" + ASSIGNMENT
+LATE_MARKER = "native-populated-line-stop"
+ORDINARY_ID = "rq_owned_legacy_populated"
+ORDINARY = "Owned legacy review <memory-context>owned stale recall</memory-context> remains."
+RAW_REPO, RAW_PATH = "repo-" + BARE, "src/" + BARE + ".py"
+RAW_SYMBOL, RAW_CHUNK = "symbol-" + BARE, "chunk-" + BARE
+RAW_LINE, RAW_EDGE, RAW_EVENT = "line-" + BARE, "edge-" + BARE, "event-" + BARE
+GRAPH_TABLES = ("code_graph_repositories", "code_graph_files", "code_graph_symbols",
+                "code_graph_chunks", "code_graph_lines", "code_graph_edges", "code_graph_events")
+GRAPH_IMAGE_TABLES = GRAPH_TABLES + ("code_graph_symbols_fts", "code_graph_chunks_fts",
+    "code_graph_lines_fts", "code_graph_identity_provenance", "code_graph_identity_migrations")
 
 
 def unwrapped(function):
@@ -137,6 +161,8 @@ class NativeReviewQueueOwner(unittest.TestCase):
         self.assertIs(self.m._sanitize_recalled, trust.sanitize_recalled)
         self.assertTrue(self.m._INJECTION_GUARD_AVAILABLE)
         self.assertNotIn("agent.memory_manager", sys.modules)
+        if label in MAINTENANCE_CASE_NAMES:
+            self.create_offline_legacy_fixture()
         self.p = self.m.MemoryWikiProvider()
         self.p.initialize("synthetic-review-chat", hermes_home=str(self.home),
                           agent_context="primary", bot_id="synthetic-review-bot",
@@ -153,6 +179,8 @@ class NativeReviewQueueOwner(unittest.TestCase):
             self.assertTrue(identity["profile_ready"], identity)
             self.assertEqual(Path(identity["request_home"]), self.home.resolve())
         self.assert_ready()
+        if label in MAINTENANCE_CASE_NAMES:
+            self.assert_legacy_premise()
         self.record("initialized", namespace=self.namespace, module_file=self.m.__file__,
                     import_home=str(self.m._IMPORT_HERMES_HOME), state=self.state())
 
@@ -649,6 +677,342 @@ class NativeReviewQueueOwner(unittest.TestCase):
             self.assertTrue(self.conn.in_transaction)
         self.assertEqual(self.accounting(), before)
         self.record("native_review_rollback_denied", exact_primary_retained=True, state=self.state())
+
+
+    @property
+    def graph(self):
+        return sys.modules[self.namespace + ".code_knowledge_graph"]
+
+    def graph_row_image(self, connection):
+        return {table: [tuple(row) for row in connection.execute(
+            f"SELECT * FROM {table} ORDER BY rowid").fetchall()]
+                for table in GRAPH_IMAGE_TABLES}
+
+    def create_offline_legacy_fixture(self):
+        """Canonical versionless base/legacy DDL, never live-handle raw seeding."""
+        self.assertFalse(hasattr(self, "p"))
+        path = self.home / "memory-wiki" / "memory_wiki.sqlite3"
+        path.parent.mkdir(parents=True, exist_ok=False)
+        self.assertFalse(path.exists())
+        with closing(sqlite3.connect(str(path))) as offline, offline:
+            self.assertIs(type(offline), sqlite3.Connection)
+            offline.row_factory = sqlite3.Row
+            offline.execute('CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL)')
+            offline.execute("CREATE TABLE IF NOT EXISTS claims(\n                id TEXT PRIMARY KEY, claim TEXT NOT NULL, topic TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active',\n                confidence REAL NOT NULL DEFAULT .70, salience REAL NOT NULL DEFAULT .70, source TEXT NOT NULL DEFAULT '', evidence TEXT NOT NULL DEFAULT '',\n                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, freshness_at INTEGER NOT NULL, access_count INTEGER NOT NULL DEFAULT 0,\n                last_accessed INTEGER NOT NULL DEFAULT 0, hash TEXT NOT NULL UNIQUE)")
+            self.assertEqual(offline.execute("PRAGMA user_version").fetchone()[0], 0)
+            self.assertIs(self.m._assert_schema_compatible(offline), True)
+            self.graph.install_code_graph_schema(offline)
+            offline.execute("""CREATE TABLE IF NOT EXISTS review_queue(
+                id TEXT PRIMARY KEY, candidate TEXT NOT NULL, topic TEXT NOT NULL DEFAULT 'general', source TEXT NOT NULL DEFAULT '', evidence TEXT NOT NULL DEFAULT '',
+                reason TEXT NOT NULL DEFAULT '', suggested_claim TEXT NOT NULL DEFAULT '', suggested_topic TEXT NOT NULL DEFAULT '', confidence REAL NOT NULL DEFAULT .5,
+                salience REAL NOT NULL DEFAULT .5, status TEXT NOT NULL DEFAULT 'pending', claim_id TEXT NOT NULL DEFAULT '', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)""")
+            offline.execute("INSERT INTO review_queue(id,candidate,created_at,updated_at) VALUES(?,?,?,?)",
+                            (ORDINARY_ID, ORDINARY, 1, 1))
+            offline.execute("INSERT INTO code_graph_repositories(repository_id,root,graph_revision,snapshot_hash,stats_json,updated_at) VALUES(?,?,?,?,?,?)",
+                            (RAW_REPO, MIXED, "legacy-revision", "b" * 64, json.dumps({"notes": MIXED}), 1))
+            offline.execute("INSERT INTO code_graph_files(repository_id,file_path,file_hash,imports_json,updated_at) VALUES(?,?,?,?,?)",
+                            (RAW_REPO, RAW_PATH, "a" * 64, json.dumps([MIXED]), 1))
+            offline.execute("INSERT INTO code_graph_symbols(repository_id,symbol_id,file_path,qualified_name,short_name,signature,contract_json,search_text,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                            (RAW_REPO, RAW_SYMBOL, RAW_PATH, "owned_legacy", "owned_legacy", MIXED, json.dumps({"notes": MIXED}), MIXED, 1))
+            offline.execute("INSERT INTO code_graph_chunks(repository_id,chunk_id,file_path,symbol_id,qualified_name,graph_event_id,graph_payload_hash,chunk_text,embedding_text,search_text,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                            (RAW_REPO, RAW_CHUNK, RAW_PATH, RAW_SYMBOL, "owned_legacy", RAW_EVENT, "b" * 64, MIXED, MIXED, MIXED, 1))
+            offline.execute("INSERT INTO code_graph_lines(repository_id,file_path,line_no,line_id,anchor_hash,line_text,symbol_id,chunk_id,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                            (RAW_REPO, RAW_PATH, 1, RAW_LINE, "d" * 64, LATE_MARKER + " " + MIXED, RAW_SYMBOL, RAW_CHUNK, 1))
+            offline.execute("INSERT INTO code_graph_edges(repository_id,edge_id,source_id,predicate,target_id,source_file,target_file,evidence,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                            (RAW_REPO, RAW_EDGE, RAW_SYMBOL, "references", RAW_SYMBOL, RAW_PATH, RAW_PATH, MIXED, 1))
+            offline.execute("INSERT INTO code_graph_events(event_id,repository_id,payload_hash,stats_json,created_at) VALUES(?,?,?,?,?)",
+                            (RAW_EVENT, RAW_REPO, "b" * 64, json.dumps({"notes": MIXED}), 1))
+            for target, columns, source in (
+                ("code_graph_symbols_fts", "repository_id,symbol_id,file_path,qualified_name,signature,search_text", "code_graph_symbols"),
+                ("code_graph_chunks_fts", "repository_id,chunk_id,file_path,symbol_id,qualified_name,search_text,chunk_text", "code_graph_chunks"),
+                ("code_graph_lines_fts", "repository_id,file_path,line_no,line_text", "code_graph_lines"),
+            ):
+                offline.execute(f"INSERT INTO {target}({columns}) SELECT {columns} FROM {source}")
+            self._offline_graph = self.graph_row_image(offline)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            offline.execute("SELECT 1")
+        self.record("offline_legacy_closed_before_provider", graph_rows=7, fts_rows=3,
+                    raw_ids_not_registered=True, provider_constructed=False)
+
+    def assert_legacy_premise(self):
+        self.assertEqual(self.graph_row_image(self.conn), self._offline_graph)
+        self.assertEqual([len(self._offline_graph[t]) for t in GRAPH_TABLES], [1] * 7)
+        self.assertEqual([len(self._offline_graph[t]) for t in GRAPH_IMAGE_TABLES[-2:]], [0, 0])
+        row = self.conn.execute("SELECT * FROM review_queue WHERE id=?", (ORDINARY_ID,)).fetchone()
+        self.assertEqual(row["candidate"], ORDINARY)
+        self.assertEqual(row["visibility_scope"], "legacy")
+        self.assertEqual(tuple(row[name] for name in ("origin_bot_id", "origin_session_id", "origin_chat_hash", "project_id")), ("", "", "", ""))
+        self._ordinary_before = tuple(row)
+        self.ordinary_clean = self.m.short(self.m.redact_secrets(self.m.scrub_memory_artifacts(ORDINARY)), 4000)
+        self.assertNotEqual(self.ordinary_clean, ORDINARY)
+        self.assertIs(self.m.secret_scan(ORDINARY)["raw_secret"], False)
+        self.assertIsNone(self.p._secret_store)
+        self.assertIn(BARE, json.dumps(self._offline_graph))
+        self.assertIn(ASSIGNMENT, json.dumps(self._offline_graph))
+
+    def durable_image(self):
+        # Independent native readback, never attached to the provider.
+        with closing(sqlite3.connect(str(self.p.db_path))) as reader:
+            self.assertIsNot(reader, self.conn)
+            row = reader.execute("SELECT * FROM review_queue WHERE id=?", (ORDINARY_ID,)).fetchone()
+            self.assertIsNotNone(row)
+            return {"ordinary": tuple(row), "graph": self.graph_row_image(reader)}
+
+    def assert_ordinary_prefix(self, image):
+        self.assertEqual(image, self._ordinary_before[:1] + (self.ordinary_clean,) + self._ordinary_before[2:])
+        self.assertIsNone(self.p._secret_store)
+        self.assertEqual(self.conn.execute("SELECT count(*) FROM secret_quarantine").fetchone()[0], 0)
+
+    def terminal_fixture(self):
+        root = self.home / "context-coordination" / "done" / "code-shrinker"
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / "legacy.json"
+        with path.open("x", encoding="utf-8") as stream:
+            stream.write(json.dumps({"notes": MIXED}) + "\n")
+        return path
+
+    def terminal_snapshot(self):
+        root = self.home / "context-coordination"
+        return [(p.relative_to(root).as_posix(), hashlib.sha256(p.read_bytes()).hexdigest())
+                for p in sorted(root.rglob("*")) if p.is_file()]
+
+    def scrub_audits(self):
+        return [tuple(row) for row in self.conn.execute(
+            "SELECT op,status,detail FROM audit_log WHERE op='scrub_secrets' ORDER BY rowid").fetchall()]
+
+    @contextmanager
+    def maintenance_observer(self, after_update=None):
+        """Passive native-return/exception witnesses; fault callback is separate.
+
+        Exact primary objects are held test-locally only for identity assertions,
+        never serialized. Closure is explicit; this does not test GC lifetime.
+        """
+        execute = self.graph._GraphCommitConnection.execute.__code__
+        rollback = self.graph._GraphCommitConnection.rollback.__code__
+        commit = self.graph._GraphCommitConnection.commit.__code__
+        methods = {unwrapped(getattr(self.p, name)).__code__: label for label, name in (
+            ("admin", "_scrub_secrets"), ("terminal", "_scrub_code_graph_terminal_artifacts"),
+            ("rebuild", "_rebuild_fts"), ("render", "_render_active_dashboard"))}
+        graph_code = self.graph.scrub_code_graph_storage.__code__
+        witness = {"updates": [], "commits": [], "rollbacks": [],
+                   "calls": dict.fromkeys((*methods.values(), "graph"), 0),
+                   "errors": {"admin": [], "graph": []}}
+        def observe(frame, event, arg):
+            if frame.f_locals.get("self") is self.conn and event == "return":
+                if frame.f_code is execute and isinstance(arg, sqlite3.Cursor) and arg.connection is self.conn:
+                    args = frame.f_locals.get("args", ())
+                    sql = args[0] if args and type(args[0]) is str else ""
+                    table = sql.split()[1] if sql.startswith("UPDATE ") else ""
+                    if table in (*GRAPH_TABLES, "review_queue"):
+                        row = {"table": table, "rows": arg.rowcount, "state": self.state()}
+                        witness["updates"].append(row)
+                        if after_update is not None:
+                            after_update(row)
+                elif frame.f_code is commit:
+                    witness["commits"].append(self.state())
+                elif frame.f_code is rollback:
+                    witness["rollbacks"].append(self.state())
+            if event == "call":
+                name = methods.get(frame.f_code) if frame.f_locals.get("self") is self.p else None
+                if frame.f_code is graph_code and frame.f_locals.get("provider") is self.p:
+                    name = "graph"
+                if name is not None:
+                    witness["calls"][name] += 1
+        def trace(frame, event, arg):
+            name = ("admin" if frame.f_code in methods and methods[frame.f_code] == "admin"
+                    and frame.f_locals.get("self") is self.p else
+                    "graph" if frame.f_code is graph_code and frame.f_locals.get("provider") is self.p else None)
+            if name is None:
+                return None
+            frame.f_trace_lines = False
+            if event == "exception" and isinstance(arg[1], RuntimeError):
+                witness["errors"][name].append(arg[1])
+            return trace
+        prior = sys.gettrace()
+        self.assertIsNone(prior)
+        sys.settrace(trace)
+        try:
+            with profile_scope(observe):
+                yield witness
+        finally:
+            sys.settrace(prior)
+
+    def assert_graph_scrubbed(self):
+        after = self.graph_row_image(self.conn)
+        self.assertEqual([len(after[t]) for t in GRAPH_TABLES], [1] * 7)
+        self.assertNotIn(BARE, json.dumps(after))
+        self.assertNotIn(ASSIGNMENT, json.dumps(after))
+        self.assertNotEqual(after, self._offline_graph)
+        for target, columns, source in (
+            ("code_graph_symbols_fts", "repository_id,symbol_id,file_path,qualified_name,signature,search_text", "code_graph_symbols"),
+            ("code_graph_chunks_fts", "repository_id,chunk_id,file_path,symbol_id,qualified_name,search_text,chunk_text", "code_graph_chunks"),
+            ("code_graph_lines_fts", "repository_id,file_path,line_no,line_text", "code_graph_lines"),
+        ):
+            self.assertEqual([tuple(r) for r in self.conn.execute(f"SELECT {columns} FROM {target}").fetchall()],
+                             [tuple(r) for r in self.conn.execute(f"SELECT {columns} FROM {source}").fetchall()])
+            self.assertEqual(len(after[target]), 1)
+            self.assertNotEqual(after[target], self._offline_graph[target])
+        self.assertGreater(len(after["code_graph_identity_provenance"]), 0)
+        self.assertTrue(all(row[1] == 2 for row in after["code_graph_identity_provenance"]))
+        self.assertEqual([r[0] for r in after["code_graph_identity_migrations"]], [2])
+        for table, column, value in (("code_graph_repositories", "snapshot_hash", "b" * 64),
+                                     ("code_graph_files", "file_hash", "a" * 64),
+                                     ("code_graph_lines", "anchor_hash", "d" * 64),
+                                     ("code_graph_events", "payload_hash", "b" * 64)):
+            self.assertEqual(self.conn.execute(f"SELECT {column} FROM {table}").fetchone()[0], value)
+        self.assertEqual(self.conn.execute("PRAGMA foreign_key_check").fetchall(), [])
+
+    def maintenance_handoff(self, target):
+        from agent.memory_provider import spawn_context_thread
+        before = self.seed()
+        inserted, release, entry_seen, reader_done = [threading.Event() for _ in range(4)]
+        errors, answers, results, observations, pauses = [], [], [], [], []
+        def pause(row):
+            if row["table"] == target and not pauses:
+                pauses.append(row)
+                inserted.set()
+                if not release.wait(15):
+                    raise RuntimeError("maintenance_writer_release_timeout")
+        def write():
+            try:
+                with self.scope(), self.maintenance_observer(pause) as witness:
+                    observations.append(witness)
+                    results.append(self.p._scrub_secrets(apply=True, limit=200))
+            except BaseException as error:
+                errors.append(error)
+                inserted.set()
+        def read():
+            try:
+                answers.append(self.recall(entry_seen))
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                reader_done.set()
+        with self.scope():
+            writer = spawn_context_thread(write, name="maintenance-writer", daemon=False)
+            reader = spawn_context_thread(read, name="maintenance-public-reader", daemon=False)
+        writer.start()
+        lock_held = reader_early = None
+        try:
+            self.assertTrue(inserted.wait(5), "actual_maintenance_UPDATE_not_reached")
+            acquired = self.p._lock.acquire(blocking=False)
+            lock_held = not acquired
+            if acquired:
+                self.p._lock.release()
+            reader.start()
+            self.assertTrue(entry_seen.wait(5), "public_reader_entry_not_reached")
+            reader_early = reader_done.wait(.08)  # Bounded Event, no sleep/poll loop.
+        finally:
+            release.set()
+            writer.join(10)
+            if reader.ident is not None:
+                reader.join(10)
+        self.record("maintenance_writer_reader_schedule", target=target, paused=pauses,
+                    full_writer_lock=lock_held, reader_returned_before_release=reader_early,
+                    errors=[type(e).__name__ for e in errors], state=self.state())
+        self.assertFalse(writer.is_alive())
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(len(pauses), 1)
+        self.assertEqual(pauses[0]["rows"], 1)
+        for key in ("owner_exact", "owner_same_thread", "in_transaction", "owned_shared"):
+            self.assertIs(pauses[0]["state"][key], True)
+        self.assertIs(pauses[0]["state"]["owner_retired"], False)
+        self.assertIs(pauses[0]["state"]["quarantined"], False)
+        self.assertIs(lock_held, True)
+        self.assertIs(reader_early, False)
+        self.assertEqual(len(results), 1)
+        result = results[0]
+        self.assertEqual((result["applied"], result["hit_count"], result["updated_rows"], result["secret_refs"]), (True, 1, 1, []))
+        self.assertGreater(result["code_graph"]["rows"], 0)
+        self.assertIs(result["code_graph"]["complete"], True)
+        self.assertEqual(observations[0]["rollbacks"], [])
+        self.assertTrue(all(not r["in_transaction"] and r["owner_exact"] and r["owner_same_thread"]
+                            for r in observations[0]["commits"]))
+        self.assertEqual(observations[0]["errors"], {"admin": [], "graph": []})
+        self.assert_ordinary_prefix(self.durable_image()["ordinary"])
+        self.assert_graph_scrubbed()
+        self.assertEqual(self.scrub_audits(), [("scrub_secrets", "ok", "hits=1 updated=1")])
+        self.assertEqual(len(answers), 1)
+        self.assert_recalled(before, answers[0])
+
+    def test_10_admin_ordinary_writer_public_reader_handoff(self):
+        # Apply cannot join: FTS owns EXCLUSIVE and terminal filesystem writes
+        # are not rollbackable. A genuine caller TX must remain untouched.
+        before = self.durable_image()
+        statements = []
+        with self.scope(), self.p._claim_transaction(self.conn):
+            self.conn.set_trace_callback(statements.append)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "claim_transaction_requires_idle_owner"):
+                    self.p._scrub_secrets(apply=True)
+                self.assertTrue(self.conn.in_transaction)
+                self.assertIs(self.p._claim_tx_connection, self.conn)
+                self.assertEqual(self.p._claim_tx_thread, threading.get_ident())
+                self.assertFalse(any(s == "COMMIT" for s in statements))
+                self.assertFalse(any(s.startswith(("UPDATE ", "INSERT ", "DELETE ")) for s in statements))
+                self.assertEqual(self.durable_image(), before)
+                self.assertEqual(self.scrub_audits(), [])
+            finally:
+                self.conn.set_trace_callback(None)
+        self.assert_ready()
+        self.maintenance_handoff("review_queue")
+
+    def test_11_admin_populated_graph_writer_public_reader_handoff(self):
+        self.maintenance_handoff("code_graph_repositories")
+
+    def test_12_admin_late_primary_rolls_back_graph_not_committed_ordinary_prefix(self):
+        before = self.seed()
+        self.terminal_fixture()
+        files_before, sql_before = self.terminal_snapshot(), self.durable_image()
+        original = self.p._redact_code_graph_text
+        fault, injections = ValueError("owned populated callback fault"), []
+        def fail_late(text):
+            if LATE_MARKER in text:
+                injections.append(self.state())
+                raise fault
+            return original(text)
+        self.p._redact_code_graph_text = fail_late
+        try:
+            with self.maintenance_observer() as witness, self.scope():
+                with self.assertRaisesRegex(RuntimeError, "code graph redaction failed") as caught:
+                    self.p._scrub_secrets(apply=True, limit=200)
+        finally:
+            del self.p._redact_code_graph_text
+        primary = caught.exception
+        self.assertIs(primary.__context__, fault)
+        self.assertIs(primary.__suppress_context__, True)
+        self.assertEqual(witness["errors"]["graph"], [primary])
+        self.assertEqual(witness["errors"]["admin"], [primary])
+        self.assertEqual(len(injections), 1)
+        self.assertTrue(injections[0]["in_transaction"])
+        self.assertTrue(injections[0]["owner_exact"])
+        self.assertTrue(injections[0]["owner_same_thread"])
+        self.assertFalse(injections[0]["owner_retired"])
+        self.assertFalse(injections[0]["quarantined"])
+        updates = [r for r in witness["updates"] if r["table"] in GRAPH_TABLES]
+        self.assertGreater(len(updates), 7)
+        self.assertTrue(all(r["rows"] == 1 and r["state"]["in_transaction"]
+                            and r["state"]["owner_exact"] and r["state"]["owner_same_thread"] for r in updates))
+        self.assertEqual([r["rows"] for r in witness["updates"] if r["table"] == "review_queue"], [1])
+        self.assertEqual(len(witness["commits"]), 1)  # Earlier ordinary row only.
+        self.assertEqual(len(witness["rollbacks"]), 1)
+        self.assertFalse(witness["rollbacks"][0]["in_transaction"])
+        self.assertTrue(witness["rollbacks"][0]["owner_exact"])
+        self.assertEqual([witness["calls"][k] for k in ("terminal", "rebuild", "render")], [0, 0, 0])
+        durable = self.durable_image()
+        self.assert_ordinary_prefix(durable["ordinary"])
+        self.assertNotEqual(durable["ordinary"], sql_before["ordinary"])
+        self.assertEqual(durable["graph"], sql_before["graph"])
+        self.assertEqual(self.graph_row_image(self.conn), sql_before["graph"])
+        self.assertEqual(self.terminal_snapshot(), files_before)
+        self.assertEqual(self.scrub_audits(), [])
+        self.assertFalse(any("UNKNOWN" in n for n in getattr(primary, "__notes__", ())))
+        self.assert_ready()
+        self.record("maintenance_late_primary", returned_graph_updates=len(updates),
+                    exact_graph_admin_primary=True, known_rollback=True,
+                    prior_ordinary_committed=True, terminal_unreached=True, state=self.state())
+        self.assert_recalled(before, self.recall())
 
 
 if __name__ == "__main__":

@@ -8,7 +8,8 @@ The selector follows test_restore_erasure_namespace.py's exact-AST pattern.
 
 Roles: original complete method/function bodies, regex assignments and required
 class literal are SOURCE-extracted. Receiver, graph-stage resolver-only adapter,
-SQL observer and fault injectors are synthetic (not authority/SDK stand-ins).
+SQL/transaction-context observers and fault injectors are synthetic, not
+authority/SDK stand-ins; the real owning-TX API is NOT executed by this suite.
 The atomic writer and terminal sinks use real stdlib files in explicit scratch.
 This does not qualify full provider imports, SQLite, native/CLI or OS isolation.
 """
@@ -17,6 +18,7 @@ from __future__ import annotations
 import argparse
 import ast
 import builtins
+from contextlib import contextmanager
 import dis
 import hashlib
 import json
@@ -25,6 +27,7 @@ from pathlib import Path
 import re
 import sys
 import tempfile
+import threading
 import time
 import types
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -194,6 +197,7 @@ class SQLObserver:
         self.pending = 0
         self.committed_updates = 0
         self.context_errors = []
+        self.in_transaction = False  # Synthetic context observation, not SQLite.
 
     def execute(self, sql, params=()):
         if sql in ["SELECT * FROM " + table + " LIMIT 5000" for table in self.TABLES]:
@@ -226,6 +230,8 @@ def receiver_class(methods):
         def __init__(self, home):
             self.home = home
             self.sql = SQLObserver()
+            self._lock = threading.RLock()
+            self.transaction_calls = []
             self.callback_mode = "healthy"
             self.terminal_calls = 0
             self.terminal_primary = None
@@ -242,6 +248,21 @@ def receiver_class(methods):
 
         def _connect(self):
             return self.sql
+
+        @contextmanager
+        def _claim_transaction(self, conn):
+            # Only observe the new call/grain role. This is NOT the product
+            # owning API or a grant of SQL/SDK authority; native is NOT_RUN.
+            if conn is not self.sql or conn.in_transaction:
+                raise AssertionError("unexpected_synthetic_transaction_context")
+            self.transaction_calls.append(("enter", conn.updates, conn.committed_updates))
+            conn.in_transaction = True
+            try:
+                with conn:
+                    yield conn
+            finally:
+                conn.in_transaction = False
+                self.transaction_calls.append(("exit", conn.updates, conn.committed_updates))
 
         def _make_secret_index_from_raw(self, *args):
             return SECRET_REF
@@ -613,6 +634,56 @@ class MandatoryRedactorAdminTests(unittest.TestCase):
         self.assertEqual(str(error), "code_knowledge_graph unavailable: ImportError")
         self.assertEqual(self.snapshot(), before)
         self.assertEqual(self.sink_counts, {"write_open": 0, "rename": 0, "remove": 0})
+
+
+    def test_admin_owner_contexts_keep_row_then_graph_grain(self):
+        self.table_fixture()
+        result, error = self.admin()
+        self.assertIsNone(error)
+        self.assertEqual(result["updated_rows"], 1)
+        self.assertEqual(self.provider.transaction_calls,
+                         [("enter", 0, 0), ("exit", 1, 1),
+                          ("enter", 1, 1), ("exit", 1, 1)])
+        self.assertFalse(self.provider.sql.in_transaction)
+        self.assertEqual((self.graph_calls, self.provider.terminal_calls), (1, 1))
+
+    def test_admin_active_apply_refuses_before_effect_but_dry_remains_readonly(self):
+        self.table_fixture()
+        self.fixture()
+        before = self.snapshot()
+        # Explicit synthetic active context, not an actual native owner claim.
+        self.provider.sql.in_transaction = True
+        result, error = self.admin()
+        self.assertIsNone(result)
+        self.assertIsInstance(error, RuntimeError)
+        self.assertEqual(str(error), "claim_transaction_requires_idle_owner")
+        self.assertTrue(self.provider.sql.in_transaction)
+        self.assertEqual((self.provider.sql.selects, self.provider.sql.updates), (0, 0))
+        self.assertEqual(self.provider.transaction_calls, [])
+        self.assertEqual((self.provider.quarantines, self.graph_calls, self.provider.terminal_calls), (0, 0, 0))
+        self.assert_no_success()
+        dry, error = self.admin(apply=False)
+        self.assertIsNone(error)
+        self.assertEqual((dry["hit_count"], dry["updated_rows"]), (1, 0))
+        self.assertTrue(self.provider.sql.in_transaction)
+        self.assertEqual(self.provider.transaction_calls, [])
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.sink_counts, {"write_open": 0, "rename": 0, "remove": 0})
+
+    def test_admin_owner_context_source_is_existing_nonjoining_per_stage_api(self):
+        # Static SOURCE control, not execution of native _claim_transaction.
+        method = self.methods["SourceMethods"]._scrub_secrets
+        tree, _ = selected_ast(Path(method.__code__.co_filename).read_bytes(), "entry")
+        cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "SourceMethods")
+        scrub = next(n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "_scrub_secrets")
+        contexts = [item.context_expr for n in ast.walk(scrub) if isinstance(n, ast.With) for item in n.items]
+        owners = [n for n in contexts if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                  and n.func.attr == "_claim_transaction"]
+        self.assertEqual(len(owners), 2)
+        self.assertTrue(all(ast.dump(n, include_attributes=False) == ast.dump(owners[0], include_attributes=False)
+                            for n in owners))
+        self.assertEqual(ast.unparse(owners[0]), "self._claim_transaction(c)")
+        self.assertFalse(any(isinstance(n, ast.Name) and n.id == "c" for n in contexts))
 
 
 def make_suite(raw, source, graph_raw, graph_source, scratch, cases=None):

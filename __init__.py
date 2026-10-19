@@ -25060,8 +25060,15 @@ class MemoryWikiProvider(MemoryProvider):
         """Redact stored secrets without surfacing them; propagate stage failures.
 
         Earlier table updates may already be committed when a later stage fails.
+        Apply is standalone maintenance, not a joinable all-store transaction:
+        _upsert_fts/_rebuild_fts own independent TXs and terminal files precede
+        the rebuild. Refuse a caller TX before any scrub effects, never commit it.
         """
-        c=self._connect(); limit=max(1,min(int(limit or 200),1000)); hits=[]; updated=0; secret_refs=[]; graph_scrub={"rows":0,"fields":0}; terminal_scrub={"scanned":0,"redacted":0,"stubs":0}
+        with self._lock:
+            c = self._connect()
+            if apply and c.in_transaction:
+                raise RuntimeError("claim_transaction_requires_idle_owner")
+        limit=max(1,min(int(limit or 200),1000)); hits=[]; updated=0; secret_refs=[]; graph_scrub={"rows":0,"fields":0}; terminal_scrub={"scanned":0,"redacted":0,"stubs":0}
         targets=[('claims','id',['claim','evidence','source']),('evidence','id',['text','source']),('review_queue','id',['candidate','evidence','suggested_claim','reason']),('secret_index','id',['subject','scope','purpose','source']),('task_capsules','id',['intent','plan','files','commands','errors','fixes','verification','followups']),('entities','id',['name','aliases','notes']),('relations','id',['subject','object','evidence']),('project_profiles','project_id',['root','purpose','commands','services','notes','stack_json','current_status']),('post_task_log','id',['summary','changed_files','backups','verification','services']),('preference_rules','id',['rule','scope','source'])]
         for table, pk, fields in targets:
             rows=c.execute(f"SELECT * FROM {table} LIMIT 5000").fetchall()
@@ -25095,7 +25102,7 @@ class MemoryWikiProvider(MemoryProvider):
                 if apply and changes:
                     sets=', '.join(f"{k}=?" for k in changes)
                     params=list(changes.values())+[rid]
-                    with c:
+                    with self._claim_transaction(c):
                         c.execute(f"UPDATE {table} SET {sets} WHERE {pk}=?", params)
                         if table=='claims':
                             try:
@@ -25109,7 +25116,7 @@ class MemoryWikiProvider(MemoryProvider):
             if len(hits) >= limit:
                 break
         if apply:
-            with c:
+            with self._claim_transaction(c):
                 graph_scrub=_scrub_code_graph_storage(self, c, apply=True, limit=max(5000, limit))
             terminal_scrub=self._scrub_code_graph_terminal_artifacts(apply=True, limit=max(5000, limit))
             self._rebuild_fts(); self._render_active_dashboard(); self._audit('scrub_secrets','ok',f'hits={len(hits)} updated={updated}')
