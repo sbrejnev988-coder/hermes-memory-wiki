@@ -14565,12 +14565,14 @@ class MemoryWikiProvider(MemoryProvider):
         """Public row serialization: always apply the same redaction guard as why/export paths."""
         return self._sanitize_row(r)
 
-    def _add_change(self, action: str, claim_id: str = "", detail: str = "") -> None:
+    def _add_change(self, action: str, claim_id: str = "", detail: str = "", *, conn=None) -> None:
+        # An explicit connection makes this a required part of its owning TX;
+        # standalone callers retain the existing best-effort change-log API.
         try:
-            c=self._connect(); ts=now(); cid="chg_"+sha(f"{action}:{claim_id}:{detail}:{ts}")[:12]
-            with self._claim_transaction(c): c.execute("INSERT OR IGNORE INTO memory_changes(id,action,claim_id,detail,created_at) VALUES(?,?,?,?,?)", (cid, action, claim_id or "", short(redact_secrets(detail),1200), ts))
+            c=self._connect() if conn is None else conn; ts=now(); cid="chg_"+sha(f"{action}:{claim_id}:{detail}:{ts}")[:12]
+            with self._claim_transaction(c, join=conn is not None): c.execute("INSERT OR IGNORE INTO memory_changes(id,action,claim_id,detail,created_at) VALUES(?,?,?,?,?)", (cid, action, claim_id or "", short(redact_secrets(detail),1200), ts))
         except Exception:
-            if getattr(self, "_transaction_quarantine", None) is not None:
+            if conn is not None or getattr(self, "_transaction_quarantine", None) is not None:
                 raise
 
     def _audit(self, op: str, status: str = "ok", detail: str = "", conn=None, *, visibility_scope: str = "legacy") -> None:
@@ -15792,11 +15794,12 @@ class MemoryWikiProvider(MemoryProvider):
         cand=normalize_claim(candidate); lint=lint_claim_text(cand, topic)
         owner=self._aux_owner({'visibility_scope':visibility_scope,'project_id':project_id},source=source)
         rid="rq_"+sha('review\0'+owner['identity']+'\0'+cand.casefold()+'\0'+str(source))[:20]; ts=now()
-        with self._connect() as c:
+        with self._claim_transaction(join=True) as c:
             c.execute("""INSERT OR IGNORE INTO review_queue(id,candidate,topic,source,evidence,reason,suggested_claim,suggested_topic,confidence,salience,status,created_at,updated_at,visibility_scope,origin_bot_id,origin_session_id,origin_chat_hash,project_id)
                          VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                       (rid,cand,self._topic_alias(topic,cand),source,short(redact_secrets(evidence),2000),reason or '; '.join(lint['issues']),lint['normalized'],lint['topic'],clamp(confidence),clamp(salience),'pending',ts,ts,owner['visibility_scope'],owner['origin_bot_id'],owner['origin_session_id'],owner['origin_chat_hash'],owner['project_id']))
-        self._add_change('review_enqueue', rid, reason or cand); return rid
+            self._add_change('review_enqueue', rid, reason or cand, conn=c)
+        return rid
 
     def _review_queue(self, mode: str = "list", item_id: str = "", claim: str = "", topic: str = "", reason: str = "", limit: int = 20) -> Dict[str, Any]:
         mode=(mode or 'list').lower(); c=self._connect(); limit=max(1,min(int(limit or 20),100))
