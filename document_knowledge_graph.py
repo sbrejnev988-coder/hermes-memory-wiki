@@ -715,7 +715,7 @@ def _open_windows_allowed_file(path: Path) -> int:
         if not _path_within_allowed_roots(actual):
             raise ValueError("opened document target escaped allowed roots")
         return msvcrt.open_osfhandle(handle, os.O_RDONLY | getattr(os, "O_BINARY", 0))
-    except Exception:
+    except BaseException:
         close_handle(handle)
         raise
 
