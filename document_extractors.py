@@ -1860,13 +1860,28 @@ def _run_ocr_command(cmd: list, timeout: int, cap: int) -> Tuple[int, bytes]:
     """
     if _OCR_RETAINED:
         raise RuntimeError("ocr_previous_ownership_unknown")
+    # Prepare Python state/callbacks before acquiring a child. Every operation
+    # after a returned Popen, including Thread construction/start, is owned below.
     deadline = time.monotonic() + timeout
-    process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False,
-                               close_fds=True, bufsize=0)
     buffers = [bytearray(), bytearray()]
     exceeded = threading.Event()
-    errors = []
+    errors, cleanup_errors, observed = [], [], []  # private exact objects
     threads = []
+    process = primary = cleanup_deadline = None
+    live = False
+
+    def cleanup_error(stage, error):
+        cleanup_errors.append(error)
+        observed.append((stage, error))
+
+    def remaining(minimum=0):
+        # A clock refusal must not prevent wait/join themselves or later owners.
+        if cleanup_deadline is not None:
+            try:
+                return max(minimum, cleanup_deadline - time.monotonic())
+            except BaseException as error:
+                cleanup_error("cleanup_clock_unknown", error)
+        return minimum
 
     def drain(index, stream, limit):
         try:
@@ -1874,15 +1889,17 @@ def _run_ocr_command(cmd: list, timeout: int, cap: int) -> Tuple[int, bytes]:
                 data = stream.read(8192)
                 if not data:
                     break
-                remaining = limit - len(buffers[index])
-                buffers[index].extend(data[:max(0, remaining)])
-                if len(data) > remaining:
+                room = limit - len(buffers[index])
+                buffers[index].extend(data[:max(0, room)])
+                if len(data) > room:
                     exceeded.set()
-        except BaseException:
-            errors.append("pipe_read_failed")
+        except BaseException as error:
+            errors.append(error)
+            observed.append(("pipe_read_failed", error))
 
-    primary = None
     try:
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, shell=False,
+                                   close_fds=True, bufsize=0)
         for index, stream, limit in ((0, process.stdout, cap), (1, process.stderr, 16_384)):
             thread = threading.Thread(target=drain, args=(index, stream, limit), daemon=True, name="document-ocr-pipe")
             threads.append(thread)
@@ -1895,40 +1912,94 @@ def _run_ocr_command(cmd: list, timeout: int, cap: int) -> Tuple[int, bytes]:
             if process.poll() is not None and not any(t.is_alive() for t in threads):
                 break
             time.sleep(0.01)
-    except BaseException as exc:
-        primary = exc
-        raise
+    except BaseException as error:
+        primary = error
     finally:
-        cleanup_errors = []
-        cleanup_deadline = time.monotonic() + 3
-        try:
-            if process.poll() is None:
-                process.kill()
-            process.wait(timeout=max(0.01, cleanup_deadline - time.monotonic()))
-        except BaseException:
-            cleanup_errors.append("child_reap_unknown")
-        for thread in threads:
+        if process is not None:
             try:
-                if thread.ident is not None:
-                    thread.join(timeout=max(0, cleanup_deadline - time.monotonic()))
-            except BaseException:
-                cleanup_errors.append("reader_join_unknown")
-        live = any(t.is_alive() for t in threads)
-        if not live:
-            for stream in (process.stdout, process.stderr):
+                cleanup_deadline = time.monotonic() + 3
+            except BaseException as error:
+                cleanup_error("cleanup_clock_unknown", error)
+            running = True  # an unsuccessful poll is not completion evidence
+            try:
+                running = process.poll() is None
+            except BaseException as error:
+                cleanup_error("child_poll_unknown", error)
+            if running:
                 try:
-                    stream.close()
+                    process.kill()
+                except BaseException as error:
+                    cleanup_error("child_kill_unknown", error)
+            try:
+                process.wait(timeout=remaining(0.01))
+            except BaseException as error:
+                cleanup_error("child_reap_unknown", error)
+            for thread in threads:
+                try:
+                    if thread.ident is not None:
+                        thread.join(timeout=remaining())
+                except BaseException as error:
+                    cleanup_error("reader_join_unknown", error)
+                try:
+                    if thread.is_alive():
+                        live = True
+                except BaseException as error:
+                    live = True
+                    cleanup_error("reader_state_unknown", error)
+            # Do not close a pipe underneath a live/unknown reader. All other
+            # joins/state checks still ran, and the exact owners remain retained.
+            if not live:
+                for name in ("stdout", "stderr"):
+                    try:
+                        stream = getattr(process, name)
+                        if stream is not None:
+                            stream.close()
+                    except BaseException as error:
+                        cleanup_error("pipe_close_unknown", error)
+            if live or cleanup_errors:
+                _OCR_RETAINED.append((process, threads))
+
+    # Body fatal wins. Otherwise promote the first actually observed reader or
+    # cleanup fatal, never a string/ordinary carrier that callers can bless.
+    selected = primary if primary is not None and not isinstance(primary, Exception) else None
+    if selected is None:
+        selected = next((error for _, error in observed if not isinstance(error, Exception)), primary)
+    if selected is None and (live or cleanup_errors):
+        selected = RuntimeError("ocr_cleanup_ownership_unknown")
+    # A reader can record its final chunk/failure after the loop's first check.
+    if selected is None and (exceeded.is_set() or errors):
+        selected = RuntimeError("ocr_capture_limit_or_read_failure")
+    if selected is not None:
+        try:
+            raise selected
+        finally:
+            try:
+                # Private diagnostics contain exact objects, never foreign text.
+                # Bypass subclass setattr hooks; failure cannot mask selection.
+                details = BaseException.__getattribute__(selected, "__dict__")
+                if type(details) is dict:
+                    dict.update(details, _ocr_primary_error=primary, _ocr_reader_errors=errors,
+                                _ocr_cleanup_errors=cleanup_errors, _ocr_observed_errors=observed,
+                                _ocr_diagnostics={"cleanup": "unknown" if live or cleanup_errors else "complete",
+                                                  "ownership": "unknown" if live or cleanup_errors else "complete"})
+            except BaseException:
+                pass
+            if observed:
+                try:
+                    # Project only observed objects, as for the existing PDF
+                    # owner: distinct reverse occurrence order, original body last.
+                    # Native context setters leave explicit causes untouched.
+                    chain, seen = [selected], {id(selected)}
+                    for error in [*(error for _, error in reversed(observed)), primary]:
+                        if error is not None and id(error) not in seen:
+                            seen.add(id(error))
+                            chain.append(error)
+                    context = None
+                    for error in reversed(chain):
+                        BaseException.__context__.__set__(error, context)
+                        context = error
                 except BaseException:
-                    cleanup_errors.append("pipe_close_unknown")
-        if live or cleanup_errors:
-            _OCR_RETAINED.append((process, threads))
-            if primary is None:
-                raise RuntimeError("ocr_cleanup_ownership_unknown")
-    # Readers may have recorded a final chunk/error after the loop's first
-    # ledger check. Only the post-join ledger can qualify the captured prefix.
-    # An original exception still unwinds above, and UNKNOWN is never released.
-    if exceeded.is_set() or errors:
-        raise RuntimeError("ocr_capture_limit_or_read_failure")
+                    pass  # no arbitrary foreign-graph or metadata guarantee
     return process.returncode, bytes(buffers[0])
 
 

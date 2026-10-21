@@ -11,7 +11,45 @@ import importlib.util
 import os
 from pathlib import Path
 import sys
+import types
 import unittest
+
+ROOT = Path(__file__).absolute().parents[1]
+INPUTS = globals().get("DEVTOOLS_INPUTS", {})
+EXTRACTOR = Path(INPUTS.get("document_extractors.py", ROOT / "document_extractors.py"))
+FORMULAS = Path(INPUTS.get("spreadsheet_formulas.py", ROOT / "spreadsheet_formulas.py"))
+FORMULAS_SHA256 = "c27cf8175b9561d6028c1c69919196cadf8b2348f52ed88d6a148c3ca39078ac"
+MODULES = {}
+
+
+def read_source(path):
+    return devtools_read_bound(str(path)) if "devtools_read_bound" in globals() else path.read_bytes()
+
+
+def load_source(path, name):
+    if name not in MODULES:
+        if path == EXTRACTOR:
+            raw = read_source(FORMULAS)
+            if hashlib.sha256(raw).hexdigest() != FORMULAS_SHA256:
+                raise RuntimeError("spreadsheet_helper_source_mismatch")
+            helper_spec = importlib.util.spec_from_file_location("spreadsheet_formulas", str(FORMULAS))
+            fresh = importlib.util.module_from_spec(helper_spec)
+            helper = sys.modules.get(helper_spec.name)
+            # Keep a healthy outer XLSX packet's module identity, but execute
+            # only the pinned bytes in a fresh, non-ambient namespace.
+            if type(helper) is types.ModuleType and helper.__dict__.get("__file__") == str(FORMULAS):
+                helper.__dict__.clear()
+                helper.__dict__.update(fresh.__dict__)
+            else:
+                helper = fresh
+            sys.modules[helper_spec.name] = helper
+            exec(compile(raw, str(FORMULAS), "exec", dont_inherit=True), helper.__dict__)
+        spec = importlib.util.spec_from_file_location(name, str(path))
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        exec(compile(read_source(path), str(path), "exec", dont_inherit=True), module.__dict__)
+        MODULES[name] = module
+    return MODULES[name]
 
 
 def make_pdf(path, contents):
@@ -47,11 +85,7 @@ class RealParserComponentTests(unittest.TestCase):
         if not root.is_absolute() or not root.is_dir():
             raise RuntimeError("own absolute TMPDIR required")
         self.root = root
-        path = Path(__file__).absolute().parents[1] / "document_extractors.py"
-        spec = importlib.util.spec_from_file_location("_real_document_parser_component", str(path))
-        self.e = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = self.e
-        exec(compile(path.read_bytes(), str(path), "exec", dont_inherit=True), self.e.__dict__)
+        self.e = load_source(EXTRACTOR, "_real_document_parser_component")
 
     def require(self, name):
         if importlib.util.find_spec(name) is None:

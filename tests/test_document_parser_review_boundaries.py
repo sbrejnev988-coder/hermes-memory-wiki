@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 import builtins
 import dis
+import hashlib
 import importlib.util
 import io
 import json
@@ -25,6 +26,7 @@ ROOT = Path(__file__).absolute().parents[1]
 INPUTS = globals().get("DEVTOOLS_INPUTS", {})
 PEER_PATH = Path(INPUTS.get("test_document_parser_pdf_ocr.py", Path(__file__).with_name("test_document_parser_pdf_ocr.py")))
 NATIVE_PATH = Path(INPUTS.get("test_p2_g3_native.py", Path(__file__).with_name("test_p2_g3_native.py")))
+COMPONENT_PATH = Path(INPUTS.get("test_document_parser_components.py", Path(__file__).with_name("test_document_parser_components.py")))
 
 
 def read_source(path):
@@ -134,13 +136,21 @@ def split_blocks():
 
 
 def capture_seam(e, *, stdout=b"abcdefgh", stderr=b"", read_error=False,
-                 wait_error=False, live_reader=False, primary=None):
+                 wait_error=False, live_reader=False, primary=None, faults=None):
     """Actual _run_ocr_command + authored terminal-turn producer/observer.
 
     poll releases final read after the loop's first ledger check. Trace observes
     decisions/ownership records only; it is NOT OS/thread/engine cleanup proof.
+    faults selects an exact stage (or stage, occurrence), never a real process.
     """
     trace, workers, retained = [], [], []
+    faults, counts = dict(faults or {}), {}
+
+    def refuse(stage):
+        counts[stage] = counts.get(stage, 0) + 1
+        error = faults.get((stage, counts[stage]), faults.get(stage))
+        if error is not None:
+            raise error
 
     class Stream:
         def __init__(self, name, data):
@@ -149,6 +159,7 @@ def capture_seam(e, *, stdout=b"abcdefgh", stderr=b"", read_error=False,
         def read(self, count):
             self.reads += 1
             trace.append("read_" + self.name)
+            refuse("read_" + self.name)
             if self.data:
                 result, self.data = self.data, b""
                 return result
@@ -157,27 +168,40 @@ def capture_seam(e, *, stdout=b"abcdefgh", stderr=b"", read_error=False,
             return b""
 
         def close(self):
-            self.closed = True
             trace.append("close_" + self.name)
+            refuse("close_" + self.name)
+            self.closed = True
+            refuse("close_after_" + self.name)
 
     class ThreadRecord:
         def __init__(self, *, target, args, daemon, name):
+            self.role = "stdout" if args[0] == 0 else "stderr"
+            trace.append("thread_" + self.role)
+            refuse("thread_" + self.role)
             self.target, self.args, self.ident, self.done = target, args, None, False
             workers.append(self)
 
         def start(self):
+            trace.append("start_" + self.role)
+            refuse("start_" + self.role)
             self.ident = 1
+            refuse("start_after_" + self.role)
 
         def finish(self):
-            if not self.done:
+            if self.ident is not None and not self.done:
                 self.target(*self.args)
                 self.done = True
 
         def is_alive(self):
-            return not self.done or live_reader
+            trace.append("alive_" + self.role)
+            refuse("alive_" + self.role)
+            return self.ident is not None and (not self.done or live_reader)
 
         def join(self, *, timeout):
             trace.append("join")
+            trace.append("join_" + self.role)
+            refuse("join_" + self.role)
+            self.finish()
 
     class ProcessRecord:
         returncode = 0
@@ -189,6 +213,7 @@ def capture_seam(e, *, stdout=b"abcdefgh", stderr=b"", read_error=False,
         def poll(self):
             self.polls += 1
             trace.append("poll")
+            refuse("poll")
             for worker in workers:
                 worker.finish()
             if primary is not None and self.polls == 1:
@@ -198,10 +223,13 @@ def capture_seam(e, *, stdout=b"abcdefgh", stderr=b"", read_error=False,
 
         def kill(self):
             self.kills += 1
+            trace.append("kill")
+            refuse("kill")
 
         def wait(self, *, timeout):
             self.waits += 1
             trace.append("wait")
+            refuse("wait")
             if wait_error:
                 raise OSError("authored reap unknown")
             return self.returncode
@@ -211,19 +239,27 @@ def capture_seam(e, *, stdout=b"abcdefgh", stderr=b"", read_error=False,
 
     def popen(cmd, **kwargs):
         launches.append((cmd, kwargs))
+        trace.append("popen")
         return process
+
+    def event():
+        trace.append("event")
+        refuse("event")
+        return threading.Event()
 
     ticks = [0]
 
     def monotonic():
         ticks[0] += 1
+        refuse("clock")
         return 100 if live_reader and ticks[0] >= 3 else 0
 
     transport = types.SimpleNamespace(Popen=popen, PIPE=subprocess.PIPE, TimeoutExpired=subprocess.TimeoutExpired)
-    threads = types.SimpleNamespace(Event=threading.Event, Thread=ThreadRecord)
+    threads = types.SimpleNamespace(Event=event, Thread=ThreadRecord)
     clock = types.SimpleNamespace(monotonic=monotonic, sleep=lambda seconds: None)
     function = clone_function(e._run_ocr_command, subprocess=transport, threading=threads, time=clock, _OCR_RETAINED=retained)
-    return types.SimpleNamespace(call=function, trace=trace, process=process, workers=workers, retained=retained, launches=launches)
+    return types.SimpleNamespace(call=function, trace=trace, process=process, workers=workers, retained=retained,
+                                 launches=launches, counts=counts)
 
 
 class ReviewBoundarySourceTests(unittest.TestCase):
@@ -427,6 +463,306 @@ class ReviewBoundarySourceTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "^ocr_previous_ownership_unknown$"):
                 seam.call(["authored-no-process"], 5, 8)
             self.assertEqual(len(seam.launches), 1)
+
+    def test_ocr01_absent_body_cleanup_fatal_exact_and_full_drain(self):
+        class Cancel(BaseException):
+            def __str__(self):
+                raise AssertionError("foreign exception text must not be formatted")
+            __repr__ = __str__
+        for stage in ("wait", "join_stdout", "close_stdout"):
+            for kind in (Cancel, SystemExit, KeyboardInterrupt):
+                fatal = kind("PrivateFixtureCanary9988")
+                cause = ValueError("authored explicit cause")
+                fatal.__cause__ = cause
+                seam = capture_seam(self.e, faults={stage: fatal})
+                with self.assertRaises(BaseException) as caught:
+                    seam.call(["authored-no-process"], 5, 8)
+                self.assertIs(caught.exception, fatal)
+                self.assertIs(fatal.__cause__, cause)
+                self.assertIsNone(fatal._ocr_primary_error)
+                self.assertIs(fatal._ocr_cleanup_errors[0], fatal)
+                self.assertEqual(fatal._ocr_diagnostics, {"cleanup": "unknown", "ownership": "unknown"})
+                self.assertNotIn("PrivateFixtureCanary9988", json.dumps(fatal._ocr_diagnostics))
+                self.assertEqual(seam.process.waits, 1)
+                self.assertEqual(seam.trace.count("join"), 2)
+                self.assertIn("close_stdout", seam.trace)
+                self.assertIn("close_stderr", seam.trace)
+                self.assertTrue(seam.process.stderr.closed)
+                self.assertEqual(len(seam.retained), 1)
+                self.assertIs(seam.retained[0][0], seam.process)
+                self.assertEqual([id(t) for t in seam.retained[0][1]], [id(t) for t in seam.workers])
+                with self.assertRaisesRegex(RuntimeError, "^ocr_previous_ownership_unknown$"):
+                    seam.call(["authored-no-process"], 5, 8)
+                self.assertEqual(len(seam.launches), 1)
+
+    def test_ocr01_body_priority_private_ledger_context_and_explicit_causes(self):
+        class Cancel(BaseException):
+            pass
+        for body_kind in (OSError, Cancel):
+            for cleanup_kind in (OSError, SystemExit):
+                body, cleanup = body_kind("authored body"), cleanup_kind("authored wait")
+                tail = OSError("authored final close")
+                body_cause, cleanup_cause = ValueError("body cause"), ValueError("cleanup cause")
+                body.__cause__, cleanup.__cause__ = body_cause, cleanup_cause
+                seam = capture_seam(self.e, primary=body, faults={"wait": cleanup, "close_stderr": tail})
+                selected = body if not isinstance(body, Exception) or isinstance(cleanup, Exception) else cleanup
+                with self.assertRaises(BaseException) as caught:
+                    seam.call(["authored-no-process"], 5, 8)
+                self.assertIs(caught.exception, selected)
+                self.assertIs(selected._ocr_primary_error, body)
+                self.assertEqual([id(e) for e in selected._ocr_cleanup_errors], [id(cleanup), id(tail)])
+                self.assertEqual([stage for stage, _ in selected._ocr_observed_errors],
+                                 ["child_reap_unknown", "pipe_close_unknown"])
+                expected = [selected, tail, cleanup if selected is body else body]
+                actual, current = [], selected
+                while current is not None and len(actual) <= len(expected):
+                    actual.append(id(current))
+                    current = current.__context__
+                self.assertEqual(actual, [id(e) for e in expected])
+                self.assertIsNone(current)
+                self.assertIs(body.__cause__, body_cause)
+                self.assertIs(cleanup.__cause__, cleanup_cause)
+                self.assertEqual(seam.trace.count("join"), 2)
+                self.assertEqual(seam.trace[-2:], ["close_stdout", "close_stderr"])
+                self.assertEqual(len(seam.retained), 1)
+
+    def test_ocr01_reader_fatal_not_a_string_and_body_fatal_still_wins(self):
+        class Cancel(BaseException):
+            pass
+        for body in (None, OSError("authored body"), Cancel("authored body fatal")):
+            reader, cleanup = SystemExit("authored pipe fatal"), KeyboardInterrupt("authored wait fatal")
+            seam = capture_seam(self.e, primary=body,
+                                faults={("read_stdout", 2): reader, "wait": cleanup})
+            with self.assertRaises(BaseException) as caught:
+                seam.call(["authored-no-process"], 5, 8)
+            selected = body if body is not None and not isinstance(body, Exception) else reader
+            self.assertIs(caught.exception, selected)
+            self.assertIs(selected._ocr_reader_errors[0], reader)
+            self.assertIs(selected._ocr_cleanup_errors[0], cleanup)
+            self.assertEqual([stage for stage, _ in selected._ocr_observed_errors],
+                             ["pipe_read_failed", "child_reap_unknown"])
+            self.assertEqual(seam.trace.count("join"), 2)
+            self.assertTrue(seam.process.stdout.closed and seam.process.stderr.closed)
+            self.assertEqual(len(seam.retained), 1)
+            with self.assertRaisesRegex(RuntimeError, "^ocr_previous_ownership_unknown$"):
+                seam.call(["authored-no-process"], 5, 8)
+            self.assertEqual(len(seam.launches), 1)
+
+    def test_ocr01_image_caller_rethrows_reader_fatal_but_keeps_ordinary_failure(self):
+        for error in (SystemExit("authored pipe fatal"), OSError("authored read failure")):
+            seam = capture_seam(self.e, faults={("read_stdout", 2): error})
+            image = clone_function(self.e.extract_image_ocr, _run_ocr_command=seam.call)
+            if not isinstance(error, Exception):
+                with self.assertRaises(BaseException) as caught:
+                    image(Path("authored.png"), 1000, "eng", 5)
+                self.assertIs(caught.exception, error)
+                self.assertEqual(error._ocr_diagnostics, {"cleanup": "complete", "ownership": "complete"})
+                self.assertIs(error._ocr_reader_errors[0], error)
+            else:
+                result = image(Path("authored.png"), 1000, "eng", 5)
+                self.assertEqual(result.status, "failed")
+                self.assertFalse(result.units)
+                self.assertEqual(result.metadata["ocr_status"], "RuntimeError")
+            self.assertTrue(seam.process.stdout.closed and seam.process.stderr.closed)
+            self.assertEqual(seam.retained, [])
+
+    def test_ocr02_preacquire_event_or_clock_refusal_launches_zero(self):
+        for stage in ("event", ("clock", 1)):
+            for kind in (OSError, SystemExit):
+                error = kind("authored preparation refusal")
+                seam = capture_seam(self.e, faults={stage: error})
+                with self.assertRaises(BaseException) as caught:
+                    seam.call(["authored-no-process"], 5, 8)
+                self.assertIs(caught.exception, error)
+                self.assertEqual(seam.launches, [])
+                self.assertEqual(seam.workers, [])
+                self.assertEqual(seam.retained, [])
+                self.assertNotIn("popen", seam.trace)
+                self.assertEqual((seam.process.kills, seam.process.waits), (0, 0))
+
+    def test_ocr02_thread_constructor_start_faults_own_child_and_pipes(self):
+        for stage in ("thread_stdout", "thread_stderr", "start_stdout", "start_stderr",
+                      "start_after_stdout", "start_after_stderr"):
+            for unknown in (False, True):
+                body = OSError("authored startup refusal")
+                faults = {stage: body}
+                if unknown:
+                    faults[("poll", 1)] = OSError("authored cleanup query refusal")
+                seam = capture_seam(self.e, faults=faults)
+                with self.assertRaises(BaseException) as caught:
+                    seam.call(["authored-no-process"], 5, 8)
+                self.assertIs(caught.exception, body)
+                self.assertEqual(len(seam.launches), 1)
+                self.assertEqual(seam.process.waits, 1)
+                self.assertEqual(seam.process.kills, 1 if unknown else 0)
+                self.assertEqual(seam.trace.count("join"), sum(t.ident is not None for t in seam.workers))
+                self.assertTrue(seam.process.stdout.closed and seam.process.stderr.closed)
+                self.assertEqual(body._ocr_diagnostics["ownership"], "unknown" if unknown else "complete")
+                if unknown:
+                    self.assertIs(seam.retained[0][0], seam.process)
+                    with self.assertRaisesRegex(RuntimeError, "^ocr_previous_ownership_unknown$"):
+                        seam.call(["authored-no-process"], 5, 8)
+                    self.assertEqual(len(seam.launches), 1)
+                else:
+                    self.assertEqual(seam.retained, [])
+
+    def test_ocr02_cleanup_clock_poll_kill_refusals_do_not_skip_wait_or_drain(self):
+        for stage in (("clock", 3), ("clock", 4), ("clock", 5), ("poll", 2), "kill"):
+            for kind in (OSError, SystemExit):
+                error = kind("authored cleanup refusal")
+                faults = {stage: error}
+                if stage == "kill":
+                    faults[("poll", 2)] = OSError("authored unknown child state")
+                seam = capture_seam(self.e, faults=faults)
+                with self.assertRaises(BaseException) as caught:
+                    seam.call(["authored-no-process"], 5, 8)
+                if isinstance(error, Exception):
+                    self.assertIs(type(caught.exception), RuntimeError)
+                    self.assertEqual(caught.exception.args, ("ocr_cleanup_ownership_unknown",))
+                else:
+                    self.assertIs(caught.exception, error)
+                self.assertTrue(any(e is error for e in caught.exception._ocr_cleanup_errors))
+                self.assertEqual(seam.process.waits, 1)
+                self.assertEqual(seam.trace.count("join"), 2)
+                self.assertTrue(seam.process.stdout.closed and seam.process.stderr.closed)
+                if stage in (("poll", 2), "kill"):
+                    self.assertEqual(seam.process.kills, 1)
+                self.assertEqual(len(seam.retained), 1)
+                with self.assertRaisesRegex(RuntimeError, "^ocr_previous_ownership_unknown$"):
+                    seam.call(["authored-no-process"], 5, 8)
+                self.assertEqual(len(seam.launches), 1)
+
+    def test_ocr02_reader_state_refusal_retains_pipes_but_attempts_other_join(self):
+        for kind in (OSError, SystemExit):
+            error = kind("authored reader state refusal")
+            seam = capture_seam(self.e, faults={("alive_stdout", 2): error})
+            with self.assertRaises(BaseException) as caught:
+                seam.call(["authored-no-process"], 5, 8)
+            if not isinstance(error, Exception):
+                self.assertIs(caught.exception, error)
+            else:
+                self.assertEqual(caught.exception.args, ("ocr_cleanup_ownership_unknown",))
+            self.assertIs(caught.exception._ocr_cleanup_errors[0], error)
+            self.assertEqual(seam.process.waits, 1)
+            self.assertEqual(seam.trace.count("join"), 2)
+            self.assertIn("alive_stderr", seam.trace)
+            self.assertNotIn("close_stdout", seam.trace)
+            self.assertNotIn("close_stderr", seam.trace)
+            self.assertFalse(seam.process.stdout.closed or seam.process.stderr.closed)
+            self.assertEqual(len(seam.retained), 1)
+            self.assertIs(seam.retained[0][0], seam.process)
+            with self.assertRaisesRegex(RuntimeError, "^ocr_previous_ownership_unknown$"):
+                seam.call(["authored-no-process"], 5, 8)
+            self.assertEqual(len(seam.launches), 1)
+
+    def test_ocr02_acquire_lifetime_and_separate_cleanup_guards_STATIC(self):
+        tree = ast.parse(read_source(peer.EXTRACTOR))
+        function = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_run_ocr_command")
+        owning = [n for n in function.body if isinstance(n, ast.Try) and n.finalbody]
+        self.assertEqual(len(owning), 1)
+        owning = owning[0]
+        acquire = owning.body[0]
+        self.assertIsInstance(acquire, ast.Assign)
+        self.assertEqual(ast.unparse(acquire.targets[0]), "process")
+        self.assertIsInstance(acquire.value, ast.Call)
+        self.assertEqual(ast.unparse(acquire.value.func), "subprocess.Popen")
+        event = next(n for n in function.body if isinstance(n, ast.Assign) and isinstance(n.value, ast.Call)
+                     and ast.unparse(n.value.func) == "threading.Event")
+        drain = next(n for n in function.body if isinstance(n, ast.FunctionDef) and n.name == "drain")
+        self.assertLess(event.end_lineno, owning.lineno)
+        self.assertLess(drain.end_lineno, owning.lineno)
+        parents = {child: node for node in ast.walk(function) for child in ast.iter_child_nodes(node)}
+        calls = [n for statement in owning.finalbody for n in ast.walk(statement)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                 and n.func.attr in {"monotonic", "poll", "kill", "wait", "join", "is_alive", "close"}]
+        self.assertEqual({n.func.attr for n in calls}, {"monotonic", "poll", "kill", "wait", "join", "is_alive", "close"})
+        for call in calls:
+            node, protected = call, False
+            while node in parents and node is not owning:
+                node = parents[node]
+                if isinstance(node, ast.Try) and any(isinstance(h.type, ast.Name) and h.type.id == "BaseException"
+                                                     for h in node.handlers):
+                    protected = True
+                    break
+            self.assertTrue(protected, call.func.attr)
+
+    def test_load03_both_loaders_have_bound_helper_before_consumer_STATIC(self):
+        for path in (PEER_PATH, COMPONENT_PATH):
+            tree = ast.parse(read_source(path))
+            loader = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "load_source")
+            pin = next(n for n in tree.body if isinstance(n, ast.Assign)
+                       and any(isinstance(t, ast.Name) and t.id == "FORMULAS_SHA256" for t in n.targets))
+            self.assertEqual(ast.literal_eval(pin.value), "c27cf8175b9561d6028c1c69919196cadf8b2348f52ed88d6a148c3ca39078ac")
+            guard = next(n for n in ast.walk(loader) if isinstance(n, ast.If) and isinstance(n.test, ast.Compare)
+                         and isinstance(n.test.left, ast.Call) and isinstance(n.test.left.func, ast.Attribute)
+                         and n.test.left.func.attr == "hexdigest")
+            self.assertIsInstance(guard.test.ops[0], ast.NotEq)
+            self.assertIsInstance(guard.body[0], ast.Raise)
+            self.assertEqual(ast.literal_eval(guard.body[0].exc.args[0]), "spreadsheet_helper_source_mismatch")
+            execution = sorted((n for n in ast.walk(loader) if isinstance(n, ast.Call)
+                                and isinstance(n.func, ast.Name) and n.func.id == "exec"), key=lambda n: n.lineno)
+            self.assertEqual(len(execution), 2)
+            self.assertLess(guard.end_lineno, execution[0].lineno)
+            self.assertEqual(ast.unparse(execution[0].args[0].args[0]), "raw")
+            self.assertEqual(ast.unparse(execution[1].args[0].args[0]), "read_source(path)")
+            self.assertIn("devtools_read_bound", ast.unparse(next(n for n in tree.body
+                          if isinstance(n, ast.FunctionDef) and n.name == "read_source")))
+            self.assertNotIn("sys.path", ast.unparse(loader))
+
+    def test_load03_wrong_helper_or_bound_read_refusal_precedes_any_module_exec(self):
+        for path in (PEER_PATH, COMPONENT_PATH):
+            tree = ast.parse(read_source(path))
+            loader = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "load_source")
+            for unreadable in (False, True):
+                reads, executed, registry = [], [], {}
+                refusal = OSError("authored bound read refusal")
+                def read(path):
+                    reads.append(path)
+                    if unreadable:
+                        raise refusal
+                    return b"# wrong helper; must never execute\n"
+                def forbidden(*args, **kwargs):
+                    executed.append("forbidden import/compile/exec")
+                    raise AssertionError("helper refusal must precede module execution")
+                namespace = {**peer.__dict__, "read_source": read, "MODULES": registry,
+                             "sys": types.SimpleNamespace(modules={}), "compile": forbidden, "exec": forbidden,
+                             "importlib": types.SimpleNamespace(util=types.SimpleNamespace(spec_from_file_location=forbidden))}
+                exec(compile(ast.Module(body=[loader], type_ignores=[]), str(path), "exec", dont_inherit=True), namespace)
+                with self.assertRaises(OSError if unreadable else RuntimeError) as caught:
+                    namespace["load_source"](peer.EXTRACTOR, "authored-loader-refusal")
+                if unreadable:
+                    self.assertIs(caught.exception, refusal)
+                else:
+                    self.assertEqual(caught.exception.args, ("spreadsheet_helper_source_mismatch",))
+                self.assertEqual(reads, [peer.FORMULAS])
+                self.assertEqual(registry, {})
+                self.assertEqual(namespace["sys"].modules, {})
+                self.assertEqual(executed, [])
+
+    def test_load03_same_process_healthy_binding_keeps_outer_helper_identity(self):
+        # This future SOURCE control is not a fresh-process/cold import proof.
+        for number, path in enumerate((PEER_PATH, COMPONENT_PATH)):
+            tree = ast.parse(read_source(path))
+            loader = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "load_source")
+            reads, before_path = [], list(sys.path)
+            helper = sys.modules["spreadsheet_formulas"]
+            def restore_helper(module, state):
+                module.__dict__.clear()
+                module.__dict__.update(state)
+            self.addCleanup(restore_helper, helper, dict(helper.__dict__))
+            def read(path):
+                reads.append(path)
+                return peer.read_source(path)
+            name = "parser_review_healthy_loader_" + str(number)
+            self.addCleanup(sys.modules.pop, name, None)
+            namespace = {**peer.__dict__, "read_source": read, "MODULES": {}}
+            exec(compile(ast.Module(body=[loader], type_ignores=[]), str(path), "exec", dont_inherit=True), namespace)
+            module = namespace["load_source"](peer.EXTRACTOR, name)
+            self.assertIs(sys.modules["spreadsheet_formulas"], helper)
+            self.assertIs(module.evaluate_cells, helper.evaluate_cells)
+            self.assertEqual(reads[:2], [peer.FORMULAS, peer.EXTRACTOR])
+            self.assertEqual(sys.path, before_path)
+            self.assertEqual(hashlib.sha256(peer.read_source(peer.FORMULAS)).hexdigest(), peer.FORMULAS_SHA256)
 
     def test_c1_actual_nested_boundary_worker_dispatch_options_keyword(self):
         tree = ast.parse(read_source(NATIVE_PATH))

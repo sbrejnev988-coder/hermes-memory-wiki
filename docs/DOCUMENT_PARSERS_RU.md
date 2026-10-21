@@ -166,3 +166,131 @@ snapshot. До нового independent cumulative review этот source subset
 source review не даёт native/FULL/installed/loaded/Vision/indexing proof или grant.
 Точный candidate/tree/static proof хранятся в этой lane evidence/RESULT.json;
 новый parser runtime, PDF/OCR engines и XLSX end-to-end остаются NOT_RUN.
+
+## Parser16 correction на 5047: подготовленный SOURCE, execution=0
+
+Полный исходный review `integration/parsers-common01/review/REVIEW.json`
+(`passed=false`, SHA256 `cb32609032f85b263269f6fea180c3318a162b8830f128f2cd0d6a87657f60ad`)
+и parent HOLD не переписаны. SRC-OCR-01/02 и SRC-LOAD-03 установлены как
+**условные SOURCE-механизмы**, не как воспроизведённые runtime incidents.
+Отдельная ветка `fix/parser16-review-source01` от
+`5047b80bbe97e55fa2a5f6c88c8cf49bd10cad40` меняет только шесть файлов из
+`corrections/parser16-review-fix01/REQUEST.json`. Старый parser target и
+current common9f68 остаются frozen; это не integration или acceptance.
+
+### SRC-OCR-01: exact fatal вместо ordinary failed-document
+
+В существующем `_run_ocr_command` ошибки pipe-reader и cleanup теперь
+удерживаются как **исходные объекты**, с частным stage/occurrence ledger.
+Приоритет после полного доступного drain: исходный body fatal; иначе первый
+фактически наблюдённый reader/cleanup fatal; иначе исходный ordinary body;
+при отсутствии body и только ordinary cleanup refusal — прежний фиксированный
+`ocr_cleanup_ownership_unknown`. Ordinary read/capture refusal остаётся
+`ocr_capture_limit_or_read_failure`, не превращается в принятый текст.
+`SystemExit`, `KeyboardInterrupt` и другой `BaseException`, не являющийся
+`Exception`, не упаковываются в ordinary `RuntimeError`.
+
+Выбрасывается exact selected object. Приватные `_ocr_primary_error`,
+`_ocr_reader_errors`, `_ocr_cleanup_errors`, `_ocr_observed_errors` сохраняют
+causal objects, `_ocr_diagnostics` содержит только фиксированные
+cleanup/ownership `complete|unknown`. `str`/`repr` чужих исключений не вызываются.
+Projection `__context__` включает distinct наблюдённые объекты в обратном
+порядке occurrence и исходный body последним, если его ещё нет; head — selected.
+Явные `__cause__` не меняются. Это не обход/сохранение произвольного foreign
+exception graph. Вторичный отказ private metadata/projection не маскирует
+selected error, но полнота диагностик при таком отказе не обещана.
+
+По неизменённому SOURCE caller contract fatal проходит мимо ordinary handlers
+`extract_image_ocr`/`extract_document`; unchanged worker имеет `BaseException`
+handler и должен выдать `ok=false`, exit2, а не ordinary failed-document под
+`ok=true`, exit0. **Этот путь worker не исполнялся.** Private attributes не
+публикуются обычным worker JSON; его прежний debug traceback отдельно не
+квалифицирован и не расширяет privacy-гарантии.
+
+### SRC-OCR-02: owning lifetime и независимые cleanup attempts
+
+Buffers, Event, ledgers, callbacks и initial state подготовлены до acquire.
+Owning `try/finally` начинается с `Popen` при `process=None`; успешный return
+из acquire и весь последующий Thread constructor/start/body охвачены им.
+После возвращённого child clock/poll/kill/wait/join/is_alive/close имеют
+отдельные защищённые attempts: отказ одного не отменяет остальные.
+Неудачный poll не считается завершением: kill и wait всё равно пробуются.
+Clock refusal не отменяет wait/join: при недоступном остатке используются
+минимальные timeouts (wait0.01s, join0s), а refusal остаётся в private ledger.
+Это не новое доказательство сохранения общего deadline при отказавших clocks.
+
+Join/state проверяются для каждого reader. При live/unknown reader pipes не
+закрываются под ним; другие join/state attempts всё равно выполняются.
+Любой cleanup refusal либо live/unknown reader консервативно сохраняет
+`(process, threads)` в `_OCR_RETAINED`; следующий вызов отказывает до `Popen`
+с `ocr_previous_ownership_unknown`. Обычный healthy результат возвращается
+только после cleanup и финальной проверки capture ledger. Автоматическое
+освобождение retained UNKNOWN или replacement worker не добавлены.
+
+Это только **direct-child Python ownership contract** после возвращённого
+acquire. Нет atomic async handoff/constructor-after-native-effect гарантии,
+нового supervisor, native/Job/process-tree/descendant/OS containment либо
+peak-memory/общего wall-time proof. Существующий `_PdfReaderOwner` и его
+private-veto политика вне этой функции неизменны. Здоровый extraction content
+не менялся: `EXTRACTOR_VERSION=3.1.8`, secret policy, cache/content version,
+PDF/XLSX APIs, caps и fingerprint axes не повышались и не менялись.
+
+### SRC-LOAD-03 и prepared regressions
+
+Оба существующих test-owned entry paths (standalone PDF/OCR loader и optional
+component setup) явно читают и SHA-проверяют shipped `spreadsheet_formulas.py`
+**до** исполнения extractor. Pin:
+`c27cf8175b9561d6028c1c69919196cadf8b2348f52ed88d6a148c3ca39078ac`.
+Используются `DEVTOOLS_INPUTS`/`devtools_read_bound` при их наличии, иначе
+точный sibling file. У здорового outer XLSX packet сохраняется module identity:
+namespace этого module заново инициализируется только из pinned source.
+Ambient `sys.path` не дополняется, SDK/engine stand-ins не вводятся.
+Wrong SHA даёт `spreadsheet_helper_source_mismatch`; read refusal сохраняется,
+не становится missing-engine skip. Component opt-in, собственный absolute
+TMPDIR и genuine-engine checks/старые assertions сохранены.
+
+`test_document_parser_review_boundaries.py` расширяет прежний `capture_seam`
+и `ReviewBoundarySourceTests` двенадцатью **подготовленными, НЕ запущенными**
+methods: exact cleanup fatal без body в wait/join/close; body-priority/causes;
+pipe fatal и ordinary inverse через image caller; pre-acquire Event/clock;
+early Thread constructor/start; независимые cleanup clock/poll/kill attempts;
+reader-state UNKNOWN/no replacement; два STATIC source-order/loader-closure
+контроля; wrong-helper/read refusal и same-process healthy prebound identity.
+Все прежние test methods/assertions/golds/reporters сохранены; изменённые
+loader/setup/seam означают новый исполняемый контракт, не перенос старого PASS.
+SOURCE loader closure, future same-process control, настоящий cold import,
+pytest collection и genuine engines — **разные оси доказательства**.
+
+Сейчас выполнены только Git/raw-byte/AST/syntax-compilation metadata checks
+**без exec/import/collection/test bodies**. Sparse physical6 не является
+полным runtime snapshot; для будущего admitted packet нужны exact shipped
+peers/helper и соответствующие bound inputs. `metadata_preflight()` не вызывался:
+он сам загружает продукт/fixture. Новые SOURCE/native/SQL/SDK/PDF/OCR/engine/
+model/network/Vision/index/CI/install/restart executions0; runtime остаётся
+`NOT_RUN`, qualification не получена. Exact frozen commit/tree, hashes/delta,
+prepared roster, actual metadata returns и ограничения —
+`parallel/foundation-documents-20261019/corrections/parser16-review-fix01/evidence/RESULT.json`.
+Независимый meaningful delta-review и решения acceptance/integration — родителю.
+
+### SRC-CALLER-04: отдельный owner handoff, pipeline/cache NOT_QUALIFIED
+
+Shipped extractor сохраняет benign literal sheet IDs, но неизменённый
+`document_knowledge_graph.py` повторно применяет **generic** `sanitize_json`
+как `_sanitize_extracted_json`: `ingest_document` при extraction-payload/cache
+capture и `_safe_json` для metadata/locators; `_cached_extraction_payload`
+проверяет результат той же generic sanitation; `_decode_json` повторяет её
+на read paths `document_source`/`document_unit_context`. В итоге trailing/leading
+spaces bounded benign sheet ID могут быть нормализованы после extractor,
+а typed structural identity hook `Unit.to_dict`/`ExtractedDocument.to_dict`
+через эти слои не переносится. Fresh extraction, сохранённый cache и readback
+поэтому не имеют доказанной literal-ID эквивалентности.
+
+Это подтверждённый SOURCE composition gap, не выполненный SQL/cache loss test.
+Он **не исправляется 17-м файлом** этой lane и не разрешает ослаблять общий
+sanitizer. Documents owner должен отдельно согласовать typed structural
+key/value contract через persistence/cache/read и подготовить real round-trip
+с same-ID positive, whitespace-distinct inverse, fresh-v-cache equality,
+Unicode/apostrophe/anchor/edge identity и прежними general privacy guards.
+До такого исправления и собственного допуска SQL/cache/pipeline exact-ID
+остаются **NOT_QUALIFIED**. Новый cache version сам по себе этот gap не лечит;
+его менять здесь не потребовалось.

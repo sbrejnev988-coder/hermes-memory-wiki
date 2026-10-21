@@ -148,3 +148,71 @@ snapshot. До нового independent cumulative review этот source subset
 source review не даёт native/FULL/installed/loaded/Vision/indexing proof или grant.
 Точный candidate/tree/static proof хранятся в этой lane evidence/RESULT.json;
 новый parser runtime, PDF/OCR engines и XLSX end-to-end остаются NOT_RUN.
+
+## Parser16 static correction: helper closure ≠ pipeline qualification
+
+Correction lane `parallel/foundation-documents-20261019/corrections/parser16-review-fix01`
+от `5047b80bbe97e55fa2a5f6c88c8cf49bd10cad40` готовит связанный OCR lifecycle
+и test-loader fix, **не новый evaluator/OOXML feature**. `spreadsheet_formulas.py`
+с SHA256 `c27cf8175b9561d6028c1c69919196cadf8b2348f52ed88d6a148c3ca39078ac`
+и все его прежние43 tests unchanged и заново не исполнялись. Здоровый content,
+`EXTRACTOR_VERSION=3.1.8`, secret policy3.0.0, cache/content versions,
+санитизаторы, literal serializer hooks и все XLSX/fingerprint APIs сохранены.
+
+SRC-LOAD-03 исправляется в существующих `test_document_parser_pdf_ocr.py`
+и `test_document_parser_components.py`: обязательный exact shipped helper
+читается через `DEVTOOLS_INPUTS`/`devtools_read_bound` либо sibling path,
+SHA-проверяется и исполняется перед extractor, без ambient `sys.path`.
+Для здорового заранее связанного outer XLSX helper сохраняется module identity,
+но namespace инициализируется pinned source, не чужими globals. Wrong-helper
+SHA/read refusal не преобразуются в optional-engine skip. Component opt-in,
+own TMPDIR и настоящие engine prerequisites остаются прежними. Static source
+closure не равен cold import, pytest collection или genuine component proof.
+Prepared wrong-helper/read-refusal/healthy identity controls находятся в
+существующем `ReviewBoundarySourceTests`; они **NOT_RUN**.
+
+SRC-OCR-01/02 исправляются только внутри существующего `_run_ocr_command`:
+pre-acquire Python state и owning try с `process=None`; отдельные cleanup
+attempts; точный body fatal, иначе первый наблюдённый reader/cleanup fatal
+вместо ordinary failed-document; private causal ledger/explicit causes;
+retained UNKNOWN/no replacement. Ordinary healthy/read failure политика
+сохранена. Подробные приоритеты, private context projection и direct-child
+ограничения описаны в `DOCUMENT_PARSERS_RU.md#parser16-correction-на-5047-подготовленный-source-execution0`.
+Нет нового supervisor или atomic async/constructor/native/descendant/tree/OS/
+peak-bound proof; PDF owner class вне OCR функции не менялась.
+
+### SRC-CALLER-04 — открытый documents-owner contract
+
+Прежние literal-ID утверждения выше относятся к **extractor output views**,
+а не автоматически к `document_knowledge_graph.py` persistence/cache/read.
+Этот unchanged owner импортирует generic `sanitize_json` как
+`_sanitize_extracted_json`. `ingest_document` повторно sanitizes extraction
+payload перед cache, `_safe_json` — stored metadata/locators; cache eligibility
+`_cached_extraction_payload` проверяет generic sanitized representation;
+`_decode_json` делает её снова на `document_source`/`document_unit_context`.
+Generic `redact_secret_text(...).strip()` может убрать literal leading/trailing
+spaces benign sheet ID, несмотря на узкий structural hook extractor serializers.
+Следовательно, `"Data"` и `"Data "` могут потерять различимость на этих слоях;
+full exact identity units/anchors/locators/edges и fresh-v-cache fidelity здесь
+**NOT_QUALIFIED**, не SQL/runtime reproduced loss и не принятый pipeline PASS.
+
+Исправление требует отдельного documents-owner задания: typed bounded benign
+structural key/value pairs должны переживать persistence/cache/read вместе с
+прежними общими privacy guards. Нужны same-ID positive, whitespace-distinct
+inverse (включая trailing space), Unicode/apostrophe и anchor/edge identity,
+real round-trip и fresh-v-cache equality. Не разрешается blanket bypass generic
+sanitizer либо расширение этой correction на 17-й файл. Cache version bump не
+заменяет identity fix; для текущего content-preserving OCR cleanup он не нужен.
+
+Original full SOURCE review `integration/parsers-common01/review/REVIEW.json`
+(`passed=false`, SHA256 `cb32609032f85b263269f6fea180c3318a162b8830f128f2cd0d6a87657f60ad`)
+и parent HOLD сохранены, прежние PASS/FAIL/UNKNOWN не переписываются. Изменённый
+loader/shared seam инвалидирует перенос затронутых исторических PASS на новые
+bytes. Выполнены только Git/raw/AST/syntax-compilation checks без exec; новых
+SOURCE/test/script/import/collection/native/SQL/SDK/PDF/OCR/engine/model/network/
+Vision/index/CI/install/restart calls0. `metadata_preflight()` не вызывался.
+Sparse physical6 — не полный runtime snapshot. Exact frozen source/tree,
+неизменные491 mode/blob, шесть raw hashes, prepared roster и actual metadata
+returns хранятся в `corrections/parser16-review-fix01/evidence/RESULT.json`.
+Independent delta-review, parent acceptance/integration и whole-goal
+native/FULL/installed/loaded остаются отдельными, здесь не выполнены.
