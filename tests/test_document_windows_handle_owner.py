@@ -52,7 +52,7 @@ STDLIB_SEEDS = (
     "itertools", "mimetypes", "urllib.error", "urllib.parse", "urllib.request",
     "zipfile", "dataclasses", "email.policy", "html.parser", "xml.etree.ElementTree",
     "unicodedata", "ctypes", "ctypes.wintypes", "ctypes._endian", "ctypes._layout",
-    "sysconfig", "struct", "msvcrt", "_ctypes", "annotationlib", "inspect",
+    "sysconfig", "struct", "msvcrt", "_ctypes", "pyexpat", "annotationlib", "inspect",
     "traceback", "linecache", "tokenize", "encodings.utf_8_sig", "encodings.idna",
 )
 SESSION = None
