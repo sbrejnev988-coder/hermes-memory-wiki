@@ -63,7 +63,9 @@ def _native(monkeypatch, home, *, content=None):
         assert Path(current_secret_scope_home()).resolve() == home.resolve()
         wire, model, timeout = adapter._build_responses_kwargs(kwargs)
         calls.append((kwargs, wire, model, timeout))
-        return SimpleNamespace(model=model, choices=[SimpleNamespace(message=SimpleNamespace(
+        # Authored synthetic validator input, NOT genuine SDK non-refusal provenance.
+        return SimpleNamespace(model=model, choices=[SimpleNamespace(index=0, finish_reason='stop', message=SimpleNamespace(
+            role='assistant', refusal=None,
             content=content if content is not None else json.dumps({'claims': [_candidate()]}),
             tool_calls=None))])
 

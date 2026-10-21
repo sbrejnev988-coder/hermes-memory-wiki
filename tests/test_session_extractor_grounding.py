@@ -349,7 +349,7 @@ def test_remote_extractor_sanitizer_failure_is_fail_closed(monkeypatch):
 
     assert requests == []
     assert result["entries"] == []
-    assert result["error"] == "transcript sanitization failed: RuntimeError"
+    assert result["error"] == "transcript_sanitization_failed"
 
 
 def test_provider_integration_cannot_widen_identical_claim_to_global(tmp_path, monkeypatch):
