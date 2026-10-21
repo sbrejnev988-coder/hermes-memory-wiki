@@ -11,6 +11,7 @@ from __future__ import annotations
 import datetime as _dt
 import ipaddress
 import json
+import math
 import os
 import re
 import time
@@ -224,6 +225,85 @@ class ExtractionSettings:
     error: str = ""
 
 
+class ExtractionBoundaryError(ValueError):
+    """A fixed, non-payload diagnostic; never include provider error/body text."""
+
+    CODES = frozenset({
+            "extraction_settings_invalid", "extraction_disabled", "extraction_provider_invalid",
+            "extraction_model_invalid", "codex_owner_settings_required", "extraction_deadline_invalid",
+            "response_size_or_type_invalid", "response_duplicate_field", "response_nonfinite_number",
+            "response_schema_invalid", "response_route_mismatch", "response_choice_invalid",
+            "response_truncated", "response_refused", "response_completion_unconfirmed",
+            "response_non_text", "response_refusal_unconfirmed", "response_text_invalid",
+            "source_message_budget_exceeded", "source_transcript_budget_exceeded",
+        })
+
+    def __init__(self, code: str):
+        self.code = code if type(code) is str and code in self.CODES else "extraction_request_failed"
+        super().__init__(self.code)
+
+
+def _validate_extraction_settings(settings: ExtractionSettings, *, graph: bool = False) -> None:
+    """Validate both reader output and direct caller snapshots, before any egress.
+
+    A disabled/error snapshot is not permission to call another provider. The
+    graph caller may shorten an admitted timeout to a finite fractional budget.
+    """
+    if not isinstance(settings, ExtractionSettings) or settings.error:
+        raise ExtractionBoundaryError("extraction_settings_invalid")
+    if type(settings.enabled) is not bool or not settings.enabled:
+        raise ExtractionBoundaryError("extraction_disabled")
+    if settings.provider not in {"openai-codex", "openrouter", "legacy"}:
+        raise ExtractionBoundaryError("extraction_provider_invalid")
+    codex = settings.provider == "openai-codex"
+    pattern = (r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}" if codex
+               else r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}")
+    if type(settings.model) is not str or not re.fullmatch(pattern, settings.model):
+        raise ExtractionBoundaryError("extraction_model_invalid")
+    # These literals must never reach a legacy/API-key route, even through a
+    # constructed snapshot or the graph helper rather than the profile reader.
+    if not codex and (settings.model == "gpt-6-luna" or settings.model.startswith("openai-codex/")):
+        raise ExtractionBoundaryError("codex_owner_settings_required")
+    if (type(settings.timeout) not in ({int, float} if graph else {int})
+            or not math.isfinite(settings.timeout) or not 0 < settings.timeout <= 60
+            or (not graph and settings.timeout < 1)
+            or type(settings.max_tokens) is not int
+            or not 256 <= settings.max_tokens <= (9000 if codex else 3000)
+            or type(settings.reasoning_effort) is not str
+            or settings.reasoning_effort not in {"low", "medium", "high", "xhigh", "max"}
+            or not isinstance(settings.home, Path) or not settings.home.is_absolute()):
+        raise ExtractionBoundaryError("extraction_settings_invalid")
+
+
+def _extraction_error_code(exc: Exception) -> str:
+    """Do not render arbitrary exception metadata (or a provider response)."""
+    if type(exc) is ExtractionBoundaryError and type(exc.code) is str and exc.code in ExtractionBoundaryError.CODES:
+        return exc.code
+    if isinstance(exc, TimeoutError):
+        return "TimeoutError"
+    if isinstance(exc, json.JSONDecodeError):
+        return "JSONDecodeError"
+    if isinstance(exc, (ImportError, AttributeError)):
+        return "extraction_capability_unavailable"
+    if isinstance(exc, ValueError):
+        return "ValueError"
+    return "extraction_request_failed"
+
+
+def _extraction_diagnostics(code: str, *, offered: int = 0, grounded: int = 0) -> Dict[str, Any]:
+    """Closed vocabulary only: no transcript, settings, path, exception or usage echo."""
+    outcome = ("grounded_candidates" if code == "ok" else
+               "unconfirmed" if code in {"response_refusal_unconfirmed", "extraction_capability_unavailable"} else
+               "truncated" if code == "response_truncated" else
+               "refused" if code == "response_refused" else
+               "source_refused" if code in {"source_message_budget_exceeded", "source_transcript_budget_exceeded"} else
+               "timeout" if code == "TimeoutError" else
+               "disabled" if code == "extraction_disabled" else "failed")
+    return {"outcome": outcome, "code": code, "offered": offered, "grounded": grounded,
+            "rejected": offered - grounded, "actual_model": "UNKNOWN",
+            "model_capability": "UNKNOWN", "server_schema_enforced": "UNKNOWN"}
+
+
 def read_extraction_settings(home: Optional[Path] = None) -> ExtractionSettings:
     """Read only the owning profile, never bridge YAML into process environment.
 
@@ -295,6 +375,8 @@ def read_extraction_settings(home: Optional[Path] = None) -> ExtractionSettings:
                         or type(settings.max_tokens) is not int or not 256 <= settings.max_tokens <= max_tokens_limit
                         or settings.reasoning_effort not in {"low", "medium", "high", "xhigh", "max"}):
                     raise ValueError("invalid extraction settings")
+                if settings.enabled:
+                    _validate_extraction_settings(settings)
                 return settings
         if not allow_legacy:
             return ExtractionSettings(home=home)
@@ -310,6 +392,8 @@ def _coerce_event_at(value: Any) -> int:
     if value is None or value == "" or isinstance(value, bool):
         return 0
     if isinstance(value, (int, float)):
+        if isinstance(value, float) and not math.isfinite(value):
+            return 0
         timestamp = int(value)
         if timestamp > 10_000_000_000:
             timestamp //= 1000
@@ -340,15 +424,23 @@ def _message_event_at(message: Dict[str, Any], role_prefix: str = "") -> int:
 
 
 def _normalize_exchanges(exchanges: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Accept role/content messages and legacy user/assistant pairs."""
+    """Select the last whole messages, or refuse their entire incomplete window.
+
+    Budgets count raw plain-string characters, including whitespace. Neither a
+    prefix nor a subset of the selected window can stand in for omitted speech:
+    the missing tail/message could deny any apparently positive assertion.
+    Older messages outside the intentional last-32 window remain out of scope.
+    """
     normalized: List[Dict[str, Any]] = []
 
     def append(role: str, content: Any, event_at: int = 0, timezone: Any = "UTC") -> None:
-        text = str(content or "").strip()
+        if role.casefold() not in {"user", "assistant"} or type(content) is not str:
+            return  # No tool/system speech or raw attachment objects as owner text.
+        text = content.strip()
         if text:
             normalized.append({
                 "role": "assistant" if role.casefold() == "assistant" else "user",
-                "content": text[:_MAX_MESSAGE_CHARS], "message_index": len(normalized),
+                "content": text, "message_index": len(normalized), "_source_chars": len(content),
                 "event_at": int(event_at or 0), "event_timezone": str(timezone or "UTC")[:80],
             })
 
@@ -364,17 +456,13 @@ def _normalize_exchanges(exchanges: List[Dict[str, Any]]) -> List[Dict[str, Any]
             append("assistant", exchange.get("assistant"), _message_event_at(exchange, "assistant_"),
                    exchange.get("assistant_event_timezone") or exchange.get("event_timezone") or "UTC")
     selected = normalized[-_MAX_MESSAGES:]
-    total = 0
-    bounded: List[Dict[str, Any]] = []
-    for message in reversed(selected):
-        available = _MAX_TRANSCRIPT_CHARS - total
-        if available <= 0:
-            break
-        item = dict(message)
-        item["content"] = item["content"][:available]
-        total += len(item["content"])
-        bounded.append(item)
-    return list(reversed(bounded))
+    if any(message["_source_chars"] > _MAX_MESSAGE_CHARS for message in selected):
+        raise ExtractionBoundaryError("source_message_budget_exceeded")
+    if sum(message["_source_chars"] for message in selected) > _MAX_TRANSCRIPT_CHARS:
+        raise ExtractionBoundaryError("source_transcript_budget_exceeded")
+    for message in selected:
+        del message["_source_chars"]
+    return selected
 
 
 def _heuristic_extract(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -540,26 +628,98 @@ def _remote_secret_material(
     return False
 
 
-def _strict_json_object(raw: str) -> Dict[str, Any]:
-    text = str(raw or "").strip()
-    if len(text.encode("utf-8", errors="ignore")) > _MAX_RESPONSE_BYTES:
-        raise ValueError("extraction response exceeds size limit")
-    fenced = re.fullmatch(r"```(?:json)?\s*([\s\S]*?)\s*```", text, flags=re.I)
-    if fenced:
-        text = fenced.group(1).strip()
+def _strict_json_document(
+    raw: str, *, root_key: str, max_entries: int, max_bytes: int = _MAX_RESPONSE_BYTES,
+) -> Dict[str, Any]:
+    """One bounded JSON object, no repair, duplicate keys, nonfinite or suffix."""
+    if type(raw) is not str or len(raw.encode("utf-8")) > max_bytes:
+        raise ExtractionBoundaryError("response_size_or_type_invalid")
+
     def unique_object(pairs):
         result = {}
         for key, value in pairs:
             if key in result:
-                raise ValueError("duplicate extraction field")
+                raise ExtractionBoundaryError("response_duplicate_field")
             result[key] = value
         return result
 
-    parsed = json.loads(text, object_pairs_hook=unique_object)
-    if (not isinstance(parsed, dict) or set(parsed) != {"claims"}
-            or not isinstance(parsed["claims"], list) or len(parsed["claims"]) > _MAX_ENTRIES):
-        raise ValueError("extraction response does not match the claim schema")
+    def finite_number(value):
+        number = float(value)
+        if not math.isfinite(number):
+            raise ExtractionBoundaryError("response_nonfinite_number")
+        return number
+
+    def no_constant(_value):
+        raise ExtractionBoundaryError("response_nonfinite_number")
+
+    parsed = json.loads(raw, object_pairs_hook=unique_object,
+                        parse_float=finite_number, parse_constant=no_constant)
+    if (type(parsed) is not dict or set(parsed) != {root_key}
+            or type(parsed[root_key]) is not list or len(parsed[root_key]) > max_entries):
+        raise ExtractionBoundaryError("response_schema_invalid")
     return parsed
+
+
+def _entry_shape_valid(entry: Any) -> bool:
+    if type(entry) is not dict or set(entry) != _ENTRY_KEYS:
+        return False
+    return not (
+        any(type(entry[key]) is not str for key in _ENTRY_KEYS - {"message_index", "confidence"})
+        or type(entry["message_index"]) is not int or entry["message_index"] < 0
+        or type(entry["confidence"]) not in {int, float} or not 0 <= entry["confidence"] <= 1
+        or entry["type"] not in _VALID_TYPES or entry["speaker"] not in {"user", "assistant"}
+        or not 10 < len(entry["claim"]) <= 2000 or not 1 <= len(entry["topic"]) <= 120
+        or not 5 <= len(entry["evidence_quote"]) <= _MAX_MESSAGE_CHARS
+        or len(entry["event_at"]) > 120
+    )
+
+
+def _strict_json_object(raw: str) -> Dict[str, Any]:
+    parsed = _strict_json_document(raw, root_key="claims", max_entries=_MAX_ENTRIES)
+    if not all(_entry_shape_valid(entry) for entry in parsed["claims"]):
+        raise ExtractionBoundaryError("response_schema_invalid")
+    return parsed
+
+
+def _codex_response_content(response: Any, model: str) -> str:
+    """Require a complete non-refusal text answer from the public aux result.
+
+    The current native adapter echoes the REQUESTED model, not the server model.
+    Its lack of a preserved refusal field is UNKNOWN, never inferred as None.
+    A shim which loses that field therefore cannot produce accepted candidates.
+    This validator does not patch the SDK or inspect its private stream.
+    """
+    missing = object()
+    if getattr(response, "model", missing) != model:
+        raise ExtractionBoundaryError("response_route_mismatch")
+    choices = getattr(response, "choices", missing)
+    if (type(choices) is not list or len(choices) != 1
+            or type(getattr(choices[0], "index", missing)) is not int or choices[0].index != 0):
+        raise ExtractionBoundaryError("response_choice_invalid")
+    choice = choices[0]
+    reason = getattr(choice, "finish_reason", missing)
+    if reason in ("length", "incomplete"):
+        raise ExtractionBoundaryError("response_truncated")
+    if reason == "content_filter":
+        raise ExtractionBoundaryError("response_refused")
+    if reason != "stop":
+        raise ExtractionBoundaryError("response_completion_unconfirmed")
+    message = getattr(choice, "message", missing)
+    if (getattr(message, "role", missing) != "assistant"
+            or getattr(message, "tool_calls", missing) not in (None, [])
+            or getattr(message, "function_call", None) is not None):
+        raise ExtractionBoundaryError("response_non_text")
+    refusal = getattr(message, "refusal", missing)
+    if refusal is missing:
+        raise ExtractionBoundaryError("response_refusal_unconfirmed")
+    if refusal is not None and refusal != "":
+        raise ExtractionBoundaryError("response_refused")
+    content = getattr(message, "content", missing)
+    if type(content) is not str or not content.strip():
+        raise ExtractionBoundaryError("response_text_invalid")
+    if len(content.encode("utf-8")) > _MAX_RESPONSE_BYTES:
+        raise ExtractionBoundaryError("response_size_or_type_invalid")
+    return content
 
 
 def _token_key(token: str) -> str:
@@ -663,6 +823,19 @@ _LEXICAL_SEPARATOR_RE = re.compile(
 def _lexical_terms(text: str) -> Tuple[str, ...]:
     # Full identifiers, not five-character prefixes or a bag of overlapping words.
     return tuple(word.casefold().rstrip('.') for word in _WORD_RE.findall(text))
+
+
+def _lexical_action_key(text: str) -> Tuple[str, ...]:
+    """Explicit grammar inflections, not stemming or a synonym inference.
+
+    An affirmative 'uses' and negative 'does not use' name the same action;
+    leaving the surface forms unequal permits a cropped positive citation.
+    Actor, full object, qualifiers and original source spans remain mandatory.
+    """
+    singular = {"uses": "use", "using": "use", "prefers": "prefer", "loves": "love",
+                "hates": "hate", "runs": "run", "owns": "own", "supports": "support",
+                "depends": "depend", "requires": "require"}
+    return tuple(singular.get(term, term) for term in _lexical_terms(text))
 
 
 def _lexical_actor_prefix(prefix: str) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
@@ -780,7 +953,7 @@ def _lexical_assertions(
             while obj_start < right and text[obj_start].isspace():
                 obj_start += 1
             object_name, qualifier = _lexical_object_scope(text[obj_start:right])
-            assertion = dict(actor=actor, action=_lexical_terms(verb.group()),
+            assertion = dict(actor=actor, action=_lexical_action_key(verb.group()),
                              object=_lexical_terms(text[obj_start:right]), negative=polarity,
                              object_name=object_name, qualifier=qualifier,
                              residue=residue, start=left, end=right,
@@ -854,14 +1027,7 @@ def _normalize_llm_entry(
     reject_secret_material: bool = False,
     secret_scan_callback: Optional[Callable[[str], Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
-    if not isinstance(entry, dict) or set(entry) != _ENTRY_KEYS:
-        return None
-    if (any(not isinstance(entry[key], str) for key in _ENTRY_KEYS - {"message_index", "confidence"})
-            or type(entry["message_index"]) is not int or entry["message_index"] < 0
-            or type(entry["confidence"]) not in {int, float} or not 0 <= entry["confidence"] <= 1
-            or entry["type"] not in _VALID_TYPES or entry["speaker"] not in {"user", "assistant"}
-            or len(entry["claim"]) > 2000 or len(entry["topic"]) > 120
-            or len(entry["evidence_quote"]) > _MAX_MESSAGE_CHARS):
+    if not _entry_shape_valid(entry):
         return None
     try:
         message_index = int(entry["message_index"])
@@ -884,6 +1050,8 @@ def _normalize_llm_entry(
             or (reject_secret_material and (
                 _remote_secret_material(claim, secret_scan_callback)
                 or _remote_secret_material(quote, secret_scan_callback)
+                or _remote_secret_material(topic, secret_scan_callback)
+                or _remote_secret_material(source_message.get("event_timezone"), secret_scan_callback)
             ))
             or _INJECTION_RE.search(claim) or _INJECTION_RE.search(quote) or _INJECTION_RE.search(source_message["content"])
             or (quote.lstrip().startswith(("{", "[")) and re.search(r'"claims?"\s*:', quote, re.I))
@@ -908,7 +1076,7 @@ def _response_schema() -> Dict[str, Any]:
         "topic": {"type": "string", "maxLength": 120},
         "evidence_quote": {"type": "string", "maxLength": _MAX_MESSAGE_CHARS},
         "speaker": {"type": "string", "enum": ["user", "assistant"]},
-        "message_index": {"type": "integer", "minimum": 0}, "event_at": {"type": "string"},
+        "message_index": {"type": "integer", "minimum": 0}, "event_at": {"type": "string", "maxLength": 120},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},
     }
     return {"name": "grounded_session_memory", "strict": True, "schema": {
@@ -1015,15 +1183,26 @@ def _codex_http_client(deadline, *, _admit=None, transport=None):
 
 def _codex_content(settings: ExtractionSettings, messages: List[Dict[str, Any]], *, _admit=None, _deadline=None) -> str:
     """Use the public native Responses adapter, not the mutating provider resolver."""
+    _validate_extraction_settings(settings, graph=True)
+    if settings.provider != "openai-codex":
+        raise ExtractionBoundaryError("codex_owner_settings_required")
+    if _deadline is not None and (type(_deadline) not in {int, float} or not math.isfinite(_deadline)):
+        raise ExtractionBoundaryError("extraction_deadline_invalid")
+    # Admission precedes auth reads/client setup, and runs again at the existing
+    # final HTTP hook. This does not create or refresh graph/SQL authority.
+    if _admit is not None:
+        _admit()
+    deadline = time.monotonic() + settings.timeout
+    if _deadline is not None:
+        deadline = min(deadline, _deadline)
+    if time.monotonic() >= deadline:
+        raise TimeoutError("Codex original deadline exceeded")
     from agent.auxiliary_client import CodexAuxiliaryClient, aux_stream_deadline
     from agent.codex_headers import CODEX_AUX_BASE_URL, codex_cloudflare_headers
     from agent.secret_scope import set_secret_scope, reset_secret_scope, current_secret_scope_home
     from hermes_constants import set_hermes_home_override, reset_hermes_home_override
-    from openai import OpenAI
+    from openai import OpenAI, APITimeoutError
 
-    deadline = time.monotonic() + settings.timeout
-    if _deadline is not None:
-        deadline = min(deadline, _deadline)
     access = _own_codex_grant(settings)
     home_token = set_hermes_home_override(settings.home)
     try:
@@ -1057,11 +1236,13 @@ def _codex_content(settings: ExtractionSettings, messages: List[Dict[str, Any]],
                     )
                     if time.monotonic() >= deadline:
                         raise TimeoutError("Codex response exceeded budget")
-                    if response.model != settings.model or response.choices[0].message.tool_calls:
-                        raise ValueError("Codex non-text response")
+                    content = _codex_response_content(response, settings.model)
                     if _admit is not None:
                         _admit()
-                    return response.choices[0].message.content
+                    return content
+                except APITimeoutError as exc:
+                    primary = exc
+                    raise TimeoutError("Codex transport timed out") from exc
                 except BaseException as exc:
                     primary = exc
                     raise
@@ -1074,7 +1255,7 @@ def _codex_content(settings: ExtractionSettings, messages: List[Dict[str, Any]],
                     except BaseException as cleanup:
                         if primary is None:
                             raise
-                        primary.add_note('Codex client cleanup: ' + type(cleanup).__name__)
+                        primary.add_note('Codex client cleanup failed; primary retained')
         finally:
             reset_secret_scope(secret_token)
     finally:
@@ -1159,8 +1340,12 @@ def _llm_extract(
     extraction_settings: Optional[ExtractionSettings] = None,
 ) -> Dict[str, Any]:
     settings = extraction_settings if extraction_settings is not None else read_extraction_settings()
-    if not settings.enabled:
-        return {"extracted": 0, "entries": [], "error": "extraction disabled"}
+    try:
+        _validate_extraction_settings(settings)
+    except Exception as exc:
+        code = _extraction_error_code(exc)
+        return {"extracted": 0, "entries": [], "error": code, "diagnostics": _extraction_diagnostics(code)}
+    deadline = time.monotonic() + settings.timeout
     is_codex = settings.provider == "openai-codex"
     is_native = settings.provider in {"openai-codex", "openrouter"}
     is_loopback = False
@@ -1177,9 +1362,10 @@ def _llm_extract(
         outbound_messages = messages if is_loopback else _sanitize_remote_messages(
             messages, redact_callback, secret_scan_callback,
         )
-    except Exception as exc:
+    except Exception:
         # No request is built when the privacy boundary cannot be enforced.
-        return {"extracted": 0, "entries": [], "error": f"transcript sanitization failed: {type(exc).__name__}"}
+        code = "transcript_sanitization_failed"
+        return {"extracted": 0, "entries": [], "error": code, "diagnostics": _extraction_diagnostics(code)}
 
     transcript = [{
         "message_index": m["message_index"], "speaker": m["role"], "content": m["content"],
@@ -1204,7 +1390,7 @@ def _llm_extract(
                        + '\nEmpty result example: {"claims":[]}')
         request_messages = [{"role": "system", "content": system}, {"role": "user", "content": prompt}]
         if is_codex:
-            content = _codex_content(settings, request_messages)
+            content = _codex_content(settings, request_messages, _deadline=deadline)
         elif settings.provider == "openrouter":
             content = _openrouter_content(settings, request_messages)
         else:
@@ -1222,20 +1408,29 @@ def _llm_extract(
             content = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
         result = _strict_json_object(content)
         by_index = {int(message["message_index"]): message for message in messages}
+        outbound_by_index = {int(message["message_index"]): message for message in outbound_messages}
         entries = []
         for raw_entry in result["claims"][:_MAX_ENTRIES]:
+            # The model cannot cite data withheld by a stronger owner redactor.
+            sent = outbound_by_index.get(raw_entry["message_index"])
+            if sent is None or raw_entry["evidence_quote"].strip() not in sent["content"]:
+                continue
             normalized = _normalize_llm_entry(
                 raw_entry, by_index, reject_secret_material=not is_loopback,
                 secret_scan_callback=secret_scan_callback,
             )
             if normalized is not None:
                 entries.append(normalized)
-        return {"extracted": len(entries), "entries": entries, "session_id": session_id}
+        if time.monotonic() >= deadline:
+            raise TimeoutError("Extraction candidate exceeded original deadline")
+        return {"extracted": len(entries), "entries": entries, "session_id": session_id,
+                "diagnostics": _extraction_diagnostics("ok", offered=len(result["claims"]), grounded=len(entries))}
     except Exception as exc:
         # Session finalization must remain available during provider/network/model failure.
         # Transport and model exceptions can echo submitted transcript text or
         # bearer credentials. Only the exception class may reach durable audit.
-        return {"extracted": 0, "entries": [], "error": type(exc).__name__}
+        code = _extraction_error_code(exc)
+        return {"extracted": 0, "entries": [], "error": code, "diagnostics": _extraction_diagnostics(code)}
 
 
 def _deduplicate(entries: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1314,7 +1509,19 @@ def extract_session_claims(
     **_: Any,
 ) -> Dict[str, Any]:
     """Extract and optionally persist source-grounded, chat-scoped claims."""
-    messages = _normalize_exchanges(exchanges)
+    try:
+        messages = _normalize_exchanges(exchanges)
+    except ExtractionBoundaryError as exc:
+        # Known local refusal is terminal for BOTH heuristic and remote paths.
+        # Do not read routing settings, dispatch an empty/cropped transcript, or
+        # call persistence with a positive left after omitting unknown speech.
+        code = _extraction_error_code(exc)
+        return {
+            "extracted": 0, "persisted": 0, "persisted_ids": [], "accepted": 0,
+            "queued_for_review": 0, "review_ids": [], "persistence_unknown": 0,
+            "entries": [], "session_id": session_id, "heuristic_only": False,
+            "errors": [], "error": code, "llm_diagnostics": _extraction_diagnostics(code),
+        }
     settings = extraction_settings if extraction_settings is not None else read_extraction_settings()
     heuristic_entries = _heuristic_extract(messages)
     llm_result = _llm_extract(
@@ -1323,9 +1530,13 @@ def extract_session_claims(
         secret_scan_callback=secret_scan_callback,
         extraction_settings=settings,
     ) if settings.enabled else {"extracted": 0, "entries": [], "error": settings.error}
-    entries = _deduplicate([*heuristic_entries, *llm_result.get("entries", [])])
+    entries = _deduplicate(entry for entry in [*heuristic_entries, *llm_result.get("entries", [])]
+                           if not any(_remote_secret_material(entry.get(key), secret_scan_callback)
+                                      for key in ("claim", "topic", "evidence_quote", "event_timezone")))
 
     persisted_ids: List[str] = []
+    review_ids: List[str] = []
+    unknown_outcomes = 0
     errors: List[str] = []
     if add_claim_callback is not None:
         for entry in entries:
@@ -1338,19 +1549,33 @@ def extract_session_claims(
                     visibility_scope="chat", event_at=int(entry.get("event_at") or 0),
                     event_timezone=str(entry.get("event_timezone") or "UTC")[:80],
                 )
-                if claim_id:
-                    persisted_ids.append(str(claim_id))
+                if type(claim_id) is str and re.fullmatch(r"c_[A-Za-z0-9_-]{1,160}", claim_id):
+                    if claim_id not in persisted_ids:
+                        persisted_ids.append(claim_id)
+                elif type(claim_id) is str and re.fullmatch(r"rq_[A-Za-z0-9_-]{1,160}", claim_id):
+                    if claim_id not in review_ids:
+                        review_ids.append(claim_id)
+                elif claim_id:
+                    unknown_outcomes += 1  # A truthy callback is not a durable accepted claim.
+                    errors.append("persistence_outcome_unknown")
             except Exception as exc:
-                errors.append(type(exc).__name__)
+                errors.append(_extraction_error_code(exc))
     return {
         "extracted": len(entries), "persisted": len(persisted_ids), "persisted_ids": persisted_ids,
+        "accepted": len(persisted_ids), "queued_for_review": len(review_ids), "review_ids": review_ids,
+        "persistence_unknown": unknown_outcomes,
         "entries": entries, "session_id": session_id, "heuristic_only": not settings.enabled,
         "errors": errors, "error": llm_result.get("error", ""),
+        "llm_diagnostics": llm_result.get("diagnostics", _extraction_diagnostics("extraction_disabled")),
     }
 
 
 def extractor_score_session(exchanges: List[Dict[str, Any]]) -> Dict[str, float]:
-    messages = _normalize_exchanges(exchanges)
+    try:
+        messages = _normalize_exchanges(exchanges)
+    except ExtractionBoundaryError:
+        # A known incomplete source is no signal to admit background work.
+        return {"total": 0.0}
     user_text = " ".join(message["content"] for message in messages if message["role"] == "user")
     signals = sum(1 for pattern in (_PATTERN_REMEMBER, _PATTERN_PREFERENCE, _PATTERN_DECISION, _PATTERN_FACT)
                   if pattern.search(user_text))

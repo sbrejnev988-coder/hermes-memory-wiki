@@ -9816,8 +9816,12 @@ class MemoryWikiProvider(MemoryProvider):
             exchanges = []
             for message in messages[-32:]:
                 role = str(message.get("role", "")).lower()
-                content = str(message.get("content", "") or "").strip()
-                if role in {"user", "assistant"} and content:
+                content = message.get("content", "")
+                if type(content) is not str:
+                    continue  # Never turn attachments or foreign __str__ into speech.
+                if role in {"user", "assistant"} and content.strip():
+                    # Keep raw length/whitespace until extractor budget admission;
+                    # caller trimming must not hide an incomplete source window.
                     exchange = {"role": role, "content": content}
                     # Preserve host-supplied source time for grounded event ordering.
                     # The extractor ignores unknown fields and never trusts an LLM
