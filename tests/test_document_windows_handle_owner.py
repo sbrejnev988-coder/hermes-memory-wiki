@@ -26,7 +26,7 @@ FIXTURE = ROOT / "tests/fixtures/document_windows_handle_owner_baseline.py.txt"
 BASELINE_COMMIT = "e6e721e0b33b1a6f64b2c4751ed7ffd2a9487ed7"
 BASELINE_MODULE_SHA256 = "4a8f993a2ece5a5c2484d2c5e1be1202586fa2c67023fca674678aa53c966524"
 BASELINE_FIXTURE_SHA256 = "c6beb960d1b45f34bce220325ccc5bebe667f44a1cca7579f62931b89132ebb0"
-CANDIDATE_MODULE_SHA256 = "3640c616f89199def1f9a1cde7ae7aef6530116ee915b7bd6ff941f80c54338f"
+CANDIDATE_MODULE_SHA256 = "09d4dbd04d258f692b57884b8aaca157c3aaf1fcdfba4542044fc3ab29a6b68c"
 ROSTER = (
     "test_01_native_readonly_transfer_and_close",
     "test_02_ordinary_pretransfer_cleanup",
@@ -491,7 +491,23 @@ class DocumentWindowsHandleOwner(unittest.TestCase):
             raise AssertionError("non_unique_owning_function")
         n = nodes[0]
         span = b"".join(raw.splitlines(keepends=True)[n.lineno-1:n.end_lineno])
-        if span != fixture.replace(b"    except Exception:\n", b"    except BaseException:\n"):
+        expected = fixture.replace(
+            b"    handle = create_file(str(path), 0x80000000, 0x00000001, None, 3, 0x08200080, None)\n"
+            b"    invalid = ctypes.c_void_p(-1).value\n"
+            b"    if handle == invalid:\n"
+            b"        raise ctypes.WinError(ctypes.get_last_error())\n"
+            b"    try:\n",
+            b"    invalid = ctypes.c_void_p(-1).value\n"
+            b"    handle = None\n"
+            b"    try:\n"
+            b"        handle = create_file(str(path), 0x80000000, 0x00000001, None, 3, 0x08200080, None)\n"
+            b"        if handle == invalid:\n"
+            b"            raise ctypes.WinError(ctypes.get_last_error())\n",
+        ).replace(
+            b"    except Exception:\n        close_handle(handle)\n",
+            b"    except BaseException:\n        if handle is not None and handle != invalid:\n            close_handle(handle)\n",
+        )
+        if span != expected:
             raise AssertionError("not_minimal_owning_handler_delta")
         if sha(raw.replace(span, fixture)) != BASELINE_MODULE_SHA256:
             raise AssertionError("bytes_outside_owning_function_changed")
@@ -577,8 +593,18 @@ class DocumentWindowsHandleOwner(unittest.TestCase):
             with self.subTest(id="native." + name):
                 call = NativeCall(SESSION.product._open_windows_allowed_file, path)
                 with call.observe(self._testMethodName, "native." + name):
-                    with self.assertRaises((OSError, ValueError)):
+                    with self.assertRaises((OSError, ValueError)) as caught:
                         call.function(path)
+                    if isinstance(caught.exception, OSError):
+                        # PermissionError from the audit fence is NOT a Win32 refusal.
+                        self.assertIn(getattr(caught.exception, "winerror", None), {
+                            "outside-owned-allowlist": (), "missing": (2, 3), "directory": (5,),
+                        }[name])
+                    else:
+                        self.assertEqual(str(caught.exception), {
+                            "outside-owned-allowlist": "opened document target escaped allowed roots",
+                            "directory": "opened document is a directory or reparse point",
+                        }.get(name))
                     if name == "outside-owned-allowlist":
                         self.assertIsNotNone(call.row["handle"])
                         self.assertEqual(SESSION.oracle.state(call.row["handle"], call.row["identity"])["state"], "closed")
@@ -610,6 +636,10 @@ class DocumentWindowsHandleOwner(unittest.TestCase):
                     records.append((fd, call.row))
                     self.assertEqual(call.row["transfer_admissions"], 1)
                     self.assertEqual(os.read(fd, 4096), PAYLOAD)
+            if len(records) != 2:
+                # An acquisition subtest already failed; unittest retains that
+                # non-success. Do not obscure it with a cascading IndexError.
+                return
             self.assertNotEqual(records[0][0], records[1][0])
             self.assertNotEqual(records[0][1]["handle"], records[1][1]["handle"])
             for fd, row in records:

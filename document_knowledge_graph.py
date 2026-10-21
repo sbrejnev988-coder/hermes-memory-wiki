@@ -701,11 +701,12 @@ def _open_windows_allowed_file(path: Path) -> int:
     close_handle.argtypes = [wintypes.HANDLE]
     close_handle.restype = wintypes.BOOL
 
-    handle = create_file(str(path), 0x80000000, 0x00000001, None, 3, 0x08200080, None)
     invalid = ctypes.c_void_p(-1).value
-    if handle == invalid:
-        raise ctypes.WinError(ctypes.get_last_error())
+    handle = None
     try:
+        handle = create_file(str(path), 0x80000000, 0x00000001, None, 3, 0x08200080, None)
+        if handle == invalid:
+            raise ctypes.WinError(ctypes.get_last_error())
         info = BY_HANDLE_FILE_INFORMATION()
         if not get_info(handle, ctypes.byref(info)):
             raise ctypes.WinError(ctypes.get_last_error())
@@ -716,7 +717,8 @@ def _open_windows_allowed_file(path: Path) -> int:
             raise ValueError("opened document target escaped allowed roots")
         return msvcrt.open_osfhandle(handle, os.O_RDONLY | getattr(os, "O_BINARY", 0))
     except BaseException:
-        close_handle(handle)
+        if handle is not None and handle != invalid:
+            close_handle(handle)
         raise
 
 
