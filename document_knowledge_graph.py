@@ -3915,8 +3915,9 @@ def document_unit_context(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]
     units = []
     disclosure.documents(disclosure.watch("document_units", "unit_id", [r['unit_id'] for r in rows]))
     for raw in rows:
-        item = _hydrate_document_unit(raw, xlsx_context)
+        item = _row(raw)
         item["unit_text"] = _clean(item.get("unit_text"), 20_000)
+        item = _hydrate_document_unit(item, xlsx_context)
         units.append(item)
     out = {"source_id": source_id, "target_ordinal": ordinal, "units": units}
     if source["parser"] == "stdlib-xlsx-ooxml" and xlsx_context is None:
