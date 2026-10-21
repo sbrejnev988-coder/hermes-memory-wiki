@@ -115,6 +115,9 @@ def load_sources():
 
 
 class LunaOracleCompatSource(unittest.TestCase):
+    # Explicit unittest SOURCE suite only; exclude ordinary pytest discovery.
+    __test__ = False
+
     @classmethod
     def setUpClass(cls):
         cls.x = load_sources()
