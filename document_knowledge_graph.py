@@ -38,6 +38,9 @@ try:
         EXTRACTOR_VERSION as _EXTRACTOR_VERSION,
         SECRET_POLICY_VERSION as _SECRET_POLICY_VERSION,
         sanitize_json as _sanitize_extracted_json,
+        XLSX_IDENTITY_POLICY as _XLSX_IDENTITY_POLICY,
+        xlsx_identity_context as _xlsx_identity_context,
+        xlsx_identity_fields as _xlsx_identity_fields,
     )
 except ImportError:
     from document_extractors import (
@@ -45,6 +48,9 @@ except ImportError:
         EXTRACTOR_VERSION as _EXTRACTOR_VERSION,
         SECRET_POLICY_VERSION as _SECRET_POLICY_VERSION,
         sanitize_json as _sanitize_extracted_json,
+        XLSX_IDENTITY_POLICY as _XLSX_IDENTITY_POLICY,
+        xlsx_identity_context as _xlsx_identity_context,
+        xlsx_identity_fields as _xlsx_identity_fields,
     )
 try:
     from .guard import sanitize_context_text as _sanitize_untrusted_text
@@ -162,16 +168,139 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
 
 
-def _safe_json(value: Any) -> str:
-    return _json(_sanitize_extracted_json(value))
+def _document_xlsx_context(parser: Any, metadata: Any, *, persisted: bool = False) -> Any:
+    """Typed representation eligibility only; never grants source/read authority."""
+    if parser != "stdlib-xlsx-ooxml":
+        return None
+    if persisted and (type(metadata) is not dict
+                      or metadata.get("xlsx_identity_policy") != _XLSX_IDENTITY_POLICY
+                      or metadata.get("xlsx_identity_state") != "bounded_benign_fields_only"):
+        return None
+    context = _xlsx_identity_context(metadata)
+    # A structural label cannot exempt an injection or an allblank identity.
+    if context is not None and all(_sanitize_untrusted_text(name, max_len=len(name)) == name
+                                   for name in context.sheets):
+        return context
+    return None
 
 
-def _decode_json(value: Any, default: Any) -> Any:
+def _sanitize_document_json(value: Any, *, xlsx_shape: str = "", xlsx_context: Any = None,
+                            xlsx_unit: Any = None, **bounds: Any) -> Any:
+    """Generic redaction first, with a bounded key+value+shape literal channel.
+
+    Used BEFORE read guards, never to repair their output from an earlier raw ID.
+    Keys, prose, formulas, invalid shapes and non-XLSX callers keep the shipped
+    generic sanitizer. Do not resurrect a leaf removed by its depth/item caps.
+    """
+    safe = _sanitize_extracted_json(value, **bounds)
+    for path, literal in _xlsx_identity_fields(value, shape=xlsx_shape, context=xlsx_context, unit=xlsx_unit):
+        if (len(literal) > bounds.get("max_string", 20000)
+                or bounds.get("depth", 0) + len(path) >= bounds.get("max_depth", 8)
+                or any(type(key) is int and key >= bounds.get("max_items", 10000) for key in path)):
+            continue
+        parent = safe
+        try:
+            for key in path[:-1]:
+                parent = parent[key]
+            key = path[-1]
+            if ((type(parent) is dict and key in parent)
+                    or (type(parent) is list and type(key) is int and 0 <= key < len(parent))):
+                # Only undo the identified whitespace-only normalization. In
+                # particular, a full composed anchor can trigger the genuine
+                # secret detector even when its isolated sheet name did not.
+                # Never overwrite that redaction/transformation with raw data.
+                if type(parent[key]) is not str or parent[key] not in (literal, literal.rstrip()):
+                    continue
+                # Retain the genuine local guard's transformed/refused value.
+                # The provider inspector/disclosure still run at final delivery.
+                parent[key] = _sanitize_untrusted_text(literal, max_len=len(literal))
+        except (KeyError, IndexError, TypeError):
+            continue
+    return safe
+
+
+def _safe_json(value: Any, *, xlsx_shape: str = "", xlsx_context: Any = None,
+               xlsx_unit: Any = None) -> str:
+    return _json(_sanitize_document_json(value, xlsx_shape=xlsx_shape,
+                                        xlsx_context=xlsx_context, xlsx_unit=xlsx_unit))
+
+
+def _decode_json(value: Any, default: Any, *, xlsx_shape: str = "", xlsx_context: Any = None,
+                 xlsx_unit: Any = None) -> Any:
     try:
         decoded = json.loads(str(value or _json(default)))
     except Exception:
         decoded = default
-    return _sanitize_extracted_json(decoded)
+    return _sanitize_document_json(decoded, xlsx_shape=xlsx_shape,
+                                   xlsx_context=xlsx_context, xlsx_unit=xlsx_unit)
+
+
+def _stored_xlsx_context(source: Any) -> Any:
+    if source["parser"] != "stdlib-xlsx-ooxml" or source["extension"] not in {".xlsx", ".xlsm", ".xltx"}:
+        return None
+    try:
+        metadata = json.loads(source["metadata_json"])
+    except (TypeError, ValueError, RecursionError):
+        return None
+    return _document_xlsx_context(source["parser"], metadata, persisted=True)
+
+
+def _hydrate_document_unit(raw: Any, xlsx_context: Any = None) -> Dict[str, Any]:
+    out = _row(raw)
+    out["metadata"] = _decode_json(out.pop("metadata_json", ""), {})
+    out["locator"] = _decode_json(out.pop("locator_json", ""), {}, xlsx_shape="locator",
+                                  xlsx_context=xlsx_context, xlsx_unit=out)
+    return _sanitize_document_json(out, xlsx_shape="unit", xlsx_context=xlsx_context)
+
+
+def _document_xlsx_payload_context(payload: Dict[str, Any], *, persisted: bool = False) -> Any:
+    context = (_document_xlsx_context(payload.get("parser"), payload.get("metadata"))
+               if payload.get("extension") in {".xlsx", ".xlsm", ".xltx"} else None)
+    if persisted:
+        context = _document_xlsx_context(payload.get("parser"), payload.get("metadata"), persisted=True) if context is not None else None
+    units, edges = payload.get("units"), payload.get("edges")
+    if (context is None or type(units) is not list or len(units) > 1000000
+            or type(edges) is not list or len(edges) > 2010000):
+        return None
+    for unit in units:
+        if ("locator", "sheet") not in dict(_xlsx_identity_fields(unit, shape="unit", context=context)):
+            return None
+    for edge in edges:
+        if type(edge) is not dict:
+            return None
+        if edge.get("predicate") == "formula_ref" and len(dict(_xlsx_identity_fields(edge, shape="edge", context=context))) != 2:
+            return None
+    return context
+
+
+def _document_extraction_payload(payload: Dict[str, Any]) -> Tuple[Dict[str, Any], Any]:
+    context = _document_xlsx_payload_context(payload)
+    safe = _sanitize_document_json(payload, xlsx_shape="payload", xlsx_context=context,
+                                   max_items=1_000_000, max_string=2_000_000, max_depth=16)
+    if payload.get("parser") == "stdlib-xlsx-ooxml":
+        if type(safe.get("metadata")) is not dict:
+            safe["metadata"] = {}
+        safe["metadata"]["xlsx_identity_policy"] = _XLSX_IDENTITY_POLICY
+        safe["metadata"]["xlsx_identity_state"] = (
+            "bounded_benign_fields_only" if context is not None else "withheld")
+    return safe, context
+
+
+def _document_representation_fingerprint(extraction_fp: str, extension: str) -> str:
+    if extension not in {".xlsx", ".xlsm", ".xltx"}:
+        return extraction_fp
+    return _sha(_json({"extraction": extraction_fp, "xlsx_identity_policy": _XLSX_IDENTITY_POLICY}))
+
+
+def _xlsx_unchanged_eligible(existing: Any, payload: Dict[str, Any], *, cache_reused: bool) -> bool:
+    if payload.get("parser") != "stdlib-xlsx-ooxml":
+        return True
+    # A fresh extraction cannot attest the OLD materialization. Even an equal
+    # revision must be rewritten after a legacy/damaged cache miss, not retained.
+    current = _stored_xlsx_context(existing) if existing is not None else None
+    incoming = _document_xlsx_context(payload.get("parser"), payload.get("metadata"), persisted=True)
+    return bool(cache_reused and current is not None and incoming is not None
+                and current.sheets == incoming.sheets)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -2197,8 +2326,11 @@ def _cached_extraction_payload(metadata_json: Any, *, extraction_fp: str,
         # Reuse the persistence sanitizer, with the exact cache-write bounds.
         # Reject rather than bless a raw/partially sanitized nested cache.
         json.dumps(candidate, allow_nan=False)
-        safe = _sanitize_extracted_json(candidate, max_items=1_000_000,
-                                        max_string=2_000_000, max_depth=16)
+        context = _document_xlsx_payload_context(candidate, persisted=True)
+        if candidate.get("parser") == "stdlib-xlsx-ooxml" and context is None:
+            return None  # legacy/withheld IDs cannot be recovered from a lossy cache
+        safe = _sanitize_document_json(candidate, xlsx_shape="payload", xlsx_context=context,
+                                        max_items=1_000_000, max_string=2_000_000, max_depth=16)
         serialized = _json(candidate)
         if _json(safe) != serialized or cache["extraction_payload_hash"] != _sha(serialized):
             return None
@@ -2476,7 +2608,8 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
         from .document_extractors import extraction_options_fingerprint
     except ImportError:
         from document_extractors import extraction_options_fingerprint
-    extraction_fp = extraction_options_fingerprint(path, options)
+    extraction_fp = _document_representation_fingerprint(
+        extraction_options_fingerprint(path, options), path.suffix.lower())
     material_fp = _sha(_json(material_options))
     snapshot, snapshot_meta = _snapshot_allowed_file(
         path,
@@ -2498,6 +2631,7 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
                 extraction_fp=extraction_fp, file_hash=snapshot_meta["file_hash"],
                 parser=existing["parser"], parser_version=existing["parser_version"],
             )
+        cache_reused = payload is not None
         if payload is None:
             payload = _extract(snapshot, {**args, "_effective_extraction_options": options})
     finally:
@@ -2522,7 +2656,11 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
     payload["file_hash"] = str(snapshot_meta["file_hash"])
     payload["mtime_ns"] = int(snapshot_meta["mtime_ns"])
     payload["file_size"] = int(snapshot_meta["size_bytes"])
-    extraction_payload = _sanitize_extracted_json(payload, max_items=1_000_000, max_string=2_000_000, max_depth=16)
+    extraction_payload, xlsx_context = _document_extraction_payload(payload)
+    if payload.get("parser") == "stdlib-xlsx-ooxml":
+        # The SAME typed, redacted representation feeds cache and materialization.
+        # No source-row migration or guessed recovery of previously lost names.
+        payload = extraction_payload
     file_identity = snapshot_meta["file_identity"]
     admission = (path, scope_id, repository_id, original_actor, original_source, file_identity)
     if managed_admission is not None:
@@ -2539,7 +2677,8 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
     same_identity = _assert_ingest_source_scope(provider, existing, scope_id, repository_id)
     _assert_ingest_path_alias_owner(provider, conn, path, source_id, scope_id, repository_id,
                                     opened_identity=file_identity)
-    if (existing and same_identity and str(existing["revision_id"] or "") == revision_id
+    representation_current = _xlsx_unchanged_eligible(existing, payload, cache_reused=cache_reused)
+    if (existing and representation_current and same_identity and str(existing["revision_id"] or "") == revision_id
             and str(existing["file_hash"] or "") == file_hash
             and str(existing["parser"] or "") == parser
             and str(existing["parser_version"] or "") == parser_version
@@ -2559,7 +2698,7 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
             "path": str(path), "file_hash": file_hash, "units": active_units,
             "file_identity_updated": identity_updated,
         }, provider=provider)
-    if (existing and not same_identity and str(existing["revision_id"] or "") == revision_id
+    if (existing and representation_current and not same_identity and str(existing["revision_id"] or "") == revision_id
             and str(existing["file_hash"] or "") == file_hash
             and str(existing["parser"] or "") == parser
             and str(existing["parser_version"] or "") == parser_version
@@ -2646,7 +2785,7 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
              str(payload.get("extension") or path.suffix.lower()), str(payload.get("mime_type") or ""),
              _clean(payload.get("title") or path.stem, 1000), file_hash, int(payload.get("mtime_ns") or 0),
              int(payload.get("file_size") or 0), parser, parser_version, revision_id,
-             extractor_status, 1, _safe_json(payload.get("metadata") or {}),
+             extractor_status, 1, _safe_json(payload.get("metadata") or {}, xlsx_shape="metadata", xlsx_context=xlsx_context),
              _safe_json(payload.get("warnings") or []), "", int(existing["created_at"] if existing else ts), ts),
         )
         _remember_file_identity(conn, source_id, file_identity)
@@ -2660,7 +2799,8 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
             uid = anchor_to_id[anchor]
             parent_id = anchor_to_id.get(str(unit.get("parent_anchor") or ""), "")
             text = _clean(unit.get("text"), material_options["unit_chars"])
-            title = _clean(unit.get("title"), 1000)
+            identity_fields = dict(_xlsx_identity_fields(unit, shape="unit", context=xlsx_context))
+            title = _clean(unit.get("title"), 2000 if ("title",) in identity_fields else 1000)
             written = conn.execute(
                 """INSERT INTO document_units(unit_id,source_id,revision_id,parent_unit_id,unit_type,anchor,ordinal,title,
                        unit_text,content_hash,locator_json,metadata_json,active,updated_at)
@@ -2675,7 +2815,8 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
                      AND document_units.anchor=excluded.anchor""",
                 (uid, source_id, revision_id, parent_id, str(unit.get("kind") or unit.get("unit_type") or "text")[:100], anchor,
                  int(unit.get("ordinal") or ordinal), title, text, str(unit.get("content_hash") or _sha(text)),
-                 _safe_json(unit.get("locator") or {}), _safe_json(unit.get("metadata") or {}), ts),
+                 _safe_json(unit.get("locator") or {}, xlsx_shape="locator", xlsx_context=xlsx_context,
+                            xlsx_unit=unit), _safe_json(unit.get("metadata") or {}), ts),
             )
             if written.rowcount != 1:
                 raise sqlite3.IntegrityError("document unit identity conflict")
@@ -2999,6 +3140,9 @@ def scan_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
             stat = path.stat()
             existing = existing_by_path.get(str(path.resolve(strict=False)))
             if (stat_fast_path and existing and int(existing["active"] or 0) == 1
+                    # XLSX representation/cache policy is checked only by the
+                    # canonical ingest owner, not by timestamp/size equality.
+                    and path.suffix.lower() not in {".xlsx", ".xlsm", ".xltx"}
                     and int(existing["mtime_ns"] or 0) == int(stat.st_mtime_ns)
                     and int(existing["size_bytes"] or 0) == int(stat.st_size)
                     and str(existing["scope_id"] or "") == requested_scope
@@ -3456,15 +3600,20 @@ def _load_candidate(conn: sqlite3.Connection, key: str) -> Optional[Dict[str, An
     kind, _, object_id = key.partition(":")
     if kind == "unit":
         row = conn.execute(
-            """SELECT u.*,s.source_path,s.display_name,s.title source_title,s.extension,s.scope_id,s.repository_id
+            """SELECT u.*,s.source_path,s.display_name,s.title source_title,s.extension,s.scope_id,s.repository_id,
+                      s.parser source_parser,s.metadata_json source_metadata_json
                FROM document_units u JOIN document_sources s ON s.source_id=u.source_id
                WHERE u.unit_id=? AND u.active=1 AND s.active=1""", (object_id,),
         ).fetchone()
         if not row: return None
         out = _row(row); out["candidate_type"] = "unit"; out["id"] = object_id; out["excerpt"] = out.get("unit_text")
-        out["locator"] = _decode_json(out.pop("locator_json", ""), {})
-        out["metadata"] = _decode_json(out.pop("metadata_json", ""), {})
-        return _sanitize_extracted_json(out)
+        source = {"parser": out.pop("source_parser"), "metadata_json": out.pop("source_metadata_json"),
+                  "extension": out["extension"]}
+        context = _stored_xlsx_context(source)
+        out = _hydrate_document_unit(out, context)
+        if source["parser"] == "stdlib-xlsx-ooxml" and context is None:
+            out["xlsx_identity_state"] = "legacy_or_withheld"
+        return out
     if kind == "chunk":
         row = conn.execute(
             """SELECT c.*,s.source_path,s.display_name,s.title source_title,s.extension
@@ -3713,10 +3862,14 @@ def document_source(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     _assert_source_access(provider, row)
     _assert_connector_owner(provider, str(row["source_id"]))
     out = _row(row)
+    xlsx_context = _stored_xlsx_context(out)
     for key in ("metadata_json", "warnings_json"):
         raw = out.pop(key, "")
         default = {} if key == "metadata_json" else []
-        out[key[:-5]] = _decode_json(raw, default)
+        out[key[:-5]] = _decode_json(raw, default, xlsx_shape="metadata" if key == "metadata_json" else "",
+                                     xlsx_context=xlsx_context)
+    if out.get("parser") == "stdlib-xlsx-ooxml" and xlsx_context is None:
+        out["xlsx_identity_state"] = "legacy_or_withheld"
     has_claims = conn.execute(
         "SELECT 1 FROM sqlite_master WHERE type='table' AND name='claims'"
     ).fetchone()
@@ -3741,11 +3894,12 @@ def document_unit_context(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]
     if not source_id: raise ValueError("source_id is required")
     conn = provider._connect(); install_document_graph_schema(conn)
     disclosure = _document_disclosure(provider, conn)
-    source = conn.execute("SELECT scope_id,repository_id FROM document_sources WHERE source_id=? AND active=1", (source_id,)).fetchone()
+    source = conn.execute("SELECT scope_id,repository_id,parser,extension,metadata_json FROM document_sources WHERE source_id=? AND active=1", (source_id,)).fetchone()
     if not source: raise ValueError("document source not found")
     disclosure.documents(disclosure.watch("document_sources", "source_id", [source_id]))
     _assert_source_access(provider, source)
     _assert_connector_owner(provider, source_id)
+    xlsx_context = _stored_xlsx_context(source)
     if unit_id:
         target = conn.execute("SELECT ordinal FROM document_units WHERE source_id=? AND unit_id=? AND active=1", (source_id, unit_id)).fetchone()
     elif anchor:
@@ -3761,13 +3915,13 @@ def document_unit_context(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]
     units = []
     disclosure.documents(disclosure.watch("document_units", "unit_id", [r['unit_id'] for r in rows]))
     for raw in rows:
-        item = _row(raw)
+        item = _hydrate_document_unit(raw, xlsx_context)
         item["unit_text"] = _clean(item.get("unit_text"), 20_000)
-        item["locator"] = _decode_json(item.pop("locator_json", ""), {})
-        item["metadata"] = _decode_json(item.pop("metadata_json", ""), {})
-        units.append(_sanitize_extracted_json(item))
-    return _disclosed_document_output(provider, {"source_id": source_id, "target_ordinal": ordinal,
-                                   "units": units}, disclosure)
+        units.append(item)
+    out = {"source_id": source_id, "target_ordinal": ordinal, "units": units}
+    if source["parser"] == "stdlib-xlsx-ooxml" and xlsx_context is None:
+        out["xlsx_identity_state"] = "legacy_or_withheld"
+    return _disclosed_document_output(provider, out, disclosure)
 
 
 def document_neighbors(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:

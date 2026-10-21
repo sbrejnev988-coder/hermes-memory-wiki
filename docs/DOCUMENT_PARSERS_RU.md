@@ -274,13 +274,14 @@ prepared roster, actual metadata returns и ограничения —
 
 ### SRC-CALLER-04: отдельный owner handoff, pipeline/cache NOT_QUALIFIED
 
-Shipped extractor сохраняет benign literal sheet IDs, но неизменённый
+В baseline d93 shipped extractor сохраняет benign literal sheet IDs, но тогда неизменённый
 `document_knowledge_graph.py` повторно применяет **generic** `sanitize_json`
 как `_sanitize_extracted_json`: `ingest_document` при extraction-payload/cache
 capture и `_safe_json` для metadata/locators; `_cached_extraction_payload`
 проверяет результат той же generic sanitation; `_decode_json` повторяет её
-на read paths `document_source`/`document_unit_context`. В итоге trailing/leading
-spaces bounded benign sheet ID могут быть нормализованы после extractor,
+на read paths `document_source`/`document_unit_context`. Точный механизм —
+`clean_text` → `redact_secret_text` с построчным `line.rstrip()`:
+trailing spaces bounded benign scalar sheet ID могут исчезнуть после extractor,
 а typed structural identity hook `Unit.to_dict`/`ExtractedDocument.to_dict`
 через эти слои не переносится. Fresh extraction, сохранённый cache и readback
 поэтому не имеют доказанной literal-ID эквивалентности.
@@ -293,4 +294,66 @@ key/value contract через persistence/cache/read и подготовить r
 Unicode/apostrophe/anchor/edge identity и прежними general privacy guards.
 До такого исправления и собственного допуска SQL/cache/pipeline exact-ID
 остаются **NOT_QUALIFIED**. Новый cache version сам по себе этот gap не лечит;
-его менять здесь не потребовалось.
+его менять для той OCR correction не потребовалось. Удаление leading spaces
+на этом literal path не доказано; они остаются обязательным regression control.
+
+### SRC-CALLER04: отдельный literal-owner code + prepared regressions
+
+В этой производной lane реализован connected documentKG representation path.
+`xlsx_identity_context`/`xlsx_identity_fields` в extractor — узкая схема
+key + value + shape: producer metadata/coverage, уникальные nonblank benign
+имена до1024 символов и до10000 листов, согласованные sheet index/title,
+row/cell locator/anchor/parent и допустимые A1 coordinates. Один parser label,
+ключ `sheet` либо policy marker не разрешает исключение. Имена не strip/casefold/
+Unicode-normalize; апострофы и различимые Unicode sequences не реконструируются.
+Generic sanitizer/secret detector, formulas/text/keys и обычный non-XLSX API
+сохраняются; malformed/overcap/redacted/allblank/injection identity не получает
+literal admission. Неизвестная/withheld fidelity явно отмечается, не exact success.
+
+`_document_extraction_payload` готовит одну redacted typed representation для
+cache capture **и** XLSX materialization. Узкий канал проходит source
+`metadata.sheets`, `_safe_json`/`_decode_json`, unit locator и sheet title,
+unit metadata (по прежнему generic), row/cell anchors и `formula_ref` endpoints.
+Полные benign sheet titles до1024 не режутся прежним1000-character display cap;
+остальной title API не расширен. `_hydrate_document_unit` используется и
+`_load_candidate`, и `document_unit_context`; `document_source` декодирует
+свою metadata по той же схеме, до реальных terminal guards. Keys и arbitrary
+metadata не получают exemption; существующие depth/item/string caps не обходятся.
+Literal channel отменяет только установленную whitespace-only normalization;
+он не перезаписывает результат full-field secret detector, в том числе когда
+secret-like совпадение возникает лишь в composed structural anchor.
+
+`xlsx-literal-structure-v1` — representation policy, **не** новая версия parser/
+evaluator или secret detector. XLSX extraction fingerprint включает её до
+revision-ID и обеих early-return ветвей. Cache admission требует актуальный
+typed payload, policy/state и прежние file/parser/hash/equality checks.
+`_xlsx_unchanged_eligible` дополнительно запрещает `unchanged`/`scope_updated`
+после cache miss или legacy source metadata, даже при equal revision.
+`scan_documents` не применяет stat-only shortcut к XLSX: даже trusted mtime/size
+equality проходит canonical ingest/cache policy; non-XLSX fast path сохранён.
+Перечитывается настоящий разрешённый source; миграции пользовательских строк и
+догадок о потерянных IDs нет. Legacy reads — `legacy_or_withheld`, не recovery.
+
+`bounded_benign_fields_only` — состояние representation **до** read guards,
+не аттестация exact final output. `_clean` сам не делает strip. Настоящий
+`guard.py` сохраняет benign nonblank spaces, но может отфильтровать injection/
+allblank; provider inspector вправе отказать или преобразовать значение.
+`_guard_document_output`, disclosure finish, ACL/owner/connector/FS/worker guards
+не изменены; raw ID не восстанавливается поверх их transformation/veto.
+
+Новый `tests/test_document_xlsx_identity_source.py` содержит explicit stdlib
+SOURCE suite и отдельный будущий own-SQLite suite. Module/class `__test__=False`,
+collection не читает/не импортирует продукт; actual pytest nonselection
+**NOT_RUN**. SOURCE definitions используют настоящий OOXML/evaluator/redactors,
+serializer/cache/hydration owners; SQLite definitions — настоящую собственную
+SQLite и shipped standalone Provider, заменяя только worker transport настоящим
+inline extractor. Никакой fake public/disclosure/SQL authority не добавлен.
+Public wrapper + genuine provider/read-fence/SDK/worker composition остаются
+отдельными gates, не заменёнными static caller assertions.
+
+Выполнены только authoring, inert AST/syntax compilation без exec и Git
+metadata/checkpoint. **Ни одно тело теста, product import, collection,
+metadata_preflight, SQL/native/engine/model/network/Vision/index/CI не выполнено.**
+Нет RED→GREEN, independent approval, приёмки, integration/install/restart.
+Полные source pins, static delta/preservation и prepared roster со статусами
+NOT_RUN — `corrections/parser16-literal-owner01/evidence/RESULT.json`.

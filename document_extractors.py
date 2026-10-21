@@ -37,7 +37,7 @@ from dataclasses import dataclass, field, asdict
 from email import policy
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from xml.etree import ElementTree as ET
 
 # Package import in the plugin; the standalone SOURCE/worker path binds the
@@ -49,6 +49,8 @@ else:
 
 EXTRACTOR_VERSION = "3.1.8"
 SECRET_POLICY_VERSION = "3.0.0"
+# Separate documentKG representation policy; parser/evaluator semantics did not change.
+XLSX_IDENTITY_POLICY = "xlsx-literal-structure-v1"
 
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".markdown", ".rst", ".log", ".ini", ".cfg", ".conf",
@@ -709,6 +711,156 @@ def _xlsx_output_anchor(value: Any) -> str:
     except ValueError:
         return "<REDACTED>"
     return f"sheet:{_xlsx_literal_id(name)}/{kind}:{coordinate}"
+
+
+@dataclass(frozen=True)
+class _XlsxIdentityContext:
+    sheets: Tuple[str, ...]
+    positions: Dict[str, int]
+
+
+def xlsx_identity_context(metadata: Any) -> Optional[_XlsxIdentityContext]:
+    """Validate a bounded producer schema, not a parser label or arbitrary key.
+
+    This is representation eligibility, NEVER owner/privacy/disclosure authority.
+    Callers must retain their real read guards, including guard transformations.
+    Redacted, blank or malformed identities cannot attest literal fidelity.
+    """
+    if type(metadata) is not dict:
+        return None
+    names, policy, coverage = (metadata.get(key) for key in ("sheets", "formula_policy", "coverage"))
+    if (type(names) is not list or not 1 <= len(names) <= 10000
+            or type(policy) is not dict or policy.get("engine") != "bounded_subset_v1"
+            or type(coverage) is not dict or type(coverage.get("declared_sheets")) is not int
+            or coverage["declared_sheets"] != len(names)
+            or type(coverage.get("input_complete")) is not bool
+            or type(coverage.get("output_truncated")) is not bool):
+        return None
+    for name in names:
+        if (type(name) is not str or not name or name.isspace()
+                or "<REDACTED" in name or name.startswith("[filtered")
+                or _xlsx_literal_id(name) != name):
+            return None
+    if len(set(names)) != len(names):
+        return None
+    return _XlsxIdentityContext(tuple(names), {name: index for index, name in enumerate(names, 1)})
+
+
+def xlsx_identity_fields(value: Any, *, shape: str, context: Any,
+                         unit: Any = None) -> Iterable[Tuple[Tuple[Any, ...], str]]:
+    """Yield ONLY validated structural leaves; all other fields stay generic.
+
+    No text/formula/key exemption, normalization, fuzzy match or ID recovery.
+    The iterator avoids accumulating a second workbook-sized identity mapping.
+    The context is built once from xlsx_identity_context's validated schema.
+    """
+    if type(context) is not _XlsxIdentityContext:
+        return
+
+    def unit_fields(record):
+        if type(record) is not dict or type(record.get("locator")) is not dict:
+            return
+        kind = record.get("kind", record.get("unit_type"))
+        if ("kind" in record and "unit_type" in record and record["kind"] != record["unit_type"]):
+            return
+        loc = record["locator"]
+        name = loc.get("sheet")
+        if type(name) is not str or name not in context.positions:
+            return
+        index = context.positions[name]
+        if type(record.get("ordinal")) is not int or not 1 <= record["ordinal"] <= 1000000:
+            return
+        if kind == "sheet":
+            if (set(loc) != {"sheet", "sheet_index"} or type(loc["sheet_index"]) is not int
+                    or loc["sheet_index"] != index or record.get("anchor") != f"sheet:{index}"
+                    or record.get("title") != name or record.get("parent_anchor", "") != ""):
+                return
+            yield ("title",), name
+        elif kind in {"table_row", "cell"}:
+            if kind == "table_row":
+                row = loc.get("row")
+                if (set(loc) != {"sheet", "row"} or type(row) is not int or not 1 <= row <= 1048576
+                        or record.get("anchor") != f"sheet:{name}/row:{row}"):
+                    return
+                cells = (record.get("metadata") or {}).get("cells") if type(record.get("metadata")) is dict else None
+                if cells is not None:
+                    if type(cells) is not list or len(cells) > 10000:
+                        return
+                    seen = set()
+                    for cell in cells:
+                        if type(cell) is not dict or type(cell.get("coordinate")) is not str:
+                            return
+                        try:
+                            _, cell_row = _xlsx_coordinate(cell["coordinate"])
+                        except ValueError:
+                            return
+                        if cell_row != row or cell["coordinate"] in seen:
+                            return
+                        seen.add(cell["coordinate"])
+            else:
+                coordinate = loc.get("cell")
+                if set(loc) != {"sheet", "cell"} or type(coordinate) is not str:
+                    return
+                try:
+                    _xlsx_coordinate(coordinate)
+                except ValueError:
+                    return
+                if record.get("anchor") != f"sheet:{name}/cell:{coordinate}":
+                    return
+            if "parent_anchor" in record and record["parent_anchor"] != f"sheet:{index}":
+                return
+        else:
+            return
+        yield ("locator", "sheet"), name
+        yield ("anchor",), record["anchor"]
+        if record.get("parent_anchor"):
+            yield ("parent_anchor",), record["parent_anchor"]
+
+    def edge_fields(record):
+        if type(record) is not dict or record.get("predicate") != "formula_ref":
+            return
+        anchors = []
+        for key in ("source_anchor", "target_anchor"):
+            anchor = record.get(key)
+            if type(anchor) is not str or len(anchor) > 1100 or not anchor.startswith("sheet:"):
+                return
+            name, sep, coordinate = anchor[6:].rpartition("/cell:")
+            if not sep or name not in context.positions:
+                return
+            try:
+                _xlsx_coordinate(coordinate)
+            except ValueError:
+                return
+            anchors.append((key, anchor))
+        for key, anchor in anchors:
+            yield (key,), anchor
+
+    if shape == "metadata":
+        if type(value) is dict and value.get("sheets") == list(context.sheets):
+            for index, name in enumerate(context.sheets):
+                yield ("sheets", index), name
+    elif shape == "unit":
+        yield from unit_fields(value)
+    elif shape == "locator" and type(unit) is dict:
+        for path, literal in unit_fields({**unit, "locator": value}):
+            if path[0] == "locator":
+                yield path[1:], literal
+    elif shape == "edge":
+        yield from edge_fields(value)
+    elif shape == "payload":
+        if (type(value) is not dict or value.get("parser") != "stdlib-xlsx-ooxml"
+                or value.get("extension") not in {".xlsx", ".xlsm", ".xltx"}
+                or type(value.get("units")) is not list or len(value["units"]) > 1000000
+                or type(value.get("edges")) is not list or len(value["edges"]) > 2010000):
+            return
+        yield from ((("metadata",) + path, literal) for path, literal in
+                    xlsx_identity_fields(value.get("metadata"), shape="metadata", context=context))
+        for index, record in enumerate(value["units"]):
+            for path, literal in unit_fields(record):
+                yield ("units", index) + path, literal
+        for index, record in enumerate(value["edges"]):
+            for path, literal in edge_fields(record):
+                yield ("edges", index) + path, literal
 
 
 _XLSX_FORMULA_TOKEN_RE = re.compile(
