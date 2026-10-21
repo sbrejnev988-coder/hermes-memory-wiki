@@ -1,0 +1,37 @@
+def _open_posix_directory(path: Path) -> int:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    if not nofollow:
+        raise RuntimeError("platform lacks O_NOFOLLOW; refusing unsafe document traversal")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow | getattr(os, "O_CLOEXEC", 0)
+    anchor = path.anchor or os.path.sep
+    fd = os.open(anchor, flags)
+    try:
+        for part in path.parts[1:] if path.anchor else path.parts:
+            next_fd = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _open_posix_allowed_file(path: Path, root: Path, relative: Path) -> int:
+    root_fd = _open_posix_directory(root)
+    try:
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        flags = os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0)
+        current_fd = root_fd
+        for index, part in enumerate(relative.parts):
+            is_final = index == len(relative.parts) - 1
+            part_flags = flags if is_final else flags | getattr(os, "O_DIRECTORY", 0)
+            next_fd = os.open(part, part_flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+        return current_fd
+    except Exception:
+        try:
+            os.close(root_fd)
+        except OSError:
+            pass
+        raise

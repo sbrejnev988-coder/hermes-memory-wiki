@@ -622,30 +622,31 @@ def _open_posix_directory(path: Path) -> int:
     try:
         for part in path.parts[1:] if path.anchor else path.parts:
             next_fd = os.open(part, flags, dir_fd=fd)
-            os.close(fd)
-            fd = next_fd
+            previous_fd, fd = fd, next_fd
+            # Publish the child owner before close, which may raise after release.
+            os.close(previous_fd)
         return fd
-    except Exception:
+    except BaseException:
         os.close(fd)
         raise
 
 
 def _open_posix_allowed_file(path: Path, root: Path, relative: Path) -> int:
-    root_fd = _open_posix_directory(root)
+    current_fd = _open_posix_directory(root)
     try:
         nofollow = getattr(os, "O_NOFOLLOW", 0)
         flags = os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0)
-        current_fd = root_fd
         for index, part in enumerate(relative.parts):
             is_final = index == len(relative.parts) - 1
             part_flags = flags if is_final else flags | getattr(os, "O_DIRECTORY", 0)
             next_fd = os.open(part, part_flags, dir_fd=current_fd)
-            os.close(current_fd)
-            current_fd = next_fd
+            previous_fd, current_fd = current_fd, next_fd
+            # Never retry the released integer: it may already name another FD.
+            os.close(previous_fd)
         return current_fd
-    except Exception:
+    except BaseException:
         try:
-            os.close(root_fd)
+            os.close(current_fd)
         except OSError:
             pass
         raise
@@ -762,21 +763,26 @@ def _snapshot_allowed_file(path: Path, *, max_bytes: int,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0),
             0o600,
         )
-        digest = hashlib.sha256()
-        copied = 0
         try:
-            with os.fdopen(fd, "rb", closefd=False) as source, os.fdopen(snapshot_fd, "wb") as target:
-                while True:
-                    block = source.read(1024 * 1024)
-                    if not block:
-                        break
-                    copied += len(block)
-                    if copied > max_bytes:
-                        raise ValueError("document changed beyond configured maximum while snapshotting")
-                    digest.update(block)
-                    target.write(block)
-                target.flush()
-                os.fsync(target.fileno())
+            try:
+                digest = hashlib.sha256()
+                copied = 0
+                # Keep the raw target owner through both constructors/enters.
+                # Borrowing avoids an ambiguous transfer or a second FD close.
+                with os.fdopen(fd, "rb", closefd=False) as source, os.fdopen(snapshot_fd, "wb", closefd=False) as target:
+                    while True:
+                        block = source.read(1024 * 1024)
+                        if not block:
+                            break
+                        copied += len(block)
+                        if copied > max_bytes:
+                            raise ValueError("document changed beyond configured maximum while snapshotting")
+                        digest.update(block)
+                        target.write(block)
+                    target.flush()
+                    os.fsync(target.fileno())
+            finally:
+                os.close(snapshot_fd)
         except Exception:
             snapshot_path.unlink(missing_ok=True)
             raise
