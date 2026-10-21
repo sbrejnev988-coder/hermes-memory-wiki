@@ -47,7 +47,9 @@ class G3Tests(g1.DocumentStateG1):
         self.path.write_bytes(b'%PDF-1.4\n% authored option-dispatch boundary fixture\n%%EOF\n')
         # Optional PyMuPDF is absent in selected PM. Exercise real extract_document
         # dispatch and capture bounded PDF options; no fabricated native parser/OCR claim.
-        def pdf_boundary(path,max_units,max_pages,ocr,language,minimum):
+        def pdf_boundary(path,max_units,max_pages,ocr,language,minimum,*,options):
+            self.assertEqual(options,self.e.effective_extraction_options(options))
+            self.assertEqual((max_units,max_pages,ocr,language,minimum),tuple(options[k] for k in ('max_units','max_pages','ocr','ocr_language','ocr_min_native_chars')))
             return self.e.ExtractedDocument('pdf-boundary','application/pdf','Authored PDF',
                 [self.e.Unit('page','page:1','Authored PDF native-dispatch text '+language,ordinal=1)])
         with mock.patch.dict(os.environ,{'MEMORY_WIKI_DOCUMENT_OCR_MIN_NATIVE_CHARS':'0'}), mock.patch.object(self.e,'_extract_pdf_pymupdf',side_effect=pdf_boundary) as parser, mock.patch.object(self.d,'_extract',side_effect=lambda p,a:self.e.extract_document(p,a['_effective_extraction_options'])) as extract:

@@ -50,8 +50,9 @@ def _apply_resource_limits() -> None:
 def main() -> int:
     try:
         _apply_resource_limits()
-        raw = sys.stdin.buffer.read(int(os.environ.get("MEMORY_WIKI_DOCUMENT_WORKER_INPUT_MAX", "1048576")) + 1)
-        if len(raw) > int(os.environ.get("MEMORY_WIKI_DOCUMENT_WORKER_INPUT_MAX", "1048576")):
+        input_max = _limit("MEMORY_WIKI_DOCUMENT_WORKER_INPUT_MAX", 1_048_576, 1024, 8_388_608)
+        raw = sys.stdin.buffer.read(input_max + 1)
+        if len(raw) > input_max:
             raise ValueError("worker input exceeds configured limit")
         request = json.loads(raw.decode("utf-8"))
         if not isinstance(request, dict):
@@ -70,7 +71,7 @@ def main() -> int:
         if os.environ.get("MEMORY_WIKI_DOCUMENT_WORKER_DEBUG", "0").lower() not in {"", "0", "false", "no", "off"}:
             response["traceback"] = traceback.format_exc(limit=8)[-6000:]
     encoded = json.dumps(response, ensure_ascii=False, separators=(",", ":"), default=str)
-    max_output = max(1, int(os.environ.get("MEMORY_WIKI_DOCUMENT_WORKER_OUTPUT_MB", "512"))) * 1024 * 1024
+    max_output = _limit("MEMORY_WIKI_DOCUMENT_WORKER_OUTPUT_MB", 512, 8, 4096) * 1024 * 1024
     if len(encoded.encode("utf-8")) > max_output:
         response = {"ok": False, "error": "document worker output exceeds configured limit"}
         encoded = json.dumps(response, ensure_ascii=False, separators=(",", ":"))
