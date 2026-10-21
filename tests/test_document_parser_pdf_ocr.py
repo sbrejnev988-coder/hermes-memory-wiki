@@ -161,6 +161,73 @@ class ParserSourceTests(unittest.TestCase):
         self.assertTrue(d["table_cells_limited"])
         self.assertNotIn("omitted", "\n".join(u.text for u in out.units))
 
+        # Keep the original incomplete-table refusal above. The controls below
+        # must reach ordinary emission instead of passing on its empty output.
+        text = "Capacity record sample." * 120
+        for limit, length, truncated in ((1000, 1000, True), (5000, len(text), False)):
+            options = e.effective_extraction_options({"max_chars": limit, "max_cells": 8,
+                "pdf_max_blocks_per_page": 4})
+            normal = e._PdfOutput(options)
+            diag = e._pdf_emit_page(normal, 2, text,
+                [(0, 0, 20, 10, text, 0, 0)], [], options)
+            self.assertIsNone(normal.fallback_veto)
+            self.assertEqual(diag["structure"], "blocks")
+            self.assertEqual(diag["text_units"], 1)
+            self.assertEqual([u.kind for u in normal.units], ["page", "text_block"])
+            self.assertEqual([u.text for u in normal.units if u.kind == "text_block"], [text[:length]])
+            self.assertEqual(normal.characters, length)
+            self.assertEqual(normal.truncated, truncated)
+            self.assertEqual(diag["truncated"], truncated)
+            retained = [u.to_dict() for u in normal.units if u.kind == "text_block"]
+            self.assertEqual([u["text"] for u in retained], [text[:length]])
+
+        first, second = "First retained block.", "Second retained block."
+        records = [(0, 0, 10, 10, first, 0, 0), (0, 20, 10, 30, second, 1, 0)]
+        for maximum, wanted, truncated in ((1, [first], True), (2, [first, second], False)):
+            options = e.effective_extraction_options({"max_chars": 5000, "max_cells": 8,
+                "pdf_max_blocks_per_page": maximum})
+            normal = e._PdfOutput(options)
+            diag = e._pdf_emit_page(normal, 3, first + " " + second, records, [], options)
+            self.assertIsNone(normal.fallback_veto)
+            self.assertEqual(diag["structure"], "blocks")
+            self.assertFalse(diag["table_cells_limited"])
+            self.assertEqual(diag["text_units"], len(wanted))
+            retained = [u.to_dict() for u in normal.units if u.kind == "text_block"]
+            self.assertEqual([u["text"] for u in retained], wanted)
+            self.assertEqual([u["anchor"] for u in retained],
+                [f"page:3/block:{number}" for number in range(len(wanted))])
+            self.assertEqual(normal.characters, sum(map(len, wanted)))
+            self.assertLess(normal.characters, options["max_chars"])
+            self.assertEqual(normal.truncated, truncated)
+            self.assertEqual(diag["truncated"], truncated)
+
+        # Complete benign table context reaches metadata clipping, not veto.
+        metadata_size = len("NameCount") + len(text) + len("42")
+        for limit, truncated in ((1000, True), (5000, False)):
+            options = e.effective_extraction_options({"max_chars": limit, "max_cells": 4,
+                "pdf_max_blocks_per_page": 4})
+            table = sample_table()
+            table["rows"][1]["cells"][0]["text"] = text
+            normal = e._PdfOutput(options)
+            diag = e._pdf_emit_page(normal, 4, "Name Count " + text + " 42",
+                [(10, 30, 110, 70, "Name Count " + text + " 42", 0, 0)], [table], options)
+            self.assertIsNone(normal.fallback_veto)
+            self.assertEqual(diag["structure"], "blocks_and_native_tables")
+            self.assertFalse(diag["table_cells_limited"])
+            self.assertEqual(normal.cells, 4)
+            self.assertEqual(normal.metadata_characters, min(metadata_size, limit))
+            rows = [u.to_dict() for u in normal.units if u.kind == "table_row"]
+            self.assertEqual(len(rows), 2)
+            values = [[cell["text"] for cell in row["metadata"]["cells"]] for row in rows]
+            self.assertEqual(values[0], ["Name", "Count"])
+            room = limit - len("NameCount")
+            self.assertEqual(values[1], [text[:room], "" if truncated else "42"])
+            self.assertEqual(sum(len(value) for row in values for value in row), min(metadata_size, limit))
+            self.assertTrue(any(row["text"] for row in rows))
+            self.assertLessEqual(sum(len(u.text) for u in normal.units), limit)
+            self.assertEqual(normal.truncated, truncated)
+            self.assertEqual(diag["truncated"], truncated)
+
     def test_text_health_and_ocr_selection_are_not_accuracy_claims(self):
         e = self.e
         self.assertEqual(e._text_quality("")["status"], "empty")
