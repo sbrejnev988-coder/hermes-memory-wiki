@@ -135,7 +135,12 @@ def main():
     (fixture_home / 'native-origins.json').write_text(json.dumps({'origins': {name: row['origin'] for name, row in origins.items()}}, indent=2) + '\n', encoding='utf-8')
     import pytest
     target = 'tests' if stage == 'full' else 'tests/ci_owned/recovery_cases.py'
-    args = ['-q', target, '--basetemp=' + str(runroot / 'pytest-temp'), '--junitxml=' + str(out / 'junit.xml'), '-o', 'cache_dir=' + str(runroot / 'pytest-cache'), '-o', 'log_file=' + str(out / 'pytest-detail.log')]
+    source_args = []
+    if stage == 'full':
+        from fixture_prerequisites import native_pytest_args
+        source_result = json.loads((runroot / 'source-prerequisites/source-results.json').read_text(encoding='utf-8'))
+        source_args = native_pytest_args(source, source_result)
+    args = ['-q', target, '--confcutdir=' + str(source / 'tests'), *source_args, '--basetemp=' + str(runroot / 'pytest-temp'), '--junitxml=' + str(out / 'junit.xml'), '-o', 'cache_dir=' + str(runroot / 'pytest-cache'), '-o', 'log_file=' + str(out / 'pytest-detail.log')]
     return dispatch_pytest(pytest.main, args, source=source, out=out)
 
 if __name__ == '__main__':

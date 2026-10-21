@@ -8,18 +8,33 @@ from pathlib import Path
 
 import pytest
 import memory_wiki as wiki
-
-OUT=Path(os.environ['RECOVERY_DIAGNOSTIC_OUT'])
+from agent import secret_scope
+import hermes_constants
 
 @pytest.fixture(scope='module')
-def provider():
-    p=wiki.MemoryWikiProvider()
-    p.initialize('synthetic-diff-polarity',hermes_home=str(OUT/'home'),agent_context='test',bot_id='synthetic-diff-bot',project_id='synthetic-diff')
-    assert p.db_path.resolve().is_relative_to(OUT.resolve())
-    assert p.__class__.__bases__ == (wiki.MemoryProvider,)
-    yield p
-    p._shutdown_lifecycle(render=False)
-    assert p._conn is None and p._owned_conn is None
+def provider(tmp_path_factory):
+    OUT = tmp_path_factory.mktemp('diff-polarity')
+    home = OUT/'home'
+    home.mkdir(parents=True, exist_ok=True)
+    home_token = hermes_constants.set_hermes_home_override(home)
+    try:
+        secret_token = secret_scope.set_secret_scope({}, profile_home=str(home))
+        try:
+            p = None
+            try:
+                p=wiki.MemoryWikiProvider()
+                p.initialize('synthetic-diff-polarity',hermes_home=str(home),agent_context='test',bot_id='synthetic-diff-bot',project_id='synthetic-diff')
+                assert p.db_path.resolve().is_relative_to(OUT.resolve())
+                assert p.__class__.__bases__ == (wiki.MemoryProvider,)
+                yield p
+            finally:
+                if p is not None:
+                    p._shutdown_lifecycle(render=False)
+                    assert p._conn is None and p._owned_conn is None
+        finally:
+            secret_scope.reset_secret_scope(secret_token)
+    finally:
+        hermes_constants.reset_hermes_home_override(home_token)
 
 def seed(provider,text,index):
     c=provider._connect();cid='diff-polarity-'+str(index)

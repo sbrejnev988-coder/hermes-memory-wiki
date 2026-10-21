@@ -22,9 +22,8 @@ import hermes_constants
 
 jobs = wiki._background_jobs
 observations = wiki._memory_observations
-# The native cold lane supplies a synthetic TMPDIR; never use a profile store.
-FIXTURE = Path(os.environ.get('WIKI_G2_FIXTURE') or
-               (Path(os.environ['TMPDIR']) / ('wiki-g2-' + str(os.getpid()))))
+# Bound by the shipped pytest fixture at setup, never by collection-time ENV.
+FIXTURE = None
 DETAILS = {}
 
 
@@ -72,7 +71,7 @@ def provider(name, *, bot='synthetic-G2-owner', session='synthetic-G2-session', 
     home_token = hermes_constants.set_hermes_home_override(home)
     secret_token = secret_scope.set_secret_scope({}, profile_home=str(home))
     p = None
-    previous_flag = os.environ['MEMORY_WIKI_BACKGROUND_JOBS_ENABLED']
+    previous_flag = os.environ.get('MEMORY_WIKI_BACKGROUND_JOBS_ENABLED')
     try:
         # Startup cannot launch an eager worker while the test authors input.
         os.environ['MEMORY_WIKI_BACKGROUND_JOBS_ENABLED'] = '0'
@@ -85,7 +84,10 @@ def provider(name, *, bot='synthetic-G2-owner', session='synthetic-G2-session', 
         os.environ['MEMORY_WIKI_BACKGROUND_JOBS_ENABLED'] = '1'
         yield p
     finally:
-        os.environ['MEMORY_WIKI_BACKGROUND_JOBS_ENABLED'] = previous_flag
+        if previous_flag is None:
+            os.environ.pop('MEMORY_WIKI_BACKGROUND_JOBS_ENABLED', None)
+        else:
+            os.environ['MEMORY_WIKI_BACKGROUND_JOBS_ENABLED'] = previous_flag
         if p is not None:
             assert p._background_worker is None
             connection = p._conn

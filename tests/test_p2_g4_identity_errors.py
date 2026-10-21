@@ -20,10 +20,10 @@ import urllib.error
 from email.message import Message
 
 SOURCE = Path(__file__).resolve().parents[1]
-FIX = Path(os.environ['G4_FIXTURE'])
-assert Path(os.environ['HERMES_HOME']) == FIX / 'app'
-assert Path(os.environ['USERPROFILE']) == FIX / 'user'
-sys.path.insert(0, str(SOURCE))
+sys.path.insert(0, str(SOURCE / 'scripts/ci_owned'))
+from fixture_prerequisites import source_fixture
+from source_suites import CaseResult, case_report
+FIX = None
 NETWORK_EVENTS = []
 NETWORK_EXPECTED = False
 
@@ -37,12 +37,8 @@ def _audit(event, args):
     if event in {'subprocess.Popen', '_winapi.CreateProcess', 'os.system'}:
         raise RuntimeError('offline_process_denied')
 
-sys.addaudithook(_audit)
-collapse = importlib.import_module('collapse')
-drive = importlib.import_module('google_drive_source_adapter')
-assert Path(collapse.__file__).resolve() == SOURCE / 'collapse.py'
-assert Path(drive.__file__).resolve() == SOURCE / 'google_drive_source_adapter.py'
-assert 'agent.memory_provider' not in sys.modules
+# No product import during pytest/unittest collection.
+collapse = drive = None
 
 TEXT = 'Маршрутизация сохраняет текущие данные источника безопасно'
 FILE_A = 'file_abcdefgh123456'
@@ -106,6 +102,24 @@ def record(local_id=42, **values):
     return {'id': local_id, 'content': TEXT, 'salience': 0.5, 'confidence': 0.5, **values}
 
 class G4Tests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        global FIX, collapse, drive
+        # These source tests require their own process, not a poisoned SDK
+        # collector. Refuse before installing an irreversible audit hook.
+        assert 'agent.memory_provider' not in sys.modules
+        FIX = source_fixture('G4_FIXTURE')
+        assert Path(os.environ['HERMES_HOME']) == FIX / 'app'
+        assert Path(os.environ['USERPROFILE']) == FIX / 'user'
+        'synthetic.invalid'.encode('idna')
+        sys.addaudithook(_audit)
+        # The suite's original hook protects the first product import too.
+        sys.path.insert(0, str(SOURCE))
+        collapse = importlib.import_module('collapse')
+        drive = importlib.import_module('google_drive_source_adapter')
+        assert Path(collapse.__file__).resolve() == SOURCE / 'collapse.py'
+        assert Path(drive.__file__).resolve() == SOURCE / 'google_drive_source_adapter.py'
+
     def refused(self, error, expected, provider=None):
         owner = provider or SimpleNamespace()
         attempts = []
@@ -315,7 +329,7 @@ class G4Tests(unittest.TestCase):
         self.assertEqual(ast.dump(protected, include_attributes=False), ast.dump(actual, include_attributes=False))
         # Raw current binding, not a claim of native provider initialization.
         self.assertEqual(hashlib.sha256((SOURCE/'__init__.py').read_bytes()).hexdigest(),
-                         'bb6815f0f00f9f208f23727d5fa1c09c969eac87326fad5a29b434ac5b9bbf6f')
+                         'f7c896a12a43dff50de99d45b02c496ccf1eabe00c9afc834a8b6d2f59182985')
         NETWORK_EXPECTED = True
         try:
             with self.assertRaises(NetworkDenied):
@@ -326,11 +340,12 @@ class G4Tests(unittest.TestCase):
         self.assertNotIn('agent.memory_provider',sys.modules)
 
 if __name__ == '__main__':
-    runner = unittest.TextTestRunner(verbosity=2)
+    runner = unittest.TextTestRunner(verbosity=2, resultclass=CaseResult)
     result = runner.run(unittest.defaultTestLoader.loadTestsFromTestCase(G4Tests))
     unexpected = [v for v in NETWORK_EVENTS if not v['expected']]
     print(json.dumps({'boundary':'DIRECT_PRODUCT_OFFLINE_NOT_NATIVE_PROVIDER', 'cases':result.testsRun,
                       'failures':len(result.failures),'errors':len(result.errors),
                       'unexpected_network_events':len(unexpected),'network_denial_control':len(NETWORK_EVENTS),
-                      'native_SDK_provider_loaded':False,'sourceAccepted':False,'installedloadedlive':False}))
+                      'native_SDK_provider_loaded':False,'sourceAccepted':False,'installedloadedlive':False,
+                      **case_report(result)}))
     raise SystemExit(0 if result.wasSuccessful() and result.testsRun==8 and not unexpected else 1)

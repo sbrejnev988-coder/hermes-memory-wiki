@@ -15,7 +15,15 @@ import pytest
 import memory_wiki as mw
 from agent.memory_provider import MemoryProvider
 from tools import registry
-import hermes_trust_core as trust
+try:
+    import hermes_trust_core as trust
+except ModuleNotFoundError as error:
+    # Only genuinely absent optional trust delivery is optional. Broken
+    # transitive imports and a requested strict gate remain real failures.
+    if error.name != 'hermes_trust_core' or os.environ.get('MW_REQUIRE_TRUST_CORE') == '1':
+        raise
+    pytest.skip('optional genuine hermes_trust_core is not installed; strict diagnostics NOT_RUN',
+                allow_module_level=True)
 
 QUERY = "Atlas telescope diagnostic fixture"
 CLAIM = "Atlas telescope diagnostic fixture uses the copper observatory."
@@ -25,9 +33,9 @@ OBSERVATIONS = []
 
 
 @pytest.fixture(scope="session", autouse=True)
-def observations():
+def observations(tmp_path_factory):
+    target = tmp_path_factory.mktemp('prefetch-diagnostics') / 'observations.json'
     yield
-    target = Path(os.environ["AUDIT8_OBSERVATIONS"])
     target.write_text(json.dumps(OBSERVATIONS, indent=2) + "\n", encoding="utf-8")
 
 

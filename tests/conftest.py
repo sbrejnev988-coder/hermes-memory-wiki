@@ -18,6 +18,9 @@ _OWNER_SPEC.loader.exec_module(_OWNER)
 
 @pytest.fixture(autouse=True)
 def own_native_provider_connections(request, monkeypatch):
+    if request.node.path.name.startswith('test_foundation_ci_'):
+        # Tooling SOURCE controls do not acquire provider resources or SDK rights.
+        return None
     # The native runner preloads the actual package; no standalone SDK fallback.
     import memory_wiki
     from agent.memory_provider import MemoryProvider
@@ -53,6 +56,30 @@ _DOCUMENT_ACCESS_POLICY_ENV = (
     "MEMORY_WIKI_DOCUMENT_ALLOW_CROSS_SCOPE",
     "MEMORY_WIKI_DOCUMENT_ALLOW_SCOPE_MIGRATION",
 )
+
+
+@pytest.fixture(autouse=True)
+def portable_prerequisites(request, tmp_path_factory, monkeypatch):
+    """Поставляем setup вместе с tests, а не в непубликуемом outer controller."""
+    name = request.node.path.name
+    if name in {'test_observation_finite_work.py', 'test_observation_repair01.py'}:
+        import test_observation_finite_work as finite
+        root = tmp_path_factory.mktemp('observation-work')
+        monkeypatch.setattr(finite, 'FIXTURE', root)
+        if name == 'test_observation_repair01.py':
+            monkeypatch.setattr(request.module, 'FIXTURE', root)
+        for key, value in {
+            'MEMORY_WIKI_EVENT_LEDGER_ENABLED': '1',
+            'MEMORY_WIKI_OBSERVATIONS_ENABLED': '1',
+            'MEMORY_WIKI_BACKGROUND_JOBS_ENABLED': '0',
+            'MEMORY_WIKI_GRAPH_AUTO_EXTRACT': '0',
+            'MEMORY_WIKI_GRAPH_EXTRACT_ENABLED': '0',
+        }.items():
+            monkeypatch.setenv(key, value)
+    elif name == 'test_prefetch_current_diagnostics.py':
+        monkeypatch.setenv('MEMORY_WIKI_BACKGROUND_JOBS_ENABLED', '0')
+        monkeypatch.setenv('MEMORY_WIKI_GRAPH_EXTRACT_ENABLED', '0')
+        monkeypatch.setenv('MEMORY_WIKI_GRAPH_AUTO_EXTRACT', '0')
 
 
 @pytest.fixture(autouse=True)

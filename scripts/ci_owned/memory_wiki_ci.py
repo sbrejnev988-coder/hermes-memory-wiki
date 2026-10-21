@@ -358,6 +358,11 @@ def main():
             raise RuntimeError('CI dependency versions differ from declared native import contract')
         # New disposable synthetic environment; never collect ambient credentials.
         env = clean_environment(os.environ, root, core, source)
+        if args.stage == 'full':
+            from source_suites import run_suites
+            from fixture_prerequisites import native_pytest_args
+            receipt['source_suites'] = run_suites(source, root / 'source-prerequisites')
+            native_pytest_args(source, receipt['source_suites'])
         config = root / 'runtime.json'
         from ci_process import LaunchRecorder
         import uuid

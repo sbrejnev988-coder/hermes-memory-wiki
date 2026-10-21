@@ -18,13 +18,13 @@ import xml.etree.ElementTree as ET
 from email.message import Message
 
 SOURCE = Path(__file__).resolve().parents[1]
-FIX = Path(os.environ['G4_REPAIR_FIXTURE']).resolve()
-assert Path(os.environ['HERMES_HOME']).resolve() == FIX/'app'
-assert Path(os.environ['USERPROFILE']).resolve() == FIX/'user'
-assert not any(any(x in k.upper() for x in ('TOKEN','SECRET','PASSWORD','API_KEY','CREDENTIAL')) for k in os.environ)
+sys.path.insert(0, str(SOURCE / 'scripts/ci_owned'))
+from fixture_prerequisites import source_fixture
+from source_suites import CaseResult, case_report
+FIX = None
 VIOLATIONS = []
-READ_ROOTS = (SOURCE, FIX, Path(sys.base_prefix).resolve(), Path(sys.prefix).resolve())
-WRITES = {FIX/'junit.xml', FIX/'receipt.json'}
+READ_ROOTS = ()
+WRITES = set()
 
 def audit(event, args):
     denied = event.startswith('socket.') or event in {'subprocess.Popen','_winapi.CreateProcess','os.system','sqlite3.connect'}
@@ -40,23 +40,9 @@ def audit(event, args):
         VIOLATIONS.append(event)
         raise RuntimeError('isolated_boundary_refused')
 
-sys.addaudithook(audit)
-sys.path.insert(0, str(SOURCE))
-NATIVE_METHODS = tuple(getattr(http.client.HTTPResponse, n) for n in ('read','_get_chunk_left','_read_next_chunk_size','_read_and_discard_trailer'))
-drive = importlib.import_module('google_drive_source_adapter')
-assert Path(drive.__file__).resolve() == SOURCE/'google_drive_source_adapter.py'
-assert 'agent.memory_provider' not in sys.modules
-PUBLIC_RAW = (SOURCE/'__init__.py').read_bytes()
-PUBLIC_TREE = ast.parse(PUBLIC_RAW)
-SELECTED = []
-for name in ['_PUBLIC_VALIDATION_ERRORS','_safe_exception_label','_public_tool_error']:
-    nodes = [n for n in PUBLIC_TREE.body if (isinstance(n, ast.FunctionDef) and n.name==name) or (isinstance(n, ast.Assign) and any(isinstance(t,ast.Name) and t.id==name for t in n.targets))]
-    assert len(nodes) == 1
-    SELECTED.append(nodes[0])
-PUBLIC = {'re':re,'urllib':urllib,'__builtins__':__builtins__}
-exec(compile(ast.Module(body=SELECTED,type_ignores=[]),str(SOURCE/'__init__.py'),'exec'),PUBLIC)
-public_error = PUBLIC['_public_tool_error']
-BOUND = {getattr(n,'name',n.targets[0].id if isinstance(n,ast.Assign) else ''):{'line':n.lineno,'end_line':n.end_lineno,'AST_SHA256':hashlib.sha256(ast.dump(n,include_attributes=True).encode()).hexdigest()} for n in SELECTED}
+# Collection declares placeholders only; setup owns all product execution.
+NATIVE_METHODS = drive = PUBLIC_RAW = PUBLIC_TREE = None
+SELECTED = PUBLIC = public_error = BOUND = None
 OBSERVATIONS = []
 URL='https://www.googleapis.com/drive/v3/files/'
 FILE_A='file_abcdefgh123456'
@@ -112,6 +98,36 @@ def error(code, raw, **kw):
     return urllib.error.HTTPError(URL+FILE_A,code,PRIVATE,headers,response),response,body
 
 class RepairTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        global FIX, READ_ROOTS, WRITES
+        global NATIVE_METHODS, drive, PUBLIC_RAW, PUBLIC_TREE, SELECTED, PUBLIC, public_error, BOUND
+        assert 'agent.memory_provider' not in sys.modules
+        FIX = source_fixture('G4_REPAIR_FIXTURE').resolve()
+        assert Path(os.environ['HERMES_HOME']).resolve() == FIX/'app'
+        assert Path(os.environ['USERPROFILE']).resolve() == FIX/'user'
+        assert not any(any(x in k.upper() for x in ('TOKEN','SECRET','PASSWORD','API_KEY','CREDENTIAL')) for k in os.environ)
+        READ_ROOTS = (SOURCE, FIX, Path(sys.base_prefix).resolve(), Path(sys.prefix).resolve())
+        WRITES = {FIX/'junit.xml', FIX/'receipt.json'}
+        'synthetic.invalid'.encode('idna')
+        sys.addaudithook(audit)
+        # Original fence precedes product import, read, compile and exec.
+        sys.path.insert(0, str(SOURCE))
+        NATIVE_METHODS = tuple(getattr(http.client.HTTPResponse, n) for n in ('read','_get_chunk_left','_read_next_chunk_size','_read_and_discard_trailer'))
+        drive = importlib.import_module('google_drive_source_adapter')
+        assert Path(drive.__file__).resolve() == SOURCE/'google_drive_source_adapter.py'
+        PUBLIC_RAW = (SOURCE/'__init__.py').read_bytes()
+        PUBLIC_TREE = ast.parse(PUBLIC_RAW)
+        SELECTED = []
+        for name in ['_PUBLIC_VALIDATION_ERRORS','_safe_exception_label','_public_tool_error']:
+            nodes = [n for n in PUBLIC_TREE.body if (isinstance(n, ast.FunctionDef) and n.name==name) or (isinstance(n, ast.Assign) and any(isinstance(t,ast.Name) and t.id==name for t in n.targets))]
+            assert len(nodes) == 1
+            SELECTED.append(nodes[0])
+        PUBLIC = {'re':re,'urllib':urllib,'__builtins__':__builtins__}
+        exec(compile(ast.Module(body=SELECTED,type_ignores=[]),str(SOURCE/'__init__.py'),'exec'),PUBLIC)
+        public_error = PUBLIC['_public_tool_error']
+        BOUND = {getattr(n,'name',n.targets[0].id if isinstance(n,ast.Assign) else ''):{'line':n.lineno,'end_line':n.end_lineno,'AST_SHA256':hashlib.sha256(ast.dump(n,include_attributes=True).encode()).hexdigest()} for n in SELECTED}
+
     def refusal(self, err, expected, owner=None):
         owner=owner or SimpleNamespace()
         def transport(*args,**kwargs):
@@ -213,7 +229,7 @@ class RepairTests(unittest.TestCase):
 if __name__=='__main__':
     stream=io.StringIO()
     suite=unittest.defaultTestLoader.loadTestsFromTestCase(RepairTests)
-    result=unittest.TextTestRunner(stream=stream,verbosity=2).run(suite)
+    result=unittest.TextTestRunner(stream=stream,verbosity=2,resultclass=CaseResult).run(suite)
     assert NATIVE_METHODS == tuple(getattr(http.client.HTTPResponse, n) for n in ('read','_get_chunk_left','_read_next_chunk_size','_read_and_discard_trailer'))
     captured=stream.getvalue()
     sys.stderr.write(captured)
@@ -229,5 +245,5 @@ if __name__=='__main__':
     ET.ElementTree(xml).write(FIX/'junit.xml',encoding='utf-8',xml_declaration=True)
     with (FIX/'receipt.json').open('w',encoding='utf-8') as fp:
         json.dump(report,fp,ensure_ascii=True,indent=2)
-    print(json.dumps({'cases':report['cases'],'failures':report['failures'],'errors':report['errors'],'violations':len(VIOLATIONS),'public_boundary':report['public_boundary'],'native_provider_cases':0}))
+    print(json.dumps({'failures':report['failures'],'violations':len(VIOLATIONS),'public_boundary':report['public_boundary'],'native_provider_cases':0, **case_report(result)}))
     raise SystemExit(0 if result.wasSuccessful() and result.testsRun==2 and not VIOLATIONS else 1)

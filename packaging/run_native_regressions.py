@@ -9,6 +9,7 @@ import argparse
 import importlib
 import importlib.metadata
 import importlib.util
+import hashlib
 import json
 import os
 import stat
@@ -66,6 +67,10 @@ def collection_reporter(source: Path, evidence_root: Path):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--core", type=Path, required=True)
+    parser.add_argument("--gate", choices=("tests", "startup"), default="tests")
+    parser.add_argument("--fixture-root", type=Path)
+    parser.add_argument("--trust-core", type=Path)
+    parser.add_argument("--trust-sha256")
     args, pytest_args = parser.parse_known_args()
     core = args.core.resolve(strict=True)
     root = Path(__file__).resolve().parents[1]
@@ -84,9 +89,45 @@ def main() -> int:
     importlib.metadata.version("pytest")  # Missing test dependencies must fail, not skip.
     # Proposed S2 caller repair: only the two declared legacy workflow homes.
     # This producer is not a containment controller or a release receipt.
-    fixture_home = Path(os.environ["HERMES_HOME"]).absolute()
-    if fixture_home.parent != root or fixture_home.name not in {".hermes-ci", ".hermes-release"}:
-        raise RuntimeError("Legacy native receipt requires a declared isolated workflow home")
+    sys.path.insert(0, str(root / 'scripts/ci_owned'))
+    from fixture_prerequisites import clean_environment, no_links, native_pytest_args
+    if args.gate == 'startup':
+        if args.fixture_root is None or args.trust_core is None or args.trust_sha256 is None or pytest_args:
+            parser.error('startup requires --fixture-root NEW --trust-core FILE --trust-sha256 SHA; no pytest arguments')
+        fixture_root = no_links(args.fixture_root)
+        if fixture_root.exists():
+            raise RuntimeError('Startup fixture root must be new; no live home or reset')
+        fixture_root.mkdir(parents=True)
+        env = clean_environment(fixture_root, os.environ)
+        fixture_home = Path(env['HERMES_HOME'])
+        os.environ.clear()
+        os.environ.update(env)
+    else:
+        fixture_home = Path(os.environ["HERMES_HOME"]).absolute()
+        if fixture_home.parent != root or fixture_home.name not in {".hermes-ci", ".hermes-release"}:
+            raise RuntimeError("Legacy native receipt requires a declared isolated workflow home")
+        no_links(fixture_home).mkdir(exist_ok=True)
+        from fixture_prerequisites import OFFLINE_SETTINGS
+        for key, value in OFFLINE_SETTINGS.items():
+            os.environ.setdefault(key, value)
+    if (args.trust_core is None) != (args.trust_sha256 is None):
+        parser.error('genuine trust delivery needs both --trust-core and --trust-sha256')
+    if args.trust_core is not None:
+        import re
+        trust_path = no_links(args.trust_core).resolve(strict=True)
+        if (trust_path.name != 'hermes_trust_core.py' or not trust_path.is_file()
+                or not re.fullmatch('[0-9a-f]{64}', args.trust_sha256)
+                or hashlib.sha256(trust_path.read_bytes()).hexdigest() != args.trust_sha256):
+            raise RuntimeError('Genuine trust source path/SHA mismatch')
+        sys.path.insert(0, str(trust_path.parent))
+        os.environ['HERMES_SECURITY_STRICT'] = '1'
+        os.environ['MW_REQUIRE_TRUST_CORE'] = '1'
+    source_args = []
+    if args.gate == 'tests':
+        from source_suites import run_suites
+        source_result = run_suites(root, fixture_home / 'source-prerequisites')
+        source_args = native_pytest_args(root, source_result)
+
     receipt_path = fixture_home.parent / "native-origins.json"
     for path in [*reversed(fixture_home.parents), fixture_home, receipt_path]:
         try:
@@ -97,6 +138,16 @@ def main() -> int:
             raise RuntimeError("Native receipt path must not follow links or reparse points")
     if receipt_path.exists():
         raise RuntimeError("Refuse to overwrite previous native origin evidence")
+    if args.gate == 'startup':
+        # Offline boundary is armed before genuine native imports, not only
+        # before the happy-path callback. This is an audit guard, not OS isolation.
+        sys.dont_write_bytecode = True
+        def offline(event, event_args):
+            if event.startswith(('socket.', 'subprocess.', 'ctypes.')) or event in {
+                '_winapi.CreateProcess', 'os.system', 'os.posix_spawn', 'os.fork', 'os.exec',
+            }:
+                raise PermissionError('startup_offline_network_or_process_refused')
+        sys.addaudithook(offline)
     sys.path.insert(0, str(root))
     sys.path.insert(0, str(core))
     origins = {}
@@ -120,6 +171,14 @@ def main() -> int:
         plugin = importlib.util.module_from_spec(spec)
         sys.modules["memory_wiki"] = plugin
         spec.loader.exec_module(plugin)
+    if args.trust_core is not None:
+        trust = importlib.import_module('hermes_trust_core')
+        if (Path(trust.__file__).resolve() != trust_path
+                or hashlib.sha256(trust_path.read_bytes()).hexdigest() != args.trust_sha256
+                or not plugin._INJECTION_GUARD_AVAILABLE
+                or plugin._sanitize_recalled is not trust.sanitize_recalled):
+            raise RuntimeError('Genuine trust loaded origin/API mismatch')
+        origins['hermes_trust_core'] = str(trust_path)
     native_base = importlib.import_module("agent.memory_provider").MemoryProvider
     if (Path(plugin.__file__).resolve() != root / "__init__.py"
             or plugin.MemoryProvider is not native_base
@@ -135,10 +194,18 @@ def main() -> int:
     if receipt_path.read_bytes() != raw:
         raise RuntimeError("Native origin receipt readback mismatch")
     print(f"Native Hermes contract verified: NousResearch/hermes-agent@{sha}", flush=True)
+    if args.gate == 'startup':
+        from provider_startup import run
+        report = run(plugin, fixture_home)
+        with (fixture_home.parent / 'provider-startup.json').open('x', encoding='utf-8') as stream:
+            json.dump(report, stream, ensure_ascii=False, indent=2)
+            stream.write('\n')
+        print(json.dumps(report))
+        return 0
     reporter = collection_reporter(root, fixture_home)
     import pytest
     # Explicit plugin test directory prevents discovery of the core's own tests.
-    return reporter.run(pytest.main, ["-q", "tests", *pytest_args])
+    return reporter.run(pytest.main, ["-q", "tests", "--confcutdir=" + str(root / "tests"), *source_args, *pytest_args])
 
 
 if __name__ == "__main__":
