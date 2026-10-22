@@ -194,6 +194,24 @@ class SharedCodexAuthSourceTests(unittest.TestCase):
         self.write(self.owner, data)
         self.assertEqual(self.root_reads(lambda: self.assertEqual(self.grant(), _jwt("pool"))), [])
 
+        # Missing/null/empty/other-provider remain lawful absence, not malformed.
+        (self.owner / "auth.json").unlink()
+        states = ({}, {"active_provider": None}, {"active_provider": ""}, {"active_provider": "openrouter"})
+        for state in states:
+            with self.subTest(absent_discriminator=state):
+                self.write(self.owner, {"providers": {}, "credential_pool": {}, "suppressed_sources": {}, **state})
+                self.assertEqual(self.root_reads(lambda: self.assertEqual(self.grant(), _jwt())),
+                                 [self.root / "auth.json"])
+        (self.owner / "auth.json").unlink()
+        for home in (self.owner, self.root):
+            for state in states:
+                with self.subTest(source=home.name, healthy_discriminator=state):
+                    self.write(home, dict(_pool(_row("typed")), **state))
+                    self.assertEqual(self.root_reads(lambda: self.assertEqual(self.grant(), _jwt("typed"))),
+                                     [] if home == self.owner else [self.root / "auth.json"])
+            if home == self.owner:
+                (home / "auth.json").unlink()
+
     def test_local_authority_refusals_never_bypass_to_shared(self):
         refusals = [
             [], {"providers": None}, {"credential_pool": []}, {"suppressed_sources": None},
@@ -216,6 +234,21 @@ class SharedCodexAuthSourceTests(unittest.TestCase):
         data.update(_pool())
         self.write(self.owner, data)
         self.assertEqual(self.root_reads(lambda: self.assertRaises(ValueError, self.grant)), [])
+
+        for home in (self.owner, self.root):
+            for active in (False, 0, 1, 1.5, [], ["openai-codex"], {}, {"provider": "openai-codex"}):
+                with self.subTest(source=home.name, malformed_discriminator=active):
+                    (self.owner / "auth.json").unlink(missing_ok=True)
+                    self.write(self.root, _pool(_row()))
+                    # A live healthy root witness makes owner refusal distinguishing.
+                    self.assertEqual(self.grant(replace(self.settings, home=self.root)), _jwt())
+                    data = {"providers": {}, "credential_pool": {}, "suppressed_sources": {},
+                            "active_provider": active}
+                    if home == self.root:
+                        data.update(_pool(_row()))  # Root cannot accept malformed metadata either.
+                    self.write(home, data)
+                    self.assertEqual(self.root_reads(lambda: self.assertRaises(ValueError, self.grant)),
+                                     [] if home == self.owner else [self.root / "auth.json"])
 
     def test_malformed_unreadable_and_duplicate_local_documents_are_terminal(self):
         for raw in ("{", "null", '{"providers":{"openai-codex":{}},"providers":{}}',
@@ -290,6 +323,36 @@ class SharedCodexAuthSourceTests(unittest.TestCase):
             self.assertEqual(self.grant(), _jwt("healthy"))
             if home == self.owner:
                 (home / "auth.json").unlink()
+
+        for home in (self.owner, self.root):
+            for until in (None, False, True, "invalid", [], {}, float("inf"), -float("inf"), float("nan")):
+                with self.subTest(source=home.name, exact_cooldown=until):
+                    (self.owner / "auth.json").unlink(missing_ok=True)
+                    self.write(self.root, _pool(_row()))
+                    self.assertEqual(self.grant(replace(self.settings, home=self.root)), _jwt())
+                    row = _row("benched", model_cooldowns={MODEL: until})
+                    data = _singleton("must-not-revive")
+                    data.update(_pool(row))
+                    self.write(home, data)
+                    self.assertEqual(self.root_reads(lambda: self.assertRaises(ValueError, self.grant)),
+                                     [] if home == self.owner else [self.root / "auth.json"])
+                    # Nonfinite JSON is refused by the reader too; check row eligibility independently.
+                    self.assertFalse(self.api._codex_row_ready(row, self.settings, NOW))
+            for changes in ({}, {"model_cooldowns": None}, {"model_cooldowns": {}},
+                            {"model_cooldowns": {MODEL: NOW}}, {"model_cooldowns": {MODEL: NOW - 0.5}},
+                            {"model_cooldowns": {"other-model": NOW + 900}},
+                            {"model_cooldowns": {"other-model": None}}):
+                with self.subTest(source=home.name, lawful_cooldown=changes):
+                    (self.owner / "auth.json").unlink(missing_ok=True)
+                    self.write(home, _pool(_row("eligible", **changes)))
+                    self.assertEqual(self.grant(), _jwt("eligible"))
+            for until in (None, NOW + 900):
+                with self.subTest(source=home.name, eligible_pool_sibling_after=until):
+                    (self.owner / "auth.json").unlink(missing_ok=True)
+                    data = _singleton("must-not-revive")
+                    data.update(_pool(_row("benched", model_cooldowns={MODEL: until}), _row("eligible")))
+                    self.write(home, data)
+                    self.assertEqual(self.grant(), _jwt("eligible"))
 
     def test_selected_credential_metadata_cannot_reroute_proxy_to_official(self):
         changes = ({"base_url": "https://proxy.invalid/codex"},
@@ -371,16 +434,60 @@ class SharedCodexAuthSourceTests(unittest.TestCase):
         self.assertIn("extraction_settings=module.read_extraction_settings(worker.home)", ast.unparse(jobs))
         self.assertIn("read_graph_extraction_settings(self.home, model_override=override)", ast.unparse(provider))
 
+        def same(node, statement):
+            return ast.dump(node) == ast.dump(ast.parse(statement).body[0])
+
+        def plain_try(node):
+            return isinstance(node, ast.Try) and not node.handlers and not node.orelse
+
+        def fixture_lifetime(raw):
+            # Actual top-level pytest fixture, read/AST only; never import or emulate it.
+            fixtures = [n for n in ast.parse(raw).body if isinstance(n, ast.FunctionDef) and n.name == "native"]
+            if len(fixtures) != 1:
+                return False
+            body = fixtures[0].body
+            bindings = [i for i, n in enumerate(body)
+                        if same(n, "token = constants.set_hermes_home_override(foreign)")]
+            if len(bindings) != 1 or bindings[0] != len(body) - 2:
+                return False
+            outer = body[-1]
+            if (not plain_try(outer) or len(outer.body) != 2 or len(outer.finalbody) != 1
+                    or not same(outer.finalbody[0], "constants.reset_hermes_home_override(token)")):
+                return False
+            if not same(outer.body[0], "secret_token = secret_scope.set_secret_scope("
+                        "{'HERMES_CODEX_BASE_URL': 'https://foreign.invalid/codex'}, profile_home=str(foreign))"):
+                return False
+            inner = outer.body[1]
+            if (not plain_try(inner) or len(inner.body) != 1 or len(inner.finalbody) != 1
+                    or not isinstance(inner.body[0], ast.Expr) or not isinstance(inner.body[0].value, ast.Yield)):
+                return False
+            checks = inner.finalbody[0]
+            expected = ast.parse("assert all(client.is_closed for client in traffic.clients)\n"
+                "assert constants.get_hermes_home() == foreign\n"
+                "assert secret_scope.current_secret_scope_home() == str(foreign)\n"
+                "assert auxiliary_client._current_aux_stream_deadline() is None\n"
+                "assert os.environ['HERMES_HOME'] == str(foreign)\n").body
+            return (plain_try(checks) and [ast.dump(n) for n in checks.body] == [ast.dump(n) for n in expected]
+                    and len(checks.finalbody) == 1
+                    and same(checks.finalbody[0], "secret_scope.reset_secret_scope(secret_token)"))
+
+        self.assertTrue(fixture_lifetime(self.raw["test_extractor_shared_codex_auth.py"]))
+        self.assertFalse(fixture_lifetime(self.raw["native_baseline_fixture.py"]))
+
 
 def make_suite(inputs, read_bound, scratch, case_started=None):
     """Use the existing controller's basename inputs, verified reads and scratch."""
     needed = ("extractor.py", "entity_relation_extractor.py", "__init__.py", "background_jobs.py",
-              "hermes_constants.py", "auth_constants.py", "codex_headers.py")
+              "hermes_constants.py", "auth_constants.py", "codex_headers.py",
+              "test_extractor_shared_codex_auth.py", "native_baseline_fixture.py")
     paths = {name: str(Path(inputs[name])) for name in needed}
     raw = {name: read_bound(paths[name]) for name in needed}
     for name, expected in CORE_SOURCE_PINS.items():
         if hashlib.sha256(raw[name]).hexdigest() != expected:
             raise ValueError("native_helper_SOURCE_pin_mismatch")
+    if hashlib.sha256(raw["native_baseline_fixture.py"]).hexdigest() != (
+            "29d91b027350eb5769e1d654b14e74147d858a2d4278da0ab5560387ffba9694"):
+        raise ValueError("native_fixture_baseline_SOURCE_pin_mismatch")
     cls = SharedCodexAuthSourceTests
     cls.paths, cls.raw, cls.scratch = paths, raw, Path(scratch)
     cls.case_started = staticmethod(case_started) if case_started is not None else None

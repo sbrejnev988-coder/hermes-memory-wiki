@@ -1151,8 +1151,10 @@ def _codex_row_ready(row: Dict[str, Any], settings: ExtractionSettings, now: flo
         cooldowns = {}
     if not isinstance(cooldowns, dict):
         return False
-    until = cooldowns.get(settings.model)
-    return until is None or (type(until) in {int, float} and math.isfinite(until) and until <= now)
+    if settings.model not in cooldowns:
+        return True
+    until = cooldowns[settings.model]
+    return type(until) in {int, float} and math.isfinite(until) and until <= now
 
 
 def _codex_stored_expiry(value: Any, *, milliseconds: bool = False) -> Optional[float]:
@@ -1193,8 +1195,11 @@ def _codex_grant_from_auth(auth: Any, settings: ExtractionSettings) -> Optional[
     if (not isinstance(suppressed, (list, dict))
             or any(not isinstance(source, str) or not source for source in suppressed)):
         raise ValueError("invalid Codex suppression")
+    active_provider = auth.get("active_provider")
+    if active_provider is not None and type(active_provider) is not str:
+        raise ValueError("invalid Codex active provider")
     if (not any("openai-codex" in mapping for mapping in (pools, providers)) and not suppressed
-            and auth.get("active_provider") != "openai-codex"):
+            and active_provider != "openai-codex"):
         return None
     state = providers.get("openai-codex", {})
     if not isinstance(state, dict):

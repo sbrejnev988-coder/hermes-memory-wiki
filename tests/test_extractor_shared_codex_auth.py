@@ -165,18 +165,22 @@ def native(tmp_path, monkeypatch):
     monkeypatch.setattr(openai, "DefaultHttpxClient", http_factory)
     monkeypatch.setattr(openai, "OpenAI", openai_factory)
     token = constants.set_hermes_home_override(foreign)
-    secret_token = secret_scope.set_secret_scope({"HERMES_CODEX_BASE_URL": "https://foreign.invalid/codex"},
-                                                 profile_home=str(foreign))
     try:
-        yield SimpleNamespace(session=session, graph=graph, constants=constants, scope=secret_scope,
-            root=root, home=home, other=other, settings=settings, traffic=traffic, row=row)
+        secret_token = secret_scope.set_secret_scope({"HERMES_CODEX_BASE_URL": "https://foreign.invalid/codex"},
+                                                     profile_home=str(foreign))
+        try:
+            yield SimpleNamespace(session=session, graph=graph, constants=constants, scope=secret_scope,
+                root=root, home=home, other=other, settings=settings, traffic=traffic, row=row)
+        finally:
+            try:
+                assert all(client.is_closed for client in traffic.clients)
+                assert constants.get_hermes_home() == foreign
+                assert secret_scope.current_secret_scope_home() == str(foreign)
+                assert auxiliary_client._current_aux_stream_deadline() is None
+                assert os.environ["HERMES_HOME"] == str(foreign)
+            finally:
+                secret_scope.reset_secret_scope(secret_token)
     finally:
-        assert all(client.is_closed for client in traffic.clients)
-        assert constants.get_hermes_home() == foreign
-        assert secret_scope.current_secret_scope_home() == str(foreign)
-        assert auxiliary_client._current_aux_stream_deadline() is None
-        assert os.environ["HERMES_HOME"] == str(foreign)
-        secret_scope.reset_secret_scope(secret_token)
         constants.reset_hermes_home_override(token)
 
 
