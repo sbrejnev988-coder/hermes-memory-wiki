@@ -113,3 +113,53 @@ publish/install/loaded/native/E2E/FULL приёмка.
 Чтение, вложение или Vision-анализ документа сами по себе не разрешают ingest,
 scan, inbox или embedding. Настоящее индексирование и remote/model эффекты
 требуют отдельной явной команды владельца и исходных security/resource gates.
+
+## CUM-XLSX-01: rematerialization не равна утрате поддержки
+
+Обычный XLSX с безопасным текстом и формулой `1/0` либо неподдержанной `ROUND`
+может иметь `status: partial`. Такой payload по-прежнему **не** принимается из
+cache; новый XLSX representation gate по-прежнему требует доказанный cache hit.
+Поэтому даже при равной revision требуется настоящее повторное построение units,
+chunks и FTS. Ранние `unchanged`/`scope_updated` ветви не ослаблены.
+
+В rebuild временный `active=0` больше не означает, что claim потерял последний
+support: прежний `_archive_visible_claims` вызывается после успешной записи всех
+новых chunks/revision, но внутри того же `_ingest_transaction`, до result/event
+и private commit hook. Он проверяет окончательные active supports, используя
+снимок **исходных** scope/content/provenance старых links. Неизменный same-scope
+chunk сохраняет прежнюю active связь; изменённые/исчезнувшие последние supports
+по-прежнему архивируются. Ошибка rebuild не требует последующего «unarchive»:
+откат принадлежит прежнему transaction owner.
+
+При rebuild со сменой scope **или** repository тот же CID не наследует active
+old-scope link: chunk UPSERT отсоединяет его до проверки оставшихся supports.
+Другой законный active support сохраняет старый claim, но не переносит связь
+в новый scope. Для nonactive/missing IDs UPSERT сохраняет непустой link как
+no-revive authority; он не очищает erased/archived ID ради нового embedding.
+Прежние exact source/revision/content/anchor conflict predicates, claim writer,
+ACL/provenance, cache/privacy, erasure, journal и owning commit guards не менялись.
+Standalone graph без таблицы `claims` не получает обязательную зависимость от неё:
+выбирается только фиксированный SQL-фрагмент `0`, а неизвестные IDs сохраняются.
+Это предотвращение нового ошибочного retirement, **не** автоматическое
+восстановление claims, уже archived/erased до исправления.
+
+`tests/test_document_xlsx_rematerialization_source.py` — подготовленный отдельный
+пакет: три SOURCE parser/cache/identity controls и три STATIC controls порядка,
+scope UPSERT и неизменности остальных owners. Main совместим с прежними
+`devtools.harness.run_source`/`source_bootstrap` и `PacketResult`; reuse shipped
+loader/literal fixture, старые tests не выбираются. Этот пакет не исполняет ingest,
+SQL или claim writer и не доказывает качество/ACL/COMMIT.
+
+Отдельный `genuine_suite(fixture_module)` содержит явные future SQL/SPI/native
+cases для lawful active claim, cache miss, obsolete/shared/last support,
+scope/repository migration, archived/erased/missing IDs и rollback. Только внутри
+неизменённого shipped `derived_case` с его настоящим `Fixture`: actual quality
+admission, active `claims` row и provenance проверяются, review/queued ID не
+принимается за claim. Неподтверждённые native imports/home/secret context/HANDLE
+и полный parent entry остаются prerequisites; разрешающие stand-ins запрещены.
+
+**Все новые tests, collection, SOURCE и genuine SQL/SPI/native исполнения —
+NOT_RUN.** Здесь проверены только metadata/AST/inert compile и локальный Git
+candidate. Ни SOURCE PASS, ни независимого approval, integration/install/loaded
+или нового execution allowance из подготовки не следует. Точный roster, closure,
+ограничения и следующий отдельный parent gate — в lane `RESULT.json`.

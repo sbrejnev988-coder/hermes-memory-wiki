@@ -2804,10 +2804,16 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
 
     with _ingest_transaction(provider, conn, _commit_hook, source_id=source_id, _replay_reference=_replay_reference, _admission=admission):
         old_links = _linked_document_chunks(conn, source_id) if existing else []
+        # Standalone document graphs need not have the provider's claims table.
+        # Without it a retained ID is unknown, not permission to clear/recreate.
+        active_claim_link_sql = (
+            "EXISTS (SELECT 1 FROM claims WHERE id=document_chunks.embedding_claim_id AND status='active')"
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='claims'").fetchone()
+            else "0"
+        )
         conn.execute("UPDATE document_units SET active=0,updated_at=? WHERE source_id=? AND active=1", (ts, source_id))
         conn.execute("UPDATE document_chunks SET active=0,updated_at=? WHERE source_id=? AND active=1", (ts, source_id))
         conn.execute("UPDATE document_edges SET active=0,updated_at=? WHERE source_id=? AND active=1", (ts, source_id))
-        archived = _archive_visible_claims(conn, provider, old_links)
         conn.execute("DELETE FROM document_units_fts WHERE source_id=?", (source_id,))
         conn.execute("DELETE FROM document_chunks_fts WHERE source_id=?", (source_id,))
         conn.execute("UPDATE document_revisions SET status='superseded' WHERE source_id=? AND status='active'", (source_id,))
@@ -2865,14 +2871,22 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
             start_anchor = str(chunk["start_anchor"]); end_anchor = str(chunk["end_anchor"])
             cid = _chunk_id(source_id, revision_id, str(chunk["content_hash"]), start_anchor, end_anchor)
             chunk["chunk_id"] = cid
-            # Preserve the old link, including an archived/erased claim ID:
-            # clearing it would discard the retirement authority on reactivation.
+            # Same-scope identity keeps its link, including archived/erased IDs.
+            # A scope/repository migration must detach an ACTIVE old-scope link
+            # before retirement tests the final supports. Nonactive/missing IDs
+            # remain no-revive authority, never new embedding work.
             written = conn.execute(
-                """INSERT INTO document_chunks(chunk_id,source_id,revision_id,scope_id,repository_id,start_unit_id,end_unit_id,
+                f"""INSERT INTO document_chunks(chunk_id,source_id,revision_id,scope_id,repository_id,start_unit_id,end_unit_id,
                        start_anchor,end_anchor,chunk_kind,title,chunk_text,embedding_text,content_hash,embedding_claim_id,
                        token_estimate,active,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, ?,1,?)
                    ON CONFLICT(chunk_id) DO UPDATE SET scope_id=excluded.scope_id,
                      repository_id=excluded.repository_id,start_unit_id=excluded.start_unit_id,
+                     embedding_claim_id=CASE
+                       WHEN document_chunks.scope_id=excluded.scope_id
+                         AND document_chunks.repository_id=excluded.repository_id
+                       THEN document_chunks.embedding_claim_id
+                       WHEN {active_claim_link_sql}
+                       THEN '' ELSE document_chunks.embedding_claim_id END,
                      end_unit_id=excluded.end_unit_id,chunk_kind=excluded.chunk_kind,title=excluded.title,
                      chunk_text=excluded.chunk_text,embedding_text=excluded.embedding_text,
                      token_estimate=excluded.token_estimate,active=1,updated_at=excluded.updated_at
@@ -2924,6 +2938,11 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
         )
         if written.rowcount != 1:
             raise sqlite3.IntegrityError("document revision identity conflict")
+        # Inactive above is a temporary rewrite interval, not lost support.
+        # The existing provenance/ACL owner sees the FINAL active chunks, while
+        # old_links still carries their ORIGINAL scope/content for retirement.
+        # Obsolete/last supports retire in this same owning transaction only.
+        archived = _archive_visible_claims(conn, provider, old_links)
         result = _record_result()
         if _commit_hook is not None:
             _commit_hook.apply(provider, conn)
