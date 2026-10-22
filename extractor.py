@@ -223,6 +223,7 @@ class ExtractionSettings:
     endpoint: str = field(default="", repr=False)
     api_key: str = field(default="", repr=False)
     error: str = ""
+    codex_auth_source: str = "owner_only"
 
 
 class ExtractionBoundaryError(ValueError):
@@ -243,6 +244,14 @@ class ExtractionBoundaryError(ValueError):
         super().__init__(self.code)
 
 
+def _validate_codex_auth_source(settings: ExtractionSettings) -> None:
+    """An explicit Codex-only policy, including on disabled reader snapshots."""
+    if (type(settings.codex_auth_source) is not str
+            or settings.codex_auth_source not in {"owner_only", "owner_or_default"}
+            or (settings.codex_auth_source != "owner_only" and settings.provider != "openai-codex")):
+        raise ExtractionBoundaryError("extraction_settings_invalid")
+
+
 def _validate_extraction_settings(settings: ExtractionSettings, *, graph: bool = False) -> None:
     """Validate both reader output and direct caller snapshots, before any egress.
 
@@ -251,6 +260,7 @@ def _validate_extraction_settings(settings: ExtractionSettings, *, graph: bool =
     """
     if not isinstance(settings, ExtractionSettings) or settings.error:
         raise ExtractionBoundaryError("extraction_settings_invalid")
+    _validate_codex_auth_source(settings)
     if type(settings.enabled) is not bool or not settings.enabled:
         raise ExtractionBoundaryError("extraction_disabled")
     if settings.provider not in {"openai-codex", "openrouter", "legacy"}:
@@ -360,10 +370,11 @@ def read_extraction_settings(home: Optional[Path] = None) -> ExtractionSettings:
                 if section is missing:
                     break
             if section is not missing:
-                allowed = {"enabled", "provider", "model", "timeout", "max_tokens", "reasoning_effort"}
+                allowed = {"enabled", "provider", "model", "timeout", "max_tokens", "reasoning_effort", "codex_auth_source"}
                 if not isinstance(section, dict) or set(section) - allowed:
                     raise ValueError("invalid extraction settings")
                 settings = ExtractionSettings(home=home, **section)
+                _validate_codex_auth_source(settings)
                 model_pattern = (r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}" if settings.provider == "openai-codex"
                                  else r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._:/-]{0,160}")
                 max_tokens_limit = 9000 if settings.provider == "openai-codex" else 3000
@@ -1100,59 +1111,174 @@ def _read_response(response: Any) -> bytes:
     return data
 
 
-def _own_codex_grant(settings: ExtractionSettings) -> str:
-    """Read one usable owner OAuth grant without native pool healing or root fallback.
+def _codex_official_issuer(metadata: Dict[str, Any]) -> bool:
+    """Respect declared issuer constraints; absence is legacy, not attestation."""
+    return all(key not in metadata or (type(metadata[key]) is str
+               and metadata[key].rstrip("/") == "https://auth.openai.com") for key in ("issuer", "iss"))
 
-    A present pool is authoritative: an exhausted/unknown pool must not be
-    bypassed by its singleton mirror. Refresh and quota recovery belong to the
-    native app, never to this extraction call.
+
+def _codex_official_metadata(metadata: Dict[str, Any]) -> bool:
+    """Never turn an explicitly proxy/API-key credential into official OAuth.
+
+    Legacy native singleton/pool rows can omit route/source fields. Present
+    metadata must agree with the one supported transport, at every selected
+    level; one field must not hide a conflicting field in the same grant.
+    """
+    from agent.codex_headers import CODEX_AUX_BASE_URL
+
+    if not _codex_official_issuer(metadata):
+        return False
+    for key, allowed in (("provider", {"openai-codex"}), ("auth_type", {"oauth"}),
+                         ("auth_mode", {"chatgpt"}),
+                         ("source", {"device_code", "manual:device_code", "manual:loopback_pkce"})):
+        if key in metadata and (type(metadata[key]) is not str or metadata[key] not in allowed):
+            return False
+    for key in ("base_url", "inference_base_url"):
+        value = metadata.get(key)
+        if value is not None and value != "" and (
+                type(value) is not str or value.rstrip("/") != CODEX_AUX_BASE_URL):
+            return False
+    return True
+
+
+def _codex_row_ready(row: Dict[str, Any], settings: ExtractionSettings, now: float) -> bool:
+    """Credential-wide refusal and the exact requested model, without recovery."""
+    if row.get("last_status") not in (None, "", "ok") or any(row.get(key) for key in (
+            "last_error_code", "last_error_reason", "last_error_message", "last_error_reset_at")):
+        return False
+    cooldowns = row.get("model_cooldowns")
+    if cooldowns is None:
+        cooldowns = {}
+    if not isinstance(cooldowns, dict):
+        return False
+    until = cooldowns.get(settings.model)
+    return until is None or (type(until) in {int, float} and math.isfinite(until) and until <= now)
+
+
+def _codex_stored_expiry(value: Any, *, milliseconds: bool = False) -> Optional[float]:
+    """Strict native stored seconds/ms/aware ISO; never infer from last_refresh."""
+    if type(value) in {int, float}:
+        if not math.isfinite(value):
+            return None
+        # Native generic timestamp metadata also serializes millis in expires_at.
+        return value / 1000 if milliseconds or value > 1_000_000_000_000 else value
+    if type(value) is str and not milliseconds:
+        try:
+            parsed = _dt.datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+            if parsed.tzinfo is not None:
+                timestamp = parsed.timestamp()
+                return timestamp if math.isfinite(timestamp) else None
+        except (ValueError, OverflowError, OSError):
+            pass
+    return None
+
+
+def _codex_grant_from_auth(auth: Any, settings: ExtractionSettings) -> Optional[str]:
+    """Return a usable grant, or None ONLY for proven Codex authority absence.
+
+    Shared and owner stores have exactly the same admission rules. Present
+    pool/provider/suppression authority is final, even empty or unusable. The
+    singleton never revives an authoritative pool, nor does root revive owner.
     """
     from hermes_cli.auth_constants import _decode_jwt_claims
 
-    auth = json.loads((settings.home / "auth.json").read_text(encoding="utf-8-sig"))
     if not isinstance(auth, dict):
-        raise ValueError("invalid own Codex auth")
-    pools, suppression = auth.get("credential_pool", {}), auth.get("suppressed_sources", {})
-    if not isinstance(pools, dict) or not isinstance(suppression, dict):
-        raise ValueError("invalid own Codex authority")
+        raise ValueError("invalid Codex auth")
+    pools, suppression, providers = (auth.get("credential_pool", {}),
+                                    auth.get("suppressed_sources", {}), auth.get("providers", {}))
+    if not all(isinstance(value, dict) for value in (pools, suppression, providers)):
+        raise ValueError("invalid Codex authority")
     suppressed = suppression.get("openai-codex", [])
     # Native legacy mappings use their keys; values do not change membership.
     if (not isinstance(suppressed, (list, dict))
             or any(not isinstance(source, str) or not source for source in suppressed)):
-        raise ValueError("invalid own Codex suppression")
+        raise ValueError("invalid Codex suppression")
+    if (not any("openai-codex" in mapping for mapping in (pools, providers)) and not suppressed
+            and auth.get("active_provider") != "openai-codex"):
+        return None
+    state = providers.get("openai-codex", {})
+    if not isinstance(state, dict):
+        raise ValueError("invalid Codex provider state")
+    now = time.time()
     if "openai-codex" in pools:
         pool = pools["openai-codex"]
         if not isinstance(pool, list) or any(not isinstance(row, dict) for row in pool):
-            raise ValueError("invalid own Codex pool")
+            raise ValueError("invalid Codex pool")
         candidates = [row for row in pool if row.get("auth_type") == "oauth"]
     else:
         # Suppression gates native singleton seeding, not independent manual pool accounts.
         if "device_code" in suppressed:
-            raise ValueError("own Codex singleton suppressed")
-        state = auth.get("providers", {}).get("openai-codex", {})
+            raise ValueError("Codex singleton suppressed")
+        if not _codex_official_metadata(state) or not _codex_row_ready(state, settings, now):
+            raise ValueError("Codex provider refused")
         candidates = [state.get("tokens", {})] if state.get("auth_mode") == "chatgpt" else []
-    required_until = time.time() + settings.timeout
+    required_until = now + settings.timeout
     for row in candidates:
-        if not isinstance(row, dict) or row.get("last_status") not in (None, "", "ok"):
-            continue
-        if row.get("last_error_code") or row.get("last_error_reason") or row.get("last_error_reset_at"):
-            continue
-        # Native model cooldowns/entitlements bench only this exact model,
-        # independently of credential-wide status; elapsed benches stay read-only.
-        model_until = (row.get("model_cooldowns") or {}).get(settings.model)
-        if isinstance(model_until, (int, float)) and model_until > time.time():
+        if (not isinstance(row, dict) or not _codex_official_metadata(row)
+                or not _codex_row_ready(row, settings, now)):
             continue
         access, refresh = row.get("access_token"), row.get("refresh_token")
         if not all(isinstance(value, str) and value.strip() for value in (access, refresh)):
             continue
         # JWT expiry is authoritative when present; stored expiry also constrains
         # a pool grant. Unknown or malformed expiry is not permission to infer.
-        expiries = [value for value in (_decode_jwt_claims(access).get("exp"), row.get("expires_at"))
-                    if value is not None]
+        claims = _decode_jwt_claims(access)
+        if not _codex_official_issuer(claims):
+            continue
+        expiries = [claims["exp"]] if claims.get("exp") is not None else []
+        for key in ("expires_at", "expires_at_ms"):
+            if row.get(key) is not None:
+                expiries.append(_codex_stored_expiry(row[key], milliseconds=key == "expires_at_ms"))
         if (expiries and all(type(value) in (int, float) and required_until < value < float("inf")
                              for value in expiries)):
             return access
-    raise ValueError("own Codex OAuth requires native refresh or reauthentication")
+    raise ValueError("Codex OAuth requires native refresh or reauthentication")
+
+
+def _read_codex_authority(home: Path, settings: ExtractionSettings) -> Optional[str]:
+    """One fresh, read-only file snapshot. Only missing files mean absence."""
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("invalid Codex auth document")
+            result[key] = value
+        return result
+
+    def no_constant(_value):
+        raise ValueError("invalid Codex auth document")
+
+    try:
+        raw = (home / "auth.json").read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return None
+    auth = json.loads(raw, object_pairs_hook=unique_object, parse_constant=no_constant)
+    return _codex_grant_from_auth(auth, settings)
+
+
+def _own_codex_grant(settings: ExtractionSettings) -> str:
+    """Compatibility reader: owner first; root only after explicit absence+opt-in.
+
+    The source home never replaces settings.home or the execution/secret owner.
+    No resolver, status, pool lifecycle, refresh, copies, links or token cache.
+    """
+    _validate_extraction_settings(settings, graph=True)
+    if settings.provider != "openai-codex":
+        raise ExtractionBoundaryError("codex_owner_settings_required")
+    access = _read_codex_authority(settings.home, settings)
+    if access is not None:
+        return access
+    if settings.codex_auth_source == "owner_or_default":
+        from hermes_constants import get_default_hermes_root
+
+        root = Path(get_default_hermes_root(home=settings.home))
+        if not root.is_absolute():
+            raise ValueError("invalid Codex root")
+        if root.resolve() != settings.home.resolve():
+            access = _read_codex_authority(root, settings)
+            if access is not None:
+                return access
+    raise ValueError("Codex OAuth authority unavailable")
 
 
 def _codex_http_client(deadline, *, _admit=None, transport=None):

@@ -186,19 +186,81 @@ plugins:
           timeout: 30
           max_tokens: 1800
           reasoning_effort: low
+          codex_auth_source: owner_only
 ```
 
 For the paid OpenRouter route, use the same section with
 `provider: openrouter` and `model: xiaomi/mimo-v2.6-flash`. Its key must already
 exist as `OPENROUTER_API_KEY` in **that profile's** native `.env`; ambient keys and
-another profile's secrets are not used. Never put keys in YAML. Codex uses the
-owner's native OAuth grant in `auth.json`, not an OpenAI API key or a new auth
-store. Extraction reads only that owner's existing singleton grant or healthy
-OAuth pool row, without native pool selection/healing or root fallback. A present
-pool is authoritative; expired, exhausted, malformed or unknown-expiry grants
-fail closed. Token refresh, sign-in and quota recovery remain the user's/native
-app's responsibility, not an extraction side effect.
-An empty Codex pool also denies singleton fallback; an absent pool key permits it only without native `device_code` suppression.
+another profile's secrets are not used. Never put keys in YAML. Codex uses native
+OAuth in `auth.json`, not an OpenAI API key or a new auth store. The default
+`codex_auth_source: owner_only` reads only the owner's existing authority.
+`owner_or_default` explicitly permits the native default root ONLY when owner
+Codex authority is proven absent; it does not recover from a local refusal.
+A present pool is authoritative, even empty/invalid/exhausted; singleton seeding
+requires an absent pool key and no `device_code` suppression. Expired, malformed
+or unknown-expiry grants fail closed. Sign-in, refresh and quota recovery remain
+the native app's responsibility, never an extraction side effect.
+
+### Явный shared Codex auth: источник grant не является владельцем данных
+
+Новый leaf принимается независимо в `settings.extraction.codex_auth_source` и
+`settings.graph_extraction.codex_auth_source`: только строки `owner_only`
+(default) или `owner_or_default`. Opt-in разрешён только с `provider: openai-codex`;
+неизвестные значения/типы и shared policy на OpenRouter отвергаются даже в disabled
+section. Session opt-in не наследуется графом и не включает auto-graph.
+
+Для будущего согласованного shared-режима задайте `codex_auth_source: owner_or_default`
+в нужной owner-local section. **Это описание нового source-контракта, не заявление
+об установке, включении настройки или native/live приёмке.** Сначала необходимы
+приёмка candidate, совместимость текущего Core и отдельные config/network/activation gates.
+
+- Сначала читается `settings.home/auth.json`. Только отсутствующий файл или
+  корректный store без Codex provider/pool/непустой suppression/active-provider authority
+  допускает root. Valid other-provider-only store не мешает этому opt-in.
+- Malformed/duplicate JSON, unreadable local store, неверные containers,
+  explicit empty/invalid/exhausted pool, Codex provider state или suppression
+  refusal окончательны: root не читается. Healthy owner всегда выше root.
+- Root вычисляет настоящий `get_default_hermes_root(home=settings.home)`;
+  без этого API — отказ, без guessed Windows path, ambient `HERMES_HOME` или
+  произвольного credential path. Root не запускает следующий fallback.
+- Один validator для обоих источников: OAuth access+refresh, credential status,
+  ошибки/reset, cooldown **точного requested model**, известная expiry JWT/row
+  с запасом на весь timeout. Неизвестная/истёкшая expiry не разрешает refresh.
+  JWT `exp` — finite numeric seconds; stored `expires_at` — seconds/native
+  milliseconds или timezone-aware ISO, `expires_at_ms` — finite numeric millis.
+  Все присутствующие constraints ограничивают срок, bool/NaN/Inf и naive ISO запрещены.
+  Suppression list и legacy mapping учитывают membership; запрет singleton-seeding
+  не отменяет независимую healthy manual OAuth pool row, включая native
+  `manual:device_code` и `manual:loopback_pkce`. Пустые valid suppression `[]`/`{}`
+  сами по себе не являются отказом/authority.
+- Present `provider`/`auth_type`/`auth_mode`/`source` и route metadata выбранного
+  grant должны соответствовать official Codex OAuth. Явные `issuer`/`iss` в state,
+  row или JWT должны соответствовать `https://auth.openai.com`; decode не проверяет
+  подпись JWT и не является криптографическим доказательством issuer. Custom proxy/API-key source
+  или off-host `base_url`/`inference_base_url` не перенаправляются на official host.
+  Legacy native grants без optional source/URL fields сохраняют прежний admission.
+- Каждый вызов перечитывает исходный store. Нет token cache, credential copies,
+  symlink/hardlink, resolver/status/load_pool, healing, login/refresh, lock/backup
+  или auth/config writes. Native rotation остаётся у Hermes; следующий вызов
+  увидит новый snapshot. Это не lock/atomic lease относительно native writer.
+- `settings.home`, secret scope, ACL, очереди и persistence остаются у owner.
+  Shared grant разделяет квоту, **не** память/конфигурацию и не даёт unlimited/zero cost.
+
+Regressions подготовлены в `tests/test_extractor_shared_codex_auth_source.py`
+(stdlib SOURCE-extracted auth/native helper bodies + synthetic files/clock;
+reader/caller checks STATIC, не YAML/SDK) и
+`tests/test_extractor_shared_codex_auth.py` (genuine pytest/Core/SDK/YAML,
+synthetic stores + offline HTTPX). Их наличие/AST compile не означает execution.
+SOURCE entry требует отдельного admission через неизменённый project controller;
+native/SDK/SQL/worker/model/HTTP gates здесь **NOT_RUN**. Текущий native adapter
+не сохраняет `message.refusal`; completed offline wire сам по себе не снимает
+`response_refusal_unconfirmed`. Новый auth source не обходит этот прежний guard.
+
+Откат policy: новым reader вернуть `owner_only` в каждой opt-in section, затем
+перед возвратом старого plugin удалить только новый leaf (старый strict reader
+его не знает). Auth store из старой копии не восстанавливать: refresh chain могла
+ротироваться. Установка, saved setting и loaded process — отдельные состояния.
 
 Both routes redact remote transcripts and apply the same local JSON schema,
 exact quote/index/speaker, source ownership, ACL and existing storage quality
@@ -259,9 +321,10 @@ plugins:
           model: gpt-6-luna-900k
           timeout: 30
           reasoning_effort: low
+          codex_auth_source: owner_only
 ```
 
-Only `enabled`, `provider`, `model`, `timeout` and `reasoning_effort` are accepted.
+Only `enabled`, `provider`, `model`, `timeout`, `reasoning_effort` and `codex_auth_source` are accepted.
 `enabled` is a boolean (default false); enabled sections require an explicit
 provider and effective model. Providers are `openai-codex` and `openrouter`.
 Timeout defaults to 30 seconds and must be a number in 1–60; reasoning defaults
@@ -291,11 +354,13 @@ alone is refused there instead of being sent to a paid route. To keep an explici
 YAML OpenRouter graph route, set `provider: openrouter` and its intended model;
 its existing graph endpoint/key settings remain in use.
 
-Codex needs no `OPENROUTER_API_KEY`. It uses the unchanged session adapter's
-read-only `_own_codex_grant` and native `CodexAuxiliaryClient`, pinned to
+Codex needs no `OPENROUTER_API_KEY`. It uses the session adapter's shared
+read-only authority validator and native `CodexAuxiliaryClient`, pinned to
 `https://chatgpt.com/backend-api/codex/responses` and the graph provider's owner.
-Graph URL/key overrides, ambient OpenAI credentials and another owner's grant
-cannot change that route. Missing/expired/unknown grants, authoritative empty or
+Graph URL/key overrides and ambient OpenAI credentials cannot change that route.
+An independently configured graph `codex_auth_source: owner_or_default` permits
+only the native root after proven local Codex absence, without changing the owner.
+Missing/expired/unknown grants, authoritative empty or
 malformed pools, native singleton suppression, credential failures and active
 **exact-requested-model** cooldowns deny the call; no resolver, healing, refresh,
 CLI credential adoption, quota probe, SDK retry or paid fallback is performed.
@@ -683,12 +748,13 @@ plugins:
 | `timeout` | integer 1–60 секунд, bool запрещён | integer/float 1–60, bool запрещён |
 | `max_tokens` | integer: Codex 256–9000, OpenRouter 256–3000 | key не поддержан; request использует 700-token hint |
 | `reasoning_effort` | `low`, `medium`, `high`, `xhigh`, `max` | тот же accepted enum |
+| `codex_auth_source` | `owner_only` (default), `owner_or_default` только для Codex | независимый opt-in с тем же default/enum |
 
 Это полный accepted leaf-набор. Не добавляйте `api_key`, `base_url`, `endpoint`, `retry`, `temperature`, `context_length` или graph `max_tokens`; неизвестные поля и неверные типы/ranges дают отказ. Code default disabled model literal `gpt-6-luna` — не рекомендация и не entitlement.[1][2]
 
 Codex model grammar — 1–200 символов `[A-Za-z0-9][A-Za-z0-9._-]{0,199}`, без `/`. Session OpenRouter требует `org/model`; graph OpenRouter имеет свой validator и допускает bare ID. Не исправляйте slug и не выводите context capacity из suffix. Session effort передаётся обоим native routes; graph OpenRouter payload effort не передаёт. Native Codex может нормализовать effort к vocabulary модели.[1][2][14]
 
-**Auth и стоимость:** Codex использует read-only owner-local native OAuth; present pool авторитетен, empty pool не разрешает singleton/root/sibling fallback. Extractor не выполняет sign-in, refresh, healing или auth-store writes. Subscription расходует квоту и не unlimited. Session OpenRouter — отдельный metered opt-in с owner `OPENROUTER_API_KEY`; graph OpenRouter сохраняет собственные graph endpoint/key readers. Ошибка выбранного route не включает платный fallback.[1][2][14]
+**Auth и стоимость:** Codex default `codex_auth_source: owner_only` использует read-only owner-local OAuth. Независимый opt-in `owner_or_default` разрешает native root только при доказанном отсутствии local Codex authority, не при отказе. Present empty/invalid/exhausted pool, provider/suppression refusal или unreadable/malformed store не разрешают singleton/root/sibling bypass. Общий validator и неизменный owner scope описаны [выше](#явный-shared-codex-auth-источник-grant-не-является-владельцем-данных). Extractor не выполняет sign-in, refresh, healing или auth-store writes. Subscription расходует общую квоту и не unlimited. OpenRouter остаётся отдельным metered opt-in, без paid fallback после Codex failure.[1][2][14]
 
 Native Codex endpoint закреплён на `https://chatgpt.com/backend-api/codex`; transport/auth failure не выбирает новый endpoint.[14][15]
 
@@ -1134,7 +1200,7 @@ their contents.
 
 New entity and relation rows carry `visibility_scope`, owner identity, optional `source_claim_id`, and a validity interval. A relation linked to a claim inherits its visibility and disappears from graph queries when the claim is superseded, retired, or expired. Graph queries can include a bounded second hop. Model-facing graph reads, exports, and context packing enforce the same boundary. Old rows acquire the `legacy` marker during schema migration; their owner cannot be inferred from the process that starts Hermes. They remain hidden unless `MEMORY_WIKI_ALLOW_LEGACY_UNSCOPED_GRAPH=1` is explicitly set for one shared authorization domain. To attribute old rows individually, use `python tools/migrate_legacy_graph.py --database PATH --mapping MAP.json` for a dry run, then repeat with `--apply --attest "I verified every graph row owner"` after reviewing the mapping. The apply path creates an SQLite backup. Example mapping: `{"records":[{"table":"entities","id":"ent_existing","visibility_scope":"chat","origin_bot_id":"verified-bot-id","origin_session_id":"verified-session-id"}]}`. The same tool accepts `preference_rules`, `review_queue`, and `secret_index` rows. Every mapping entry needs a verified owner; assign `global` only when the row was intentionally shared. Ownership migration of an old preference rule does **not** attest its content for the system prompt. Imported bundle graph rows remain gated because copying owner IDs across homes requires explicit remapping. New preference candidates and review items carry owner scope; old rows remain closed unless their respective shared-domain flag is set. Local admin secret metadata defaults to private visibility; its owner-tagged rows can be queried when the local index is enabled. Bulk claim maintenance that cannot yet filter by owner is denied whenever the database contains claims hidden from the current session.
 
-`memory_wiki_graph_extract_claim` требует конкретный visible/current/public/non-quarantined claim и явное включение: новым принятым PIN через отдельный `graph_extraction`, либо legacy OpenRouter через `MEMORY_WIKI_GRAPH_EXTRACT_ENABLED=1`, его model/key при отсутствии YAML. Codex использует только owner OAuth, без OpenRouter key и paid fallback. Передаётся до 4,000 символов claim; strict JSON ограничивает предложения восемью, проверяет predicate/grounding. `apply:false` не пишет edges; запись идёт через обычный journaled `memory_wiki_add_relation`, replay не вызывает модель. На исходном срезе проверка отрицания имеет известный дефект; проверять важные edges и не выдавать такую extraction за принятую семантику до исправления и exact-source gate.
+`memory_wiki_graph_extract_claim` требует конкретный visible/current/public/non-quarantined claim и явное включение: новым принятым PIN через отдельный `graph_extraction`, либо legacy OpenRouter через `MEMORY_WIKI_GRAPH_EXTRACT_ENABLED=1`, его model/key при отсутствии YAML. Codex использует выбранную read-only OAuth authority (`owner_only` по умолчанию; native root только после независимого `owner_or_default` и доказанного отсутствия local Codex authority), без OpenRouter key и paid fallback. Передаётся до 4,000 символов claim; strict JSON ограничивает предложения восемью, проверяет predicate/grounding. `apply:false` не пишет edges; запись идёт через обычный journaled `memory_wiki_add_relation`, replay не вызывает модель. На исходном срезе проверка отрицания имеет известный дефект; проверять важные edges и не выдавать такую extraction за принятую семантику до исправления и exact-source gate.
 
 `MEMORY_WIKI_GRAPH_AUTO_EXTRACT=1` adds a bounded synchronous step after grounded session claims are persisted. It never sends raw transcript text: only a new active/current public chat claim with `memory-wiki-extraction-evidence-v1` provenance can qualify. A conservative local relation-verb filter skips preferences and other claims unlikely to produce an allowed edge. Claims that already own any relation are not sent again. The per-session call cap and total deadline apply before each request; request or write failures are counted in a content-free audit record and never fail session shutdown. Relations keep the source claim's ACL and lifecycle through the ordinary journaled relation writer.
 

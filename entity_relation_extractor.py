@@ -19,13 +19,13 @@ try:
     from .extractor import (
         ExtractionSettings, _codex_content, _lexical_sentence_spans, _negation_spans,
         _LEXICAL_DENIAL_RE, _lexical_assertions, _lexical_terms,
-        _validate_extraction_settings, _strict_json_document, _remote_secret_material, _INJECTION_RE,
+        _validate_extraction_settings, _validate_codex_auth_source, _strict_json_document, _remote_secret_material, _INJECTION_RE,
     )
 except ImportError:  # pragma: no cover - standalone plugin loading
     from extractor import (
         ExtractionSettings, _codex_content, _lexical_sentence_spans, _negation_spans,
         _LEXICAL_DENIAL_RE, _lexical_assertions, _lexical_terms,
-        _validate_extraction_settings, _strict_json_document, _remote_secret_material, _INJECTION_RE,
+        _validate_extraction_settings, _validate_codex_auth_source, _strict_json_document, _remote_secret_material, _INJECTION_RE,
     )
 
 
@@ -50,12 +50,13 @@ def read_graph_extraction_settings(
         if section is missing:
             return None
     if not isinstance(section, dict) or set(section) - {
-            "enabled", "provider", "model", "timeout", "reasoning_effort"}:
+            "enabled", "provider", "model", "timeout", "reasoning_effort", "codex_auth_source"}:
         raise ValueError("invalid graph extraction settings")
     section = dict(section)
     if model_override is not None:
         section["model"] = model_override
     settings = ExtractionSettings(home=home, max_tokens=700, **section)
+    _validate_codex_auth_source(settings)
     model_pattern = (r"[A-Za-z0-9][A-Za-z0-9._-]{0,199}" if settings.provider == "openai-codex"
                      else r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}")
     if (type(settings.enabled) is not bool or settings.provider not in {"openai-codex", "openrouter"}
