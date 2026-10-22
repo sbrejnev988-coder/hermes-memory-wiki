@@ -326,7 +326,7 @@ class SharedCodexAuthSourceTests(unittest.TestCase):
 
         for home in (self.owner, self.root):
             for until in (None, False, True, "invalid", [], {}, float("inf"), -float("inf"), float("nan")):
-                with self.subTest(source=home.name, exact_cooldown=until):
+                with self.subTest(source=home.name, exact_cooldown=repr(until)):
                     (self.owner / "auth.json").unlink(missing_ok=True)
                     self.write(self.root, _pool(_row()))
                     self.assertEqual(self.grant(replace(self.settings, home=self.root)), _jwt())
