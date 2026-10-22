@@ -1080,12 +1080,25 @@ def install_document_graph_schema(conn: sqlite3.Connection) -> None:
     )
 
 
+# Public content knobs only: executable/endpoint, ZIP and supervisor policies
+# remain owner-controlled. Legacy ocr/ocr_language keep their existing coercion.
+_PUBLIC_EXTRACTION_OPTION_TYPES = {
+    "pdf_parser": str, "pdf_mode": str, "pdf_reading_order": str,
+    "pdf_tables": bool, "pdf_native_fallback": bool, "pdf_table_strategy": str,
+    "pdf_max_blocks_per_page": int, "pdf_max_tables_per_page": int,
+    "ocr_min_chars": int, "ocr_dpi": int, "ocr_max_pixels": int,
+    "ocr_max_pages": int, "ocr_max_tsv_rows": int, "ocr_min_native_chars": int,
+    "ocr_psm": str, "max_units": int, "max_cells": int, "max_pages": int,
+    "max_chars": int, "external_timeout": int,
+}
+
+
 def _worker_options(args: Dict[str, Any]) -> Dict[str, Any]:
     try:
         from .document_extractors import effective_extraction_options
     except ImportError:
         from document_extractors import effective_extraction_options
-    return effective_extraction_options({
+    options = {
         "max_bytes": _env_int("MEMORY_WIKI_DOCUMENT_MAX_BYTES", 128 * 1024 * 1024, 1_000_000, 2_000_000_000),
         "max_units": _env_int("MEMORY_WIKI_DOCUMENT_MAX_UNITS", 100_000, 100, 1_000_000),
         "max_cells": _env_int("MEMORY_WIKI_DOCUMENT_MAX_CELLS", 500_000, 100, 5_000_000),
@@ -1100,7 +1113,21 @@ def _worker_options(args: Dict[str, Any]) -> Dict[str, Any]:
         "ocr_min_native_chars": _env_int("MEMORY_WIKI_DOCUMENT_OCR_MIN_NATIVE_CHARS", 40, 0, 10_000),
         "external_timeout": _env_int("MEMORY_WIKI_DOCUMENT_EXTERNAL_TIMEOUT", 90, 5, 900),
         "tika_url": str(_document_env("MEMORY_WIKI_TIKA_URL", "") or ""),
-    })
+    }
+    for key, expected_type in _PUBLIC_EXTRACTION_OPTION_TYPES.items():
+        if key not in args:
+            continue
+        value = args[key]
+        # bool is an int subclass; neither truthiness nor int()/str() coercion
+        # is the public contract for these newly exposed fields.
+        if type(value) is not expected_type:
+            raise ValueError("invalid " + key)
+        if key in {"max_units", "max_cells", "max_pages", "max_chars", "external_timeout"}:
+            value = min(value, options[key])
+        options[key] = value
+    # One boundary normalization. Canonical fingerprint/worker callers keep
+    # receiving this SAME effective dict; no second parser implementation here.
+    return effective_extraction_options(options)
 
 
 def _worker_env(worker: Path) -> Dict[str, str]:
@@ -3118,8 +3145,15 @@ def scan_documents(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
                 if not old_path.exists() and not _file_identity_history(conn, str(source_id)):
                     raise PermissionError("indexed document path identity unavailable")
 
-    # Timestamp/size equality is only a performance hint for explicitly trusted immutable stores.
-    stat_fast_path = bool(args.get("stat_fast_path", False)) and _env_bool("MEMORY_WIKI_DOCUMENT_ALLOW_STAT_FAST_PATH", False)
+    # Timestamp/size equality is only a hint for trusted immutable stores.
+    # Explicit content options (even False/0/default-valued ones) must reach
+    # canonical ingest and its fingerprint; stat equality says nothing about
+    # extraction settings. Legacy OCR fields are content options as well.
+    stat_fast_path = (
+        bool(args.get("stat_fast_path", False))
+        and _env_bool("MEMORY_WIKI_DOCUMENT_ALLOW_STAT_FAST_PATH", False)
+        and not any(key in args for key in (*_PUBLIC_EXTRACTION_OPTION_TYPES, "ocr", "ocr_language"))
+    )
     max_changed = max(1, min(int(args.get("max_changed") or max_files), max_files))
     changed_processed = 0
     deferred = 0

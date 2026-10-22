@@ -10143,6 +10143,37 @@ class MemoryWikiProvider(MemoryProvider):
     # ----- tools ---------------------------------------------------------
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         P = lambda props, req=(): {"type":"object","properties":props,"required":list(req)}
+        # One shared content contract for explicit ingest and scan. Defaults
+        # describe the unconfigured owner; requests cannot raise ENV ceilings.
+        document_options = {
+            "ocr": {"type": "boolean", "default": False},
+            "ocr_language": {"type": "string", "default": "eng+rus"},
+            "pdf_parser": {"type": "string", "enum": ["auto", "pymupdf", "pypdf"], "default": "auto"},
+            "pdf_mode": {"type": "string", "enum": ["blocks", "pages"], "default": "blocks"},
+            "pdf_reading_order": {"type": "string", "enum": ["layout", "source"], "default": "layout"},
+            "pdf_tables": {"type": "boolean", "default": True},
+            "pdf_native_fallback": {"type": "boolean", "default": True},
+            "pdf_table_strategy": {"type": "string", "enum": ["lines", "lines_strict", "text"], "default": "lines"},
+            "pdf_max_blocks_per_page": {"type": "integer", "default": 2000, "minimum": 1, "maximum": 20000},
+            "pdf_max_tables_per_page": {"type": "integer", "default": 32, "minimum": 1, "maximum": 1000},
+            "ocr_min_chars": {"type": "integer", "default": 8, "minimum": 1, "maximum": 10000},
+            "ocr_dpi": {"type": "integer", "default": 200, "minimum": 72, "maximum": 400},
+            "ocr_max_pixels": {"type": "integer", "default": 20000000, "minimum": 1000000, "maximum": 100000000},
+            "ocr_max_pages": {"type": "integer", "default": 100, "minimum": 1, "maximum": 10000},
+            "ocr_max_tsv_rows": {"type": "integer", "default": 100000, "minimum": 1, "maximum": 1000000},
+            "ocr_min_native_chars": {"type": "integer", "default": 40, "minimum": 0, "maximum": 10000},
+            "ocr_psm": {"type": "string", "enum": [str(n) for n in range(14)], "default": "3"},
+            "max_units": {"type": "integer", "default": 100000, "minimum": 1, "maximum": 1000000,
+                          "description": "May only lower the owner MEMORY_WIKI_DOCUMENT_MAX_UNITS ceiling."},
+            "max_cells": {"type": "integer", "default": 500000, "minimum": 1, "maximum": 5000000,
+                          "description": "May only lower the owner MEMORY_WIKI_DOCUMENT_MAX_CELLS ceiling."},
+            "max_pages": {"type": "integer", "default": 10000, "minimum": 1, "maximum": 100000,
+                          "description": "May only lower the owner MEMORY_WIKI_DOCUMENT_MAX_PAGES ceiling."},
+            "max_chars": {"type": "integer", "default": 100000000, "minimum": 1000, "maximum": 500000000,
+                          "description": "May only lower the owner MEMORY_WIKI_DOCUMENT_MAX_CHARS ceiling."},
+            "external_timeout": {"type": "integer", "default": 90, "minimum": 1, "maximum": 900,
+                                 "description": "Seconds; may only lower the owner MEMORY_WIKI_DOCUMENT_EXTERNAL_TIMEOUT ceiling."},
+        }
         return [
             {"name":"memory_wiki_query","description":"Search memory-wiki claims with FTS + salience/freshness scoring.","parameters":P({"query":{"type":"string"},"limit":{"type":"integer","default":10},"include_stale":{"type":"boolean","default":True},"topic":{"type":"string"}}, ["query"])},
             {"name":"memory_wiki_global_search","description":"Explicit opt-in read-only hybrid search across configured local Hermes profiles. Fans out FTS5 + Qdrant semantic retrieval, revalidates every match against each profile SQLite source of truth, and returns active redacted non-secret claims without copying or mutating profile data.","parameters":{**P({"query":{"type":"string","minLength":1,"maxLength":4000},"limit":{"type":"integer","default":30,"minimum":1,"maximum":200},"mode":{"type":"string","enum":["hybrid","fts","vector"],"default":"hybrid"}}, ["query"]),"additionalProperties":False}},
@@ -10241,8 +10272,8 @@ class MemoryWikiProvider(MemoryProvider):
             {"name":"memory_wiki_is_social_close","description":"Check if text is a social closer (ok, thanks, 👍) that should skip memory search.","parameters":P({"text":{"type":"string"}}, ["text"])},
         
             # ── Universal document knowledge graph v2 ──
-            {"name":"memory_wiki_document_ingest","description":"Parse and index one allowlisted document in an isolated worker. Supports Office/OpenDocument/PDF/text/data formats; no automatic full reindex.","parameters":P({"path":{"type":"string","minLength":1},"scope_id":{"type":"string","default":""},"repository_id":{"type":"string","default":""},"ocr":{"type":"boolean","default":False},"ocr_language":{"type":"string","default":"eng+rus"},"embed":{"type":"boolean","default":False},"embed_limit":{"type":"integer","default":200,"minimum":1,"maximum":10000}}, ["path"])},
-            {"name":"memory_wiki_document_scan","description":"Recursively discover and incrementally index supported documents below an allowlisted directory. If root is omitted, scans the Hermes attachment cache (~/.hermes/cache/documents). Reports missing indexed sources and prunes them only when prune_missing=true.","parameters":P({"root":{"type":"string","default":""},"scope_id":{"type":"string","default":""},"repository_id":{"type":"string","default":""},"recursive":{"type":"boolean","default":True},"max_files":{"type":"integer","default":5000,"minimum":1,"maximum":100000},"extensions":{"type":"array","items":{"type":"string"}},"exclude_dirs":{"type":"array","items":{"type":"string"}},"ocr":{"type":"boolean","default":False},"embed":{"type":"boolean","default":False},"prune_missing":{"type":"boolean","default":False}}, [])},
+            {"name":"memory_wiki_document_ingest","description":"Parse and index one allowlisted document in an isolated worker. Supports Office/OpenDocument/PDF/text/data formats; no automatic full reindex.","parameters":P({"path":{"type":"string","minLength":1},"scope_id":{"type":"string","default":""},"repository_id":{"type":"string","default":""},**document_options,"embed":{"type":"boolean","default":False},"embed_limit":{"type":"integer","default":200,"minimum":1,"maximum":10000}}, ["path"])},
+            {"name":"memory_wiki_document_scan","description":"Recursively discover and incrementally index supported documents below an allowlisted directory. If root is omitted, scans the Hermes attachment cache (~/.hermes/cache/documents). Reports missing indexed sources and prunes them only when prune_missing=true.","parameters":P({"root":{"type":"string","default":""},"scope_id":{"type":"string","default":""},"repository_id":{"type":"string","default":""},"recursive":{"type":"boolean","default":True},"max_files":{"type":"integer","default":5000,"minimum":1,"maximum":100000},"extensions":{"type":"array","items":{"type":"string"}},"exclude_dirs":{"type":"array","items":{"type":"string"}},**document_options,"embed":{"type":"boolean","default":False},"prune_missing":{"type":"boolean","default":False}}, [])},
             {"name":"memory_wiki_document_embed_pending","description":"Create/reuse embeddings for pending semantic document chunks in a bounded batch.","parameters":P({"source_id":{"type":"string","default":""},"scope_id":{"type":"string","default":""},"repository_id":{"type":"string","default":""},"limit":{"type":"integer","default":500,"minimum":1,"maximum":10000}}, [])},
             {"name":"memory_wiki_document_query","description":"Hybrid document retrieval: FTS5/BM25 over addressable units and chunks + Qdrant embeddings + weighted RRF + configured reranker.","parameters":P({"query":{"type":"string","minLength":1},"source_id":{"type":"string","default":""},"scope_id":{"type":"string","default":""},"repository_id":{"type":"string","default":""},"global_only":{"type":"boolean","default":False},"extension":{"type":"string","default":""},"limit":{"type":"integer","default":12,"minimum":1,"maximum":50},"candidate_limit":{"type":"integer","default":120,"minimum":20,"maximum":500},"max_chars_per_hit":{"type":"integer","default":3000,"minimum":300,"maximum":20000}}, ["query"])},
             {"name":"memory_wiki_document_source","description":"Show indexed metadata, revision and counts for one document source.","parameters":P({"source_id":{"type":"string","default":""},"path":{"type":"string","default":""}}, [])},
