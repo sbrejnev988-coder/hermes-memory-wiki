@@ -2594,6 +2594,14 @@ def _ingest_transaction(provider, conn, hook, *, source_id, _replay_reference=No
         _document_recovery_file_identities(conn, source_id)
 
 
+def _embed_ingest_result(provider: Any, args: Dict[str, Any], source_id: str,
+                         result: Dict[str, Any]) -> Dict[str, Any]:
+    """Hand off requested embedding after the ingest stage exits, without relabelling it."""
+    if bool(args.get("embed", _env_bool("MEMORY_WIKI_DOCUMENT_EMBED_ON_INGEST", False))):
+        result["embedding"] = embed_pending_documents(provider, {"source_id": source_id, "limit": int(args.get("embed_limit") or 200)})
+    return result
+
+
 def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _replay_reference=None) -> Dict[str, Any]:
     if _commit_hook is not None and _replay_reference is not None:
         raise ValueError("document replay cannot use a connector commit hook")
@@ -2718,13 +2726,15 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
             "SELECT COUNT(*) FROM document_units WHERE source_id=? AND active=1",
             (source_id,),
         ).fetchone()[0])
-        return _guard_document_output({
+        result = {
             "status": "unchanged", "extractor_status": extractor_status,
             "content_indexed": extractor_status == "ok" and active_units > 0,
             "source_id": source_id, "revision_id": str(existing["revision_id"]),
             "path": str(path), "file_hash": file_hash, "units": active_units,
             "file_identity_updated": identity_updated,
-        }, provider=provider)
+        }
+        _embed_ingest_result(provider, args, source_id, result)
+        return _guard_document_output(result, provider=provider)
     if (existing and representation_current and not same_identity and str(existing["revision_id"] or "") == revision_id
             and str(existing["file_hash"] or "") == file_hash
             and str(existing["parser"] or "") == parser
@@ -2754,13 +2764,15 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
             "SELECT COUNT(*) FROM document_units WHERE source_id=? AND active=1",
             (source_id,),
         ).fetchone()[0])
-        return _guard_document_output({
+        result = {
             "status": "scope_updated", "extractor_status": extractor_status,
             "content_indexed": extractor_status == "ok" and active_units > 0,
             "source_id": source_id, "revision_id": str(existing["revision_id"]),
             "path": str(path), "file_hash": file_hash, "units": active_units,
             "archived_claims": archived, "embedding_pending": int(pending),
-        }, provider=provider)
+        }
+        _embed_ingest_result(provider, args, source_id, result)
+        return _guard_document_output(result, provider=provider)
 
     units = list(payload.get("units") or [])
     chunks = _make_chunks(payload, units, material_options)
@@ -2915,8 +2927,7 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
         result = _record_result()
         if _commit_hook is not None:
             _commit_hook.apply(provider, conn)
-    if bool(args.get("embed", _env_bool("MEMORY_WIKI_DOCUMENT_EMBED_ON_INGEST", False))):
-        result["embedding"] = embed_pending_documents(provider, {"source_id": source_id, "limit": int(args.get("embed_limit") or 200)})
+    _embed_ingest_result(provider, args, source_id, result)
     return _guard_document_output(result, provider=provider)
 
 
