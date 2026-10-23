@@ -19,13 +19,15 @@ sys.path.insert(0, str(SOURCE / 'scripts/ci_owned'))
 from fixture_prerequisites import SOURCE_SUITES, clean_environment, native_pytest_args, no_links, suite_case_ids
 from source_suites import CaseResult, case_report, run_unittest
 
-# Actual test-method AST from authoritative a4e118e; setup/fixtures may change,
-# not historical behavioral assertions, gold, fault injections or security tests.
+# Historical a4e118e test-method AST, except explicit current-pin migrations.
+# CI-O02 -> current25431 migrates only G4 test_08's literal __init__ pin and
+# its eight-method digest below; the migrated AST is not unchanged a4 original.
+# All other five digests, behavioral assertions, gold/fault/security checks stay fixed.
 ORIGINAL_TESTS = {
     'test_memory_diff_polarity.py': 'f150f6c71394ca3f75e210c8806f49c4e5955bcc81121ebc896b6ba0a449c4f9',
     'test_observation_finite_work.py': '3d3145b411768f4d7f92974838ecb833888e563a72c5fa09fd37a42da582a7e4',
     'test_observation_repair01.py': '84c16fab3c539bfd3c2aedcd27d1ec14191c792d49f1ba78bf54f9e357cf426e',
-    'test_p2_g4_identity_errors.py': '8017b80c0d73939d4ad390d5ff77b65863b9feae04b39b83a46c416dad172d92',
+    'test_p2_g4_identity_errors.py': 'ea6341d85a25afc3f00fd79039046417bdd2b64ff15d75483474852bcb18f84e',
     'test_p2_g4_repair01.py': 'e5354523774ed81ce4c7724770f93d683a657cdac9747abcbe27d00a5ec0da30',
     'test_prefetch_current_diagnostics.py': '14ea1da3cd12bb1848ed2eeb6cff09c89a4794134b84b41b18c6dc3ccbeb1540',
 }

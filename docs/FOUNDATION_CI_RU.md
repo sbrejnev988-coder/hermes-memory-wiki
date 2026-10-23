@@ -243,3 +243,36 @@ Published/installed common остаётся d390; candidate не установ�
 Native/SDK/SQL/Linux/hosted matrix/FULL/release и owner-run activation остаются
 отдельными незакрытыми gates. Диагностический SOURCE setup не добавляется в
 обычный release generator и не заменяет его обязательный real-provider export.
+
+
+## CI-O03: CURRENT G4 oracle на frozen25431 (metadata-only)
+
+На baseline `25431e0a801dd5f9c1114a90c94249f5eaaad978` устарел только CURRENT
+whole-file oracle G4, а не продукт. В test_08 и его ReviewBoundary control literal
+`f7c896a12a43dff50de99d45b02c496ccf1eabe00c9afc834a8b6d2f59182985`
+заменён на заранее фиксированный raw SHA текущего `__init__.py`
+`8007b015f204a0b673e7cf41410fe609f60b8151bd39d9042a53336de7fdaf09`
+(1524144B, Git blob `5d02a2c816ffecb5ab8f7227bdbd6dc75901827d`). Expected
+остаётся литералом, не вычисляется из actual/HEAD во время теста.
+
+Ровно зависимый digest восьми identity-errors методов в `ORIGINAL_TESTS`
+мигрирует с `8017b80c0d73939d4ad390d5ff77b65863b9feae04b39b83a46c416dad172d92`
+на `ea6341d85a25afc3f00fd79039046417bdd2b64ff15d75483474852bcb18f84e`.
+Рецепт прежний: `ast.walk`, test `FunctionDef`, `ast.dump(include_attributes=False)`,
+sorted methods, `json.dumps(ensure_ascii=True).encode()`, SHA256. Это явная
+metadata migration одной pin Constant, **не** неизменный original-a4 AST;
+CI-O01/O02 выше описывают исторические pins/digests, не текущую квалификацию.
+Остальные пять ORIGINAL_TESTS digest, включая repair01 `e5354523...`, неизменны.
+
+Raw/AST inverse возвращает три test-файла к baseline после обратной замены двух
+current literals и одного digest; поясняющий comment учитывается отдельно.
+Оба historical gold, исходные hooks/setup, transport/SQL assertions, NetworkDenied
+tail, roster8+2+10 и ReviewBoundary7 сохранены. Все506 non-target mode/blob rows,
+включая весь продукт, runners/workflows/guards, byte-exact прежние. Historical
+`SCHEMA_PINS['baseline']` public-options не является CURRENT oracle и не меняется.
+
+Здесь только инертная raw/AST/digest/Git qualification: tests/collection/product
+import/exec/SOURCE/SQL/SDK/bootstrap/native/FULL/CrossPlatform/CI — **NOT_RUN**.
+Исторические PASS не переносятся. Исправление stale oracle не доказывает, что это
+единственная причина CI failure: конкретный child case/outcome остаётся UNKNOWN.
+CI/native не объявляются GREEN; независимое review и приёмка остаются родителю.
