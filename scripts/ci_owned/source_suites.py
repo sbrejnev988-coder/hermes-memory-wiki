@@ -273,7 +273,8 @@ def run_suites(source, root):
                 child = subprocess.run(command, cwd=fixture, env=env, stdout=out, stderr=err,
                                        timeout=60, check=False, shell=False)
             row['exit_code'] = child.returncode
-            raw = (fixture / 'stdout.log').read_bytes()
+            with (fixture / 'stdout.log').open('rb') as stream:
+                raw = stream.read(96001)
             if len(raw) > 96000:
                 raise RuntimeError('source_report_too_large')
             reports = [json.loads(line) for line in raw.splitlines() if line.startswith(b'{')]

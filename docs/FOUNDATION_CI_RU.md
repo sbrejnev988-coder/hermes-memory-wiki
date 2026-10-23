@@ -425,3 +425,60 @@ matrix, G4/native continuation, SDK/provider startup, FULL, install/loaded ил�
 release readiness. Старые SOURCE8+2+10, ReviewBoundary7 и все historical отказы
 остаются прежними; CI/workflow/runner не меняются. Parent review/приёмка и любое
 дальнейшее исполнение имеют отдельные scope/budget gates.
+
+## CI-SOURCE-STDOUT-BOUND-01: bounded read отчёта в parent
+
+После завершения каждого SOURCE child `run_suites` открывает собственный
+`suite-N/stdout.log` в `rb` и запрашивает ровно `read(96001)`. Прежняя проверка
+`len(raw) > 96000` остаётся перед JSON decode и проверками отчёта: корректный
+отчёт ровно96000B принимается,96001B даёт прежний
+`RuntimeError('source_report_too_large')` и per-suite `error_type=RuntimeError`.
+Контекст закрывает stream также при ошибке чтения. SHA чтение самого entry через
+`read_bytes()`, timeout60, row/report/error schema, roster8+2+10, strict
+`native_pytest_args` и diagnostic primary-preservation не изменяются.
+
+Это устраняет **неограниченное чтение captured stdout в память parent** до
+проверки размера. Это не общий лимит памяти процесса: JSON parsing и другие
+inputs имеют свои затраты, а buffered I/O может иметь внутренний буфер.
+Исправление **не ограничивает** запись stdout child на диск, его capture,
+`stderr.log`, весь SDK, OS/process-tree containment или cancellation. При
+огромном логе parent читает ограниченный префикс и отказывает, но сам файл от
+этого не становится ограниченным. Причина исторического CI hang/OOM этим
+**не установлена**; такой historical runtime incident здесь не воспроизводится.
+
+Ближайшие новые shipped controls используют только stdlib и запускаются из
+полного checkout без внешнего peer, SDK или SDK-absence setup:
+
+```
+python -I -S -B tests/test_source_suite_stdout_bound.py
+```
+
+`StdoutBoundTests` также совместим с ordinary pytest discovery; у него нет
+blanket `__test__ = False`, collection не читает и не исполняет product source,
+не создаёт fixture и не ставит audit hook. В `setUp` создаётся новый собственный
+временный каталог; только его `TemporaryDirectory` удаляет свои fixtures.
+Тесты исполняют exact extracted `run_suites` с исходными
+`no_links/clean_environment/suite_case_ids/native_pytest_args`, настоящими own
+файлами и наблюдателем `read(size)`/закрытия. Вызов target `subprocess.run`
+заменён **только synthetic completed-process observer**: ни G4 child, ни pytest,
+SDK, SQL или network из target не запускаются. Healthy nonempty, exact96000,
+96001 с допустимым префиксом, bounded requested size, read failure/closure,
+malformed/roster/outcome/count refusals и original qualifier primary покрываются
+отдельно; один дополнительный control проверяет только STATIC collection/read
+contract. Эти synthetic rows не являются настоящим SOURCE20/native receipt.
+
+Локальный ограниченный SOURCE packet отдельно исполняет exact331 baseline как
+ожидаемый witness прежнего `read(-1)`, используя файл всего96001B, не гигабайты.
+Это expected old violation, не healthy baseline PASS. Его denominator отделён
+от девяти candidate SOURCE mains и одного STATIC main; subtests отдельно.
+Полные actual outcomes/exits/stdin/captures/ownership и frozen candidate binding
+сохраняются в проектной lane
+`repairs/ci-source-report-stdout-bound-20261024/RESULT.json`, не выводятся из
+наличия этого guide. Controller — unchanged stock public API с собственными
+точными output/scratch leaves, не qualification aggregate-capped canonical CLI.
+
+Код переносим между Windows/Linux, но actual Linux, hosted CI/matrix,
+ordinary native pytest, genuine SDK/SQL, FULL/build/install/loaded/release
+в этой работе **NOT_RUN**. Старые SOURCE tests, ReviewBoundaryControls, gold,
+workflows и COLD descriptor/pins сохраняются byte-exact. Независимое review,
+приёмка/интеграция и любая публикация остаются отдельными действиями родителя.
