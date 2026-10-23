@@ -9,9 +9,10 @@ import re
 import unicodedata
 from typing import List
 
+# One optional authority qualifier, not arbitrary words before the existing noun.
 _INJECTION_PATTERNS: List[re.Pattern] = [
-    re.compile(r"ignore\s+(?:all\s+)?(?:previous|prior|above|the\s+above)\s+(?:instructions?|directives?|commands?|context|conversation)", re.I),
-    re.compile(r"(?:disregard|forget|override|bypass|skip)\s+(?:all\s+)?(?:previous|prior|above|earlier|existing)\s+(?:instructions?|directives?|rules?|constraints?|guidelines?)", re.I),
+    re.compile(r"ignore\s+(?:all\s+)?(?:previous|prior|above|the\s+above)\s+(?:(?:system|developer)\s+)?(?:instructions?|directives?|commands?|context|conversation)", re.I),
+    re.compile(r"(?:disregard|forget|override|bypass|skip)\s+(?:all\s+)?(?:previous|prior|above|earlier|existing)\s+(?:(?:system|developer)\s+)?(?:instructions?|directives?|rules?|constraints?|guidelines?)", re.I),
     re.compile(r"you\s+(?:are|must|should|shall|will)\s+(?:now|henceforth|from\s+now\s+on)\s+(?:act|behave|operate|function|respond)\s+(?:as|like)\s+(?:an?|the)\s", re.I),
     re.compile(r"(?:system\s*(?:prompt|message|instruction|directive)|developer\s*(?:prompt|message|note))\s*(?:is|was|has\s+been|:)\s*", re.I),
     re.compile(r"(?:new|updated|revised|changed|overridden)\s+(?:system\s*(?:prompt|message|instruction)|instructions?|directives?|rules?)", re.I),
