@@ -124,9 +124,9 @@ def main() -> int:
         os.environ['MW_REQUIRE_TRUST_CORE'] = '1'
     source_args = []
     if args.gate == 'tests':
-        from source_suites import run_suites
+        from source_suites import qualified_native_args, run_suites
         source_result = run_suites(root, fixture_home / 'source-prerequisites')
-        source_args = native_pytest_args(root, source_result)
+        source_args = qualified_native_args(root, source_result)
 
     receipt_path = fixture_home.parent / "native-origins.json"
     for path in [*reversed(fixture_home.parents), fixture_home, receipt_path]:

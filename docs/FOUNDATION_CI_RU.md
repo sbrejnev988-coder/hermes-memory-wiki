@@ -276,3 +276,92 @@ import/exec/SOURCE/SQL/SDK/bootstrap/native/FULL/CrossPlatform/CI — **NOT_RUN*
 Исторические PASS не переносятся. Исправление stale oracle не доказывает, что это
 единственная причина CI failure: конкретный child case/outcome остаётся UNKNOWN.
 CI/native не объявляются GREEN; независимое review и приёмка остаются родителю.
+
+## CI-AST/DIAG: actual-parser compatibility и SOURCE failure visibility
+
+На public0c (`0c2f2b6402cbfe1dec243897e4bb2394a3fe426a`) шесть test-method
+fingerprints совпадали с literal `ORIGINAL_TESTS` на CPython3.13.2/3.14.7, но ни
+один не совпадал на actual3.11.9/3.12.10. Это инертное parser/hash наблюдение,
+не исполнение тестов или SDK: у3.11 нет `FunctionDef.type_params`, а у3.12 иначе
+отображаются пустые AST fields. `feature_version` нового parser это не исправляет.
+
+Теперь `original_tests_for_runtime` выбирает явные literal таблицы3.11/3.12 и
+прежнюю, неизменную `ORIGINAL_TESTS` для3.13/3.14. Иная implementation, неизвестная
+версия или malformed tuple дают отказ, не skip/fallback. Producer **не изменён**:
+все `ast.walk` `FunctionDef` с `name.startswith('test')`,
+`ast.dump(include_attributes=False)`, sorted strings,
+`json.dumps(ensure_ascii=True).encode()`, SHA256. Никакой AST normalization,
+self-derived expected, обновления gold из HEAD или удаления meaningful fields.
+
+Независимые actual-parser profiles:
+`diagnosis/ci-0c2-39962629120-20261023/ast311.stdout.json`
+(2427B, SHA256 `127419a52e00f970ba368aaac01827935dfd15f3df33efd150946b58aa231cf7`),
+`ast312.stdout.json` (2411B,
+`ff3e5e8d256c4dcba4622835f551daf9b2951c9b6c7d7cc88ab3efd91c0a83fb`).
+Их шесть exact raw source bindings (в прежнем порядке `ORIGINAL_TESTS`):
+
+| public tests input | B | raw SHA256 |
+|---|---:|---|
+| `test_memory_diff_polarity.py` | 5847 | `9720bfe64b04183c2b378b0f901245c951df567dd9672a2d6d516fcecdfe2420` |
+| `test_observation_finite_work.py` | 18456 | `8bb326e6e42084d37e10a0ed784807e96b67c56612e5bc0fac26b693ec0888fa` |
+| `test_observation_repair01.py` | 12947 | `b773c354227036fc8322fb8d61649a42bc6359def70df10e056059e52affd96a` |
+| `test_p2_g4_identity_errors.py` | 19883 | `ec293d2136a19afef4b3c60d8bf0f2888ab32972c82a9072e11511f127056d24` |
+| `test_p2_g4_repair01.py` | 13944 | `be3299b328933adab7c67b6a6de1d8df6b9a43dff78da43444e2155dfeb387df` |
+| `test_prefetch_current_diagnostics.py` | 13729 | `877bce96128a1efdbaac201d36dde7dc890fe42c07dd5eec206bdd94bb96dfa0` |
+
+Все прежние assertions, исторические gold, hooks/setup, transport/SQL/NetworkDenied
+и product raw8007 остаются прежними. Shipped SOURCE roster по-прежнему8+2+10,
+ReviewBoundary7 не меняется. Additive `CompatibilityDiagnosticControls`
+(`__test__ = False`) — отдельный явный tooling UNIT/SOURCE roster, не выполнение
+старых G4 или полный Prerequisite10 и не дополнительные native ignores.
+
+### Ошибка qualifier остаётся первичной
+
+`run_suites` по-прежнему сохраняет исходные `suite-N/stdout.log`, `stderr.log` и
+`source-results.json`; новые children для диагностики не запускаются.
+`qualified_native_args` вызывает **тот же неизменный** strict `native_pytest_args`.
+При отказе packaging caller и standalone SOURCE main выводят одну bounded
+`SOURCE_FAILURE_DIAGNOSTIC` JSON line в stderr, после чего bare `raise` повторно
+поднимает exact original exception. Ни formatter/read/write failure, ни вторичная
+`BaseException`/cancellation не заменяют primary и не разрешают native continuation.
+Если даже fallback stderr недоступен, ошибка qualifier всё равно сохраняется.
+
+Console projection содержит только fixed suite names, source-bound main case IDs,
+finite outcomes/builtin error-type labels либо явный `UNKNOWN`, относительные
+имена существующих captures и public-input byte layout. Raw messages,
+foreign exception class metadata, subtest payload/`id()`, ENV/auth/user files,
+stdout/stderr содержимое и произвольный `str`/`repr` туда не попадают. Предел строки
+16000 ASCII bytes. Missing/malformed case report не превращается в passed по
+одним aggregate counts; сырые captures не переписываются.
+
+Reader допускает только `__init__.py`, `tests/fixtures/g4_original_boundary_gold.txt`
+и `tests/fixtures/g4_metadata_scope.txt`: no-links ancestors, regular file,
+не более2000000B на input и bounded read(cap+1). Console отдаёт только raw SHA256,
+B и отдельные CRLF/LF-only/CR-only counts либо `UNKNOWN`, не bytes. Это сигнал для
+следующего actualCI, **не доказательство** Windows CRLF incident. Ограничение
+SOURCE binder1MB не повышается: исполнение полного oversized reader на init
+в локальном tooling packet **NOT_RUN**; его wiring проверяется статически.
+
+Изменение формата явное и additive: core `memory-stack.source-suites/v1`
+(`total/passed/failed/errors/skipped/cases{id,outcome}/subtests`) сохранён;
+`case_report` добавляет только namespaced
+`diagnostics{schema:memory-stack.source-case-errors/v1,case_error_types}`.
+`run_suites` дополнительно сохраняет `cases` и `diagnostics` в per-suite row.
+Diagnostic console имеет собственный `memory-stack.source-failure-diagnostic/v1`.
+Проверены consumers по source: оба G4 распаковывают прежний `case_report`,
+Prerequisite subtest control читает прежние поля, packaging и standalone main
+пользуются новым wrapper, `memory_wiki_ci.py` и `ci_child.py` читают прежние
+qualification fields через неизменный `native_pytest_args`. Они не используют
+новые поля как authority; их отдельные callers не изменены. Summary не является
+native receipt и не меняет SOURCE/native split или workflow/checkout/EOL policy.
+
+Actual новый tooling outcome, admission/capture/roster, candidate и ограничения —
+только `repairs/ci-ast-compat-diagnostics-20261023/RESULT.json`, не утверждение PASS
+в этом документе. Подготовлены pure selector/formatter/primary-preservation
+controls с реальным strict metadata-validator на authored typed metadata.
+Это не SDK stand-in и не actual3.11 native execution. FullG4/Prerequisite10/SQL,
+provider/init execution/SDK/native, hosted CI/Windows matrix, FULL/build/install/
+loaded/release здесь **NOT_RUN**. Исторический run39962629120 остаётся последним
+разрешённым snapshot:6 regression failures,2 Ubuntu3.13/3.14 in_progress;
+конкретные failed child cases и единственная причина historicalCI — **UNKNOWN**.
+Independent review frozen четырёхфайловой дельты и приёмка остаются родителю.
