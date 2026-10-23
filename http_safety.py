@@ -40,7 +40,7 @@ def urlopen_no_redirect(request: Any, *, timeout: float, _before_dispatch=None):
                 raise TimeoutError('HTTP original deadline exceeded')
         return transport(request, timeout=timeout)
     url = request.full_url if isinstance(request, urllib.request.Request) else str(request)
-    hostname = (urllib.parse.urlsplit(url).hostname or "").lower()
+    hostname = (urllib.parse.urlsplit(url).hostname or "").casefold().rstrip(".")
     try:
         loopback = hostname == "localhost" or ipaddress.ip_address(hostname).is_loopback
     except ValueError:

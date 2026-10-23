@@ -197,6 +197,25 @@ def test_local_http_never_uses_environment_proxy(monkeypatch):
     assert not any(isinstance(item, http_safety.urllib.request.ProxyHandler)
                    for item in handlers_seen[-1])
 
+    # Classification only: keep the original URL/Request untouched, including
+    # the terminal dot that existing extraction callers accept as loopback.
+    for url in ("http://localhost.:6333/collections",
+                "http://localhost:6333/collections",
+                "http://[::1]:6333/collections"):
+        for request in (url, http_safety.urllib.request.Request(url)):
+            assert http_safety.urlopen_no_redirect(request, timeout=2) == "opened"
+            assert any(isinstance(item, http_safety.urllib.request.ProxyHandler)
+                       and item.proxies == {} for item in handlers_seen[-1])
+            assert any(isinstance(item, http_safety._NoRedirectHandler)
+                       for item in handlers_seen[-1])
+
+    # Remote HTTPS and localhost-looking names must retain normal proxy policy.
+    for url in ("https://openrouter.ai/api", "http://localhost.example.invalid/api"):
+        for request in (url, http_safety.urllib.request.Request(url)):
+            assert http_safety.urlopen_no_redirect(request, timeout=2) == "opened"
+            assert not any(isinstance(item, http_safety.urllib.request.ProxyHandler)
+                           for item in handlers_seen[-1])
+
 
 def test_tika_loopback_document_upload_ignores_environment_proxy(tmp_path, monkeypatch):
     module = _load("memory_wiki_tika_proxy_boundary", ROOT / "document_extractors.py")
