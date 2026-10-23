@@ -15882,8 +15882,14 @@ class MemoryWikiProvider(MemoryProvider):
 
     def _recent_changes(self, since_seconds: int = 3600, limit: int = 50) -> Dict[str, Any]:
         cutoff=now()-max(1,int(since_seconds or 3600)); limit=max(1,min(int(limit or 50),200)); c=self._connect()
+        visibility_sql, visibility_params = self._claim_visibility_sql(prefix="claims.")
         rows=[]
-        for row in c.execute("SELECT * FROM memory_changes WHERE created_at>=? ORDER BY created_at DESC LIMIT ?", (cutoff,limit)).fetchall():
+        for row in c.execute(
+            "SELECT memory_changes.* FROM memory_changes JOIN claims ON claims.id=memory_changes.claim_id "
+            f"WHERE memory_changes.created_at>=? AND {visibility_sql} "
+            "ORDER BY memory_changes.created_at DESC LIMIT ?",
+            (cutoff, *visibility_params, limit),
+        ).fetchall():
             claim=c.execute("SELECT * FROM claims WHERE id=?",(row["claim_id"],)).fetchone()
             if claim is not None and self._claim_visible(claim): rows.append(self._sanitize_row(row))
         return {"since_seconds":since_seconds,"count":len(rows),"changes":rows}
