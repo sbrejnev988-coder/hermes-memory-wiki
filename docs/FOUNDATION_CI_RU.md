@@ -200,8 +200,46 @@ commit/tree и границы находятся в
 `repairs/ci-schema-contract-20261023/RESULT.json` проекта, не в этом narrative.
 
 Native generator/SDK/bootstrap/SQL, Linux runtime, hosted CI/matrix, FULL,
-install/loaded/fleet/release acceptance здесь **NOT_RUN**. Старый exact cache pin
-в `test_audit_package_contracts_20261003.py` сохранён вне writable scope: перед
-будущим полным native gate нужен отдельный разрешённый source/gold rebind с
-сохранением historical pin и всех assertions. Настоящие профили не менялись;
+install/loaded/fleet/release acceptance здесь **NOT_RUN**. В исходном пятифайловом
+этапе старый exact cache pin в `test_audit_package_contracts_20261003.py` оставался
+вне writable scope. Его последующий отдельно разрешённый SOURCE-only rebind
+описан ниже; это не native acceptance. Настоящие профили не менялись;
 независимое review и приёмка candidate остаются родителю.
+
+## CI-SCHEMA-02: fixture qualification и current-cache input rebind
+
+Первичный `5265` RESULT остаётся `BLOCKED/fixture`: child0/outer1 и три audit
+refusal не переписаны в PASS. Последующий finite diagnostic с passive audit
+observer, установленным до byte-exact stock bootstrap guard, наблюдал три
+`open("<unknown>")` из CPython3.14 traceback caret formatting через `ast.parse`.
+Это attribution нового diagnostic, не восстановленный caller старого packet
+или исторического GitHub CI. Guards, provider и assertions не ослаблялись.
+
+Отдельный final SOURCE packet использует штатный selected interpreter с
+`-I -B -S -X no_debug_ranges` и свежим собственным `-X pycache_prefix=...`.
+Отключены лишь необязательные column/caret debug ranges; обычный исходный
+traceback, stage и exception checks остаются. `-B` и пустой owned cache prefix
+исключают прежние compiled stdlib debug ranges без записи в глобальный cache.
+Существующие public supervisor/interpret и stock bootstrap переиспользованы,
+нового guard или SDK stand-in нет; observers в final child отсутствуют.
+
+Выполнен весь прежний roster: **20 shipped regressions +1 expected baseline
+violation**, child/outer0/0, audit refusals0, supervisor `errors=[]` и
+`primary_error=null`, complete stdin/captures/reap/ownership. Own pycache prefix
+после запуска пуст. Точный runtime/input/capture binding и scope находятся в
+`repairs/ci-schema-contract-20261023/source-qualification03/RESULT.json` проекта.
+Это SOURCE qualification выбранных функций/синтетических diagnostic seams,
+не genuine provider/SDK/native export, ordinary pytest collection или CI PASS.
+
+Отдельный source-only input rebind добавляет
+`CURRENT_CACHE_SHA256_SOURCE_20261023` для принятой additive cache-дельты и
+переводит только три current native-test consumer references на этот exact SHA.
+Исторические `CACHE_SHA256`, `CURRENT_CACHE_SHA256_SOURCE_20261009`, metadata gold
+и все dictionary/manifest/SDK/readonly assertions сохранены. Native tests этого
+rebind **NOT_RUN**: совпавший digest не доказывает native export или lifecycle.
+Independent delta review и parent disposition обязательны до adoption.
+
+Published/installed common остаётся d390; candidate не установлен и не загружен.
+Native/SDK/SQL/Linux/hosted matrix/FULL/release и owner-run activation остаются
+отдельными незакрытыми gates. Диагностический SOURCE setup не добавляется в
+обычный release generator и не заменяет его обязательный real-provider export.
