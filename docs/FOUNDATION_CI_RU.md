@@ -365,3 +365,63 @@ loaded/release здесь **NOT_RUN**. Исторический run39962629120 �
 разрешённым snapshot:6 regression failures,2 Ubuntu3.13/3.14 in_progress;
 конкретные failed child cases и единственная причина historicalCI — **UNKNOWN**.
 Independent review frozen четырёхфайловой дельты и приёмка остаются родителю.
+
+## CI-EOL: canonical checkout bytes без изменения raw-SHA oracle
+
+В сохранённом Windows3.11 CI на22e строка475 содержит точный
+`SOURCE_FAILURE_DIAGNOSTIC`: G4 `test_08` failed / `AssertionError`, repair2 и
+prerequisite10 passed; native/pytest ещё не достигнуты. Metadata трёх публичных
+inputs совпадает с canonical LF → CRLF: `__init__.py`,
+`tests/fixtures/g4_original_boundary_gold.txt` и
+`tests/fixtures/g4_metadata_scope.txt`. Это достаточный checkout-контрпример,
+но exact первая historical assertion без child stderr и причины остальных
+Windows/Linux jobs остаются **UNKNOWN**.
+
+Repo-owned `.gitattributes` задаёт одну политику `* text=auto eol=lf`.
+Git распознаёт text автоматически, сохраняет его в checkout с LF даже при
+`core.autocrlf=true` / `core.eol=crlf`, а binary с NUL не нормализует.
+Никаких global/system Git config writes, `git add --renormalize`, переписывания
+продукта, старых fixtures/gold либо новых accepted CRLF hashes. В частности,
+CURRENT raw SHA `__init__.py` остаётся
+`8007b015f204a0b673e7cf41410fe609f60b8151bd39d9042a53336de7fdaf09`.
+Эта политика действует при checkout; уже существующие CRLF-файлы она сама по
+себе не переписывает. Проверять следует новый checkout в разрешённом scope,
+а не принимать dirty normalization всего рабочего дерева.
+
+Новая переносимая stdlib regression запускается **отдельно**, без product/SDK
+imports и без исполнения старых SOURCE suites:
+
+```
+python -I -S -B tests/test_ci_checkout_eol.py --git <ABSOLUTE_EXISTING_GIT> --fixture-root <ABSOLUTE_NEW_OWNED_ROOT>
+```
+
+Файл и `CheckoutEolTests` имеют `__test__ = False`; обычный pytest не должен
+неявно запускать этот отдельный Git-metadata контракт. Явный `unittest` suite
+сохраняет шесть ordered methods. Все зависимости поставляются в tree: только
+stdlib, exact три публичных файла и `.gitattributes`; внешнего peer/prep helper
+нет. Caller предоставляет существующий exact Git executable и новый собственный
+fixture root. HOME/USERPROFILE/AppData/TEMP изолированы; global/system configs —
+свои пустые файлы, `GIT_CONFIG_NOSYSTEM=1`, credentials и ambient Git ENV не
+наследуются. Fixture не удаляется и не переиспользуется.
+
+Один packet создаёт собственный Git index из публичных canonical bytes и делает
+настоящие `git checkout-index` snapshots. Без attributes hostile checkout обязан
+дать exact observed CRLF SHA всех трёх inputs; с поставляемой политикой — exact
+canonical bytes. Healthy `autocrlf=false/eol=crlf` и `autocrlf=input/eol=lf`
+сохраняют LF. Удаление только `eol=lf` в отдельном **fixture**-mutant снова обязано
+воспроизвести CRLF mismatch: baseline/mutant failure controls различают фикс,
+а не просто проверяют metadata команды. Во всех snapshots проверяется binary
+NUL/mixed-EOL preservation; UTF-8 text без final newline — отдельный контроль.
+Ожидаются6 main methods и9 Git commands, без subtests/pytest phases; actual
+roster/outcomes/exits, полные raw captures и resource readback — только в lane
+`repairs/ci-canonical-checkout-eol-20261023/RESULT.json` проекта.
+
+Это **обычный local Git-checkout metadata packet**, не canonical SOURCE sandbox:
+существующий SOURCE bootstrap запрещает subprocess, а stock supervisor допускает
+другие cwd/log roots. Их guards не изменяются; отдельный минимальный lane entry
+фиксирует exact executable, own fixture, durable intents, exits и captures.
+Успешный local Windows Git packet не доказывает actual Linux runtime, hosted CI
+matrix, G4/native continuation, SDK/provider startup, FULL, install/loaded или
+release readiness. Старые SOURCE8+2+10, ReviewBoundary7 и все historical отказы
+остаются прежними; CI/workflow/runner не меняются. Parent review/приёмка и любое
+дальнейшее исполнение имеют отдельные scope/budget gates.
