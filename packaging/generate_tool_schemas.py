@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -90,24 +91,44 @@ def _render(schemas: list[dict[str, Any]]) -> str:
     return json.dumps(schemas, ensure_ascii=False, indent=2) + "\n"
 
 
-def main() -> int:
+def _generation_failed(stage: str) -> int:
+    # A setup/import/validation/I/O failure is not evidence of cache staleness.
+    print(f"MCP_SCHEMA_GENERATION_FAILED stage={stage}", file=sys.stderr)
+    traceback.print_exc(file=sys.stderr)
+    return 1
+
+
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--check",
         action="store_true",
         help="fail when the packaged schema cache is stale instead of rewriting it",
     )
-    args = parser.parse_args()
-    rendered = _render(_runtime_schemas())
+    args = parser.parse_args(argv)
+    try:
+        schemas = _runtime_schemas()
+    except Exception:
+        return _generation_failed("native_export")
+    try:
+        rendered = _render(schemas)
+    except Exception:
+        return _generation_failed("schema_validation")
     if args.check:
-        current = TARGET.read_text(encoding="utf-8") if TARGET.is_file() else ""
+        try:
+            current = TARGET.read_text(encoding="utf-8") if TARGET.is_file() else ""
+        except (OSError, UnicodeError):
+            return _generation_failed("cache_read")
         if current != rendered:
             print("MCP_SCHEMA_CACHE_STALE", file=sys.stderr)
             return 2
-        print(f"MCP_SCHEMA_CACHE_OK tools={len(json.loads(rendered))}")
+        print(f"MCP_SCHEMA_CACHE_OK tools={len(schemas)}")
         return 0
-    TARGET.write_text(rendered, encoding="utf-8", newline="\n")
-    print(f"MCP_SCHEMA_CACHE_WRITTEN tools={len(json.loads(rendered))} path={TARGET}")
+    try:
+        TARGET.write_text(rendered, encoding="utf-8", newline="\n")
+    except (OSError, UnicodeError):
+        return _generation_failed("cache_write")
+    print(f"MCP_SCHEMA_CACHE_WRITTEN tools={len(schemas)} path={TARGET}")
     return 0
 
 

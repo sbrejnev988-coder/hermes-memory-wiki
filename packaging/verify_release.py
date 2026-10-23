@@ -17,6 +17,29 @@ def fail(message: str) -> None:
     raise SystemExit(2)
 
 
+def _check_schema_cache() -> None:
+    # Keep this a native export gate: SOURCE parity does not qualify a release.
+    try:
+        schema_check = subprocess.run(
+            [sys.executable, str(ROOT / "packaging" / "generate_tool_schemas.py"), "--check"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="backslashreplace",
+            check=False,
+        )
+    except OSError as exc:
+        fail(f"native MCP schema generator could not start ({type(exc).__name__})")
+    if schema_check.returncode:
+        print(f"MCP_SCHEMA_CHECK_FAILED exit={schema_check.returncode}", file=sys.stderr)
+        for stream, output in (("stdout", schema_check.stdout), ("stderr", schema_check.stderr)):
+            if output:
+                print(f"MCP_SCHEMA_CHECK_{stream.upper()}:", file=sys.stderr)
+                print(output, end="" if output.endswith("\n") else "\n", file=sys.stderr)
+        fail(f"native MCP schema check failed (exit={schema_check.returncode}); see child diagnostics above")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--tag", default="")
@@ -57,15 +80,7 @@ def main() -> int:
             fail(f"{label} does not declare {version}")
     if args.tag and args.tag != f"v{version}":
         fail(f"tag {args.tag} does not equal v{version}")
-    schema_check = subprocess.run(
-        [sys.executable, str(ROOT / "packaging" / "generate_tool_schemas.py"), "--check"],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if schema_check.returncode:
-        fail("packaged MCP schema cache differs from native provider schemas")
+    _check_schema_cache()
     compatibility_check = subprocess.run(
         [sys.executable, str(ROOT / "packaging" / "check_mcp_compatibility.py")],
         cwd=ROOT,

@@ -162,3 +162,46 @@ modules, тела и scripts не исполнялись. Исторически
 SDK/startup/hosted/native/FULL/installed/loaded/live/release остаются unqualified.
 Точный frozen candidate и static proof — только в этой lane `evidence/RESULT.json`;
 исторические outcomes/отказы остаются по прежним ссылкам, не переписываются.
+
+## CI-SCHEMA-01: cache и диагностика release-contract на d390
+
+В исходнике d390 общий `document_options` уже расширен, а packaged
+`mcp-wrapper/tool_schemas.json` остался прежним. SOURCE-сверка полных словарей
+показывает дельту только у `memory_wiki_document_ingest` (20 добавленных свойств)
+и `memory_wiki_document_scan` (21, включая `ocr_language`). Имена/порядок всех121
+инструментов, прежние свойства, required и остальные119 словарей не меняются.
+Cache теперь содержит те же PDF/OCR опции, defaults, enum, bounds и описания
+понижаемых owner ceilings, что и объявленный метод. Это ремонт публичного cache,
+не изменение parser/SDK/provider lifecycle.
+
+Нативный `packaging/generate_tool_schemas.py --check` остаётся обязательным:
+реальный provider import и `MemoryWikiProvider().get_tool_schemas()` не заменены
+SOURCE-режимом. Exit2 + `MCP_SCHEMA_CACHE_STALE` означает завершённый export и
+validation с несовпадением cache. Ошибки export/validation/read/write дают exit1,
+`MCP_SCHEMA_GENERATION_FAILED stage=...` и исходный traceback. `verify_release.py`
+сохраняет exit и оба потока неуспешного schema child вместо безусловного
+утверждения «cache differs». Успех SOURCE не отменяет этот native release gate.
+
+`tests/test_tool_schema_source_parity.py` — инертный при collection stdlib
+regression. Он исполняет только exact self-independent owning schema method,
+сверяет полные словари/порядок/UTF-8 LF render с cache и manifest, проверяет pinned
+MCP major compatibility, nested drift и различение диагностик. Native export и
+subprocess records в diagnostic controls явно injected; это не SDK/процессный
+native proof. Локальный packet использует unchanged `devtools/harness.py`
+`run_source` и минимальный exact method carrier меньше binder cap1MB; полный
+origin raw SHA/Git blob/mode связан отдельно. Guard/caps не расширяются.
+
+Исторический автоматический run39902744179 завершился failure во всех8 jobs
+до suites на `verify_release.py`. Его generic сообщение без child stdout/stderr
+**не доказывает**, что actual child отказал именно из-за stale cache; историческая
+причина остаётся INCONCLUSIVE. Подтверждённая здесь SOURCE-дельта — отдельный факт.
+Результат единственного разрешённого packet, actual exits/captures, frozen
+commit/tree и границы находятся в
+`repairs/ci-schema-contract-20261023/RESULT.json` проекта, не в этом narrative.
+
+Native generator/SDK/bootstrap/SQL, Linux runtime, hosted CI/matrix, FULL,
+install/loaded/fleet/release acceptance здесь **NOT_RUN**. Старый exact cache pin
+в `test_audit_package_contracts_20261003.py` сохранён вне writable scope: перед
+будущим полным native gate нужен отдельный разрешённый source/gold rebind с
+сохранением historical pin и всех assertions. Настоящие профили не менялись;
+независимое review и приёмка candidate остаются родителю.

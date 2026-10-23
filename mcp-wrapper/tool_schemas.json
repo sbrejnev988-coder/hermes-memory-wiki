@@ -2251,6 +2251,151 @@
           "type": "string",
           "default": "eng+rus"
         },
+        "pdf_parser": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "pymupdf",
+            "pypdf"
+          ],
+          "default": "auto"
+        },
+        "pdf_mode": {
+          "type": "string",
+          "enum": [
+            "blocks",
+            "pages"
+          ],
+          "default": "blocks"
+        },
+        "pdf_reading_order": {
+          "type": "string",
+          "enum": [
+            "layout",
+            "source"
+          ],
+          "default": "layout"
+        },
+        "pdf_tables": {
+          "type": "boolean",
+          "default": true
+        },
+        "pdf_native_fallback": {
+          "type": "boolean",
+          "default": true
+        },
+        "pdf_table_strategy": {
+          "type": "string",
+          "enum": [
+            "lines",
+            "lines_strict",
+            "text"
+          ],
+          "default": "lines"
+        },
+        "pdf_max_blocks_per_page": {
+          "type": "integer",
+          "default": 2000,
+          "minimum": 1,
+          "maximum": 20000
+        },
+        "pdf_max_tables_per_page": {
+          "type": "integer",
+          "default": 32,
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "ocr_min_chars": {
+          "type": "integer",
+          "default": 8,
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "ocr_dpi": {
+          "type": "integer",
+          "default": 200,
+          "minimum": 72,
+          "maximum": 400
+        },
+        "ocr_max_pixels": {
+          "type": "integer",
+          "default": 20000000,
+          "minimum": 1000000,
+          "maximum": 100000000
+        },
+        "ocr_max_pages": {
+          "type": "integer",
+          "default": 100,
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "ocr_max_tsv_rows": {
+          "type": "integer",
+          "default": 100000,
+          "minimum": 1,
+          "maximum": 1000000
+        },
+        "ocr_min_native_chars": {
+          "type": "integer",
+          "default": 40,
+          "minimum": 0,
+          "maximum": 10000
+        },
+        "ocr_psm": {
+          "type": "string",
+          "enum": [
+            "0",
+            "1",
+            "2",
+            "3",
+            "4",
+            "5",
+            "6",
+            "7",
+            "8",
+            "9",
+            "10",
+            "11",
+            "12",
+            "13"
+          ],
+          "default": "3"
+        },
+        "max_units": {
+          "type": "integer",
+          "default": 100000,
+          "minimum": 1,
+          "maximum": 1000000,
+          "description": "May only lower the owner MEMORY_WIKI_DOCUMENT_MAX_UNITS ceiling."
+        },
+        "max_cells": {
+          "type": "integer",
+          "default": 500000,
+          "minimum": 1,
+          "maximum": 5000000,
+          "description": "May only lower the owner MEMORY_WIKI_DOCUMENT_MAX_CELLS ceiling."
+        },
+        "max_pages": {
+          "type": "integer",
+          "default": 10000,
+          "minimum": 1,
+          "maximum": 100000,
+          "description": "May only lower the owner MEMORY_WIKI_DOCUMENT_MAX_PAGES ceiling."
+        },
+        "max_chars": {
+          "type": "integer",
+          "default": 100000000,
+          "minimum": 1000,
+          "maximum": 500000000,
+          "description": "May only lower the owner MEMORY_WIKI_DOCUMENT_MAX_CHARS ceiling."
+        },
+        "external_timeout": {
+          "type": "integer",
+          "default": 90,
+          "minimum": 1,
+          "maximum": 900,
+          "description": "Seconds; may only lower the owner MEMORY_WIKI_DOCUMENT_EXTERNAL_TIMEOUT ceiling."
+        },
         "embed": {
           "type": "boolean",
           "default": false
@@ -2310,6 +2455,155 @@
         "ocr": {
           "type": "boolean",
           "default": false
+        },
+        "ocr_language": {
+          "type": "string",
+          "default": "eng+rus"
+        },
+        "pdf_parser": {
+          "type": "string",
+          "enum": [
+            "auto",
+            "pymupdf",
+            "pypdf"
+          ],
+          "default": "auto"
+        },
+        "pdf_mode": {
+          "type": "string",
+          "enum": [
+            "blocks",
+            "pages"
+          ],
+          "default": "blocks"
+        },
+        "pdf_reading_order": {
+          "type": "string",
+          "enum": [
+            "layout",
+            "source"
+          ],
+          "default": "layout"
+        },
+        "pdf_tables": {
+          "type": "boolean",
+          "default": true
+        },
+        "pdf_native_fallback": {
+          "type": "boolean",
+          "default": true
+        },
+        "pdf_table_strategy": {
+          "type": "string",
+          "enum": [
+            "lines",
+            "lines_strict",
+            "text"
+          ],
+          "default": "lines"
+        },
+        "pdf_max_blocks_per_page": {
+          "type": "integer",
+          "default": 2000,
+          "minimum": 1,
+          "maximum": 20000
+        },
+        "pdf_max_tables_per_page": {
+          "type": "integer",
+          "default": 32,
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "ocr_min_chars": {
+          "type": "integer",
+          "default": 8,
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "ocr_dpi": {
+          "type": "integer",
+          "default": 200,
+          "minimum": 72,
+          "maximum": 400
+        },
+        "ocr_max_pixels": {
+          "type": "integer",
+          "default": 20000000,
+          "minimum": 1000000,
+          "maximum": 100000000
+        },
+        "ocr_max_pages": {
+          "type": "integer",
+          "default": 100,
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "ocr_max_tsv_rows": {
+          "type": "integer",
+          "default": 100000,
+          "minimum": 1,
+          "maximum": 1000000
+        },
+        "ocr_min_native_chars": {
+          "type": "integer",
+          "default": 40,
+          "minimum": 0,
+          "maximum": 10000
+        },
+        "ocr_psm": {
+          "type": "string",
+          "enum": [
+            "0",
+            "1",
+            "2",
+            "3",
+            "4",
+            "5",
+            "6",
+            "7",
+            "8",
+            "9",
+            "10",
+            "11",
+            "12",
+            "13"
+          ],
+          "default": "3"
+        },
+        "max_units": {
+          "type": "integer",
+          "default": 100000,
+          "minimum": 1,
+          "maximum": 1000000,
+          "description": "May only lower the owner MEMORY_WIKI_DOCUMENT_MAX_UNITS ceiling."
+        },
+        "max_cells": {
+          "type": "integer",
+          "default": 500000,
+          "minimum": 1,
+          "maximum": 5000000,
+          "description": "May only lower the owner MEMORY_WIKI_DOCUMENT_MAX_CELLS ceiling."
+        },
+        "max_pages": {
+          "type": "integer",
+          "default": 10000,
+          "minimum": 1,
+          "maximum": 100000,
+          "description": "May only lower the owner MEMORY_WIKI_DOCUMENT_MAX_PAGES ceiling."
+        },
+        "max_chars": {
+          "type": "integer",
+          "default": 100000000,
+          "minimum": 1000,
+          "maximum": 500000000,
+          "description": "May only lower the owner MEMORY_WIKI_DOCUMENT_MAX_CHARS ceiling."
+        },
+        "external_timeout": {
+          "type": "integer",
+          "default": 90,
+          "minimum": 1,
+          "maximum": 900,
+          "description": "Seconds; may only lower the owner MEMORY_WIKI_DOCUMENT_EXTERNAL_TIMEOUT ceiling."
         },
         "embed": {
           "type": "boolean",
