@@ -49,6 +49,9 @@ response accounting или identity-guarded cache cleanup. Исключения,
 исходный disclosure guard распространяет наружу до transport try, не превращены
 в новый локальный fallback. Optional accounting/receipt errors не разрешают I/O
 и не заменяют выбранный возврат; первичная cancellation не поглощается.
+При уже распространяющемся fatal disclosure-исключении отказ optional diagnostics
+не заменяет exact original primary. Без pending primary новая cancellation
+по-прежнему распространяется, а не превращается в успешный skip.
 
 Порог кандидатов, exact-technical skip, content/ACL guards, cache key, circuit,
 rank fusion и последний HTTP admission не ослаблены. Rerank не безусловен:
@@ -124,7 +127,16 @@ Git PIN и SHA фиксируются metadata родителя. Новый boot
   успешного провайдера и не native/physical-transport proof.
 - 18: **STATIC** fingerprints неизменённых owner/cancel/budget/terminal/disclosure/
   transport/config/fusion bodies и constants относительно pinned baseline.
-  Disclosure-withdrawal runtime composition остаётся NOT_RUN в этой SOURCE lane.
+  Настоящая disclosure-withdrawal runtime composition остаётся NOT_RUN.
+- 19: исполнение exact outer exception-handler с owned synthetic primary и
+  отказом optional diagnostic (`Exception`/`BaseException`), сохранение identity
+  primary и уже полученного response accounting; отдельно новая cancellation без
+  pending primary. Это не исполнение настоящего privacy guard или native I/O.
+
+Первый parent SOURCE packet сохранил 17/18 PASS и fixture-only FAIL в 14: на
+синтетическом clock `100.2 - 100.0 > 0.20`. Отрицательный control исправлен на
+точно представимое `0.125`, добавлен отдельный healthy `0.25`; product comparison
+не менялся. Оригинальный FAIL сохраняется, новый полный roster содержит 19 mains.
 
 Автор не запускал import/main/test/collection/py_compile. Подготовлены code/tests/
 docs и локальный candidate; выполнены только AST/raw-byte/Git metadata проверки.

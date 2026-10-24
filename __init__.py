@@ -20657,9 +20657,16 @@ class MemoryWikiProvider(MemoryProvider):
                     if stored_cache_entry is not None and cache.get(cache_key) is stored_cache_entry:
                         cache.pop(cache_key, None)
                     stats["last_error"] = "document_disclosure_changed"
-                _rerank_skip("document_disclosure_changed", state=state, safe_candidate_count=len(prefix))
                 if fatal:
+                    # A diagnostic failure during fatal unwind must not replace
+                    # the exact pending primary; ordinary cancellation without
+                    # a pending fatal still propagates from _rerank_skip.
+                    try:
+                        _rerank_skip("document_disclosure_changed", state=state, safe_candidate_count=len(prefix))
+                    except BaseException:
+                        pass
                     raise  # Exact primary, after identity-guarded tentative-cache discard.
+                _rerank_skip("document_disclosure_changed", state=state, safe_candidate_count=len(prefix))
                 return []
             if fatal:
                 raise

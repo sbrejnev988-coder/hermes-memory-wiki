@@ -41,6 +41,7 @@ CASE_METHODS = (
     "test_16_optional_diagnostics_and_finite_vocabulary",
     "test_17_healthy_reaches_transport_admission_without_http",
     "test_18_STATIC_preserved_safety_contracts",
+    "test_19_fatal_disclosure_retains_primary_when_diagnostics_fail",
 )
 
 EXPECTED_REASONS = (
@@ -592,7 +593,9 @@ class HybridBudgetObservabilitySource(unittest.TestCase):
         for mode, apply, seconds, cancelled, expected in (
             ("fts", True, 5.5, False, "mode_or_disabled"),
             ("hybrid", False, 5.5, False, "mode_or_disabled"),
-            ("hybrid", True, .2, False, "deadline"),
+            # Exact binary below-bound control: 100.2 - 100.0 may exceed .20.
+            ("hybrid", True, .125, False, "deadline"),
+            ("hybrid", True, .25, False, "candidate_threshold"),
             ("hybrid", True, 5.5, True, "cancelled"),
             ("hybrid", True, 5.5, False, "candidate_threshold"),
         ):
@@ -704,6 +707,51 @@ class HybridBudgetObservabilitySource(unittest.TestCase):
                        and len(node.args) > 1 and isinstance(node.args[1], ast.Constant)
                        and node.args[1].value == "skipped"]
         self.assertEqual(provisional, [])
+
+
+    def test_19_fatal_disclosure_retains_primary_when_diagnostics_fail(self):
+        # Execute the exact outer exception handler, not a replacement privacy
+        # guard or synthetic provider response. Its pending exception is owned.
+        rerank = self._function("_rerank_rows", self._provider)
+        outer = _one(rerank.body, lambda node: isinstance(node, ast.Try) and any(
+            isinstance(h.type, ast.Name) and h.type.id == "BaseException" for h in node.handlers))
+        handler = _one(outer.handlers, lambda h: isinstance(h.type, ast.Name) and h.type.id == "BaseException")
+        pending = ast.copy_location(ast.Raise(exc=ast.Name(id="pending_primary", ctx=ast.Load()), cause=None), outer)
+        wrapped = ast.copy_location(ast.Try(body=[pending], handlers=[handler], orelse=[], finalbody=[]), outer)
+        probe = ast.copy_location(ast.FunctionDef(name="source_error_handler",
+            # The original function initializes this local before its try.
+            args=ast.arguments(posonlyargs=[], args=[ast.arg(arg="request_accounted")], vararg=None,
+                kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[ast.Constant(value=False)]),
+            body=[wrapped], decorator_list=[], returns=None), rerank)
+        ast.fix_missing_locations(probe)
+        self._exec([probe], self.ns)
+        for diagnostic_type in (RuntimeError, _TransportStop):
+            with self.subTest(diagnostic_type=diagnostic_type.__name__):
+                primary = _TransportStop("owned pending primary")
+                secondary = diagnostic_type("owned optional diagnostic refusal")
+                self._reset_decision()
+                self.state["stats"]["requests"] = 0
+                def failed_diagnostic(*_args, **_kwargs):
+                    raise secondary
+                self.ns.update(pending_primary=primary, _disclosure=types.SimpleNamespace(ok=False),
+                    response_received=True, request_accounted=False, stored_cache_entry=None,
+                    cache=self.state["cache"], cache_key="unused-synthetic-key", stats=self.state["stats"],
+                    state=self.state, prefix=self.rows, original=self.rows, _stage_receipt=failed_diagnostic)
+                with self.assertRaises(_TransportStop) as caught:
+                    self.ns["source_error_handler"]()
+                self.assertIs(caught.exception, primary)
+                self.assertEqual(self.state["stats"]["requests"], 1)
+                self.assertEqual(self.state["skip_reasons"]["document_disclosure_changed"], 1)
+                self.assertEqual(self.state["stats"]["skipped"], 1)
+                self.assertEqual(self.boundary, [])
+        # With no pending primary, an actual cancellation is not swallowed.
+        cancellation = _TransportStop("owned fresh cancellation")
+        def cancelled_diagnostic(*_args, **_kwargs):
+            raise cancellation
+        self.ns["_stage_receipt"] = cancelled_diagnostic
+        with self.assertRaises(_TransportStop) as caught:
+            self.ns["_rerank_skip"]("mode_or_disabled", state=self.state)
+        self.assertIs(caught.exception, cancellation)
 
 
 def source_suite(source_loader, *, expected_sha256, filename,
