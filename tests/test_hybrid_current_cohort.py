@@ -184,7 +184,8 @@ class HybridCurrentCohortTests(unittest.TestCase):
         for path in (HYBRID, SELF):
             self.plan = copy.deepcopy(self.original)
             self.row(path).update(role='pytest', lane='legacy', requires_sdk_absent=False,
-                                  requires=['exact_source_inputs', 'native_legacy'])
+                                  requires=['exact_source_inputs', 'native_legacy'],
+                                  entry={'kind': 'pytest', 'invocation': 'pytest ' + path, 'callables': {}})
             self.refresh()
             self.reject('partition_hybrid_source_contract:' + path.replace('.', r'\.'))
 

@@ -3,7 +3,7 @@
   "status": "SOURCE_CHECKPOINT_NOT_NATIVE_ADMISSION",
   "frozen_provider_sha256": "44cdca1b753f13650fcb9c9fb9bdec9192a9f7c11cdffbe91163abe64dd02805",
   "needs_final_rebind": false,
-  "input_inventory_sha256": "a5c03989f82745c67aa0eb146270522f22a39f093d2a09545cd77a1b0062579b",
+  "input_inventory_sha256": "2162ac26f77affccdc3eeb90bb446d68d2c082d7553514e5bdf45f9167cf87a7",
   "cold_processes": {
     "strict": {
       "HERMES_SECURITY_STRICT": "1",
@@ -4986,7 +4986,7 @@
     },
     {
       "path": "tests/test_hybrid_current_cohort.py",
-      "sha256": "3e2721bb9c8baaac06e53b24c5992ce17c26db27adbcec9f0f038c65b66183fa",
+      "sha256": "4170134aa8df5c03817e81244d351a7f1a95a95f3c4271ef66df2dbcc4df2212",
       "role": "source-only",
       "lane": "source-explicit",
       "entry": {
