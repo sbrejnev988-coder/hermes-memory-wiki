@@ -71,11 +71,24 @@ class ColdPartitionTests(unittest.TestCase):
                 if cls.inputs.keys() & carrier.keys():
                     raise ValueError('duplicate_fixture_transport_path')
                 cls.inputs.update({p: text.encode('utf-8') for p, text in carrier.items()})
+            # Retain the original transports for historical composition controls.
+            cls.retained_inputs = dict(cls.inputs)
+            if 'COLD_OVERLAY.json' in DEVTOOLS_INPUTS:
+                overlay = json.loads(devtools_read_bound(DEVTOOLS_INPUTS['COLD_OVERLAY.json']))
+                if set(overlay) != {'raw', 'zlib'}:
+                    raise ValueError('cohort_overlay_shape')
+                for encoding, rows in overlay.items():
+                    if type(rows) is not dict:
+                        raise ValueError('cohort_overlay_rows')
+                    for path, binding in rows.items():
+                        data = devtools_read_bound(DEVTOOLS_INPUTS[binding])
+                        cls.inputs[path] = zlib.decompress(data) if encoding == 'zlib' else data
             raw = devtools_read_bound(DEVTOOLS_INPUTS['cold_lane_entry.py'])
         else:
             cls.original = json.loads((ROOT / 'docs/COLD_LANES.json').read_bytes())
             cls.inputs = current_inputs(cls.original)
             raw = cls.inputs['tests/cold_lane_entry.py']
+            cls.retained_inputs = None
         cls.module = types.ModuleType('_cold_partition_source')
         cls.module.__file__ = str(ROOT / 'tests/cold_lane_entry.py')
         exec(compile(raw, cls.module.__file__, 'exec', dont_inherit=True), cls.module.__dict__)

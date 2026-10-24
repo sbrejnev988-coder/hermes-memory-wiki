@@ -1,6 +1,7 @@
 """Current COLD file composition and explicit old41 isolation, SOURCE only.
 
-Direct: own credential-free homes/TMPDIR, python -I -B -S THIS (full checkout).
+Prepared SOURCE: own credential-free homes/TMPDIR, python -I -B -S; explicit
+retained COLD transports are required for the historical baseline controls.
 The existing SOURCE bootstrap may supply the same independent compressed byte
 census used by ColdPartitionTests; none of the classified files is executed.
 main reuses that exact whole module/main/TestCase/reporter before this suite.
@@ -565,6 +566,9 @@ class ColdCurrentCompositionTests(unittest.TestCase):
     def assert_roles(self, plan):
         rows = {row['path']: row for row in plan['partition']}
         for path, expected in EXPECTED.items():
+            if path == SELF:
+                expected = {**expected, 'requires': [*expected['requires'], 'pinned_external_source_inputs'],
+                            'entry': {**expected['entry'], 'invocation': 'Existing SOURCE runner -> main() with complete current inputs and retained prior COLD transports; full old41 plus current composition14'}}
             self.assertEqual({key: rows[path][key] for key in expected}, expected, path)
             actual = declarations(self.raw[path])
             declared = [group['owner'] + '.' + method for group in rows[path]['case_groups']
@@ -574,7 +578,11 @@ class ColdCurrentCompositionTests(unittest.TestCase):
             self.assertTrue(all(group['contract'] and group['requires'] for group in rows[path]['case_groups']), path)
 
     def d4_inputs(self):
-        raw = dict(self.raw)
+        # Historical violations use the retained prior transports, never the
+        # current hybrid/pin overlays disguised as an old source snapshot.
+        if self.peer.ColdPartitionTests.retained_inputs is None:
+            raise RuntimeError('historical_retained_transports_required')
+        raw = dict(self.peer.ColdPartitionTests.retained_inputs)
         del raw[SELF]
         self.assertEqual(raw[OLD].count(MARKER), 1)
         raw[OLD] = raw[OLD].replace(MARKER, b'', 1)
@@ -584,7 +592,7 @@ class ColdCurrentCompositionTests(unittest.TestCase):
     def test_01_healthy_final_census_self_inclusion_and_raw_pins(self):
         rows = self.plan['partition']
         actual = sorted(p for p in self.raw if p.startswith('tests/') and p.endswith('.py'))
-        self.assertEqual(len(actual), 355)
+        self.assertEqual(len(actual), 357)
         self.assertEqual([row['path'] for row in rows], actual)
         self.assertIn(SELF, actual)
         result = self.module.validate_partition(self.plan, self.raw)
@@ -623,7 +631,7 @@ class ColdCurrentCompositionTests(unittest.TestCase):
             self.assertEqual(self.plan[key], self.baseline[key], key)
 
     def test_04_narrow_marker_inverse_and_old41_AST_STATIC(self):
-        raw = self.raw[OLD]
+        raw = self.peer.ColdPartitionTests.retained_inputs[OLD]
         self.assertEqual(raw.count(MARKER), 1)
         inverse = raw.replace(MARKER, b'', 1)
         self.assertEqual(digest(inverse), OLD_SHA256)
@@ -639,6 +647,10 @@ class ColdCurrentCompositionTests(unittest.TestCase):
         methods = sorted(n.name for n in owner.body if isinstance(n, ast.FunctionDef) and n.name.startswith('test_'))
         self.assertEqual(methods, list(OLD_ROSTER))
         self.assertEqual(len(methods), 41)
+        # The current transport overlay changes setup only, not these 41 bodies.
+        now = next(n for n in ast.parse(self.raw[OLD]).body if isinstance(n, ast.ClassDef) and n.name == 'ColdPartitionTests')
+        self.assertEqual([ast.dump(n, include_attributes=False) for n in now.body if isinstance(n, ast.FunctionDef) and n.name.startswith('test_')],
+                         [ast.dump(n, include_attributes=False) for n in owner.body if isinstance(n, ast.FunctionDef) and n.name.startswith('test_')])
         self.assertIs(self.row(OLD)['requires_sdk_absent'], True)
         own = next(n for n in ast.parse(self.raw[SELF]).body if isinstance(n, ast.ClassDef) and n.name == 'ColdCurrentCompositionTests')
         self.assertTrue(any(isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == '__test__' for t in n.targets)

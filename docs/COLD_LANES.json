@@ -1,9 +1,9 @@
 {
   "schema": "memory-stack.current-source-cold-lanes/v1",
   "status": "SOURCE_CHECKPOINT_NOT_NATIVE_ADMISSION",
-  "frozen_provider_sha256": "8007b015f204a0b673e7cf41410fe609f60b8151bd39d9042a53336de7fdaf09",
+  "frozen_provider_sha256": "44cdca1b753f13650fcb9c9fb9bdec9192a9f7c11cdffbe91163abe64dd02805",
   "needs_final_rebind": false,
-  "input_inventory_sha256": "a5aff9e07103a36b6cd4fca13d89c92880b4ca29c31792a991c3ec45786ab984",
+  "input_inventory_sha256": "a5c03989f82745c67aa0eb146270522f22a39f093d2a09545cd77a1b0062579b",
   "cold_processes": {
     "strict": {
       "HERMES_SECURITY_STRICT": "1",
@@ -698,7 +698,7 @@
     },
     {
       "path": "tests/cold_lane_entry.py",
-      "sha256": "a9d8ac4fe753b1e0f34c15d3c95b48cdc36f469990449f6fd15c823e75f4cba6",
+      "sha256": "0890165d834930d108128f30044a921248771998410f8f45ca4819ac13699b50",
       "role": "support",
       "lane": "support",
       "entry": null,
@@ -1369,7 +1369,7 @@
       },
       "peers": [],
       "path": "tests/test_ci_checkout_eol.py",
-      "sha256": "623cd0701d07c4b66f7977f06ef055e5bd1e2f4be1c26dd740608866b907e800",
+      "sha256": "f8e632a9ab4786e271b2a52842c7798a4858232d830e34c2bd6393947701fe5a",
       "case_groups": [
         {
           "owner": "CheckoutEolTests",
@@ -1778,12 +1778,13 @@
       "requires": [
         "exact_source_inputs",
         "source_stdlib",
-        "explicit_source_binding"
+        "explicit_source_binding",
+        "pinned_external_source_inputs"
       ],
       "requires_sdk_absent": true,
       "entry": {
         "kind": "unittest",
-        "invocation": "python -I -B -S tests/test_cold_lane_current_composition.py (own TMPDIR; full old41 plus current composition controls)",
+        "invocation": "Existing SOURCE runner -> main() with complete current inputs and retained prior COLD transports; full old41 plus current composition14",
         "callables": {
           "main": ""
         }
@@ -1792,8 +1793,8 @@
         "tests/test_cold_lane_partition.py",
         "tests/cold_lane_entry.py"
       ],
-      "reason": "Explicit standalone stdlib main composes exact old41 main/reporter and new SOURCE/static/baseline controls. Independent physical/compressed census never executes the classified files. Own class __test__=False; old suite actually requires agent.memory_provider and memory_wiki absence.",
-      "sha256": "dc9115ee2fc029a168ed35119c9e7fce2aa2b3b3ba00be76ffde361f63c044e5",
+      "reason": "Explicit standalone stdlib main composes exact old41 main/reporter and new SOURCE/static/baseline controls. Independent physical/compressed census never executes the classified files. Own class __test__=False; old suite actually requires agent.memory_provider and memory_wiki absence. Historical old322/354 and stale16 controls require retained prior COLD transports, not current bytes relabelled historical; ordinary unbound direct main is not this entry.",
+      "sha256": "2c2fe0030bd9e370be42e4c6847529b27c1869ba10b9f776cc1a4159827aa95f",
       "case_groups": [
         {
           "owner": "ColdCurrentCompositionTests",
@@ -1824,7 +1825,7 @@
     },
     {
       "path": "tests/test_cold_lane_partition.py",
-      "sha256": "4798deae17a2b9f57f413d485055159eb80c9873f86a1d7c597f72bda440a6d7",
+      "sha256": "0a3800b591bf265e3c228c2e9da39db17478bb668bc609a2a176ce7115ae7f2b",
       "role": "unittest-explicit",
       "lane": "source-explicit",
       "entry": {
@@ -4450,7 +4451,7 @@
         }
       ],
       "path": "tests/test_foundation_ci_prerequisites.py",
-      "sha256": "f12b353ed91801aa1803c041a5090d15c9f04b71d2a5876bf8bc6a56b0941e23",
+      "sha256": "7ef8711ac4c2d2f01641ed688f2fb32ad1634165154ed1165c426b8e1f946c09",
       "case_groups": [
         {
           "owner": "PrerequisiteControls",
@@ -4521,7 +4522,7 @@
         "tests/test_memory_diff_polarity.py"
       ],
       "path": "tests/test_foundation_ci_review_boundaries.py",
-      "sha256": "ab9dba255ea328156455284f07db1a4cf4571f473c7bc4c1094b8f43406a1436",
+      "sha256": "bf02e8414588788bb115fe23ba8bbf0b0493847f2c70e1a9c486307ff12efc39",
       "case_groups": [
         {
           "owner": "ReviewBoundaryControls",
@@ -4911,6 +4912,138 @@
       "requires_sdk_absent": false,
       "peers": [],
       "reason": "Credential-bearing HTTP clients must never follow redirects. Collectible declarations; full prerequisites/individual bodies NOT executed by inventory."
+    },
+    {
+      "path": "tests/test_hybrid_budget_observability_source.py",
+      "sha256": "62c6ff8fda8fea0f8356113fbbc55b15f4180a4f603bfe14ddff0ed325b979c0",
+      "role": "source-only",
+      "lane": "source-explicit",
+      "entry": {
+        "kind": "source-controller",
+        "invocation": "Existing SOURCE runner -> scripts/ci_owned/hybrid_source.py:make_suite with SHA-bound test/provider/semantic loaders -> unittest.TestSuite",
+        "callables": {
+          "source_suite": "source_loader, *, expected_sha256, filename, semantic_loader, semantic_sha256, semantic_filename"
+        },
+        "binding": {
+          "entry": "scripts/ci_owned/hybrid_source.py",
+          "factory": "make_suite",
+          "source_inputs": [
+            "tests/test_hybrid_budget_observability_source.py",
+            "__init__.py",
+            "semantic_io.py"
+          ],
+          "loader_roles": {
+            "test_loader": "reviewed test declarations",
+            "source_loader": "exact provider bytes; lazy setUpClass read",
+            "semantic_loader": "exact semantic_io bytes; lazy setUpClass read"
+          }
+        }
+      },
+      "requires": [
+        "exact_source_inputs",
+        "source_stdlib",
+        "source_controller",
+        "explicit_source_binding",
+        "hybrid_lazy_source"
+      ],
+      "requires_sdk_absent": true,
+      "peers": [],
+      "reason": "Standalone 19-case SOURCE suite with explicit lazy provider/semantic byte loaders. Direct main refuses; __test__=False does not qualify SDK/native discovery.",
+      "case_groups": [
+        {
+          "owner": "HybridBudgetObservabilitySource",
+          "methods": [
+            "test_01_primary_after_half_keeps_result",
+            "test_02_configured_reserve_and_tiny_budget",
+            "test_03_primary_deadline_serial_fallback",
+            "test_04_runtime_error_serial_fallback",
+            "test_05_exhausted_outer_discards_late_result",
+            "test_06_cancellation_never_starts_fallback",
+            "test_07_nested_deadline_and_event_restoration",
+            "test_08_direct_gate_reason_matrix",
+            "test_09_secret_exact_and_circuit_once",
+            "test_10_safe_candidate_filtering",
+            "test_11_identity_and_safe_document_threshold",
+            "test_12_all_predispatch_deadline_positions",
+            "test_13_cache_hit_and_invalid_cache",
+            "test_14_search_bypass_exact_source_slice",
+            "test_15_detached_status_and_profile_isolation",
+            "test_16_optional_diagnostics_and_finite_vocabulary",
+            "test_17_healthy_reaches_transport_admission_without_http",
+            "test_18_STATIC_preserved_safety_contracts",
+            "test_19_fatal_disclosure_retains_primary_when_diagnostics_fail"
+          ],
+          "contract": "SOURCE explicit unittest lifecycle; not native SDK or classified-file execution",
+          "requires": [
+            "exact_source_inputs",
+            "source_stdlib",
+            "source_controller",
+            "explicit_source_binding",
+            "hybrid_lazy_source"
+          ]
+        }
+      ]
+    },
+    {
+      "path": "tests/test_hybrid_current_cohort.py",
+      "sha256": "3e2721bb9c8baaac06e53b24c5992ce17c26db27adbcec9f0f038c65b66183fa",
+      "role": "source-only",
+      "lane": "source-explicit",
+      "entry": {
+        "kind": "source-controller",
+        "invocation": "Existing SOURCE runner -> explicit make_suite with complete current census and retained prior COLD transports; unittest lifecycle",
+        "callables": {
+          "make_suite": "inputs, retained_inputs, plan, cold_module, hybrid_entry"
+        }
+      },
+      "requires": [
+        "exact_source_inputs",
+        "source_stdlib",
+        "source_controller",
+        "explicit_source_binding",
+        "pinned_external_source_inputs"
+      ],
+      "requires_sdk_absent": true,
+      "peers": [
+        "tests/cold_lane_entry.py",
+        "tests/test_cold_lane_partition.py",
+        "tests/test_cold_lane_current_composition.py",
+        "tests/test_ci_checkout_eol.py",
+        "tests/test_foundation_ci_prerequisites.py",
+        "tests/test_foundation_ci_review_boundaries.py",
+        "tests/test_hybrid_budget_observability_source.py",
+        "tests/test_p2_g4_identity_errors.py"
+      ],
+      "reason": "Explicit current-cohort AST/metadata controls with retained historical transports, not G4/EOL/native test-body execution.",
+      "case_groups": [
+        {
+          "owner": "HybridCurrentCohortTests",
+          "methods": [
+            "test_01_current_LF_and_CRLF_pins_use_exact_accepted_runtime",
+            "test_02_G4_literal_inverse_preserves_whole_raw_and_network_tail",
+            "test_03_EOL_and_review_inverses_keep_every_other_byte",
+            "test_04_historical_gold_and_original_profile_literals_unchanged",
+            "test_05_original_fingerprint_producer_after_typed_inverse",
+            "test_06_unknown_pin_expression_and_parser_are_explicit_refusals",
+            "test_07_complete_current_census_and_explicit_factory_closure",
+            "test_08_recounted_new_suite_omissions_are_not_hidden",
+            "test_09_source_only_contract_survives_false_absence_and_native_roles",
+            "test_10_missing_or_redirected_loader_bindings_are_refused",
+            "test_11_factory_is_lazy_and_returns_original_19_case_lifecycle",
+            "test_12_bad_test_loader_bytes_and_hash_refuse_before_declarations",
+            "test_13_actual_direct_producer_cannot_bind_standalone_source_suite",
+            "test_14_native_prerequisites_and_historical_observations_stay_unqualified"
+          ],
+          "contract": "SOURCE explicit unittest lifecycle; not native SDK or classified-file execution",
+          "requires": [
+            "exact_source_inputs",
+            "source_stdlib",
+            "source_controller",
+            "explicit_source_binding",
+            "pinned_external_source_inputs"
+          ]
+        }
+      ]
     },
     {
       "path": "tests/test_hybrid_runtime_receipts.py",
@@ -6555,7 +6688,7 @@
     },
     {
       "path": "tests/test_p2_g4_identity_errors.py",
-      "sha256": "ec293d2136a19afef4b3c60d8bf0f2888ab32972c82a9072e11511f127056d24",
+      "sha256": "a696b050ce6805549d217bd9bebebf8bcadbfccb28f87d2bd392cd56ed01092f",
       "role": "source-only",
       "lane": "source-explicit",
       "entry": {
@@ -8136,6 +8269,8 @@
     "tests/test_graph_public_settings_unavailable.py",
     "tests/test_graph_settings_unavailable.py",
     "tests/test_graph_worker_origin_session.py",
+    "tests/test_hybrid_budget_observability_source.py",
+    "tests/test_hybrid_current_cohort.py",
     "tests/test_journal_rebuild_owner_lifetime.py",
     "tests/test_local_guard_required_gaps.py",
     "tests/test_luna_extractor_boundaries.py",
@@ -8200,7 +8335,7 @@
       "executed_evidence": "7-case isolated packet at runtime source SHA 7ebb63ce54ea1c0fb2f56fddc2cb7a7b4aeabae3ae271fa8262c56fcc0aa51f3; not full cold native suite/fleet."
     }
   ],
-  "file_count": 355,
+  "file_count": 357,
   "requirements": {
     "native_legacy": "BLOCKED until independently admitted native cold bootstrap, genuine SDK/registry/MRO and dependency origins; trust-core genuinely absent; HERMES_SECURITY_STRICT=0. No SDK substitution or import hiding.",
     "native_strict": "BLOCKED until independently admitted native cold bootstrap, genuine SDK/registry/MRO, complete dependencies and actual public hermes_trust_core delivery/API; HERMES_SECURITY_STRICT=1.",
@@ -8224,7 +8359,8 @@
     "own_sqlite_source": "Separate finite own SQLite/filesystem allowance for the explicit SQL suite, real file-backed connections and cleanup. SOURCE extraction/synthetic principals do not establish native provider SQL-owner/SDK authority. Not admitted by a non-SQL packet.",
     "pinned_external_source_inputs": "Entry requires named frozen external SOURCE carriers/baselines or extracted owning-method spans with exact full-origin/raw/span hashes. Oversized full provider must not be a direct stock binding; no fake SDK/missing-import success.",
     "explicit_source_binding": "Bind the actual make_suite/packet_suite or admitted main before TestCase setup, complete shipped transitive peers/products/fixtures, credential-free homes/TMPDIR and original bound-reader audit. Bare pytest/unittest discovery is not that binding.",
-    "mixed_entry_contracts": "All case declarations remain catalogued. Explicit SOURCE/static and separately admitted SQL/native/baseline cohorts have different entry contracts recorded in case_groups/entry_variants; no whole-file SOURCE or native PASS inferred."
+    "mixed_entry_contracts": "All case declarations remain catalogued. Explicit SOURCE/static and separately admitted SQL/native/baseline cohorts have different entry contracts recorded in case_groups/entry_variants; no whole-file SOURCE or native PASS inferred.",
+    "hybrid_lazy_source": "Standalone hybrid source_suite requires explicit SHA-bound test, provider and semantic byte loaders. Use the small test-owned hybrid_source.make_suite under the unchanged SOURCE controller/reporter, never bare main or native pytest."
   },
   "pending_peer_inputs": [],
   "source_pins": [
@@ -8238,7 +8374,7 @@
     },
     {
       "path": "__init__.py",
-      "sha256": "8007b015f204a0b673e7cf41410fe609f60b8151bd39d9042a53336de7fdaf09"
+      "sha256": "44cdca1b753f13650fcb9c9fb9bdec9192a9f7c11cdffbe91163abe64dd02805"
     },
     {
       "path": "packaging/run_native_regressions.py",
@@ -8265,8 +8401,28 @@
       "sha256": "c3446731fe913e5b459bd8d7d8161576bd9876fd1d4e8fe4041bed7d785c067c"
     },
     {
+      "path": "scripts/ci_owned/fixture_prerequisites.py",
+      "sha256": "115ea1506eae2aa6729a2cddb4e34cc11354b8174749323d306354c3c9f381f0"
+    },
+    {
+      "path": "scripts/ci_owned/hybrid_source.py",
+      "sha256": "338229fc5fef0e633b96736160ff82152d11c4c5f1822e5585afc722c89d13ea"
+    },
+    {
       "path": "scripts/ci_owned/memory_wiki_ci.py",
       "sha256": "541fdb0d94efec2314f910f1f723a107305d4fea09a1ef276a508f38870f204d"
+    },
+    {
+      "path": "scripts/ci_owned/source_suites.py",
+      "sha256": "779e92be71d765cf23762fc3b277c134e2973ce7f0b10954a9cfbfd72ecc1419"
+    },
+    {
+      "path": "semantic_io.py",
+      "sha256": "9b2676a14b00750f55e01dd520187f7fe0253cb33407976a84ffb89893eeab9a"
+    },
+    {
+      "path": "tests/fixtures/g4_metadata_scope.txt",
+      "sha256": "260e167dfccf4abcd129baf18edfe777198ac841147f53df16e237cfa3fb937f"
     },
     {
       "path": "tests/fixtures/g4_original_boundary_gold.txt",
@@ -8301,10 +8457,10 @@
     "new_test_python_files": 1,
     "counting_unit": "unique current tests/**/*.py regular source file, not pytest nodes/cases or semantic body review",
     "baseline": "a208e12a03ab1d290372ce059a7a7ab8d711bfd3",
-    "final_merge_rebind": "Rebound to complete independently enumerated d4-derived physical current355 census and all source_pins; any subsequent raw/test/layout change requires a new rebind. No Core/trust/SDK authority supplied.",
+    "final_merge_rebind": "Current ec87-derived logical357 census plus exact overlays/new test-owned entry. No full checkout/materialization, native/SDK/trust authority or whole-source PASS.",
     "source_pins_scope": "Provider/declared existing entries/workflow/gold source identity only; not full product dependency import closure",
     "peer_edges_scope": "Conservative statically named test filenames/imports; not proof all dynamic imports/runtime branches were reviewed",
-    "current_rebind": {
+    "previous_rebind": {
       "baseline": "d4b45cb337e496648ce0ab7c80a606065d80c5e2",
       "baseline_descriptor_sha256": "fbd512127d0de3ac07ca659f6128db52e79ad092ebd1a41cfa95cbb46ffa851e",
       "baseline_declared_tests": 322,
@@ -8314,6 +8470,34 @@
       "new_regression_files": 1,
       "current_test_python_files": 355,
       "no_new_testbody_execution_or_native_admission": true
+    },
+    "current_rebind": {
+      "baseline": "ec87e40a1974cfbc36f777186d05178566e889ce",
+      "baseline_tree": "9486355683ed2f9e8ddb379870cdbc66fda7dcdf",
+      "baseline_test_python_files": 356,
+      "baseline_missing_from_descriptor": 1,
+      "new_regression_files": 1,
+      "current_test_python_files": 357,
+      "no_new_testbody_execution_or_native_admission": true
     }
+  },
+  "source_transport": {
+    "scope": "exact logical Git census reconstructed from retained readonly UTF-8 transports plus explicit bound overlays; not physical full checkout or test-body execution",
+    "retained": [
+      {
+        "ref": "repairs/cold-current-composition-20261024/COLD_TEST_INPUTS.zlib",
+        "sha256": "f8953dea2f5033d89eb2457d968615511db8cc79342ff360c2912a59437f5bde"
+      },
+      {
+        "ref": "repairs/cold-current-composition-20261024/COLD_ENTRY_INPUTS.zlib",
+        "sha256": "05b273871fe6278cb51e6753d0d9f252dde4cca07fbf8e9f960c70ba11aa7644"
+      }
+    ],
+    "provider_overlay": {
+      "ref": "repairs/hybrid-budget-observability-20261024/candidate_main_fix01.zlib",
+      "sha256": "20a6449e20adee28ed25971b1f152e9419ad5bffd6650992d86db64893b0ab5c",
+      "decoded_sha256": "44cdca1b753f13650fcb9c9fb9bdec9192a9f7c11cdffbe91163abe64dd02805"
+    },
+    "overlay_contract": "COLD_OVERLAY.json: raw and zlib maps from exact repository path to separately read_bound input basename. Preserve retained inputs before overlay for historical d4 controls. Complete membership/raw SHA validated afterward."
   }
 }

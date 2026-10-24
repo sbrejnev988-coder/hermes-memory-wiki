@@ -166,6 +166,19 @@ def validate_partition(plan, source_inputs=None):
         if (_CI_PEER not in row['peers']
                 or not {'exact_source_inputs', 'source_stdlib', 'isolated_ci_peer_binding'}.issubset(row['requires'])):
             raise ValueError('partition_ci_bootstrap_prerequisites:' + path)
+    hybrid = 'tests/test_hybrid_budget_observability_source.py'
+    cohort = 'tests/test_hybrid_current_cohort.py'
+    for path, expected in ((hybrid, hybrid_source_entry()), (cohort, cohort_source_entry())):
+        if path not in by_path:
+            continue  # Historical descriptors; current byte census still detects omissions.
+        row = by_path.get(path, {})
+        if (row.get('role') != 'source-only' or row.get('lane') != 'source-explicit'
+                or row.get('requires_sdk_absent') is not True
+                or row.get('entry') != expected
+                or not {'exact_source_inputs', 'source_stdlib', 'source_controller',
+                        'explicit_source_binding'}.issubset(row.get('requires', []))
+                or any(k.startswith('native_') for k in row.get('requires', []))):
+            raise ValueError('partition_hybrid_source_contract:' + path)
     processes = plan.get('cold_processes')
     if type(processes) is not dict or set(processes) != {'strict', 'legacy', 'legacy-recovery'}:
         raise ValueError('partition_cold_processes')
@@ -214,6 +227,8 @@ def validate_partition(plan, source_inputs=None):
         raise ValueError('partition_provider_pin')
     if any(path not in by_path and path not in pin_map for path in _CI_INPUTS):
         raise ValueError('partition_ci_bootstrap_inputs')
+    if (hybrid in by_path or cohort in by_path) and any(path not in pin_map for path in ('scripts/ci_owned/hybrid_source.py', 'semantic_io.py')):
+        raise ValueError('partition_hybrid_source_inputs')
     pending = plan.get('pending_peer_inputs')
     if type(pending) is not list or any(type(p) is not dict for p in pending):
         raise ValueError('partition_pending_peer')
@@ -248,6 +263,12 @@ def validate_partition(plan, source_inputs=None):
                          and any(isinstance(t, ast.Name) and t.id == 'CORE_SHA' for t in n.targets)]
             if revisions != ([] if target['declared_revision'] is None else [target['declared_revision']]):
                 raise ValueError('partition_native_target_pin:' + target['entry'])
+        if hybrid in by_path or cohort in by_path:
+            factory_tree = ast.parse(source_inputs['scripts/ci_owned/hybrid_source.py'])
+            factories = [n for n in factory_tree.body if isinstance(n, ast.FunctionDef) and n.name == 'make_suite']
+            if (len(factories) != 1 or ast.unparse(factories[0].args) !=
+                    'test_loader, *, test_sha256, test_filename, source_loader, expected_sha256, filename, semantic_loader, semantic_sha256, semantic_filename'):
+                raise ValueError('partition_hybrid_factory_signature')
         for path, row in by_path.items():
             tree = ast.parse(source_inputs[path], filename=path)
             if path in _STAGE_CONSUMERS:
@@ -298,6 +319,24 @@ def validate_partition(plan, source_inputs=None):
                 raise ValueError('partition_hidden_cases:' + path)
     return {'file_count': len(rows), 'role_counts': {role: sum(row['role'] == role for row in rows) for role in sorted(roles)},
             'source_inputs_verified': source_inputs is not None, 'native_sdk_execution_admitted': False}
+
+
+def hybrid_source_entry():
+    """Explicit two-loader contract; __test__=False is not SDK compatibility."""
+    return {'kind': 'source-controller',
+            'invocation': 'Existing SOURCE runner -> scripts/ci_owned/hybrid_source.py:make_suite with SHA-bound test/provider/semantic loaders -> unittest.TestSuite',
+            'callables': {'source_suite': 'source_loader, *, expected_sha256, filename, semantic_loader, semantic_sha256, semantic_filename'},
+            'binding': {'entry': 'scripts/ci_owned/hybrid_source.py', 'factory': 'make_suite',
+                        'source_inputs': ['tests/test_hybrid_budget_observability_source.py', '__init__.py', 'semantic_io.py'],
+                        'loader_roles': {'test_loader': 'reviewed test declarations',
+                                         'source_loader': 'exact provider bytes; lazy setUpClass read',
+                                         'semantic_loader': 'exact semantic_io bytes; lazy setUpClass read'}}}
+
+
+def cohort_source_entry():
+    return {'kind': 'source-controller',
+            'invocation': 'Existing SOURCE runner -> explicit make_suite with complete current census and retained prior COLD transports; unittest lifecycle',
+            'callables': {'make_suite': 'inputs, retained_inputs, plan, cold_module, hybrid_entry'}}
 
 
 def cold_plan():
