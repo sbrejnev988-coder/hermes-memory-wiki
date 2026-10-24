@@ -4322,7 +4322,17 @@ _RERANK_STATS: Dict[str, Any] = {
     "skipped": 0, "search_units": 0, "cost_usd": 0.0,
     "last_latency_ms": 0, "last_error": "",
 }
+# Bounded metadata only: no query, candidate, endpoint or exception text keys.
+# Keep nested counters OUT of stats: foreign profiles initialize numeric stats.
+_RERANK_SKIP_REASONS = (
+    "disabled", "invalid_profile_settings", "endpoint_invalid", "no_key",
+    "query_length", "candidate_threshold", "secret_query", "exact_technical",
+    "circuit_open", "safe_candidate_threshold", "candidate_identity",
+    "safe_document_threshold", "deadline", "cancelled", "mode_or_disabled",
+    "invalid_rerank_cache", "document_disclosure_changed", "other",
+)
 _RERANK_DEFAULT_STATE = {"cache": _RERANK_CACHE, "stats": _RERANK_STATS,
+                         "skip_reasons": dict.fromkeys(_RERANK_SKIP_REASONS, 0),
                          "failure_count": 0, "circuit_until": 0.0}
 _RERANK_PROFILE_STATES: Dict[str, Dict[str, Any]] = {}
 
@@ -4335,6 +4345,7 @@ def _rerank_scope_state(settings=None) -> Dict[str, Any]:
         state = (_RERANK_DEFAULT_STATE if home == str(_IMPORT_HERMES_HOME)
                  else _RERANK_PROFILE_STATES.setdefault(home, {
                      "cache": {}, "stats": {key: ("" if key == "last_error" else 0) for key in _RERANK_STATS},
+                     "skip_reasons": dict.fromkeys(_RERANK_SKIP_REASONS, 0),
                      "failure_count": 0, "circuit_until": 0.0,
                  }))
         if state.get("generation") not in {None, generation}:
@@ -4342,7 +4353,32 @@ def _rerank_scope_state(settings=None) -> Dict[str, Any]:
             state.update(failure_count=0, circuit_until=0.0)
             state["epoch"] = int(state.get("epoch", 0)) + 1
         state["generation"] = generation
-        return state# --- P6: Fault injection hooks for automated testing (DEBUG only) ---
+        return state
+
+
+def _rerank_skip(reason, *, state=None, status="skipped", **fields):
+    """Record one local decision, never a physical HTTP attempt or authority.
+
+    Call only at the selected exit (not at provisional threshold checks).
+    Diagnostics may fail independently; they cannot change that exit or grant I/O.
+    """
+    reason = reason if type(reason) is str and reason in _RERANK_SKIP_REASONS else "other"
+    try:
+        state = _rerank_scope_state() if state is None else state
+        with _RERANK_LOCK:
+            skipped = state["stats"]["skipped"] + 1
+            count = state["skip_reasons"][reason] + 1
+            state["stats"]["skipped"] = skipped
+            state["skip_reasons"][reason] = count
+    except Exception:
+        pass
+    try:
+        _stage_receipt("rerank", status, reason, **fields)
+    except Exception:
+        pass
+
+
+# --- P6: Fault injection hooks for automated testing (DEBUG only) ---
 _FAULT_INJECT_FTS_CORRUPT = os.environ.get("MW_FAULT_INJECT_FTS_CORRUPT", "0") == "1"
 _FAULT_INJECT_STALE = os.environ.get("MW_FAULT_INJECT_STALE", "0") == "1"
 _FAULT_INJECT_BACKUP_CHECKSUM_MISMATCH = os.environ.get("MW_FAULT_INJECT_BACKUP_CHECKSUM_MISMATCH", "0") == "1"
@@ -8726,13 +8762,11 @@ class MemoryWikiProvider(MemoryProvider):
             request = _RECALL_REQUEST.get()
             delivery = {}
             remaining_seconds = _prefetch_time_remaining()
-            # The reserve covers BOTH fresh serial fallback preparation and
-            # the original terminal tail, not just one FTS read. Spending all
-            # but the configured minimum on primary starves that full path.
-            # Split the remaining cooperative budget, retaining any larger
-            # explicit reserve; the absolute total/deadline is never extended.
-            primary_seconds = max(0.0, min(remaining_seconds * 0.5,
-                remaining_seconds - PREFETCH_FALLBACK_RESERVE_SECONDS))
+            # Keep the configured reserve for serial fallback + terminal tail.
+            # Do not impose a second, unconditional half-budget cutoff: the
+            # enclosing owner still enforces the SAME absolute outer deadline.
+            primary_seconds = max(0.0,
+                remaining_seconds - PREFETCH_FALLBACK_RESERVE_SECONDS)
             result = ""
             reason = "deadline"
             # The complete scoped callback is already on one bounded owner.
@@ -20268,6 +20302,8 @@ class MemoryWikiProvider(MemoryProvider):
         with _RERANK_LOCK:
             state = _rerank_scope_state(settings)
             status = dict(state["stats"])
+            status["skip_reasons"] = dict(state["skip_reasons"])
+            status["stats_scope"] = "process_local_bound_profile"
             rules_blob = json.dumps(dict(settings['RERANK_RULES']), ensure_ascii=False, sort_keys=True) if settings['RERANK_RULES_ENABLED'] else ""
             status.update({
                 "enabled": settings['RERANK_ENABLED'],
@@ -20310,10 +20346,9 @@ class MemoryWikiProvider(MemoryProvider):
         cache = state["cache"]
         original = list(scored or [])
         if _prefetch_budget_expired():
-            _stage_receipt("rerank", "timeout", "cancelled" if _prefetch_cancelled() else "deadline")
+            _rerank_skip("cancelled" if _prefetch_cancelled() else "deadline", state=state, status="timeout")
             return original
         generation = state["generation"]
-        _stage_receipt("rerank", "skipped", "conditions", safe_candidate_count=0, elapsed_ms=0.0)
         q = str(query or "").strip()
         reason = (settings["reason"] or "disabled" if not settings['RERANK_ENABLED'] else
                   "endpoint_invalid" if not settings['RERANK_ENDPOINT_VALID'] else
@@ -20322,14 +20357,10 @@ class MemoryWikiProvider(MemoryProvider):
                   "candidate_threshold" if len(original) < settings['RERANK_MIN_CANDIDATES'] else "")
         if reason:
             _hybrid_note("rerank_gate", "candidate_threshold" if reason == "candidate_threshold" else "skipped")
-            _stage_receipt("rerank", "skipped", reason)
-            with _RERANK_LOCK:
-                stats["skipped"] += 1
+            _rerank_skip(reason, state=state, safe_candidate_count=0, elapsed_ms=0.0)
             return original
         if secret_scan(q).get("raw_secret"):
-            _stage_receipt("rerank", "skipped", "secret_query")
-            with _RERANK_LOCK:
-                stats["skipped"] += 1
+            _rerank_skip("secret_query", state=state)
             _debug_log("RERANK skipped because the query contains a raw secret")
             return original
 
@@ -20339,17 +20370,14 @@ class MemoryWikiProvider(MemoryProvider):
             and query_mode == "technical"
             and (float(top_parts.get("exact", 0.0)) > 0.0 or float(top_parts.get("bm25", 0.0)) >= 0.85)
         ):
-            with _RERANK_LOCK:
-                stats["skipped"] += 1
-            _stage_receipt("rerank", "skipped", "exact_technical")
+            _rerank_skip("exact_technical", state=state)
             _debug_log("RERANK skip exact-dominant technical query")
             return original
 
         now_mono = time.monotonic()
         with _RERANK_LOCK:
             if state["circuit_until"] > now_mono:
-                _stage_receipt("rerank", "skipped", "circuit_open")
-                stats["skipped"] += 1
+                _rerank_skip("circuit_open", state=state)
                 return original
 
         prefix: List[Dict[str, Any]] = []
@@ -20373,10 +20401,8 @@ class MemoryWikiProvider(MemoryProvider):
                 continue
             prefix.append(row)
             prefix_positions.append(position)
-        _stage_receipt("rerank", "skipped", "safe_candidate_threshold", safe_candidate_count=len(prefix))
         if len(prefix) < settings['RERANK_MIN_CANDIDATES']:
-            with _RERANK_LOCK:
-                stats["skipped"] += 1
+            _rerank_skip("safe_candidate_threshold", state=state, safe_candidate_count=len(prefix))
             return [row for position, row in enumerate(original) if position not in guard_refused_positions]
 
         # Fetch code metadata once for the whole top-K. This makes repository,
@@ -20421,13 +20447,13 @@ class MemoryWikiProvider(MemoryProvider):
         # remove another row. The original top-K is never refilled or expanded.
         original = [row for position, row in enumerate(original) if position not in guard_refused_positions]
         if invalid_identity:
-            _stage_receipt("rerank", "skipped", "candidate_identity")
+            _rerank_skip("candidate_identity", state=state, safe_candidate_count=len(prefix))
             return original
-        _stage_receipt("rerank", "skipped", "safe_document_threshold", safe_candidate_count=len(prefix))
         if len(prefix) < settings['RERANK_MIN_CANDIDATES']:
+            _rerank_skip("safe_document_threshold", state=state, safe_candidate_count=len(prefix))
             return original
         if _prefetch_network_timeout(settings['RERANK_TIMEOUT']) <= 0.0:
-            _stage_receipt("rerank", "skipped", "deadline")
+            _rerank_skip("cancelled" if _prefetch_cancelled() else "deadline", state=state, safe_candidate_count=len(prefix))
             return original
         rerank_query = _build_rerank_query(q, query_mode, settings=settings)
         # Cached rerank results are attached by stable row ID, so the cache key must
@@ -20467,7 +20493,7 @@ class MemoryWikiProvider(MemoryProvider):
             with _RERANK_LOCK:
                 cached = cache.get(cache_key)
                 if _prefetch_budget_expired():
-                    _stage_receipt("rerank", "timeout", "cancelled" if _prefetch_cancelled() else "deadline")
+                    _rerank_skip("cancelled" if _prefetch_cancelled() else "deadline", state=state, status="timeout", safe_candidate_count=len(prefix))
                     return original
                 if cached is not None and (
                     not isinstance(cached, (list, tuple)) or len(cached) != 2
@@ -20475,7 +20501,7 @@ class MemoryWikiProvider(MemoryProvider):
                 ):
                     cache.pop(cache_key, None)
                     stats["last_error"] = "invalid_rerank_cache"
-                    _stage_receipt("rerank", "failed", "invalid_rerank_cache")
+                    _rerank_skip("invalid_rerank_cache", state=state, status="failed", safe_candidate_count=len(prefix))
                     return original
                 if cached and cached[0] > now_mono:
                     try:
@@ -20484,11 +20510,11 @@ class MemoryWikiProvider(MemoryProvider):
                         # Corrupt rank metadata is not a new RPC allowance.
                         cache.pop(cache_key, None)
                         stats["last_error"] = "invalid_rerank_cache"
-                        _stage_receipt("rerank", "failed", "invalid_rerank_cache")
+                        _rerank_skip("invalid_rerank_cache", state=state, status="failed", safe_candidate_count=len(prefix))
                         return original
                     stats["cache_hits"] += 1
                     _hybrid_note("rerank_cache", "hit")
-                    _stage_receipt("rerank", "cache_hit", "", ranks=[{"id": cid, "rank": rank} for cid, _score, rank in cached[1]])
+                    _stage_receipt("rerank", "cache_hit", "", safe_candidate_count=len(prefix), ranks=[{"id": cid, "rank": rank} for cid, _score, rank in cached[1]])
                     cached_ordered = ordered
                 if cached_ordered is None:
                     for key in [k for k, value in cache.items() if value[0] <= now_mono]:
@@ -20615,6 +20641,7 @@ class MemoryWikiProvider(MemoryProvider):
                     cache[cache_key] = stored_cache_entry
                     _hybrid_note("rerank_cache", "stored")
             _stage_receipt("rerank", "executed", "", elapsed_ms=latency_ms,
+                           safe_candidate_count=len(prefix),
                            ranks=[{"id": cid, "rank": rank} for cid, _score, rank in ranked])
             check_document_disclosure()
             return ordered
@@ -20629,11 +20656,10 @@ class MemoryWikiProvider(MemoryProvider):
                         request_accounted = True
                     if stored_cache_entry is not None and cache.get(cache_key) is stored_cache_entry:
                         cache.pop(cache_key, None)
-                    stats["skipped"] += 1
                     stats["last_error"] = "document_disclosure_changed"
+                _rerank_skip("document_disclosure_changed", state=state, safe_candidate_count=len(prefix))
                 if fatal:
                     raise  # Exact primary, after identity-guarded tentative-cache discard.
-                _stage_receipt("rerank", "skipped", "document_disclosure_changed")
                 return []
             if fatal:
                 raise
@@ -20651,7 +20677,7 @@ class MemoryWikiProvider(MemoryProvider):
                 if state.get("generation") == generation and state["failure_count"] >= settings['RERANK_CIRCUIT_FAILURES']:
                     state["circuit_until"] = time.monotonic() + settings['RERANK_CIRCUIT_SECONDS']
                     state["failure_count"] = 0
-            _stage_receipt("rerank", "failed", ("cancelled" if _prefetch_cancelled() else "deadline" if _prefetch_budget_expired() else "timeout") if isinstance(exc, TimeoutError) else _semantic_io_label(exc), elapsed_ms=latency_ms)
+            _stage_receipt("rerank", "failed", ("cancelled" if _prefetch_cancelled() else "deadline" if _prefetch_budget_expired() else "timeout") if isinstance(exc, TimeoutError) else _semantic_io_label(exc), elapsed_ms=latency_ms, safe_candidate_count=len(prefix))
             return original
 
     @staticmethod
@@ -21393,7 +21419,8 @@ class MemoryWikiProvider(MemoryProvider):
         if retrieval_mode == "hybrid" and apply_rerank and not _prefetch_budget_expired(0.20):
             scored = self._rerank_rows(q, scored, query_mode, _disclosure=disclosure)
         else:
-            _stage_receipt("rerank", "skipped", "deadline" if _prefetch_budget_expired(0.20) else "mode_or_disabled")
+            _rerank_skip(("cancelled" if _prefetch_cancelled() else "deadline")
+                         if _prefetch_budget_expired(0.20) else "mode_or_disabled")
         scored = self._apply_diversity(scored, query_mode)
         # Preserve private rejected candidates for diagnostic callers, but LIMIT
         # counts approved rows. Public projection still guards every field and
