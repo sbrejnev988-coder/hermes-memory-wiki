@@ -58,6 +58,9 @@ def current_inputs(plan):
 
 
 class ColdPartitionTests(unittest.TestCase):
+    # Explicit stdlib SOURCE only: setUpClass and the suite require no SDK preload.
+    __test__ = False
+
     @classmethod
     def setUpClass(cls):
         if 'DEVTOOLS_INPUTS' in globals():

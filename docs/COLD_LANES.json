@@ -1,9 +1,9 @@
 {
   "schema": "memory-stack.current-source-cold-lanes/v1",
   "status": "SOURCE_CHECKPOINT_NOT_NATIVE_ADMISSION",
-  "frozen_provider_sha256": "3b5318cafa62dad23870aecd515ba0786548c2502cdd82022f96093c164295fc",
+  "frozen_provider_sha256": "8007b015f204a0b673e7cf41410fe609f60b8151bd39d9042a53336de7fdaf09",
   "needs_final_rebind": false,
-  "input_inventory_sha256": "a6ad7bf1d859e31a1a708912d5d5a036334c5b32aa42c64dd2797d965b627228",
+  "input_inventory_sha256": "a5aff9e07103a36b6cd4fca13d89c92880b4ca29c31792a991c3ec45786ab984",
   "cold_processes": {
     "strict": {
       "HERMES_SECURITY_STRICT": "1",
@@ -31,6 +31,7 @@
         "tests/test_qdrant_publication_egress.py",
         "tests/test_recalled_content_safety.py",
         "tests/test_rerank_final_order.py",
+        "tests/test_review_queue_owner.py",
         "tests/test_source_review_findings.py",
         "tests/test_unified_recall_episode_owner.py"
       ],
@@ -107,6 +108,7 @@
         "tests/test_document_index_temporal_isolation.py",
         "tests/test_document_ingest_snapshot.py",
         "tests/test_document_ooxml_member_limit.py",
+        "tests/test_document_parser_components.py",
         "tests/test_document_profile_home_isolation.py",
         "tests/test_document_query_source_artifacts.py",
         "tests/test_document_recovery_g1_native.py",
@@ -156,8 +158,10 @@
         "tests/test_exception_diagnostics.py",
         "tests/test_extraction_review_l1_l2.py",
         "tests/test_extraction_review_security.py",
+        "tests/test_extractor_shared_codex_auth.py",
         "tests/test_final_calendar_intent.py",
         "tests/test_final_extraction_contract.py",
+        "tests/test_foundation_ci_review_boundaries.py",
         "tests/test_fts_security_parity_regression.py",
         "tests/test_full_oracle_episode_probe.py",
         "tests/test_github_source_adapter.py",
@@ -167,6 +171,7 @@
         "tests/test_graph_extractor_codex.py",
         "tests/test_graph_native_commit_admission.py",
         "tests/test_guard_dan_false_positive.py",
+        "tests/test_guard_instruction_qualifiers.py",
         "tests/test_host_memory_remove_privacy.py",
         "tests/test_http_redirect_safety.py",
         "tests/test_invalidate_revision_acl_regression.py",
@@ -284,8 +289,11 @@
         "tests/test_session_graph_auto_enrichment.py",
         "tests/test_shared_blocks.py",
         "tests/test_source_connectors.py",
+        "tests/test_source_suite_stdout_bound.py",
+        "tests/test_spreadsheet_formulas_bounded.py",
         "tests/test_startup_fts_and_diagnostics.py",
         "tests/test_temporal_supersession_partition.py",
+        "tests/test_tool_schema_source_parity.py",
         "tests/test_unified_recall.py",
         "tests/test_unified_recall_delivery.py",
         "tests/test_visual_evidence.py",
@@ -706,7 +714,7 @@
     },
     {
       "path": "tests/conftest.py",
-      "sha256": "5e5ba9c658a1733c7cb5083cca62fb54e4b30bf149abfa02d290393bf96d7e43",
+      "sha256": "965710ed34e63ce907b67542a57d6066dba9415107ea051859537d514b819428",
       "role": "support",
       "lane": "support",
       "entry": null,
@@ -1209,7 +1217,7 @@
     },
     {
       "path": "tests/test_audit_package_contracts_20261003.py",
-      "sha256": "4d651318106fa58c54e56936569daa8f57328ec2bd3b6f2423626343ab4966b7",
+      "sha256": "ec2a6f58c90d3f5895c2a8d05051bbbee8449faaa155402793f110a3afc07c68",
       "role": "pytest",
       "lane": "legacy",
       "entry": {
@@ -1342,6 +1350,45 @@
         "tests/test_document_native_commit_fence.py"
       ],
       "reason": "JRO-C01/C02: real factory/MRO callback delivery before owning cleanup. Collectible declarations; full prerequisites/individual bodies NOT executed by inventory."
+    },
+    {
+      "role": "callable",
+      "lane": "native-explicit-packet",
+      "requires": [
+        "exact_source_inputs",
+        "git_checkout_fixture"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "Explicit Git metadata main creates real local Git subprocesses; module __test__=False. No SDK/SQL/network; not a stock SOURCE child.",
+      "entry": {
+        "kind": "callable",
+        "invocation": "python -I -B -S tests/test_ci_checkout_eol.py --git EXACT_GIT --fixture-root NEW_OWNED_ROOT",
+        "callables": {
+          "main": ""
+        }
+      },
+      "peers": [],
+      "path": "tests/test_ci_checkout_eol.py",
+      "sha256": "623cd0701d07c4b66f7977f06ef055e5bd1e2f4be1c26dd740608866b907e800",
+      "case_groups": [
+        {
+          "owner": "CheckoutEolTests",
+          "methods": [
+            "test_01_baseline_hostile_matches_observed_crlf",
+            "test_02_candidate_hostile_preserves_exact_public_bytes",
+            "test_03_healthy_false_and_input_preserve_exact_bytes",
+            "test_04_binary_nul_is_never_line_normalized",
+            "test_05_utf8_without_final_newline_is_preserved",
+            "test_06_missing_eol_mutant_and_isolation_controls"
+          ],
+          "contract": "declared primary entry; Explicit Git metadata main creates real local Git subprocesses; module __test__=False. No SDK/SQL/network; not a stock SOURCE child.",
+          "requires": [
+            "exact_source_inputs",
+            "git_checkout_fixture"
+          ],
+          "execution_evidence": null
+        }
+      ]
     },
     {
       "path": "tests/test_ci_lifecycle_observer.py",
@@ -1725,8 +1772,59 @@
       "reason": "Deterministic fault matrix for the journaled Code Shrinker inbox state machine. Collectible declarations; full prerequisites/individual bodies NOT executed by inventory."
     },
     {
+      "path": "tests/test_cold_lane_current_composition.py",
+      "role": "unittest-explicit",
+      "lane": "source-explicit",
+      "requires": [
+        "exact_source_inputs",
+        "source_stdlib",
+        "explicit_source_binding"
+      ],
+      "requires_sdk_absent": true,
+      "entry": {
+        "kind": "unittest",
+        "invocation": "python -I -B -S tests/test_cold_lane_current_composition.py (own TMPDIR; full old41 plus current composition controls)",
+        "callables": {
+          "main": ""
+        }
+      },
+      "peers": [
+        "tests/test_cold_lane_partition.py",
+        "tests/cold_lane_entry.py"
+      ],
+      "reason": "Explicit standalone stdlib main composes exact old41 main/reporter and new SOURCE/static/baseline controls. Independent physical/compressed census never executes the classified files. Own class __test__=False; old suite actually requires agent.memory_provider and memory_wiki absence.",
+      "sha256": "dc9115ee2fc029a168ed35119c9e7fce2aa2b3b3ba00be76ffde361f63c044e5",
+      "case_groups": [
+        {
+          "owner": "ColdCurrentCompositionTests",
+          "methods": [
+            "test_01_healthy_final_census_self_inclusion_and_raw_pins",
+            "test_02_classification_all32_new_and_this_roster_STATIC",
+            "test_03_prior_roles_edges_entries_and_gold_preserved_STATIC",
+            "test_04_narrow_marker_inverse_and_old41_AST_STATIC",
+            "test_05_baseline_missing32_is_expected_old_violation",
+            "test_06_baseline_stale16_are_expected_old_violations",
+            "test_07_recounted_deleted_new_row_is_not_hidden",
+            "test_08_unpartitioned_physical_addition_refused",
+            "test_09_self_deletion_and_byte_drift_refused",
+            "test_10_all_source_pin_drifts_refused",
+            "test_11_source_absence_classes_cannot_enter_SDK_preload",
+            "test_12_wrong_blanket_roles_or_fake_absence_detected_STATIC",
+            "test_13_native_flags_targets_and_source_closures_stay_closed",
+            "test_14_current_source_native_and_explicit_packet_unions"
+          ],
+          "contract": "explicit composed main: old41 unchanged plus this SOURCE/static/expected-baseline suite; actual SDK absence",
+          "requires": [
+            "source_stdlib",
+            "explicit_source_binding"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
       "path": "tests/test_cold_lane_partition.py",
-      "sha256": "96097117a11b6c2ca94183e32fe012b08598eebcaa59d889b3bf7f6d8af54669",
+      "sha256": "4798deae17a2b9f57f413d485055159eb80c9873f86a1d7c597f72bda440a6d7",
       "role": "unittest-explicit",
       "lane": "source-explicit",
       "entry": {
@@ -1740,7 +1838,7 @@
         "exact_source_inputs",
         "source_stdlib"
       ],
-      "requires_sdk_absent": false,
+      "requires_sdk_absent": true,
       "peers": [
         "tests/baseline-source_connectors.py",
         "tests/ci_owned/test_current_sdk_bootstrap.py",
@@ -1754,7 +1852,7 @@
         "tests/test_p2_g4_repair01.py",
         "tests/test_runtime_lifecycle_handoff.py"
       ],
-      "reason": "Focused stdlib SOURCE regressions for the existing cold entry's metadata. Explicit stdlib suite/entry; not automatic native pytest setup."
+      "reason": "Focused stdlib SOURCE regressions for the existing cold entry's metadata. Explicit stdlib suite/entry; not automatic native pytest setup. Actual final standalone body asserts agent.memory_provider and memory_wiki absent; class marker protects standard pytest discovery, not an executed native collector."
     },
     {
       "path": "tests/test_collection_evidence.py",
@@ -2131,6 +2229,51 @@
       "reason": "Regression: document embedding claims must not put raw paths in evidence. Collectible declarations; full prerequisites/individual bodies NOT executed by inventory."
     },
     {
+      "role": "source-only",
+      "lane": "source-explicit",
+      "requires": [
+        "exact_source_inputs",
+        "source_controller",
+        "explicit_source_binding"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "Inert marked main binds exact PDF peer and real full-source handoff helper; dispatch is observer only, caller SQL/transaction wiring STATIC. No actual embedding/provider.",
+      "entry": {
+        "kind": "source-controller",
+        "invocation": "Existing admitted SOURCE bootstrap with whole bound shipped peer/products -> main()",
+        "callables": {
+          "main": ""
+        }
+      },
+      "peers": [
+        "tests/test_document_parser_pdf_ocr.py"
+      ],
+      "path": "tests/test_document_embedding_handoff_source.py",
+      "sha256": "710ea10a545161c93f77cf171d639be1b07a113b396e980cfe2ec80317a32306",
+      "case_groups": [
+        {
+          "owner": "DocumentEmbeddingHandoffSourceTests",
+          "methods": [
+            "test_actual_env_and_profile_default_precedence",
+            "test_exact_source_payload_and_limit_defaults",
+            "test_explicit_true_handoff_once_preserves_result_identity",
+            "test_inverse_delta_and_unrelated_preservation_STATIC",
+            "test_off_and_default_off_never_dispatch",
+            "test_raised_primary_identity_is_preserved",
+            "test_success_callers_after_transaction_before_guard_STATIC",
+            "test_typed_callback_outcomes_are_not_completed"
+          ],
+          "contract": "declared primary entry; Inert marked main binds exact PDF peer and real full-source handoff helper; dispatch is observer only, caller SQL/transaction wiring STATIC. No actual embedding/provider.",
+          "requires": [
+            "exact_source_inputs",
+            "source_controller",
+            "explicit_source_binding"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
       "path": "tests/test_document_graph_local_audit_fixes.py",
       "sha256": "ee8d81b2e95cb7881967e6f83e132804b43ef307c7cd94b90c4e80d8365192af",
       "role": "pytest",
@@ -2259,6 +2402,486 @@
       "reason": "Regression: configured ZIP member cap applies to OOXML XML parts. Collectible declarations; full prerequisites/individual bodies NOT executed by inventory."
     },
     {
+      "role": "unittest-explicit",
+      "lane": "source-explicit",
+      "requires": [
+        "exact_source_inputs",
+        "source_stdlib",
+        "explicit_source_binding"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "actual whole SOURCE modules/record consumers and their shipped packet_suite; authored parser/open/transport records, no genuine engine/SDK/SQL. Composed prior suites include exact embedded b464 expected-defect witnesses, not healthy baseline. Reuse original packet_suite/setup/cleanup/reporter and full peer chain.",
+      "entry": {
+        "kind": "unittest",
+        "invocation": "python -I -B -S tests/test_document_parser_causal_chain.py",
+        "callables": {
+          "packet_suite": "",
+          "metadata_preflight": ""
+        }
+      },
+      "peers": [
+        "tests/test_document_parser_veto_composition.py"
+      ],
+      "path": "tests/test_document_parser_causal_chain.py",
+      "sha256": "5a1287eff4aee7834cf8118be462fd29fdeea80800c925dab0e5eb17bb6599ca",
+      "case_groups": [
+        {
+          "owner": "CausalChainSourceTests",
+          "methods": [
+            "test_chain_final_cleanup_is_selected_fatal_with_explicit_causes",
+            "test_chain_healthy_and_ordinary_inverse_preserve_original_policy",
+            "test_chain_identity_invalidates_previous_3_1_4",
+            "test_chain_repeated_observed_identity_keeps_occurrence_ledger_without_cycle",
+            "test_chain_suppressed_cleanup_still_projects_body_and_drains"
+          ],
+          "contract": "declared primary entry; actual whole SOURCE modules/record consumers and their shipped packet_suite; authored parser/open/transport records, no genuine engine/SDK/SQL. Composed prior suites include exact embedded b464 expected-defect witnesses, not healthy baseline. Reuse original packet_suite/setup/cleanup/reporter and full peer chain.",
+          "requires": [
+            "exact_source_inputs",
+            "source_stdlib",
+            "explicit_source_binding"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
+      "role": "pytest",
+      "lane": "legacy",
+      "requires": [
+        "exact_source_inputs",
+        "native_legacy",
+        "optional_parser_component"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "Genuine optional PyMuPDF/pypdf parser TestCase bodies, not authored SOURCE record seams. Existing opt-in/absence skips retained; no parser/native execution by inventory.",
+      "entry": {
+        "kind": "pytest",
+        "invocation": "tests/cold_lane_entry.py legacy docs/COLD_LANES.json -> pytest.main([\"tests/test_document_parser_components.py\"]) via separately admitted recorder",
+        "callables": {}
+      },
+      "peers": [],
+      "path": "tests/test_document_parser_components.py",
+      "sha256": "e7c0e502b779671246b002cd08294237e1593ddc2eaa7d95532487504f26f6e9",
+      "case_groups": [
+        {
+          "owner": "RealParserComponentTests",
+          "methods": [
+            "test_real_pymupdf_empty_middle_is_partial_not_empty_success",
+            "test_real_pymupdf_grid_and_cell_locators_original_unchanged",
+            "test_real_pypdf_native_text_without_fabricated_geometry"
+          ],
+          "contract": "declared primary entry; Genuine optional PyMuPDF/pypdf parser TestCase bodies, not authored SOURCE record seams. Existing opt-in/absence skips retained; no parser/native execution by inventory.",
+          "requires": [
+            "exact_source_inputs",
+            "native_legacy",
+            "optional_parser_component"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
+      "role": "unittest-explicit",
+      "lane": "source-explicit",
+      "requires": [
+        "exact_source_inputs",
+        "source_stdlib",
+        "explicit_source_binding"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "actual whole SOURCE modules/record consumers and their shipped packet_suite; authored parser/open/transport records, no genuine engine/SDK/SQL. Standalone unittest or bound SOURCE main; worker.main runs in process with authored stdio, so Windows no-op resource setup or separate POSIX setrlimit admission is required.",
+      "entry": {
+        "kind": "unittest",
+        "invocation": "python -I -B -S tests/test_document_parser_pdf_ocr.py",
+        "callables": {}
+      },
+      "peers": [],
+      "path": "tests/test_document_parser_pdf_ocr.py",
+      "sha256": "9f0b834cb4a366876bd3451986b87f7b8eedc2124a50a9661105440655c50e93",
+      "case_groups": [
+        {
+          "owner": "ParserSourceTests",
+          "methods": [
+            "test_bbox_validation_and_plain_fallback_never_invents_geometry",
+            "test_effective_options_bounds_and_invalid_values",
+            "test_global_character_cell_and_block_bounds",
+            "test_native_before_ocr_and_cleanup_source_contracts_STATIC",
+            "test_page_coverage_keeps_empty_middle_partial_and_omissions",
+            "test_pdf_and_ocr_content_axes_in_fingerprint",
+            "test_real_stdlib_ooxml_cached_formula_preserves_existing_contract",
+            "test_real_stdlib_text_and_csv_redaction_unchanged_original",
+            "test_real_worker_protocol_with_actual_extractor_and_invalid_options",
+            "test_structural_blocks_tables_cells_and_reading_order",
+            "test_table_context_redaction_including_overlapping_blocks",
+            "test_tesseract_tsv_per_page_quality_engine_language_bbox",
+            "test_text_health_and_ocr_selection_are_not_accuracy_claims",
+            "test_tsv_empty_low_quality_and_invalid_payloads_never_succeed",
+            "test_tsv_rows_pages_chars_and_unit_cap_are_explicit",
+            "test_unit_bound_cannot_turn_container_only_into_success"
+          ],
+          "contract": "declared primary entry; actual whole SOURCE modules/record consumers and their shipped packet_suite; authored parser/open/transport records, no genuine engine/SDK/SQL. Standalone unittest or bound SOURCE main; worker.main runs in process with authored stdio, so Windows no-op resource setup or separate POSIX setrlimit admission is required.",
+          "requires": [
+            "exact_source_inputs",
+            "source_stdlib",
+            "explicit_source_binding"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
+      "role": "unittest-explicit",
+      "lane": "source-explicit",
+      "requires": [
+        "exact_source_inputs",
+        "source_stdlib",
+        "explicit_source_binding"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "actual whole SOURCE modules/record consumers and their shipped packet_suite; authored parser/open/transport records, no genuine engine/SDK/SQL. Reuse original packet_suite/setup/cleanup/reporter and full peer chain.",
+      "entry": {
+        "kind": "unittest",
+        "invocation": "python -I -B -S tests/test_document_parser_review_boundaries.py",
+        "callables": {
+          "packet_suite": "",
+          "metadata_preflight": ""
+        }
+      },
+      "peers": [
+        "tests/test_document_parser_pdf_ocr.py",
+        "tests/test_document_parser_components.py",
+        "tests/test_p2_g3_native.py"
+      ],
+      "path": "tests/test_document_parser_review_boundaries.py",
+      "sha256": "6269d05a725d8a6903dc78c3a9db2c7b59fdeac9a3dd856275a9c4ba57ff19a4",
+      "case_groups": [
+        {
+          "owner": "ReviewBoundarySourceTests",
+          "methods": [
+            "test_c1_actual_nested_boundary_worker_dispatch_options_keyword",
+            "test_l1_effective_inverse_and_nonextraction_axes_unchanged",
+            "test_l1_ocr_false_threshold_changes_fingerprint_and_native_selection",
+            "test_l2_blocks_failure_keeps_native_fact_once_with_context_redaction",
+            "test_l2_plain_fallback_partial_and_compound_structural_refusal",
+            "test_l3_final_chunk_stdout_and_stderr_overflow_refused",
+            "test_l3_final_read_error_rejects_otherwise_valid_prefix",
+            "test_l3_healthy_exact_bounds_return_after_join_and_close",
+            "test_l3_primary_identity_survives_capture_and_cleanup_unknown",
+            "test_l3_unknown_or_live_reader_never_releases_or_admits_replacement",
+            "test_load03_both_loaders_have_bound_helper_before_consumer_STATIC",
+            "test_load03_same_process_healthy_binding_keeps_outer_helper_identity",
+            "test_load03_wrong_helper_or_bound_read_refusal_precedes_any_module_exec",
+            "test_n1_source_label_matches_tables_then_parser_blocks",
+            "test_ocr01_absent_body_cleanup_fatal_exact_and_full_drain",
+            "test_ocr01_body_priority_private_ledger_context_and_explicit_causes",
+            "test_ocr01_image_caller_rethrows_reader_fatal_but_keeps_ordinary_failure",
+            "test_ocr01_reader_fatal_not_a_string_and_body_fatal_still_wins",
+            "test_ocr02_acquire_lifetime_and_separate_cleanup_guards_STATIC",
+            "test_ocr02_cleanup_clock_poll_kill_refusals_do_not_skip_wait_or_drain",
+            "test_ocr02_preacquire_event_or_clock_refusal_launches_zero",
+            "test_ocr02_reader_state_refusal_retains_pipes_but_attempts_other_join",
+            "test_ocr02_thread_constructor_start_faults_own_child_and_pipes",
+            "test_s1_cells_refusal_split_overlap_and_page_fallback",
+            "test_s1_direct_emitter_refuses_budgets_before_raw_or_cell_output",
+            "test_s1_healthy_tables_redact_context_but_preserve_nonsecret_content",
+            "test_s1_table_api_failure_withholds_raw_without_poisoning_healthy_page",
+            "test_s1_tables_refusal_does_not_trust_retained_prefix"
+          ],
+          "contract": "declared primary entry; actual whole SOURCE modules/record consumers and their shipped packet_suite; authored parser/open/transport records, no genuine engine/SDK/SQL. Reuse original packet_suite/setup/cleanup/reporter and full peer chain.",
+          "requires": [
+            "exact_source_inputs",
+            "source_stdlib",
+            "explicit_source_binding"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
+      "role": "unittest-explicit",
+      "lane": "source-explicit",
+      "requires": [
+        "exact_source_inputs",
+        "source_stdlib",
+        "explicit_source_binding"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "actual whole SOURCE modules/record consumers and their shipped packet_suite; authored parser/open/transport records, no genuine engine/SDK/SQL. Reuse original packet_suite/setup/cleanup/reporter and full peer chain.",
+      "entry": {
+        "kind": "unittest",
+        "invocation": "python -I -B -S tests/test_document_parser_terminal_veto.py",
+        "callables": {
+          "packet_suite": "",
+          "metadata_preflight": ""
+        }
+      },
+      "peers": [
+        "tests/test_document_parser_review_boundaries.py"
+      ],
+      "path": "tests/test_document_parser_terminal_veto.py",
+      "sha256": "b48a21cbf94b8f265a203bf6b1bbbd2c2a0833b0643823cf8ef38f081bec682d",
+      "case_groups": [
+        {
+          "owner": "TerminalVetoSourceTests",
+          "methods": [
+            "test_terminal_auto_cell_and_table_caps_withhold_all_selected_pages",
+            "test_terminal_explicit_pypdf_pages_and_no_tables_remain_healthy",
+            "test_terminal_healthy_context_redaction_is_not_a_fallback_veto",
+            "test_terminal_mixed_healthy_withheld_preserves_safe_partial",
+            "test_terminal_nonprivacy_truncation_does_not_block_empty_fallback",
+            "test_terminal_ordinary_empty_and_unavailable_keep_healthy_pypdf_fallback",
+            "test_terminal_ordinary_empty_keeps_explicit_tika_fallback",
+            "test_terminal_policy_version_invalidates_previous_extraction_identity",
+            "test_terminal_veto_prevents_pypdf_and_explicit_tika_for_each_refusal"
+          ],
+          "contract": "declared primary entry; actual whole SOURCE modules/record consumers and their shipped packet_suite; authored parser/open/transport records, no genuine engine/SDK/SQL. Reuse original packet_suite/setup/cleanup/reporter and full peer chain.",
+          "requires": [
+            "exact_source_inputs",
+            "source_stdlib",
+            "explicit_source_binding"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
+      "role": "unittest-explicit",
+      "lane": "source-explicit",
+      "requires": [
+        "exact_source_inputs",
+        "source_stdlib",
+        "explicit_source_binding"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "actual whole SOURCE modules/record consumers and their shipped packet_suite; authored parser/open/transport records, no genuine engine/SDK/SQL. Reuse original packet_suite/setup/cleanup/reporter and full peer chain.",
+      "entry": {
+        "kind": "unittest",
+        "invocation": "python -I -B -S tests/test_document_parser_veto_cleanup.py",
+        "callables": {
+          "packet_suite": "",
+          "metadata_preflight": ""
+        }
+      },
+      "peers": [
+        "tests/test_document_parser_terminal_veto.py"
+      ],
+      "path": "tests/test_document_parser_veto_cleanup.py",
+      "sha256": "8a53051e683d1230cde36f6c96c4a3ef978c3abef0e093bb623c8d4f5a43d47e",
+      "case_groups": [
+        {
+          "owner": "VetoCleanupSourceTests",
+          "methods": [
+            "test_cleanup_veto_after_actual_finish_all_refusals_auto_and_opt_in",
+            "test_cleanup_veto_mixed_safe_withheld_both_orders",
+            "test_emit_handoff_failure_keeps_latch_before_page_update",
+            "test_fatal_cleanup_is_not_hidden_by_veto_carrier",
+            "test_finish_failure_after_veto_with_and_without_cleanup_failure",
+            "test_late_read_failure_after_veto_is_not_reclassified_empty",
+            "test_multiple_exitstack_callbacks_run_and_preserve_primary_chain",
+            "test_new_cleanup_policy_invalidates_previous_3_1_2_identity",
+            "test_ordinary_pre_veto_close_fault_preserves_pypdf_and_tika_fallback",
+            "test_primary_cancellation_survives_cleanup_exception",
+            "test_pypdf_only_close_fault_keeps_opt_in_tika",
+            "test_untrusted_metadata_is_not_adopted_as_established_veto",
+            "test_worker_error_serialization_after_actual_dispatcher_veto_exit"
+          ],
+          "contract": "declared primary entry; actual whole SOURCE modules/record consumers and their shipped packet_suite; authored parser/open/transport records, no genuine engine/SDK/SQL. Reuse original packet_suite/setup/cleanup/reporter and full peer chain.",
+          "requires": [
+            "exact_source_inputs",
+            "source_stdlib",
+            "explicit_source_binding"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
+      "role": "unittest-explicit",
+      "lane": "source-explicit",
+      "requires": [
+        "exact_source_inputs",
+        "source_stdlib",
+        "explicit_source_binding"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "actual whole SOURCE modules/record consumers and their shipped packet_suite; authored parser/open/transport records, no genuine engine/SDK/SQL. Composed prior suites include exact embedded b464 expected-defect witnesses, not healthy baseline. Reuse original packet_suite/setup/cleanup/reporter and full peer chain.",
+      "entry": {
+        "kind": "unittest",
+        "invocation": "python -I -B -S tests/test_document_parser_veto_composition.py",
+        "callables": {
+          "packet_suite": "",
+          "metadata_preflight": ""
+        }
+      },
+      "peers": [
+        "tests/test_document_parser_veto_cleanup.py"
+      ],
+      "path": "tests/test_document_parser_veto_composition.py",
+      "sha256": "346d9740385fa798f067d408b2c597a0011f1f10fdc911f48da425404964d25c",
+      "case_groups": [
+        {
+          "owner": "VetoCompositionSourceTests",
+          "methods": [
+            "test_comp_b464_expected_inner_alternate_violation",
+            "test_comp_b464_expected_intermediate_fatal_violation",
+            "test_comp_emitter_rechecks_alternate_origin_before_publication",
+            "test_comp_fatal_then_ordinary_all_body_priorities",
+            "test_comp_healthy_cleanup_and_ordinary_chain_inverse",
+            "test_comp_identity_invalidates_previous_3_1_3",
+            "test_comp_inner_new_reader_withheld_after_veto",
+            "test_comp_inner_preopened_reader_is_not_reused_after_veto",
+            "test_comp_multiple_fatals_keep_body_then_first_cleanup_identity",
+            "test_comp_ocr_after_veto_is_not_attempted_or_selected",
+            "test_comp_pre_veto_inner_ocr_and_native_table_mixed_inverses",
+            "test_comp_safe_native_table_after_veto_is_preserved",
+            "test_comp_stream_fatal_is_observed_through_enter_context"
+          ],
+          "contract": "declared primary entry; actual whole SOURCE modules/record consumers and their shipped packet_suite; authored parser/open/transport records, no genuine engine/SDK/SQL. Composed prior suites include exact embedded b464 expected-defect witnesses, not healthy baseline. Reuse original packet_suite/setup/cleanup/reporter and full peer chain.",
+          "requires": [
+            "exact_source_inputs",
+            "source_stdlib",
+            "explicit_source_binding"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
+      "role": "unittest-explicit",
+      "lane": "source-explicit",
+      "requires": [
+        "exact_source_inputs",
+        "source_stdlib",
+        "explicit_source_binding"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "actual whole SOURCE modules/record consumers and their shipped packet_suite; authored parser/open/transport records, no genuine engine/SDK/SQL. Composed prior suites include exact embedded b464 expected-defect witnesses, not healthy baseline. Reuse original packet_suite/setup/cleanup/reporter and full peer chain.",
+      "entry": {
+        "kind": "unittest",
+        "invocation": "python -I -B -S tests/test_document_parser_xlsx_formulas.py",
+        "callables": {
+          "packet_suite": "",
+          "metadata_preflight": ""
+        }
+      },
+      "peers": [
+        "tests/test_document_parser_causal_chain.py"
+      ],
+      "path": "tests/test_document_parser_xlsx_formulas.py",
+      "sha256": "6bd4832a1fcbde5979ac96024bf68603afbb4d2fae013aaa451ffecc262d9767",
+      "case_groups": [
+        {
+          "owner": "XlsxFormulaSourceTests",
+          "methods": [
+            "test_xlsx_context_and_generic_redaction_cover_full_raw_and_serialized_outputs",
+            "test_xlsx_forward_cross_sheet_aggregates_and_literal_unicode_ids",
+            "test_xlsx_identity_invalidates_3_1_5_and_current_fingerprint_axes",
+            "test_xlsx_limits_shared_budget_real_helper_and_default_range_depth_length",
+            "test_xlsx_malformed_external_unsupported_cycle_and_healthy_inverse",
+            "test_xlsx_ooxml_shared_array_followers_empty_formula_and_value_presence",
+            "test_xlsx_output_cap_preserves_later_sheet_dependencies_input_cap_does_not_invent_blank",
+            "test_xlsx_rejects_duplicate_invalid_ids_and_preserves_zip_and_source_caps",
+            "test_xlsx_scalar_coercion_and_absent_empty_zero_false_invalid_cache"
+          ],
+          "contract": "declared primary entry; actual whole SOURCE modules/record consumers and their shipped packet_suite; authored parser/open/transport records, no genuine engine/SDK/SQL. Composed prior suites include exact embedded b464 expected-defect witnesses, not healthy baseline. Reuse original packet_suite/setup/cleanup/reporter and full peer chain.",
+          "requires": [
+            "exact_source_inputs",
+            "source_stdlib",
+            "explicit_source_binding"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
+      "role": "unittest-explicit",
+      "lane": "source-explicit",
+      "requires": [
+        "exact_source_inputs",
+        "source_stdlib",
+        "explicit_source_binding"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "actual whole SOURCE modules/record consumers and their shipped packet_suite; authored parser/open/transport records, no genuine engine/SDK/SQL. Composed prior suites include exact embedded b464 expected-defect witnesses, not healthy baseline. Reuse original packet_suite/setup/cleanup/reporter and full peer chain.",
+      "entry": {
+        "kind": "unittest",
+        "invocation": "python -I -B -S tests/test_document_parser_xlsx_output_privacy.py",
+        "callables": {
+          "packet_suite": "",
+          "metadata_preflight": ""
+        }
+      },
+      "peers": [
+        "tests/test_document_parser_xlsx_formulas.py"
+      ],
+      "path": "tests/test_document_parser_xlsx_output_privacy.py",
+      "sha256": "ba2442e0fcd6969775e0eb258e446c5cd2cf1f7b36efbdb141359be23eabaa8a",
+      "case_groups": [
+        {
+          "owner": "XlsxOutputPrivacySourceTests",
+          "methods": [
+            "test_xout_complete_scalar_admission_not_prefix_and_cache_is_independent",
+            "test_xout_context_withholds_encoded_transformed_attributes_and_evidence",
+            "test_xout_context_words_are_data_not_producer_schema",
+            "test_xout_literal_ids_all_views_and_unsafe_identity_inverse",
+            "test_xout_shared_cache_independent_formula_and_literal_refusals",
+            "test_xout_shared_serializer_default_sanitation_limits_and_arbitrary_keys",
+            "test_xout_version_3_1_6_inverse_and_literal_hook_bounds",
+            "test_xtaint_plain_display_trim_is_not_a_secret_identity_mask",
+            "test_xtaint_protected_refusal_slots_do_not_need_values_or_cache"
+          ],
+          "contract": "declared primary entry; actual whole SOURCE modules/record consumers and their shipped packet_suite; authored parser/open/transport records, no genuine engine/SDK/SQL. Composed prior suites include exact embedded b464 expected-defect witnesses, not healthy baseline. Reuse original packet_suite/setup/cleanup/reporter and full peer chain.",
+          "requires": [
+            "exact_source_inputs",
+            "source_stdlib",
+            "explicit_source_binding"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
+      "role": "unittest-explicit",
+      "lane": "source-explicit",
+      "requires": [
+        "exact_source_inputs",
+        "posix_fd_component"
+      ],
+      "requires_sdk_absent": true,
+      "reason": "Explicit POSIX real-FD standalone suite asserts genuine absence of agent/hermes_cli/hermes_sdk. source-explicit means separate from SDK-preloaded cold lanes, NOT stock SOURCE filesystem/native admission.",
+      "entry": {
+        "kind": "unittest",
+        "invocation": "Linux/POSIX own /work: DOCUMENT_POSIX_FD_OFFLINE=1 python -B tests/test_document_posix_fd_owner.py",
+        "callables": {
+          "main": ""
+        }
+      },
+      "peers": [],
+      "path": "tests/test_document_posix_fd_owner.py",
+      "sha256": "6a9884ee14215520b5287cb2764e8fd562f7e754cb00cf9cb8338629545588e3",
+      "case_groups": [
+        {
+          "owner": "DocumentPosixFDOwner",
+          "methods": [
+            "test_01_healthy_returned_ownership_and_flags",
+            "test_02_real_missing_descendant_and_stale_root_witness",
+            "test_03_ordinary_and_fatal_open_failure",
+            "test_04_after_effect_close_error_and_reused_sentinel",
+            "test_05_before_effect_ambiguity_and_cleanup_error_semantics",
+            "test_06_symlink_and_validation_to_open_swap_refused",
+            "test_07_real_snapshot_bytes_hash_and_source_identity",
+            "test_08_static_baseline_scope_imports_and_audit"
+          ],
+          "contract": "declared primary entry; Explicit POSIX real-FD standalone suite asserts genuine absence of agent/hermes_cli/hermes_sdk. source-explicit means separate from SDK-preloaded cold lanes, NOT stock SOURCE filesystem/native admission.",
+          "requires": [
+            "exact_source_inputs",
+            "posix_fd_component"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
       "path": "tests/test_document_profile_home_isolation.py",
       "sha256": "eee251ef3fb98d98c416b65b54456106cab5ce4fc706b6dee00f8c3257428863",
       "role": "pytest",
@@ -2275,6 +2898,52 @@
       "requires_sdk_absent": false,
       "peers": [],
       "reason": "Synthetic shared-process isolation for document paths and policy settings. Collectible declarations; full prerequisites/individual bodies NOT executed by inventory."
+    },
+    {
+      "role": "source-only",
+      "lane": "source-explicit",
+      "requires": [
+        "exact_source_inputs",
+        "source_controller",
+        "explicit_source_binding",
+        "pinned_external_source_inputs"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "Marked inert main binds original PDF peer, real helper modules, exact baseline/candidate public_options_*_schema.py carriers and original reporter; options/fingerprint bodies real, ingest/scan owners STATIC.",
+      "entry": {
+        "kind": "source-controller",
+        "invocation": "Existing admitted SOURCE bootstrap + public_options_baseline_schema.py/public_options_candidate_schema.py exact SCHEMA_PINS -> main()",
+        "callables": {
+          "main": ""
+        }
+      },
+      "peers": [
+        "tests/test_document_parser_pdf_ocr.py"
+      ],
+      "path": "tests/test_document_public_options_source.py",
+      "sha256": "86f5c8292dcc625f4f82fdf876e0767c43785356c9aed70f01a11d1a100f0db3",
+      "case_groups": [
+        {
+          "owner": "DocumentPublicOptionsSourceTests",
+          "methods": [
+            "test_actual_effective_dict_and_fingerprint_same_vs_different",
+            "test_explicit_forwarding_and_owner_ceiling_inverses",
+            "test_full_ingest_scan_schemas_and_unrelated_preservation",
+            "test_invalid_types_enums_psm_and_canonical_bounds",
+            "test_legacy_no_args_and_trusted_environment_defaults",
+            "test_native_capabilities_not_public_or_request_forwarded",
+            "test_scan_and_ingest_owner_wiring_STATIC"
+          ],
+          "contract": "declared primary entry; Marked inert main binds original PDF peer, real helper modules, exact baseline/candidate public_options_*_schema.py carriers and original reporter; options/fingerprint bodies real, ingest/scan owners STATIC.",
+          "requires": [
+            "exact_source_inputs",
+            "source_controller",
+            "explicit_source_binding",
+            "pinned_external_source_inputs"
+          ],
+          "execution_evidence": null
+        }
+      ]
     },
     {
       "path": "tests/test_document_query_source_artifacts.py",
@@ -2555,6 +3224,92 @@
       "reason": "Regression: every native text/email emission respects the document unit ceiling. Collectible declarations; full prerequisites/individual bodies NOT executed by inventory."
     },
     {
+      "role": "source-only",
+      "lane": "source-explicit",
+      "requires": [
+        "exact_source_inputs",
+        "source_controller",
+        "explicit_source_binding",
+        "pinned_external_source_inputs"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "Marked inert main builds explicit five-case mixin suite using shipped XLSX identity lifecycle and external d93/3dc whole-source witnesses. Exact row loop runs; public/SQL/SPI NOT_RUN.",
+      "entry": {
+        "kind": "source-controller",
+        "invocation": "Existing admitted SOURCE bootstrap + d93_document_knowledge_graph.py + 3dc_document_knowledge_graph.py and full shipped XLSX peer -> main()",
+        "callables": {
+          "main": ""
+        }
+      },
+      "peers": [
+        "tests/test_document_xlsx_identity_source.py",
+        "tests/test_document_parser_pdf_ocr.py"
+      ],
+      "path": "tests/test_document_unit_context_order_source.py",
+      "sha256": "4b5be374e286a4b8e371c83e6f39666d2a3a27b69be059aa9e572ae95f9cfe6f",
+      "case_groups": [
+        {
+          "owner": "OrderSourceCases",
+          "methods": [
+            "test_order_STATIC_outside_loop_and_terminal_fences",
+            "test_order_generic_and_refusal_controls",
+            "test_order_ordinary_compatibility_matrix",
+            "test_order_typed_xlsx_literal_identity",
+            "test_order_unfixed_boundary_witness"
+          ],
+          "contract": "declared primary entry; Marked inert main builds explicit five-case mixin suite using shipped XLSX identity lifecycle and external d93/3dc whole-source witnesses. Exact row loop runs; public/SQL/SPI NOT_RUN.",
+          "requires": [
+            "exact_source_inputs",
+            "source_controller",
+            "explicit_source_binding",
+            "pinned_external_source_inputs"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
+      "role": "callable",
+      "lane": "native-explicit-packet",
+      "requires": [
+        "exact_source_inputs",
+        "windows_handle_component"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "Explicit native Windows HANDLE/FD/ctypes component, SESSION-required setup; ordinary collection inert, arbitrary pytest setup invalid. No genuine SDK or SQL.",
+      "entry": {
+        "kind": "callable",
+        "invocation": "python -I -S -B -u tests/test_document_windows_handle_owner.py --owned-root NEWDIR; or --plan FILE with raw plan SHA on stdin",
+        "callables": {
+          "main": ""
+        }
+      },
+      "peers": [],
+      "path": "tests/test_document_windows_handle_owner.py",
+      "sha256": "d280f4ff4a7763a44a2d2e06ed5fb5d3bba311c4c1a0562b216374ed2e400fda",
+      "case_groups": [
+        {
+          "owner": "DocumentWindowsHandleOwner",
+          "methods": [
+            "test_01_native_readonly_transfer_and_close",
+            "test_02_ordinary_pretransfer_cleanup",
+            "test_03_fatal_final_path_cleanup",
+            "test_04_fatal_root_check_cleanup",
+            "test_05_fatal_handle_to_fd_entry_cleanup",
+            "test_06_native_refusal_paths_and_closure",
+            "test_07_repeat_healthy_after_fatal",
+            "test_08_two_simultaneous_owned_readers"
+          ],
+          "contract": "declared primary entry; Explicit native Windows HANDLE/FD/ctypes component, SESSION-required setup; ordinary collection inert, arbitrary pytest setup invalid. No genuine SDK or SQL.",
+          "requires": [
+            "exact_source_inputs",
+            "windows_handle_component"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
       "path": "tests/test_document_windows_job_limits.py",
       "sha256": "caeef31009fddeeaea3bc5391ef1b5466809925fb3154902b7574c4d659553f6",
       "role": "pytest",
@@ -2571,6 +3326,49 @@
       "requires_sdk_absent": false,
       "peers": [],
       "reason": "Regression: Windows worker sandbox uses a kill-on-close process-memory job limit. Collectible declarations; full prerequisites/individual bodies NOT executed by inventory."
+    },
+    {
+      "role": "source-only",
+      "lane": "source-explicit",
+      "requires": [
+        "exact_source_inputs",
+        "source_controller",
+        "pinned_external_source_inputs"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "Synthetic Windows lifetime/oracle SOURCE: exact small shipped product fixtures plus extracted real Results class; forbids actual ctypes/_ctypes/msvcrt. No real HANDLE/FD/process effect.",
+      "entry": {
+        "kind": "source-controller",
+        "invocation": "Existing admitted SOURCE bootstrap with three shipped *.py.txt carriers and bound native test source -> main()",
+        "callables": {
+          "main": ""
+        }
+      },
+      "peers": [
+        "tests/test_document_windows_handle_owner.py"
+      ],
+      "path": "tests/test_document_windows_lifetime_source.py",
+      "sha256": "98fad6a3327904d010ef44506a351e11a9842f8cfa9b19f0c1c3313b81b262d4",
+      "case_groups": [
+        {
+          "owner": "DocumentWindowsLifetimeSource",
+          "methods": [
+            "test_01_exact_binding_static",
+            "test_02_healthy_and_preacquire_source",
+            "test_03_postacquire_lifetime_source",
+            "test_04_acquire_refusals_source",
+            "test_05_native_refusal_oracle_source",
+            "test_06_simultaneous_cascade_source"
+          ],
+          "contract": "declared primary entry; Synthetic Windows lifetime/oracle SOURCE: exact small shipped product fixtures plus extracted real Results class; forbids actual ctypes/_ctypes/msvcrt. No real HANDLE/FD/process effect.",
+          "requires": [
+            "exact_source_inputs",
+            "source_controller",
+            "pinned_external_source_inputs"
+          ],
+          "execution_evidence": null
+        }
+      ]
     },
     {
       "path": "tests/test_document_windows_short_path_alias.py",
@@ -2838,6 +3636,171 @@
       "requires_sdk_absent": false,
       "peers": [],
       "reason": "Regression: document worker JSON must be UTF-8 on Windows code pages. Collectible declarations; full prerequisites/individual bodies NOT executed by inventory."
+    },
+    {
+      "role": "unittest-explicit",
+      "lane": "source-explicit",
+      "requires": [
+        "exact_source_inputs",
+        "source_controller",
+        "explicit_source_binding",
+        "mixed_entry_contracts"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "Marked no-main source packet_suite selects test_source_* only; sqlite_suite retains two separately opted-in real own SQLite/standalone graph ingester cases. SQL helper uses real platform file/snapshot path and therefore separate native-filesystem admission too.",
+      "entry": {
+        "kind": "unittest",
+        "invocation": "Existing admitted SOURCE entry binds DEVTOOLS_* and MEMORY_WIKI_XLSX_IDENTITY_SOURCE_OPT_IN=1; packet_suite().run(original_result)",
+        "callables": {
+          "packet_suite": "",
+          "sqlite_suite": ""
+        }
+      },
+      "peers": [
+        "tests/test_document_parser_pdf_ocr.py"
+      ],
+      "entry_variants": [
+        {
+          "entry": "packet_suite()",
+          "requires": [
+            "source_controller",
+            "explicit_source_binding"
+          ],
+          "selection": "test_source_*"
+        },
+        {
+          "entry": "sqlite_suite()",
+          "requires": [
+            "own_sqlite_source",
+            "protected_fixture_settings"
+          ],
+          "selection": "test_sqlite_*; SOURCE opt-in plus MEMORY_WIKI_XLSX_IDENTITY_SQLITE_OPT_IN=1; real platform snapshot prerequisites"
+        }
+      ],
+      "path": "tests/test_document_xlsx_identity_source.py",
+      "sha256": "dd6b8a324470450dcd7684cd628fd23c36275a1064d1ce5d0e90659f57afefbd",
+      "case_groups": [
+        {
+          "owner": "XlsxIdentitySourceTests",
+          "methods": [
+            "test_source_defaults_nonxlsx_keys_text_formulas_stay_generic",
+            "test_source_guard_transform_and_veto_are_never_raw_repaired",
+            "test_source_legacy_cache_equal_revision_and_fingerprint_controls",
+            "test_source_malformed_lookalike_and_cap_controls",
+            "test_source_same_inverse_unicode_apostrophe_rows_cells_edges",
+            "test_source_secret_control_overcap_blank_injection_no_literal_admission",
+            "test_source_static_owning_callers_keep_real_terminal_guards",
+            "test_source_typed_save_decode_hydration_fresh_cache_equality"
+          ],
+          "contract": "packet_suite() SOURCE; source opt-in/whole shipped peer and original bound-reader lifecycle",
+          "requires": [
+            "source_controller",
+            "explicit_source_binding"
+          ],
+          "execution_evidence": null
+        },
+        {
+          "owner": "XlsxIdentitySourceTests",
+          "methods": [
+            "test_sqlite_actual_ingest_cache_rebuild_and_private_readback",
+            "test_sqlite_privacy_and_ordinary_nonxlsx_preserved"
+          ],
+          "contract": "separate sqlite_suite() real SQLite/standalone graph ingester/platform snapshot; SOURCE-only packet_suite does not run this case",
+          "requires": [
+            "own_sqlite_source",
+            "explicit_source_binding",
+            "protected_fixture_settings"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
+      "role": "unittest-explicit",
+      "lane": "source-explicit",
+      "requires": [
+        "exact_source_inputs",
+        "source_controller",
+        "explicit_source_binding",
+        "mixed_entry_contracts"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "Marked main/packet_suite runs three SOURCE cache/serializer and three STATIC owners. Eleven genuine_suite(fixture_module) tests retain actual shipped derived_case native/SQLite/SPI/HANDLE lifecycle; never silently selected by SOURCE main.",
+      "entry": {
+        "kind": "unittest",
+        "invocation": "Existing admitted SOURCE bootstrap binds full shipped peers/products -> main(); separate genuine_suite(fixture_module) only inside unchanged derived_case",
+        "callables": {
+          "main": "",
+          "packet_suite": "",
+          "genuine_suite": "fixture_module"
+        }
+      },
+      "peers": [
+        "tests/test_document_parser_pdf_ocr.py",
+        "tests/test_document_xlsx_identity_source.py",
+        "tests/ci_owned/derived_claim_materialization_fixture.py"
+      ],
+      "entry_variants": [
+        {
+          "entry": "packet_suite() / main()",
+          "requires": [
+            "source_controller",
+            "explicit_source_binding"
+          ],
+          "selection": "SOURCE_CASE_IDS + STATIC_CASE_IDS"
+        },
+        {
+          "entry": "genuine_suite(fixture_module)",
+          "requires": [
+            "native_packet",
+            "protected_fixture_settings"
+          ],
+          "selection": "GENUINE_CASE_IDS; exact real derived_case + MEMORY_WIKI_XLSX_REMATERIALIZATION_GENUINE_OPT_IN=1"
+        }
+      ],
+      "path": "tests/test_document_xlsx_rematerialization_source.py",
+      "sha256": "ff66aa4bd80f9ee3c9be95502c86d0d3bd51eb8354909180c7f0061156ab5d78",
+      "case_groups": [
+        {
+          "owner": "XlsxRematerializationSourceTests",
+          "methods": [
+            "test_source_healthy_cache_and_damaged_legacy_misses_stay_strict",
+            "test_source_partial_formula_cache_miss_and_exact_chunk_identity",
+            "test_source_privacy_veto_is_not_literal_repaired",
+            "test_static_other_owners_and_early_exits_unchanged",
+            "test_static_retirement_after_final_supports_inside_original_owner",
+            "test_static_scope_repository_detachment_preserves_dead_links_and_identity"
+          ],
+          "contract": "main/packet_suite explicit SOURCE_CASE_IDS + STATIC_CASE_IDS only",
+          "requires": [
+            "source_controller",
+            "explicit_source_binding"
+          ],
+          "execution_evidence": null
+        },
+        {
+          "owner": "XlsxRematerializationGenuineTests",
+          "methods": [
+            "test_genuine_archived_link_remains_no_revive",
+            "test_genuine_erased_link_remains_no_revive",
+            "test_genuine_healthy_cache_and_same_scope_cache_miss",
+            "test_genuine_missing_link_remains_no_revive",
+            "test_genuine_obsolete_shared_then_last_support_retires",
+            "test_genuine_partial_same_revision_keeps_lawful_active_support",
+            "test_genuine_repository_change_cache_miss_detaches_active_link",
+            "test_genuine_scope_change_cache_miss_detaches_active_link",
+            "test_genuine_scope_change_with_shared_support_cannot_inherit_link",
+            "test_genuine_scope_migration_retains_nonactive_link_authority",
+            "test_genuine_sql_failure_and_joined_primary_roll_back"
+          ],
+          "contract": "separate genuine_suite(fixture_module), exact derived_case/native SDK/SQLite/SPI/HANDLE and GENUINE opt-in; not main SOURCE",
+          "requires": [
+            "native_packet",
+            "protected_fixture_settings"
+          ],
+          "execution_evidence": null
+        }
+      ]
     },
     {
       "path": "tests/test_document_xml_safety.py",
@@ -3296,6 +4259,99 @@
       "reason": "Negative security regressions using real native imports and synthetic owner stores. Collectible declarations; full prerequisites/individual bodies NOT executed by inventory."
     },
     {
+      "role": "pytest",
+      "lane": "legacy",
+      "requires": [
+        "exact_source_inputs",
+        "native_legacy",
+        "protected_fixture_settings"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "Actual pytest fixture imports real Core credential/auth/secret_scope, OpenAI/httpx/native YAML and exact memory_wiki extractors; own synthetic auth.json/config.yaml, real worker thread and HTTPX MockTransport only. No SQL/provider initialize or real model/network; strict response_refusal_unconfirmed retained.",
+      "entry": {
+        "kind": "pytest",
+        "invocation": "tests/cold_lane_entry.py legacy docs/COLD_LANES.json -> pytest.main([\"tests/test_extractor_shared_codex_auth.py\"]) via separately admitted recorder",
+        "callables": {}
+      },
+      "peers": [],
+      "path": "tests/test_extractor_shared_codex_auth.py",
+      "sha256": "b19ab0eddd48d09cc9c0110ea47ff6e54a63dff5f4d2905ad27a913f4fda7d56",
+      "case_groups": [
+        {
+          "owner": "<module>",
+          "methods": [
+            "test_native_atomic_shared_rotation_preserves_two_owner_contexts_and_graph_guard",
+            "test_native_bare_worker_uses_explicit_owner_snapshot_without_sql_jobs",
+            "test_native_local_refusal_is_final_before_any_http",
+            "test_native_missing_root_capability_and_final_admission_both_fail_closed",
+            "test_native_owner_priority_does_not_even_read_invalid_root",
+            "test_native_readers_keep_session_and_graph_optins_independent",
+            "test_native_readers_reject_invalid_policy_even_when_disabled",
+            "test_native_serialized_manual_pool_survives_singleton_suppression_and_exact_model_bench",
+            "test_native_shared_authority_reuses_strict_validator_before_http",
+            "test_native_shared_grant_reaches_only_official_transport_without_faking_response_success",
+            "test_native_transport_failure_has_no_retry_refresh_paid_fallback_or_partial_edges"
+          ],
+          "contract": "declared primary entry; Actual pytest fixture imports real Core credential/auth/secret_scope, OpenAI/httpx/native YAML and exact memory_wiki extractors; own synthetic auth.json/config.yaml, real worker thread and HTTPX MockTransport only. No SQL/provider initialize or real model/network; strict response_refusal_unconfirmed retained.",
+          "requires": [
+            "exact_source_inputs",
+            "native_legacy",
+            "protected_fixture_settings"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
+      "role": "unittest-explicit",
+      "lane": "source-explicit",
+      "requires": [
+        "exact_source_inputs",
+        "source_stdlib",
+        "factory_binding",
+        "pinned_external_source_inputs"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "Marked SOURCE factory extracts exact auth bodies and pinned native root/JWT/header helpers into lexical bindings, not sys.modules SDK stand-ins. Own synthetic auth files/clock; native config/transport wiring STATIC.",
+      "entry": {
+        "kind": "unittest",
+        "invocation": "make_suite(inputs, read_bound, scratch, case_started=None) with all nine exact named inputs; original stdlib runner",
+        "callables": {
+          "make_suite": "inputs, read_bound, scratch, case_started=None"
+        }
+      },
+      "peers": [
+        "tests/test_extractor_shared_codex_auth.py"
+      ],
+      "path": "tests/test_extractor_shared_codex_auth_source.py",
+      "sha256": "59da88fb71c91a71d5c92b6a321ab0bd99255f32b6df44a0a21159ea0f394487",
+      "case_groups": [
+        {
+          "owner": "SharedCodexAuthSourceTests",
+          "methods": [
+            "test_absence_optin_and_owner_pool_singleton_precedence",
+            "test_atomic_rotation_reads_fresh_shared_snapshot_without_owner_mutation",
+            "test_default_policy_and_constructed_snapshots_are_strict",
+            "test_local_authority_refusals_never_bypass_to_shared",
+            "test_malformed_unreadable_and_duplicate_local_documents_are_terminal",
+            "test_manual_pool_suppression_and_exact_model_cooldowns_are_shared_rules",
+            "test_selected_credential_metadata_cannot_reroute_proxy_to_official",
+            "test_shared_failures_and_expiry_cover_the_entire_timeout",
+            "test_source_root_helper_is_explicit_and_never_guessed",
+            "test_static_readers_callers_and_transport_keep_owner_context"
+          ],
+          "contract": "declared primary entry; Marked SOURCE factory extracts exact auth bodies and pinned native root/JWT/header helpers into lexical bindings, not sys.modules SDK stand-ins. Own synthetic auth files/clock; native config/transport wiring STATIC.",
+          "requires": [
+            "exact_source_inputs",
+            "source_stdlib",
+            "factory_binding",
+            "pinned_external_source_inputs"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
       "path": "tests/test_final_calendar_intent.py",
       "sha256": "1eddd59d5e78dbca12c34c905c0baa3dc704427b4537f4d7f00fa8e72b34897e",
       "role": "pytest",
@@ -3351,6 +4407,141 @@
         "tests/ci_owned/claim_embedding_fixture.py"
       ],
       "reason": "Shipped genuine-SPI foreign-copy lifetime/sole-source/unusable-vector regressions. NOT_RUN under SOURCE; requires existing peer native owner/bootstrap and owned fixture admission."
+    },
+    {
+      "role": "unittest-explicit",
+      "lane": "source-explicit",
+      "requires": [
+        "exact_source_inputs",
+        "source_stdlib",
+        "explicit_source_binding",
+        "mixed_entry_contracts"
+      ],
+      "requires_sdk_absent": true,
+      "reason": "PrerequisiteControls asserts no preloaded agent.memory_provider/memory_wiki/trust. Complete script/test source layout and actual helper imports required. Direct __main__ executes only10 PrerequisiteControls;13 CompatibilityDiagnosticControls need separate explicit suite, all declarations preserved.",
+      "entry": {
+        "kind": "unittest",
+        "invocation": "python -I -B -S tests/test_foundation_ci_prerequisites.py",
+        "callables": {}
+      },
+      "peers": [
+        "tests/test_p2_g4_identity_errors.py",
+        "tests/test_p2_g4_repair01.py",
+        "tests/test_memory_diff_polarity.py",
+        "tests/test_observation_finite_work.py",
+        "tests/test_observation_repair01.py",
+        "tests/test_prefetch_current_diagnostics.py"
+      ],
+      "entry_variants": [
+        {
+          "entry": "__main__: run_unittest(PrerequisiteControls, expected=10)",
+          "requires": [
+            "source_stdlib"
+          ],
+          "selection": "PrerequisiteControls"
+        },
+        {
+          "entry": "explicit unittest suite of CompatibilityDiagnosticControls",
+          "requires": [
+            "source_stdlib",
+            "explicit_source_binding"
+          ],
+          "selection": "CompatibilityDiagnosticControls"
+        }
+      ],
+      "path": "tests/test_foundation_ci_prerequisites.py",
+      "sha256": "f12b353ed91801aa1803c041a5090d15c9f04b71d2a5876bf8bc6a56b0941e23",
+      "case_groups": [
+        {
+          "owner": "PrerequisiteControls",
+          "methods": [
+            "test_changed_python_sources_compile_without_native_import",
+            "test_clean_environment_drops_credentials_and_all_fixture_carriers",
+            "test_historical_test_bodies_are_byte_semantic_preserved",
+            "test_native_split_is_exact_and_requires_complete_source_roster",
+            "test_native_startup_gate_keeps_public_persistence_and_cleanup",
+            "test_nonzero_failed_skipped_incomplete_or_drifted_source_blocks_native",
+            "test_optional_trust_refuses_transitive_failure_and_required_absence",
+            "test_portable_native_setup_supplies_all_declared_carriers",
+            "test_source_modules_import_without_external_environment_or_audit_install",
+            "test_subtest_failure_is_not_parent_pass"
+          ],
+          "contract": "declared primary entry; PrerequisiteControls asserts no preloaded agent.memory_provider/memory_wiki/trust. Complete script/test source layout and actual helper imports required. Direct __main__ executes only10 PrerequisiteControls;13 CompatibilityDiagnosticControls need separate explicit suite, all declarations preserved.",
+          "requires": [
+            "exact_source_inputs",
+            "source_stdlib",
+            "explicit_source_binding",
+            "mixed_entry_contracts"
+          ],
+          "execution_evidence": null
+        },
+        {
+          "owner": "CompatibilityDiagnosticControls",
+          "methods": [
+            "test_case_result_retains_parent_subtest_failure_and_typed_error",
+            "test_error_types_never_read_foreign_metadata_or_stringify_payload",
+            "test_failed_case_diagnostic_is_bounded_and_omits_raw_subtest_payload",
+            "test_malformed_case_metadata_stays_unknown_not_pass",
+            "test_missing_report_exposes_only_known_timeout_type_and_unknown_cases",
+            "test_primary_cancellation_identity_survives_secondary_cancel",
+            "test_public_layout_is_bytes_only_fixed_inputs_and_exact_eol_counts",
+            "test_real_metadata_validator_positive_and_bad_rows_keep_fail_closed",
+            "test_real_strict_qualifier_primary_survives_each_secondary_failure",
+            "test_secondary_formatter_stream_and_cancel_failures_are_nonthrowing",
+            "test_selector_keeps_all_literal_profiles_and_current_gold",
+            "test_selector_refuses_unknown_and_malformed_runtime_without_skip",
+            "test_static_native_wiring_and_public_reader_do_not_execute_native"
+          ],
+          "contract": "separate explicit stdlib CompatibilityDiagnosticControls suite; __main__ selects only PrerequisiteControls",
+          "requires": [
+            "source_stdlib",
+            "explicit_source_binding"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
+      "role": "pytest",
+      "lane": "legacy",
+      "requires": [
+        "exact_source_inputs",
+        "native_legacy"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "Ordinary pytest-compatible stdlib SOURCE/typed-AST collection/fence/fixture-lifetime checks; shipped scripts/ci_owned helper layout. No SDK-absence assertion or actual product SQL/native effects; in-tree conftest exemption applies.",
+      "entry": {
+        "kind": "pytest",
+        "invocation": "tests/cold_lane_entry.py legacy docs/COLD_LANES.json -> pytest.main([\"tests/test_foundation_ci_review_boundaries.py\"]) via separately admitted recorder",
+        "callables": {}
+      },
+      "peers": [
+        "tests/test_p2_g4_identity_errors.py",
+        "tests/test_p2_g4_repair01.py",
+        "tests/test_memory_diff_polarity.py"
+      ],
+      "path": "tests/test_foundation_ci_review_boundaries.py",
+      "sha256": "ab9dba255ea328156455284f07db1a4cf4571f473c7bc4c1094b8f43406a1436",
+      "case_groups": [
+        {
+          "owner": "ReviewBoundaryControls",
+          "methods": [
+            "test_collection_executes_no_product_import_extraction_or_hook",
+            "test_correction_sources_compile_without_sdk_or_sql_execution",
+            "test_diff_fixture_binds_genuine_caller_home_and_empty_secret_scope",
+            "test_diff_tokens_enclose_initialize_yield_shutdown_and_cleanup_assertions",
+            "test_non_sql_subset_cannot_authorize_full_source_or_native_continuation",
+            "test_original_fence_precedes_every_product_setup_operation",
+            "test_pin_migration_is_literal_and_keeps_original_network_denial_tail"
+          ],
+          "contract": "declared primary entry; Ordinary pytest-compatible stdlib SOURCE/typed-AST collection/fence/fixture-lifetime checks; shipped scripts/ci_owned helper layout. No SDK-absence assertion or actual product SQL/native effects; in-tree conftest exemption applies.",
+          "requires": [
+            "exact_source_inputs",
+            "native_legacy"
+          ],
+          "execution_evidence": null
+        }
+      ]
     },
     {
       "path": "tests/test_fts_security_parity_regression.py",
@@ -3644,6 +4835,46 @@
       "reason": "Names and ordinary words must not be mistaken for the DAN jailbreak cue. Collectible declarations; full prerequisites/individual bodies NOT executed by inventory."
     },
     {
+      "role": "pytest",
+      "lane": "legacy",
+      "requires": [
+        "exact_source_inputs",
+        "native_legacy"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "Ordinary pytest-compatible unittest using real whole guard module and shipped security corpus; no SDK absence/setup requirement, no network/SQL/native calls.",
+      "entry": {
+        "kind": "pytest",
+        "invocation": "tests/cold_lane_entry.py legacy docs/COLD_LANES.json -> pytest.main([\"tests/test_guard_instruction_qualifiers.py\"]) via separately admitted recorder",
+        "callables": {}
+      },
+      "peers": [],
+      "path": "tests/test_guard_instruction_qualifiers.py",
+      "sha256": "17de481beb92b35bd2d20340f012ba98aee9c296115e65b323e305fca8f5d3fe",
+      "case_groups": [
+        {
+          "owner": "GuardInstructionQualifiers",
+          "methods": [
+            "test_01_exact_reported_attack_and_recognized_control",
+            "test_02_ignore_system_and_developer_qualifiers",
+            "test_03_other_override_verbs_keep_both_qualifiers",
+            "test_04_existing_unicode_projection_detects_qualified_commands",
+            "test_05_grammar_does_not_consume_arbitrary_or_stacked_words",
+            "test_06_benign_source_fidelity_and_display_limit",
+            "test_07_batch_uses_the_sanitized_value_without_mutation",
+            "test_08_descriptive_exception_does_not_exempt_qualified_commands",
+            "test_09_existing_frozen_corpus_current_local_contract"
+          ],
+          "contract": "declared primary entry; Ordinary pytest-compatible unittest using real whole guard module and shipped security corpus; no SDK absence/setup requirement, no network/SQL/native calls.",
+          "requires": [
+            "exact_source_inputs",
+            "native_legacy"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
       "path": "tests/test_host_memory_remove_privacy.py",
       "sha256": "df1213ae0db96f21e6b9131502729cfb2a69ba2fdcabe08e818c4c569a9d100f",
       "role": "pytest",
@@ -3664,7 +4895,7 @@
     },
     {
       "path": "tests/test_http_redirect_safety.py",
-      "sha256": "8af1b302513036847b6e2df422f0877af5aaab1cec7d5ae2b2dfdce756d78f36",
+      "sha256": "14de52387aa875d9acac3e8b8d2a61f54fb0ecff4759853b60d9c64cca26ab85",
       "role": "pytest",
       "lane": "legacy",
       "entry": {
@@ -4612,6 +5843,184 @@
       "reason": "Synthetic official-format checks for the isolated LongMemEval-V2 probe. Collectible declarations; full prerequisites/individual bodies NOT executed by inventory."
     },
     {
+      "role": "unittest-explicit",
+      "lane": "source-explicit",
+      "requires": [
+        "exact_source_inputs",
+        "source_stdlib"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "Explicit standalone Luna suite compiles full local extractor/http_safety/entity_relation_extractor without package; authored transport/reply and own synthetic home/TMPDIR. Native routing/reader wiring STATIC, not SDK/model response provenance.",
+      "entry": {
+        "kind": "unittest",
+        "invocation": "python -I -B -S tests/test_luna_extractor_boundaries.py",
+        "callables": {
+          "main": ""
+        }
+      },
+      "peers": [],
+      "path": "tests/test_luna_extractor_boundaries.py",
+      "sha256": "26b5fa3738ebe2c9267d158f1727410826cee74bf2641f6c3564b5b5970b077f",
+      "case_groups": [
+        {
+          "owner": "LunaBoundaryTests",
+          "methods": [
+            "test_action_inflections_keep_denial_without_cross_actor_or_scope",
+            "test_dedup_once_and_assistant_future_or_json_echo_rejected",
+            "test_expired_or_denied_codex_stops_before_native_import",
+            "test_graph_duplicate_nonfinite_schema_and_partial_json_rejected",
+            "test_graph_inverse_and_cropped_negation_rejected",
+            "test_graph_original_admission_denial_and_postparse_deadline",
+            "test_graph_request_and_strict_positive_grounding",
+            "test_graph_settings_denial_secret_and_oversize_before_transport",
+            "test_grounding_rejects_wrong_index_role_quote_reverse_and_polarity",
+            "test_heuristic_secret_and_non_dialogue_inputs_never_persist",
+            "test_late_valid_content_discarded_after_original_deadline",
+            "test_positive_request_to_grounded_candidate_with_source_time",
+            "test_public_response_complete_contract_and_missing_refusal_unknown",
+            "test_refused_truncated_and_non_text_never_yield_candidates",
+            "test_remote_redaction_and_withheld_quote_not_reconstructed",
+            "test_review_accepted_unknown_and_no_auto_verified_distinct",
+            "test_snapshot_validation_preserves_literal_and_no_fallback",
+            "test_static_reader_caller_transport_guards_and_protected_hook_proposal",
+            "test_strict_json_no_repairs_duplicates_nonfinite_or_malformed_entry",
+            "test_timeout_import_failure_and_primary_cancel_no_secret_echo"
+          ],
+          "contract": "declared primary entry; Explicit standalone Luna suite compiles full local extractor/http_safety/entity_relation_extractor without package; authored transport/reply and own synthetic home/TMPDIR. Native routing/reader wiring STATIC, not SDK/model response provenance.",
+          "requires": [
+            "exact_source_inputs",
+            "source_stdlib"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
+      "role": "unittest-explicit",
+      "lane": "source-explicit",
+      "requires": [
+        "exact_source_inputs",
+        "source_stdlib",
+        "pinned_external_source_inputs",
+        "mixed_entry_contracts"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "Main composes exact shipped Luna controls and source caller tests; SQL receiver always refuses. Provider owning-span carrier required under1MB binder. Optional two f7 witnesses require both exact named historical carriers and are otherwise not whole-file executed.",
+      "entry": {
+        "kind": "unittest",
+        "invocation": "python -I -B -S tests/test_luna_extractor_source_scope.py",
+        "callables": {
+          "main": ""
+        }
+      },
+      "peers": [
+        "tests/test_luna_extractor_boundaries.py"
+      ],
+      "entry_variants": [
+        {
+          "entry": "main() current cohorts",
+          "requires": [
+            "source_stdlib",
+            "pinned_external_source_inputs"
+          ],
+          "selection": "LunaBoundaryTests + LunaSourceScopeTests"
+        },
+        {
+          "entry": "main() optional f7 cohort",
+          "requires": [
+            "pinned_external_source_inputs"
+          ],
+          "selection": "LunaF7WitnessTests only when luna_f7_extractor.py/luna_f7_caller.py supplied; missing carriers not baseline PASS"
+        }
+      ],
+      "path": "tests/test_luna_extractor_source_scope.py",
+      "sha256": "f28003c31be5377edaec357bbce68868d51f32583258c59c2d5160c4b53823da",
+      "case_groups": [
+        {
+          "owner": "LunaSourceScopeTests",
+          "methods": [
+            "test_actual_caller_plain_strings_roles_indexes_and_source_time",
+            "test_actual_caller_preserves_raw_budget_before_whitespace_trim",
+            "test_actual_caller_raw_dict_list_objects_never_coerced_or_dispatched",
+            "test_actual_source_redactor_and_scan_not_permissive_standins",
+            "test_intentional_last_whole_message_window_and_indexes_preserved",
+            "test_legacy_pairs_event_metadata_and_complete_positive",
+            "test_message_exact_and_plus_one_refuse_whole_not_remaining_positive",
+            "test_original_caps_and_closed_refusal_diagnostics",
+            "test_score_known_refusal_is_zero_without_lifecycle_exception",
+            "test_trailing_denial_exact_whitespace_and_plus_one_no_positive",
+            "test_transcript_exact_and_plus_one_without_partial_boundary",
+            "test_transcript_partial_clause_or_whole_denial_omission_refuses_all",
+            "test_transcript_raw_whitespace_counts_even_when_stripped_source_fits"
+          ],
+          "contract": "declared primary entry; Main composes exact shipped Luna controls and source caller tests; SQL receiver always refuses. Provider owning-span carrier required under1MB binder. Optional two f7 witnesses require both exact named historical carriers and are otherwise not whole-file executed.",
+          "requires": [
+            "exact_source_inputs",
+            "source_stdlib",
+            "pinned_external_source_inputs",
+            "mixed_entry_contracts"
+          ],
+          "execution_evidence": null
+        },
+        {
+          "owner": "LunaF7WitnessTests",
+          "methods": [
+            "test_f7_actual_caller_coercion_is_expected_baseline_violation",
+            "test_f7_prefix_loss_is_expected_baseline_violation_not_stored_proof"
+          ],
+          "contract": "conditional explicit f7 baseline suite requires both external carriers; expected historical violation only",
+          "requires": [
+            "pinned_external_source_inputs"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
+      "role": "unittest-explicit",
+      "lane": "source-explicit",
+      "requires": [
+        "exact_source_inputs",
+        "source_stdlib",
+        "pinned_external_source_inputs"
+      ],
+      "requires_sdk_absent": true,
+      "reason": "Explicit SOURCE oracle compatibility main forbids any loaded agent/hermes_constants/openai/httpx/pytest in terminal clean check and all SQL. Exact current plus before_grounding/before_codex test carriers, real extracted/full extractor; authored reply not SDK proof.",
+      "entry": {
+        "kind": "unittest",
+        "invocation": "python -I -B -S tests/test_luna_oracle_compat_source.py",
+        "callables": {
+          "main": ""
+        }
+      },
+      "peers": [
+        "tests/test_session_extractor_grounding.py",
+        "tests/test_session_extractor_codex.py"
+      ],
+      "path": "tests/test_luna_oracle_compat_source.py",
+      "sha256": "f1bd7dd2be048b52cfc780cf4013e03d71bf76220f065be697405bd10205b98c",
+      "case_groups": [
+        {
+          "owner": "LunaOracleCompatSource",
+          "methods": [
+            "test_01_sanitizer_exact_body_safe_code_and_old_oracle_rejected",
+            "test_02_strict_authored_return_positive_and_empty_positive",
+            "test_03_original_incomplete_authored_fixture_expected_refusal",
+            "test_04_independent_missing_fields_and_non_text_controls",
+            "test_05_truncated_and_refused_replies_never_become_candidates",
+            "test_06_only_two_ast_corrections_all_other_contracts_unchanged"
+          ],
+          "contract": "declared primary entry; Explicit SOURCE oracle compatibility main forbids any loaded agent/hermes_constants/openai/httpx/pytest in terminal clean check and all SQL. Exact current plus before_grounding/before_codex test carriers, real extracted/full extractor; authored reply not SDK proof.",
+          "requires": [
+            "exact_source_inputs",
+            "source_stdlib",
+            "pinned_external_source_inputs"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
       "path": "tests/test_maintenance_contract.py",
       "sha256": "67f8615875db32bb2c1ca5e839df410a4a04745589621cb791707dc49cfbeb98",
       "role": "pytest",
@@ -4632,7 +6041,7 @@
     },
     {
       "path": "tests/test_mandatory_redactor_admin.py",
-      "sha256": "d8c2abd56aff559c16beecea82c111fb4f208f904631f3bf9587b56675690806",
+      "sha256": "ef6fe1d494b1a564b6a6bd264e282a9d28114a6fc169a76fda64b324a3ee1018",
       "role": "unittest-explicit",
       "lane": "source-explicit",
       "entry": {
@@ -4839,7 +6248,7 @@
     },
     {
       "path": "tests/test_memory_diff_polarity.py",
-      "sha256": "ffb1ec78b7e58d5fae8809fdc8fb8a5291e8d6e74d11d8c336233e10ad2981ef",
+      "sha256": "9720bfe64b04183c2b378b0f901245c951df567dd9672a2d6d516fcecdfe2420",
       "role": "pytest",
       "lane": "legacy",
       "entry": {
@@ -5028,7 +6437,7 @@
     },
     {
       "path": "tests/test_observation_finite_work.py",
-      "sha256": "7879a43e9b2448cf350c26f6643541b23cab45f725a23d0286f74964a4013a95",
+      "sha256": "8bb326e6e42084d37e10a0ed784807e96b67c56612e5bc0fac26b693ec0888fa",
       "role": "pytest",
       "lane": "legacy",
       "entry": {
@@ -5107,7 +6516,7 @@
     },
     {
       "path": "tests/test_p2_g3_native.py",
-      "sha256": "bfb5536334c23035332b9b5136e50369603e947750b92547b8f620a7e6620b11",
+      "sha256": "5eeece2598da6b4614d3347efbed73c1e1f5700d53e0574e2504d483c24f264a",
       "role": "pytest",
       "lane": "legacy",
       "entry": {
@@ -5146,7 +6555,7 @@
     },
     {
       "path": "tests/test_p2_g4_identity_errors.py",
-      "sha256": "87918f8e8fbb056367bc6e1e5196e2463a6569bb3acdc505397dc716ea4f02da",
+      "sha256": "ec293d2136a19afef4b3c60d8bf0f2888ab32972c82a9072e11511f127056d24",
       "role": "source-only",
       "lane": "source-explicit",
       "entry": {
@@ -5165,7 +6574,7 @@
     },
     {
       "path": "tests/test_p2_g4_repair01.py",
-      "sha256": "245860ef6c5adf54edab4691a58f57d75e42a1c9bc8d82ba2b1bfc77afcae697",
+      "sha256": "be3299b328933adab7c67b6a6de1d8df6b9a43dff78da43444e2155dfeb387df",
       "role": "source-only",
       "lane": "source-explicit",
       "entry": {
@@ -5240,7 +6649,7 @@
     },
     {
       "path": "tests/test_prefetch_current_diagnostics.py",
-      "sha256": "51b45933ba7ebfc229a273bab856555fbf4bf964bb91571ea113a78d9ad819f9",
+      "sha256": "877bce96128a1efdbaac201d36dde7dc890fe42c07dd5eec206bdd94bb96dfa0",
       "role": "pytest",
       "lane": "strict",
       "entry": {
@@ -5631,6 +7040,56 @@
       "reason": "Authored audit #1/#5/#6/#7 regressions; no recovered attack trace or LLM. Collectible declarations; full prerequisites/individual bodies NOT executed by inventory."
     },
     {
+      "role": "unittest-explicit",
+      "lane": "source-explicit",
+      "requires": [
+        "exact_source_inputs",
+        "source_stdlib",
+        "own_sqlite_source",
+        "pinned_external_source_inputs"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "Actual extracted query/ACL on real own file SQLite; canonical/principal/clock/sanitizer observers synthetic. external small SOURCE_CARRIER or direct exact provider-method extraction; connection cleanup real. NOT non-SQL SOURCE or native authority.",
+      "entry": {
+        "kind": "unittest",
+        "invocation": "Explicit stdlib suite/main block with SOURCE_CARRIER under admitted SOURCE entry, or direct -I -B -S with RECENT_CHANGES_TEST_ROOT own directory",
+        "callables": {}
+      },
+      "peers": [],
+      "path": "tests/test_recent_changes_visibility_source.py",
+      "sha256": "76f9e677d0938e8d4040dc4cb2680cb0cb35dbcc6c92c948abd5cc970050b24f",
+      "case_groups": [
+        {
+          "owner": "RecentChangesVisibilitySource",
+          "methods": [
+            "test_baseline_witness_inaccessible_prefix_omits_tail",
+            "test_candidate_visible_tail_before_limit",
+            "test_canonical_missing_after_selection_is_skipped",
+            "test_cutoff_and_newest_visible_order",
+            "test_empty_schema_and_history_status",
+            "test_final_revalidation_reads_canonical_claim",
+            "test_limit_clamps_defaults_and_invalid_inputs",
+            "test_sanitizer_invocation_and_projection",
+            "test_scope_bot",
+            "test_scope_chat",
+            "test_scope_global",
+            "test_scope_private",
+            "test_scope_project",
+            "test_since_seconds_clamps_and_echo",
+            "test_unknown_and_orphan_do_not_crowd_tail"
+          ],
+          "contract": "declared primary entry; Actual extracted query/ACL on real own file SQLite; canonical/principal/clock/sanitizer observers synthetic. external small SOURCE_CARRIER or direct exact provider-method extraction; connection cleanup real. NOT non-SQL SOURCE or native authority.",
+          "requires": [
+            "exact_source_inputs",
+            "source_stdlib",
+            "own_sqlite_source",
+            "pinned_external_source_inputs"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
       "path": "tests/test_recovery_artifact_registry.py",
       "sha256": "917759221b8a86090964e723e049efcb320b506d9a328868a83347c9922cb338",
       "role": "pytest",
@@ -5798,6 +7257,51 @@
       "requires_sdk_absent": false,
       "peers": [],
       "reason": "Standalone SOURCE regression; no provider/package import, SDK or restore. Explicit stdlib suite/entry; not automatic native pytest setup."
+    },
+    {
+      "role": "pytest",
+      "lane": "strict",
+      "requires": [
+        "exact_source_inputs",
+        "native_strict",
+        "protected_fixture_settings"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "Real SDK/registry/trust per-case plugin namespaces, home override, initialize and file SQLite; profile/thread/authorizer observers, natural shutdown or exact retained UNKNOWN before fixture safety close. All12 including populated graph maintenance; not SOURCE.",
+      "entry": {
+        "kind": "pytest",
+        "invocation": "tests/cold_lane_entry.py strict docs/COLD_LANES.json -> pytest.main([\"tests/test_review_queue_owner.py\"]) via separately admitted recorder",
+        "callables": {}
+      },
+      "peers": [],
+      "path": "tests/test_review_queue_owner.py",
+      "sha256": "47bcea249830b441c5bfbb2d89e0e88426ee45348f02aa077298e3495f88a045",
+      "case_groups": [
+        {
+          "owner": "NativeReviewQueueOwner",
+          "methods": [
+            "test_01_sequential_natural_queue_and_seed_recall",
+            "test_02_natural_queue_writer_public_reader_handoff",
+            "test_03_direct_firewall_queue_preserves_metadata_and_redaction",
+            "test_04_queue_known_rollback_preserves_exact_primary",
+            "test_05_joined_claim_queue_outer_rollback_is_atomic",
+            "test_06_joined_firewall_queue_outer_commit_keeps_change",
+            "test_07_change_insert_denial_rolls_back_review",
+            "test_08_foreign_thread_begin_remains_unknown_after_owner_rollback",
+            "test_09_queue_rollback_denied_retains_exact_primary_and_owner",
+            "test_10_admin_ordinary_writer_public_reader_handoff",
+            "test_11_admin_populated_graph_writer_public_reader_handoff",
+            "test_12_admin_late_primary_rolls_back_graph_not_committed_ordinary_prefix"
+          ],
+          "contract": "declared primary entry; Real SDK/registry/trust per-case plugin namespaces, home override, initialize and file SQLite; profile/thread/authorizer observers, natural shutdown or exact retained UNKNOWN before fixture safety close. All12 including populated graph maintenance; not SOURCE.",
+          "requires": [
+            "exact_source_inputs",
+            "native_strict",
+            "protected_fixture_settings"
+          ],
+          "execution_evidence": null
+        }
+      ]
     },
     {
       "path": "tests/test_runtime_lifecycle_handoff.py",
@@ -6020,6 +7524,68 @@
       "reason": "Regression: secret-context discovery respects Hermes profile isolation. Collectible declarations; full prerequisites/individual bodies NOT executed by inventory."
     },
     {
+      "role": "unittest-explicit",
+      "lane": "source-explicit",
+      "requires": [
+        "exact_source_inputs",
+        "source_stdlib",
+        "factory_binding",
+        "pinned_external_source_inputs"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "SOURCE-extracted full owner/redactor/transaction bodies with explicit synthetic SQL/store/identity/journal observers; zero sqlite3.connect, real secret core not loaded, unavailable branch has deliberate SOURCE binding. Not actual SQL/Vault/native authority.",
+      "entry": {
+        "kind": "unittest",
+        "invocation": "make_suite(raw, source, scratch, case_names) with exact owning provider source/carrier and explicit full24 roster; direct main --source FILE",
+        "callables": {
+          "make_suite": "raw, source, scratch, case_names",
+          "main": ""
+        }
+      },
+      "peers": [],
+      "path": "tests/test_secret_metadata_owner.py",
+      "sha256": "2a4fdb49ca47316377fac49d4f0bffce439a0d9a5910a9dc9a4c47aa3ef06789",
+      "case_groups": [
+        {
+          "owner": "SecretMetadataOwnerTests",
+          "methods": [
+            "test_01_quarantine_owned_insert_redacted_fields_and_postcommit_audit",
+            "test_02_quarantine_refuses_caller_TX_without_commit_rollback_or_audit",
+            "test_03_quarantine_SQL_failure_exact_primary_and_next_healthy",
+            "test_04_quarantine_best_effort_audit_failure_keeps_metadata_commit",
+            "test_05_secret_owned_store_SQL_and_postcommit_lifetimes_stable_ID",
+            "test_06_scrub_metadata_only_no_put_and_preserves_existing_reference",
+            "test_07_trust_and_scrub_plaintext_refusals_before_any_effect",
+            "test_08_secret_caller_TX_refusal_precedes_store_and_preserves_outer",
+            "test_09_foreign_or_unregistered_pending_TX_retained_without_effects",
+            "test_10_secret_SQL_failure_compensates_exact_snapshot_and_primary",
+            "test_11_cancel_compensation_and_diagnostic_failure_preserve_primary",
+            "test_12_store_partial_put_or_snapshot_failure_has_safe_cleanup",
+            "test_13_rollback_UNKNOWN_retains_owner_primary_no_compensation_or_retry",
+            "test_14_committed_or_journal_UNKNOWN_never_compensates_committed_value",
+            "test_15_postcommit_callback_errors_reported_without_compensation",
+            "test_16_actual_missing_core_refusal_is_not_a_store_fallback",
+            "test_17_F1_actual_owner_normal_final_return_keeps_new_and_rotated_value",
+            "test_18_F1_actual_contextlib_normal_exit_keeps_new_and_rotated_value",
+            "test_19_F1_body_finished_precommit_and_commit_before_effect_still_compensate",
+            "test_20_F1_receipt_refusals_before_effects_and_default_None_join_compatibility",
+            "test_21_F1_receipt_positive_exact_owner_only_never_COMMITTED_or_UNKNOWN",
+            "test_22_F1_receipt_publication_fault_preserves_primary_and_observed_effect",
+            "test_23_F1_receipt_read_fault_keeps_original_primary_without_compensation",
+            "test_24_F1_nonmatching_or_missing_observation_never_authorizes_compensation"
+          ],
+          "contract": "declared primary entry; SOURCE-extracted full owner/redactor/transaction bodies with explicit synthetic SQL/store/identity/journal observers; zero sqlite3.connect, real secret core not loaded, unavailable branch has deliberate SOURCE binding. Not actual SQL/Vault/native authority.",
+          "requires": [
+            "exact_source_inputs",
+            "source_stdlib",
+            "factory_binding",
+            "pinned_external_source_inputs"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
       "path": "tests/test_secret_registry_profile_override.py",
       "sha256": "6d3620c8fcb7fbf4aeb5e6ee4df2ecd28710e665f2bbef6b5f8b7582c92644eb",
       "role": "pytest",
@@ -6096,7 +7662,7 @@
     },
     {
       "path": "tests/test_session_extractor_codex.py",
-      "sha256": "1a953ff8f56f331a6fa701e9d89b5190b4c3ce5475e093f35f473721fc65455b",
+      "sha256": "db2ff1252e712c76ec14b220af7a7dc82b0510f274ac24ddcfe018ddfbf9ad49",
       "role": "pytest",
       "lane": "legacy",
       "entry": {
@@ -6115,7 +7681,7 @@
     },
     {
       "path": "tests/test_session_extractor_grounding.py",
-      "sha256": "83433d37265a2a17008767f9afb11973653536e61574ad3b85d5ad24aef6c6b5",
+      "sha256": "f4e2a0693ed3cd170f50fa26d0d635bf30800f733ab863f9331b4463acb02b95",
       "role": "pytest",
       "lane": "legacy",
       "entry": {
@@ -6227,6 +7793,125 @@
       "reason": "F1/F2/F3 only: real native SDK/guard and SQLite FTS, offline fixtures. Collectible declarations; full prerequisites/individual bodies NOT executed by inventory."
     },
     {
+      "role": "pytest",
+      "lane": "legacy",
+      "requires": [
+        "exact_source_inputs",
+        "native_legacy"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "Inert ordinary pytest-compatible StdoutBoundTests; own files, extracted exact source_suites/fixture validator, synthetic completed subprocess only; Path.open and globals restored in cleanup. No SDK-absence/native/SQL requirement.",
+      "entry": {
+        "kind": "pytest",
+        "invocation": "tests/cold_lane_entry.py legacy docs/COLD_LANES.json -> pytest.main([\"tests/test_source_suite_stdout_bound.py\"]) via separately admitted recorder",
+        "callables": {}
+      },
+      "peers": [
+        "tests/test_p2_g4_identity_errors.py",
+        "tests/test_p2_g4_repair01.py",
+        "tests/test_foundation_ci_prerequisites.py"
+      ],
+      "path": "tests/test_source_suite_stdout_bound.py",
+      "sha256": "b245aa9f8d460a428b83a2d23a28cb016017e7b2918999682f45e488a0fdcad3",
+      "case_groups": [
+        {
+          "owner": "StdoutBoundTests",
+          "methods": [
+            "test_01_nonempty_report_and_original_rows",
+            "test_02_exact_96000_valid_report",
+            "test_03_96001_valid_prefix_refuses_before_decode",
+            "test_04_read_observer_rejects_readall_and_unbounded",
+            "test_05_read_failure_retains_row_and_closes_stream",
+            "test_06_original_schema_identity_outcome_count_refusals",
+            "test_07_malformed_and_missing_report_refusals",
+            "test_08_lawful_outcomes_nonzero_and_process_refusals",
+            "test_09_original_qualifier_primary_identity",
+            "test_10_static_collection_and_exact_read_contract"
+          ],
+          "contract": "declared primary entry; Inert ordinary pytest-compatible StdoutBoundTests; own files, extracted exact source_suites/fixture validator, synthetic completed subprocess only; Path.open and globals restored in cleanup. No SDK-absence/native/SQL requirement.",
+          "requires": [
+            "exact_source_inputs",
+            "native_legacy"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
+      "role": "pytest",
+      "lane": "legacy",
+      "requires": [
+        "exact_source_inputs",
+        "native_legacy"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "Ordinary unittest/pytest whole-module bounded formula evaluator on in-memory synthetic cell data. Import reads/executes real helper; no parser, XLSX file, SDK absence, SQL, subprocess or model; standalone SOURCE alternative valid.",
+      "entry": {
+        "kind": "pytest",
+        "invocation": "tests/cold_lane_entry.py legacy docs/COLD_LANES.json -> pytest.main([\"tests/test_spreadsheet_formulas_bounded.py\"]) via separately admitted recorder",
+        "callables": {}
+      },
+      "peers": [],
+      "path": "tests/test_spreadsheet_formulas_bounded.py",
+      "sha256": "7123e268806b33414c51a7bea6b409c504ecb9c7f0a831ac75a3f4c037788e73",
+      "case_groups": [
+        {
+          "owner": "BoundedFormulas",
+          "methods": [
+            "test_absolute_reference_chain_and_formula_without_equals",
+            "test_aggregate_reference_vs_direct_scalar_coercion",
+            "test_arithmetic_precedence_and_excel_power",
+            "test_bad_bounds_never_coerced_or_clamped",
+            "test_blank_missing_zero_false_and_empty_text_are_distinct",
+            "test_booleans_text_numeric_coercion_and_inert_strings",
+            "test_cached_values_do_not_override_computation",
+            "test_cell_cap_is_atomic_no_silent_drop",
+            "test_common_aggregates_rectangles_reverse_sparse_and_nested",
+            "test_dependency_refusals_never_become_numeric_or_count_success",
+            "test_depth_parser_evaluation_and_dependency_limits",
+            "test_division_power_domains_and_finite_overflow",
+            "test_empty_aggregates_and_all_text_ranges",
+            "test_errors_propagate_and_counta_counts_actual_input_errors",
+            "test_external_links_dde_paths_and_network_functions_refused",
+            "test_formula_token_argument_and_text_limits",
+            "test_forward_dependencies_and_diamond_reuse",
+            "test_inter_sheet_aggregates_and_dependency_chains",
+            "test_inter_sheet_cycle_and_dependent_cycle",
+            "test_inter_sheet_exact_unicode_whitespace_and_apostrophes",
+            "test_invalid_ids_and_record_shapes_refuse_without_repair",
+            "test_malformed_formula_is_not_partial_success",
+            "test_mappings_supported_no_mutation_or_result_aliases",
+            "test_missing_and_invalid_cache_are_not_fabricated",
+            "test_nonfinite_inputs_and_malformed_typed_values",
+            "test_operations_are_global_not_reset_per_formula",
+            "test_range_exact_bound_plus_one_and_sparse_work_limit",
+            "test_refusal_error_and_cycle_preserve_original_records",
+            "test_regression_aggregate_range_eof_is_cell_local",
+            "test_regression_ascii_decimal_scientific_after_refusal",
+            "test_regression_boundary_refusal_dependencies_no_cache_fallback",
+            "test_regression_legal_ranges_after_truncated_range",
+            "test_regression_no_python_execution_or_unlisted_runtime_imports",
+            "test_regression_output_is_strict_json_and_reasons_no_source_echo",
+            "test_regression_trailing_range_eof_is_cell_local",
+            "test_regression_unicode_numeric_lookahead_is_cell_local",
+            "test_regression_unicode_text_and_sheet_tokens_remain_inert",
+            "test_self_cycle_mutual_cycle_and_unrelated_healthy_cell",
+            "test_shared_refusal_fanout_and_repeat_calls_do_not_leak_state",
+            "test_sheet_ids_are_not_casefolded_or_unicode_normalized",
+            "test_typed_literals_match_current_ooxml_raw_cells",
+            "test_unknown_date_type_and_resource_dependency_are_explicit",
+            "test_unsupported_functions_names_arrays_and_operators_no_cache_fallback"
+          ],
+          "contract": "declared primary entry; Ordinary unittest/pytest whole-module bounded formula evaluator on in-memory synthetic cell data. Import reads/executes real helper; no parser, XLSX file, SDK absence, SQL, subprocess or model; standalone SOURCE alternative valid.",
+          "requires": [
+            "exact_source_inputs",
+            "native_legacy"
+          ],
+          "execution_evidence": null
+        }
+      ]
+    },
+    {
       "path": "tests/test_startup_fts_and_diagnostics.py",
       "sha256": "7382b1eddafbfe81d7c58711413f0b7265e04ed7f067eb6eded1333083c9c983",
       "role": "pytest",
@@ -6261,6 +7946,57 @@
       "requires_sdk_absent": false,
       "peers": [],
       "reason": "Current shipped test source. Collectible declarations; full prerequisites/individual bodies NOT executed by inventory."
+    },
+    {
+      "role": "pytest",
+      "lane": "legacy",
+      "requires": [
+        "exact_source_inputs",
+        "native_legacy"
+      ],
+      "requires_sdk_absent": false,
+      "reason": "Inert ordinary unittest/pytest source-extracted complete schema dictionary and packaging modules; synthetic native-export/CompletedProcess seams. Own temp JSON only, no genuine native command/SDK/release execution.",
+      "entry": {
+        "kind": "pytest",
+        "invocation": "tests/cold_lane_entry.py legacy docs/COLD_LANES.json -> pytest.main([\"tests/test_tool_schema_source_parity.py\"]) via separately admitted recorder",
+        "callables": {}
+      },
+      "peers": [],
+      "path": "tests/test_tool_schema_source_parity.py",
+      "sha256": "819642b05dc1821c83e7d86184109ee3c91cec3f21239e393fa98cc77f1198f3",
+      "case_groups": [
+        {
+          "owner": "ToolSchemaSourceParity",
+          "methods": [
+            "test_cache_meets_pinned_api_major_contract",
+            "test_cache_read_error_is_not_staleness",
+            "test_cache_write_error_is_not_staleness",
+            "test_check_detects_nested_drift_readonly",
+            "test_check_healthy_is_readonly",
+            "test_check_missing_cache_is_stale",
+            "test_complete_schema_cache_matches_source_and_manifest",
+            "test_document_options_share_full_declared_contract",
+            "test_extraction_rejects_new_external_dependency_AST",
+            "test_native_export_error_is_not_staleness",
+            "test_native_gate_wiring_is_unconditional_AST",
+            "test_release_failure_preserves_child_exit_and_streams",
+            "test_release_launch_failure_does_not_claim_mismatch",
+            "test_release_stale_preserves_stale_marker",
+            "test_release_success_still_requires_native_command",
+            "test_render_rejects_duplicate_names",
+            "test_render_rejects_empty_name",
+            "test_render_rejects_manifest_order_drift",
+            "test_schema_validation_error_is_not_staleness",
+            "test_write_renders_utf8_lf"
+          ],
+          "contract": "declared primary entry; Inert ordinary unittest/pytest source-extracted complete schema dictionary and packaging modules; synthetic native-export/CompletedProcess seams. Own temp JSON only, no genuine native command/SDK/release execution.",
+          "requires": [
+            "exact_source_inputs",
+            "native_legacy"
+          ],
+          "execution_evidence": null
+        }
+      ]
     },
     {
       "path": "tests/test_unified_recall.py",
@@ -6370,28 +8106,51 @@
     "tests/ci_owned/foreign_reindex_cases.py",
     "tests/ci_owned/test_current_sdk_bootstrap.py",
     "tests/test_ci_lifecycle_observer.py",
+    "tests/test_cold_lane_current_composition.py",
     "tests/test_cold_lane_partition.py",
     "tests/test_collection_evidence.py",
     "tests/test_connector_legacy_schema_owner.py",
     "tests/test_connector_stage_admission.py",
     "tests/test_connector_stage_home_compat.py",
+    "tests/test_document_embedding_handoff_source.py",
+    "tests/test_document_parser_causal_chain.py",
+    "tests/test_document_parser_pdf_ocr.py",
+    "tests/test_document_parser_review_boundaries.py",
+    "tests/test_document_parser_terminal_veto.py",
+    "tests/test_document_parser_veto_cleanup.py",
+    "tests/test_document_parser_veto_composition.py",
+    "tests/test_document_parser_xlsx_formulas.py",
+    "tests/test_document_parser_xlsx_output_privacy.py",
+    "tests/test_document_posix_fd_owner.py",
+    "tests/test_document_public_options_source.py",
+    "tests/test_document_unit_context_order_source.py",
+    "tests/test_document_windows_lifetime_source.py",
+    "tests/test_document_xlsx_identity_source.py",
+    "tests/test_document_xlsx_rematerialization_source.py",
     "tests/test_episode_projection_guard.py",
     "tests/test_erasure_atomic_bootstrap.py",
     "tests/test_extraction_graph_intent.py",
     "tests/test_extraction_guard_completion.py",
+    "tests/test_extractor_shared_codex_auth_source.py",
+    "tests/test_foundation_ci_prerequisites.py",
     "tests/test_graph_public_settings_unavailable.py",
     "tests/test_graph_settings_unavailable.py",
     "tests/test_graph_worker_origin_session.py",
     "tests/test_journal_rebuild_owner_lifetime.py",
     "tests/test_local_guard_required_gaps.py",
+    "tests/test_luna_extractor_boundaries.py",
+    "tests/test_luna_extractor_source_scope.py",
+    "tests/test_luna_oracle_compat_source.py",
     "tests/test_mandatory_redactor_admin.py",
     "tests/test_observation_guard_unavailable.py",
     "tests/test_p2_g3_repair01_pure.py",
     "tests/test_p2_g4_identity_errors.py",
     "tests/test_p2_g4_repair01.py",
     "tests/test_r02_null_pagination_20261004.py",
+    "tests/test_recent_changes_visibility_source.py",
     "tests/test_restore_erasure_namespace.py",
-    "tests/test_runtime_source_identity.py"
+    "tests/test_runtime_source_identity.py",
+    "tests/test_secret_metadata_owner.py"
   ],
   "source_entry": "tests/ci_owned/doc_code_carrier_cases.py",
   "source_fixture_inputs": [
@@ -6412,9 +8171,22 @@
     "lane": "source-explicit",
     "native_cold_process_excluded": true,
     "requires_SDK_absent": "PER_FILE requires_sdk_absent, not all stdlib packets",
-    "execution": "Each declared direct unittest/make_suite/callable/isolated pytest entry retains its actual prerequisites. No universal SOURCE pytest under native conftest."
+    "execution": "Each declared direct unittest/make_suite/callable/isolated pytest entry retains its actual prerequisites. No universal SOURCE pytest under native conftest.",
+    "entry_effects": "source-explicit separates incompatible SDK-preload from explicit entries, not an automatic stock SOURCE grant. POSIX real-FD and mixed SQL/SPI case_groups retain separate native/filesystem/SQL prerequisites; metadata census executes none of them."
   },
   "native_explicit_packets": [
+    {
+      "path": "tests/test_ci_checkout_eol.py",
+      "entry": "python -I -B -S tests/test_ci_checkout_eol.py --git EXACT_GIT --fixture-root NEW_OWNED_ROOT",
+      "prerequisites": "Explicit Git metadata main creates real local Git subprocesses; module __test__=False. No SDK/SQL/network; not a stock SOURCE child. Current full checkout/declared readonly sources and transitive shipped test peers required. Static filename/import peers are layout dependencies, not a complete native dependency or semantic body audit. Separate explicit local-Git metadata packet: exact --git executable, new --fixture-root, credential-free Git configs, retained intents/captures and finite Git subprocess admission. NOT stock stdlib SOURCE; no SDK required.",
+      "executed_evidence": null
+    },
+    {
+      "path": "tests/test_document_windows_handle_owner.py",
+      "entry": "python -I -S -B -u tests/test_document_windows_handle_owner.py --owned-root NEWDIR; or --plan FILE with raw plan SHA on stdin",
+      "prerequisites": "Explicit native Windows HANDLE/FD/ctypes component, SESSION-required setup; ordinary collection inert, arbitrary pytest setup invalid. No genuine SDK or SQL. Current full checkout/declared readonly sources and transitive shipped test peers required. Static filename/import peers are layout dependencies, not a complete native dependency or semantic body audit. Separate Windows -I -S -B native HANDLE/ctypes component through exact main(--owned-root NEWDIR) or --plan plus stdin SHA; fresh ctypes/product namespace, declared readonly stdlib/public closure and owned fixture envelope. NOT SOURCE/native SDK authority.",
+      "executed_evidence": null
+    },
     {
       "path": "tests/test_fts_transaction_handoff.py",
       "entry": "run_fts_packet(provider, manager, root, checkpoint); run_negative_packet(provider, manager, root, checkpoint); run_retained_fts_unknown(home, session_id, checkpoint)",
@@ -6428,7 +8200,7 @@
       "executed_evidence": "7-case isolated packet at runtime source SHA 7ebb63ce54ea1c0fb2f56fddc2cb7a7b4aeabae3ae271fa8262c56fcc0aa51f3; not full cold native suite/fleet."
     }
   ],
-  "file_count": 322,
+  "file_count": 355,
   "requirements": {
     "native_legacy": "BLOCKED until independently admitted native cold bootstrap, genuine SDK/registry/MRO and dependency origins; trust-core genuinely absent; HERMES_SECURITY_STRICT=0. No SDK substitution or import hiding.",
     "native_strict": "BLOCKED until independently admitted native cold bootstrap, genuine SDK/registry/MRO, complete dependencies and actual public hermes_trust_core delivery/API; HERMES_SECURITY_STRICT=1.",
@@ -6444,7 +8216,15 @@
     "exact_source_inputs": "Current full checkout/declared readonly sources and transitive shipped test peers required. Static filename/import peers are layout dependencies, not a complete native dependency or semantic body audit.",
     "mixed_security_modes": "File contains multiple security-mode paths; future FULL must prove actual per-case cold mode and no unsupported skip/xfail. This file-level declaration is not per-node execution admission.",
     "protected_fixture_settings": "Some existing cases can write synthetic protected settings or spawn workers. Current no-config/env/native-child scope does not admit those effects; future own fixture/resource admission required.",
-    "isolated_ci_peer_binding": "Before the initial from binding_cases import, use the exact stdlib -I -B -S -c/runpy bootstrap and only the entry own tests/ci_owned path. Genuine peer then binds scripts/ci_owned; all declared source_inputs SHA-bound. Run from the complete source root with existing empty owned MW_CI_UNIT_FIXTURES and clean home/temp. No SDK path, site or PYTHONPATH; no new runner."
+    "isolated_ci_peer_binding": "Before the initial from binding_cases import, use the exact stdlib -I -B -S -c/runpy bootstrap and only the entry own tests/ci_owned path. Genuine peer then binds scripts/ci_owned; all declared source_inputs SHA-bound. Run from the complete source root with existing empty owned MW_CI_UNIT_FIXTURES and clean home/temp. No SDK path, site or PYTHONPATH; no new runner.",
+    "git_checkout_fixture": "Separate explicit local-Git metadata packet: exact --git executable, new --fixture-root, credential-free Git configs, retained intents/captures and finite Git subprocess admission. NOT stock stdlib SOURCE; no SDK required.",
+    "posix_fd_component": "Separate POSIX/Linux real-FD/symlink/snapshot component: supported POSIX OS, complete shipped baseline fixtures, own /work and synthetic home/temp, DOCUMENT_POSIX_FD_OFFLINE=1 for offline main. Actual SDK absence assertions; real opens/closes and links are NOT admitted by stock SOURCE.",
+    "windows_handle_component": "Separate Windows -I -S -B native HANDLE/ctypes component through exact main(--owned-root NEWDIR) or --plan plus stdin SHA; fresh ctypes/product namespace, declared readonly stdlib/public closure and owned fixture envelope. NOT SOURCE/native SDK authority.",
+    "optional_parser_component": "Separate finite optional parser opt-in MEMORY_WIKI_PARSER_COMPONENT_OPT_IN=1, real compatible PyMuPDF/pypdf installed, own absolute TMPDIR, exact extractor/formula bindings; absent libraries/opt-in cause existing skips, not qualification. No installation authorized by metadata.",
+    "own_sqlite_source": "Separate finite own SQLite/filesystem allowance for the explicit SQL suite, real file-backed connections and cleanup. SOURCE extraction/synthetic principals do not establish native provider SQL-owner/SDK authority. Not admitted by a non-SQL packet.",
+    "pinned_external_source_inputs": "Entry requires named frozen external SOURCE carriers/baselines or extracted owning-method spans with exact full-origin/raw/span hashes. Oversized full provider must not be a direct stock binding; no fake SDK/missing-import success.",
+    "explicit_source_binding": "Bind the actual make_suite/packet_suite or admitted main before TestCase setup, complete shipped transitive peers/products/fixtures, credential-free homes/TMPDIR and original bound-reader audit. Bare pytest/unittest discovery is not that binding.",
+    "mixed_entry_contracts": "All case declarations remain catalogued. Explicit SOURCE/static and separately admitted SQL/native/baseline cohorts have different entry contracts recorded in case_groups/entry_variants; no whole-file SOURCE or native PASS inferred."
   },
   "pending_peer_inputs": [],
   "source_pins": [
@@ -6458,11 +8238,11 @@
     },
     {
       "path": "__init__.py",
-      "sha256": "3b5318cafa62dad23870aecd515ba0786548c2502cdd82022f96093c164295fc"
+      "sha256": "8007b015f204a0b673e7cf41410fe609f60b8151bd39d9042a53336de7fdaf09"
     },
     {
       "path": "packaging/run_native_regressions.py",
-      "sha256": "5222f1ac2edc98eb2eb79a8079b5f8ded5e2ab68c9cfb2bfa30dd9dc426c2d49"
+      "sha256": "ba0c97a0f6af0cb6557be78d787ae7dbbe496dd29b051426c01992e260a298bc"
     },
     {
       "path": "scripts/ci_owned/ci_bootstrap.py",
@@ -6470,7 +8250,7 @@
     },
     {
       "path": "scripts/ci_owned/ci_child.py",
-      "sha256": "de53a5f95ca2814929d884acfdf9d2161ce42ba29ce0ccd9205ed3b6dd7aeab4"
+      "sha256": "65f7987d3ee9eedbad957bee0d50ad237771c796286f33a9e62af895eeeed13a"
     },
     {
       "path": "scripts/ci_owned/ci_output_admission.py",
@@ -6486,7 +8266,7 @@
     },
     {
       "path": "scripts/ci_owned/memory_wiki_ci.py",
-      "sha256": "6c9e9619ec4a96f0cd6d583408cb170844d1e40b4eee2332be8aaad859cf31dc"
+      "sha256": "541fdb0d94efec2314f910f1f723a107305d4fea09a1ef276a508f38870f204d"
     },
     {
       "path": "tests/fixtures/g4_original_boundary_gold.txt",
@@ -6521,8 +8301,19 @@
     "new_test_python_files": 1,
     "counting_unit": "unique current tests/**/*.py regular source file, not pytest nodes/cases or semantic body review",
     "baseline": "a208e12a03ab1d290372ce059a7a7ab8d711bfd3",
-    "final_merge_rebind": "Required after writer B delivers actual test/workflow/controller bytes; no guessed peer hash",
+    "final_merge_rebind": "Rebound to complete independently enumerated d4-derived physical current355 census and all source_pins; any subsequent raw/test/layout change requires a new rebind. No Core/trust/SDK authority supplied.",
     "source_pins_scope": "Provider/declared existing entries/workflow/gold source identity only; not full product dependency import closure",
-    "peer_edges_scope": "Conservative statically named test filenames/imports; not proof all dynamic imports/runtime branches were reviewed"
+    "peer_edges_scope": "Conservative statically named test filenames/imports; not proof all dynamic imports/runtime branches were reviewed",
+    "current_rebind": {
+      "baseline": "d4b45cb337e496648ce0ab7c80a606065d80c5e2",
+      "baseline_descriptor_sha256": "fbd512127d0de3ac07ca659f6128db52e79ad092ebd1a41cfa95cbb46ffa851e",
+      "baseline_declared_tests": 322,
+      "baseline_actual_tests": 354,
+      "baseline_missing_from_descriptor": 32,
+      "baseline_stale_bindings": 16,
+      "new_regression_files": 1,
+      "current_test_python_files": 355,
+      "no_new_testbody_execution_or_native_admission": true
+    }
   }
 }

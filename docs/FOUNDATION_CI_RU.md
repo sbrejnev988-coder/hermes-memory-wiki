@@ -482,3 +482,66 @@ ordinary native pytest, genuine SDK/SQL, FULL/build/install/loaded/release
 в этой работе **NOT_RUN**. Старые SOURCE tests, ReviewBoundaryControls, gold,
 workflows и COLD descriptor/pins сохраняются byte-exact. Независимое review,
 приёмка/интеграция и любая публикация остаются отдельными действиями родителя.
+
+
+## Current COLD composition и standalone isolation (d4-derived SOURCE)
+
+`COLD_LANES.json` перепривязан к полному текущему `tests/**/*.py` census:
+355 файлов, включая новый `test_cold_lane_current_composition.py`. Исходный d4
+manifest содержал322 записи при354 физических Python inputs:32 неописанных
+файла и16 stale test/entry/provider pins. Это SOURCE-механизм рассогласования
+metadata, **не установленная причина historical CI failure/hang/OOM**.
+
+Все прежние роли/entry/peer/fixture/bootstrap/security contracts сохранены.
+32 добавления классифицированы по реальному import/setup/call/cleanup: есть
+обычные pytest-compatible controls, отдельные SOURCE suites/factories, настоящий
+optional parser component, native SDK/SQLite writer cases и explicit Git/Windows
+HANDLE/POSIX FD компоненты. `case_groups` сохраняют полный статический roster,
+а `entry_variants` различают SOURCE и отдельные SQL/SPI/baseline cohorts в mixed
+файлах. Эти поля не являются выполнением cases. SDK absence объявлена только там,
+где её действительно требует entry/body; имя `_source` или peer edge её не дают.
+
+У `ColdPartitionTests` добавлен только class-level `__test__ = False` и комментарий.
+Его explicit stdlib main/reporter, setup/cleanup и все41 метода не изменены;
+raw inverse marker восстанавливает прежний whole-file SHA. Собственное
+`requires_sdk_absent` исправлено наtrue: старый последний case действительно
+проверяет отсутствие `agent.memory_provider` и `memory_wiki`. Новый класс также
+имеет marker. Это условная изоляция по стандартному pytest collector contract;
+**actual ordinary/native pytest collection здесь NOT_RUN**. Не изменены
+`native_pytest_args`, workflows, G4 gold, `validate_partition`, `partition_digest`
+или настоящий cold entry.
+
+Поддержанный standalone SOURCE entry из полного checkout:
+
+```text
+<selected-python> -I -B -S tests/test_cold_lane_current_composition.py
+```
+
+Перед entry нужны собственные credential-free HOME/USERPROFILE/AppData/HERMES_HOME
+и существующий абсолютный TMPDIR; без SDK/package preload. Main сначала вызывает
+**неизменённый старый main** (41 cases с прежним reporter/lifecycle), затем14 новых
+controls; всего55 unique main unittest cases. Внутри них2 expected-baseline
+witnesses отдельно показывают missing32/stale16,7 main имеют только STATIC
+проверки, остальные46 исполняют metadata validator/stdlib SOURCE seams.
+Subtests и вложенные инертные unittest bootstrap fixtures не прибавляются к55.
+355 каталогизированных файлов не импортируются и их suites не запускаются.
+
+В permanent harness используется прежний независимый compressed full-census
+transport `COLD_TEST_INPUTS.zlib` + `COLD_ENTRY_INPUTS.zlib`, exact bound reader,
+stock audit/bootstrap/supervise/interpret и один finite SOURCE packet. Carrier
+должен быть создан независимым no-follow обходом актуального дерева, а не списком
+manifest; каждый reconstructed raw pin сверяется. Нельзя передавать oversized
+provider direct binding, увеличивать guards или подставлять SDK. Для Windows
+SOURCE API допустимы только поддержанные собственные empty-pycache/no_debug_ranges
+flags и отдельно допущенные точные stock output/scratch paths. Известный aggregate
+CLI refusal не повторяется: API SOURCE receipt не называется canonical CLI PASS.
+
+Entry/descriptor наличие или metadata rebind **не дают допуск на запуск**.
+Действующий finite REQUEST/admission, точные output/scratch paths, полный binder,
+readonly census, deadline/report/capture/ownership budget проверяются до child.
+Если path admission отсутствует, packet остаётся BLOCKED/NOT_RUN с actual0 до
+отдельного узкого parent binding; готовый packet не повторяется ради formatter.
+`native_sdk_execution_admitted=false`, `no_selection_filters=true`, null actual
+Core/trust origins/closures и разные ordinary/hosted CORE_SHA сохранены. Real
+parser/FD/HANDLE, SQL/SPI, native/Linux/FULL/hosted/CI/installed/loaded gates имеют
+свои прежние закрытые prerequisites и не квалифицируются этой SOURCE дельтой.
