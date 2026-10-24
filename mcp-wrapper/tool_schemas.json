@@ -2719,7 +2719,7 @@
   },
   {
     "name": "memory_wiki_document_unit_context",
-    "description": "Return neighbouring addressable document units around an anchor or unit ID.",
+    "description": "Return neighbouring addressable document units around an anchor or unit ID. Pin expected_revision_id for citation follow-up; omission navigates current coordinates, not historical text.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -2739,6 +2739,13 @@
           "default": 5,
           "minimum": 0,
           "maximum": 100
+        },
+        "expected_revision_id": {
+          "type": "string",
+          "minLength": 35,
+          "maxLength": 35,
+          "pattern": "^docrev_[0-9a-f]{28}$",
+          "description": "Literal revision_id from an admitted citation; stale or malformed pins refuse. Omit for current-coordinate navigation."
         }
       },
       "required": [
@@ -2748,7 +2755,7 @@
   },
   {
     "name": "memory_wiki_document_neighbors",
-    "description": "Traverse structural and formula/reference edges around a document anchor.",
+    "description": "Traverse structural and formula/reference edges around a document anchor. Pin expected_revision_id for citation follow-up; omission navigates current coordinates, not historical text.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -2769,6 +2776,13 @@
           "default": 100,
           "minimum": 1,
           "maximum": 1000
+        },
+        "expected_revision_id": {
+          "type": "string",
+          "minLength": 35,
+          "maxLength": 35,
+          "pattern": "^docrev_[0-9a-f]{28}$",
+          "description": "Literal revision_id from an admitted citation; stale or malformed pins refuse. Omit for current-coordinate navigation."
         }
       },
       "required": [
