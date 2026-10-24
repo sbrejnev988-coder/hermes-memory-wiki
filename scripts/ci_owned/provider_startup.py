@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-CLAIM = 'Atlas foundation observatory keeps its copper telescope in the east dome.'
+CLAIM = 'User prefers the Atlas foundation observatory copper telescope in the east dome.'
 SESSION = 'foundation-startup-session'
 BOT = 'foundation-startup-bot'
 
