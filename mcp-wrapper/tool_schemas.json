@@ -1604,6 +1604,19 @@
         "dry_run": {
           "type": "boolean",
           "default": true
+        },
+        "outbox_job_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 100,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 16,
+            "maxLength": 16,
+            "pattern": "^[0-9a-f]{16}$"
+          },
+          "description": "Exact failed outbox job IDs; required for outbox retry/preflight. Applies only to outbox (including that action in all); never grants ownership."
         }
       },
       "required": []
