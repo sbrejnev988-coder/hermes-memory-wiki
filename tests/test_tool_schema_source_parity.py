@@ -114,6 +114,18 @@ class ToolSchemaSourceParity(unittest.TestCase):
         self.assertEqual(ingest["required"], ["path"])
         self.assertEqual(scan["required"], [])
 
+    def test_document_lookup_revision_contract_is_optional_and_exact(self):
+        expected = {"type": "string", "minLength": 35, "maxLength": 35,
+                    "pattern": "^docrev_[0-9a-f]{28}$",
+                    "description": "Literal revision_id from an admitted citation; stale or malformed pins refuse. Omit for current-coordinate navigation."}
+        by_name = {row["name"]: row for row in self.schemas}
+        for name in ("memory_wiki_document_unit_context", "memory_wiki_document_neighbors"):
+            with self.subTest(tool=name):
+                row = by_name[name]
+                self.assertEqual(row["parameters"]["properties"]["expected_revision_id"], expected)
+                self.assertNotIn("expected_revision_id", row["parameters"]["required"])
+                self.assertIn("omission navigates current coordinates, not historical text.", row["description"])
+
     def test_cache_meets_pinned_api_major_contract(self):
         checker = _script("packaging/check_mcp_compatibility.py")
         baseline = json.loads((ROOT / "compatibility/mcp-api-v1.json").read_bytes())

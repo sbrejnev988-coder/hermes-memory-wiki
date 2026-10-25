@@ -31,6 +31,140 @@ CASE_IDS = (
 )
 
 
+# Frozen document346 inverse, metadata only. Original bodies are literal Git
+# witnesses from 028fe5f; they are never compiled, imported or executed here.
+# Full current owner hashes bind helper/SELECT/predicates/output as intended;
+# arbitrary edits inside those owners cannot disappear behind an AST projection.
+REVISION_ORIGINAL_028 = {'document_unit_context': ('0c55fe0fd37e1fc8cb26684730a2189a9e56ddc1c7f2b2cd15d4348c58ea05cd',
+                           'def document_unit_context(provider: Any, args: Dict[str, Any]) -> '
+                           'Dict[str, Any]:\n'
+                           '    source_id = str(args.get("source_id") or "").strip()\n'
+                           '    unit_id = str(args.get("unit_id") or "").strip()\n'
+                           '    anchor = str(args.get("anchor") or "").strip()\n'
+                           '    radius = max(0, min(int(args.get("radius") or 5), 100))\n'
+                           '    if not source_id: raise ValueError("source_id is required")\n'
+                           '    conn = provider._connect(); install_document_graph_schema(conn)\n'
+                           '    disclosure = _document_disclosure(provider, conn)\n'
+                           '    source = conn.execute("SELECT '
+                           'scope_id,repository_id,parser,extension,metadata_json FROM '
+                           'document_sources WHERE source_id=? AND active=1", '
+                           '(source_id,)).fetchone()\n'
+                           '    if not source: raise ValueError("document source not found")\n'
+                           '    disclosure.documents(disclosure.watch("document_sources", '
+                           '"source_id", [source_id]))\n'
+                           '    _assert_source_access(provider, source)\n'
+                           '    _assert_connector_owner(provider, source_id)\n'
+                           '    xlsx_context = _stored_xlsx_context(source)\n'
+                           '    if unit_id:\n'
+                           '        target = conn.execute("SELECT ordinal FROM document_units '
+                           'WHERE source_id=? AND unit_id=? AND active=1", (source_id, '
+                           'unit_id)).fetchone()\n'
+                           '    elif anchor:\n'
+                           '        target = conn.execute("SELECT ordinal FROM document_units '
+                           'WHERE source_id=? AND anchor=? AND active=1", (source_id, '
+                           'anchor)).fetchone()\n'
+                           '    else:\n'
+                           '        raise ValueError("unit_id or anchor is required")\n'
+                           '    if not target: raise ValueError("document unit not found")\n'
+                           '    ordinal = int(target[0]); rows = conn.execute(\n'
+                           '        "SELECT '
+                           'unit_id,parent_unit_id,unit_type,anchor,ordinal,title,unit_text,locator_json,metadata_json '
+                           'FROM document_units "\n'
+                           '        "WHERE source_id=? AND active=1 AND ordinal BETWEEN ? AND ? '
+                           'ORDER BY ordinal",\n'
+                           '        (source_id, max(0, ordinal-radius), ordinal+radius),\n'
+                           '    ).fetchall()\n'
+                           '    units = []\n'
+                           '    disclosure.documents(disclosure.watch("document_units", "unit_id", '
+                           "[r['unit_id'] for r in rows]))\n"
+                           '    for raw in rows:\n'
+                           '        item = _row(raw)\n'
+                           '        item["unit_text"] = _clean(item.get("unit_text"), 20_000)\n'
+                           '        item = _hydrate_document_unit(item, xlsx_context)\n'
+                           '        units.append(item)\n'
+                           '    out = {"source_id": source_id, "target_ordinal": ordinal, "units": '
+                           'units}\n'
+                           '    if source["parser"] == "stdlib-xlsx-ooxml" and xlsx_context is '
+                           'None:\n'
+                           '        out["xlsx_identity_state"] = "legacy_or_withheld"\n'
+                           '    return _disclosed_document_output(provider, out, disclosure)\n'),
+ 'document_neighbors': ('671857cb4e35941c11bd91e4f4ae3f9c1bb24bc6aba1d90483202d5448526d88',
+                        'def document_neighbors(provider: Any, args: Dict[str, Any]) -> Dict[str, '
+                        'Any]:\n'
+                        '    source_id = str(args.get("source_id") or "").strip(); anchor = '
+                        'str(args.get("anchor") or "").strip()\n'
+                        '    hops = max(1, min(int(args.get("hops") or 1), 3)); limit = max(1, '
+                        'min(int(args.get("limit") or 100), 1000))\n'
+                        '    if not source_id or not anchor: raise ValueError("source_id and '
+                        'anchor are required")\n'
+                        '    conn = provider._connect(); install_document_graph_schema(conn)\n'
+                        '    disclosure = _document_disclosure(provider, conn)\n'
+                        '    source = conn.execute("SELECT scope_id,repository_id FROM '
+                        'document_sources WHERE source_id=? AND active=1", '
+                        '(source_id,)).fetchone()\n'
+                        '    if not source: raise ValueError("document source not found")\n'
+                        '    disclosure.documents(disclosure.watch("document_sources", '
+                        '"source_id", [source_id]))\n'
+                        '    _assert_source_access(provider, source)\n'
+                        '    _assert_connector_owner(provider, source_id)\n'
+                        '    queue = deque([(anchor, 0)]); seen = {anchor}; found = []\n'
+                        '    while queue and len(found) < limit:\n'
+                        '        node, depth = queue.popleft()\n'
+                        '        if depth >= hops: continue\n'
+                        '        rows = conn.execute(\n'
+                        '            "SELECT '
+                        'edge_id,source_anchor,predicate,target_anchor,evidence,confidence FROM '
+                        'document_edges WHERE source_id=? AND active=1 AND (source_anchor=? OR '
+                        'target_anchor=?) LIMIT ?",\n'
+                        '            (source_id, node, node, limit-len(found)),\n'
+                        '        ).fetchall()\n'
+                        '        for raw in rows:\n'
+                        '            edge = _row(raw); found.append(edge)\n'
+                        '            other = edge["target_anchor"] if edge["source_anchor"] == '
+                        'node else edge["source_anchor"]\n'
+                        '            if other not in seen: seen.add(other); queue.append((other, '
+                        'depth+1))\n'
+                        '    disclosure.watch("document_edges", "edge_id", [r[\'edge_id\'] for r '
+                        'in found])\n'
+                        '    return _disclosed_document_output(provider, {\n'
+                        '        "source_id": source_id, "anchor": anchor, "hops": hops,\n'
+                        '        "edges": found[:limit], "nodes": sorted(seen),\n'
+                        '    }, disclosure)\n')}
+REVISION_HELPER_SHA256 = '13661192ae369c4ccaf2673380b4674d8fee6045e527fc756dfb48fcdcff2770'
+
+
+def document_revision_inverse(raw):
+    if (type(raw) is not bytes or hashlib.sha256(raw).hexdigest() !=
+            'b7aaa8cbcfdcc44bbd8d0061214f5fa81324753ad01d6083222c41392e59003c'):
+        raise ValueError('exact_document346_graph_required')
+    tree = ast.parse(raw)
+    lines = raw.splitlines(keepends=True)
+    edits = []
+    for name in ('_document_lookup_revision', *REVISION_ORIGINAL_028):
+        nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == name]
+        if len(nodes) != 1:
+            raise ValueError('unique_revision_inverse_owner')
+        node = nodes[0]
+        span = b''.join(lines[node.lineno - 1:node.end_lineno])
+        if name == '_document_lookup_revision':
+            expected, replacement = REVISION_HELPER_SHA256, b''
+            end = node.end_lineno + 2
+            if lines[node.end_lineno:end] != [b'\n', b'\n']:
+                raise ValueError('revision_helper_boundary')
+        else:
+            expected, original = REVISION_ORIGINAL_028[name]
+            replacement, end = original.encode('utf-8'), node.end_lineno
+        if hashlib.sha256(span).hexdigest() != expected:
+            raise ValueError('revision_inverse_owner_bytes')
+        edits.append((node.lineno - 1, end, replacement))
+    for start, end, replacement in sorted(edits, reverse=True):
+        lines[start:end] = [replacement]
+    inverse = b''.join(lines)
+    if hashlib.sha256(inverse).hexdigest() != '8835f2df870a6aee67a99634d7c5b4681e30bf91174fa0bffbe95fe3918fa8ee':
+        raise ValueError('revision_inverse_whole_graph')
+    return inverse
+
+
 def row_loop(raw, filename):
     """Select the exact direct row loop, never execute the public SQL wrapper."""
     tree = ast.parse(raw, filename=filename)
@@ -258,16 +392,24 @@ class OrderSourceCases:
 
     def test_order_STATIC_outside_loop_and_terminal_fences(self):
         old_tree, old_owner, old_loop = copy.deepcopy(self.source_trees["3dc"])
-        new_tree, new_owner, new_loop = copy.deepcopy(self.source_trees["corrected"])
+        # Historical loop-only equality is asserted on the exact typed/raw
+        # inverse of the accepted revision delta, never on a masked live AST.
+        inverse = document_revision_inverse(self.source_raw["corrected"])
+        new_tree, new_owner, new_loop = row_loop(inverse, "document346_inverse_028.py")
         # Deepcopy of the tuple keeps owner/loop identities within the full tree.
         old_owner.body[old_owner.body.index(old_loop)] = ast.Pass()
         new_owner.body[new_owner.body.index(new_loop)] = ast.Pass()
         self.assertEqual(ast.dump(old_tree, include_attributes=False),
                          ast.dump(new_tree, include_attributes=False))
         old_lines = self.source_raw["3dc"].splitlines(keepends=True)
-        new_lines = self.source_raw["corrected"].splitlines(keepends=True)
+        new_lines = inverse.splitlines(keepends=True)
         self.assertEqual(old_lines[:old_loop.lineno - 1], new_lines[:new_loop.lineno - 1])
         self.assertEqual(old_lines[old_loop.end_lineno:], new_lines[new_loop.end_lineno:])
+        # The current, non-inverted owner still owns the loop and every fence.
+        current_tree, current_owner, current_loop = self.source_trees["corrected"]
+        self.assertEqual(ast.dump(current_loop, include_attributes=False),
+                         ast.dump(new_loop, include_attributes=False))
+        new_tree, new_owner, new_loop = current_tree, current_owner, current_loop
         expected = ast.parse('for raw in rows:\n'
                              '    item = _row(raw)\n'
                              '    item["unit_text"] = _clean(item.get("unit_text"), 20_000)\n'
@@ -284,6 +426,11 @@ class OrderSourceCases:
         self.assertLess(calls["_document_disclosure"][0], calls["_assert_source_access"][0])
         self.assertLess(calls["_assert_source_access"][0], calls["_assert_connector_owner"][0])
         self.assertLess(calls["_assert_connector_owner"][0], calls["_stored_xlsx_context"][0])
+        revisions = [n.lineno for n in ast.walk(new_owner) if isinstance(n, ast.Call)
+                     and isinstance(n.func, ast.Name) and n.func.id == "_document_lookup_revision"]
+        self.assertEqual(len(revisions), 1)
+        self.assertLess(calls["_assert_connector_owner"][0], revisions[0])
+        self.assertLess(revisions[0], calls["_stored_xlsx_context"][0])
         self.assertLess(calls["_stored_xlsx_context"][0], new_loop.lineno)
         self.assertGreater(calls["_disclosed_document_output"][0], new_loop.end_lineno)
         watches = [n for n in ast.walk(new_owner) if isinstance(n, ast.Call)
@@ -300,8 +447,9 @@ class OrderSourceCases:
         self.assertEqual((len(guard), len(finish)), (1, 1))
         self.assertLess(guard[0], finish[0])
         self.observations[self._testMethodName].update(
-            whole_module_outside_exact_loop_equal=True, byte_prefix_suffix_equal=True,
-            scope="STATIC_only_no_guard_or_terminal_SQL_execution")
+            revision_inverse_outside_exact_loop_equal=True, inverse_byte_prefix_suffix_equal=True,
+            current_loop_and_terminal_fences_preserved=True,
+            scope="STATIC_document346_intended_delta_only_no_guard_or_terminal_SQL_execution")
 
 
 def stored_metadata(payload):

@@ -57,6 +57,33 @@ def current_inputs(plan):
     return result
 
 
+def document_current_plan(historical_raw, witness_raw):
+    """Explicit document346 descriptor selection; never rewrite old authority.
+
+    Both documents must be independently bound inputs. This only selects a
+    prepared metadata plan; validate_partition still checks its complete bytes.
+    It neither constructs a transport nor grants a test/native execution.
+    """
+    if (type(historical_raw) is not bytes or type(witness_raw) is not bytes
+            or hashlib.sha256(historical_raw).hexdigest() !=
+            '2e9b8a9f61ef9091734bb197a6be96ea404143cba21d3dd5199f9792bfc83aa4'):
+        raise ValueError('document_witness_historical_binding')
+    witness = json.loads(witness_raw)
+    if (type(witness) is not dict
+            or witness.get('schema') != 'memory-stack.document-revision-current-witness/v1'
+            or witness.get('product_commit') != '346778f6e315143a5e0072cf3d0a686980d79c5f'
+            or witness.get('status') != 'PREPARED_CURRENT_WITNESS_NOT_EXECUTED'):
+        raise ValueError('document_witness_version')
+    plan = witness.get('current_plan')
+    if (type(plan) is not dict or plan.get('file_count') != 359
+            or plan.get('native_sdk_execution_admitted') is not False
+            or plan.get('no_selection_filters') is not True
+            or plan.get('frozen_provider_sha256') !=
+            '16f06dbffaeccfcce7d34c7180c9929e14d7046fa3d3a1dbf276f35b6007a469'):
+        raise ValueError('document_witness_current_contract')
+    return plan
+
+
 class ColdPartitionTests(unittest.TestCase):
     # Explicit stdlib SOURCE only: setUpClass and the suite require no SDK preload.
     __test__ = False
@@ -64,7 +91,13 @@ class ColdPartitionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         if 'DEVTOOLS_INPUTS' in globals():
-            cls.original = json.loads(devtools_read_bound(DEVTOOLS_INPUTS['COLD_LANES.json']))
+            descriptor_raw = devtools_read_bound(DEVTOOLS_INPUTS['COLD_LANES.json'])
+            cls.original = json.loads(descriptor_raw)
+            # Opt-in versioned metadata, not a silent replacement of historical
+            # COLD_LANES or its retained transports/qualification.
+            if 'DOCUMENT_REVISION_CURRENT_WITNESS.json' in DEVTOOLS_INPUTS:
+                cls.original = document_current_plan(descriptor_raw, devtools_read_bound(
+                    DEVTOOLS_INPUTS['DOCUMENT_REVISION_CURRENT_WITNESS.json']))
             cls.inputs = {}
             for name in ('COLD_TEST_INPUTS.zlib', 'COLD_ENTRY_INPUTS.zlib'):
                 carrier = json.loads(zlib.decompress(devtools_read_bound(DEVTOOLS_INPUTS[name])))
@@ -85,7 +118,10 @@ class ColdPartitionTests(unittest.TestCase):
                         cls.inputs[path] = zlib.decompress(data) if encoding == 'zlib' else data
             raw = devtools_read_bound(DEVTOOLS_INPUTS['cold_lane_entry.py'])
         else:
-            cls.original = json.loads((ROOT / 'docs/COLD_LANES.json').read_bytes())
+            # Full-checkout metadata entry explicitly selects the named current
+            # version, keeping the raw historical authority independently bound.
+            cls.original = document_current_plan((ROOT / 'docs/COLD_LANES.json').read_bytes(),
+                (ROOT / 'docs/DOCUMENT_REVISION_CURRENT_WITNESS.json').read_bytes())
             cls.inputs = current_inputs(cls.original)
             raw = cls.inputs['tests/cold_lane_entry.py']
             cls.retained_inputs = None

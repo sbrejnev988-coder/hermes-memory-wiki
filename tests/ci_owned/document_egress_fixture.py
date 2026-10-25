@@ -28,6 +28,9 @@ SOURCE_FILES = ('__init__.py', 'background_jobs.py', 'code_knowledge_graph.py', 
 # Historical runtime inventory: 284062dc8ce12475ec3714854e8033760d08f5166b7f8cab1dd4c79e93574b6c
 # Rebound to the complete 1.24.6 runtime source; no authority from this hash.
 SOURCE_INVENTORY_SHA256 = '8f7c7cd40277064072e897284cfcf613578bab6d98ee9d206941f10b035c2c17'
+# Independent full35 Git-blob inventory of document346; not a native result.
+# SOURCE_FILES, historical inventory, genuine provider and all guards stay intact.
+CURRENT_SOURCE_INVENTORY_SHA256_20261025 = '9c22afb127b9649399e24bbb6ba7bea25f0605038af5f40e9e58bf6e1c5e8f01'
 CASE_IDS = ('sc2_healthy', 'sc2_disabled_initial', 'sc2_late_status_before_rank', 'sc2_late_status_before_http', 'sc2_late_owner_before_http', 'sc2_sql_ABA_before_http', 'sc2_session_before_http', 'sc2_generation_before_http', 'sc2_cache_healthy', 'sc2_cache_late_revoke', 'sc2_response_revoke', 'sc2_tail_false_discards_cache', 'sc2_tail_baseexception_discards_cache', 'sc2_tail_baseexception_preserves_replacement', 'sc3_healthy_cache', 'sc3_unavailable_initial', 'sc3_late_delete_before_http', 'sc3_sql_ABA_before_http', 'sc3_session_before_http', 'sc3_generation_before_http', 'sc3_cache_late_revoke', 'sc3_response_revoke')
 CASE_IDS += ('sc4_healthy_cache', 'sc4_ineligible_initial', 'sc4_late_retire_before_http',
              'sc4_sql_ABA_before_http', 'sc4_session_before_http', 'sc4_generation_before_http',
@@ -83,7 +86,7 @@ def ri_r03_case(request, tmp_path_factory):
         no_links(target)
         observed_pins[name] = hashlib.sha256(target.read_bytes()).hexdigest()
     fingerprint = hashlib.sha256(json.dumps(observed_pins, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
-    require(fingerprint == SOURCE_INVENTORY_SHA256, 'readonly_source_drift')
+    require(fingerprint == CURRENT_SOURCE_INVENTORY_SHA256_20261025, 'readonly_source_drift')
     control = root / 'diagnostics' / 'controls' / hashlib.sha256(request.node.nodeid.encode()).hexdigest()[:16]
     no_links(control)
     control.mkdir(parents=True, exist_ok=False)

@@ -592,7 +592,7 @@ class ColdCurrentCompositionTests(unittest.TestCase):
     def test_01_healthy_final_census_self_inclusion_and_raw_pins(self):
         rows = self.plan['partition']
         actual = sorted(p for p in self.raw if p.startswith('tests/') and p.endswith('.py'))
-        self.assertEqual(len(actual), 357)
+        self.assertEqual(len(actual), 359)
         self.assertEqual([row['path'] for row in rows], actual)
         self.assertIn(SELF, actual)
         result = self.module.validate_partition(self.plan, self.raw)

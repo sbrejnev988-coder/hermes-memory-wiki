@@ -21,9 +21,9 @@ REVIEW = 'tests/test_foundation_ci_review_boundaries.py'
 HYBRID = 'tests/test_hybrid_budget_observability_source.py'
 SELF = 'tests/test_hybrid_current_cohort.py'
 OLD_PIN = '8007b015f204a0b673e7cf41410fe609f60b8151bd39d9042a53336de7fdaf09'
-CURRENT_PIN = '44cdca1b753f13650fcb9c9fb9bdec9192a9f7c11cdffbe91163abe64dd02805'
+CURRENT_PIN = '16f06dbffaeccfcce7d34c7180c9929e14d7046fa3d3a1dbf276f35b6007a469'
 OLD_CRLF = '6c1de6f456837b6c8e0bebe1e54e7030771c811bfd2191af4857cfee0e102479'
-CURRENT_CRLF = 'cdf6ccc05ece2d823522203656308581dd9b0db4829f963c7b499d285aacb5dc'
+CURRENT_CRLF = '4cd2aeb3d83f996bfc465ca9761ee1e014e37b303f9cf3c5cf056046b5926245'
 
 
 def sha(raw):
@@ -112,6 +112,17 @@ class HybridCurrentCohortTests(unittest.TestCase):
                 if path == EOL:
                     self.assertEqual(raw.count(CURRENT_CRLF.encode()), 1)
                     inverse = inverse.replace(CURRENT_CRLF.encode(), OLD_CRLF.encode(), 1)
+                if path == REVIEW:
+                    # Invert the separately qualified finite parser overlay as
+                    # well as the current main literal. Original retained gold
+                    # is not recomputed from the new helper or silently waived.
+                    start = inverse.index(b'# Same immutable audit functions,')
+                    end = inverse.index(b'def tree(relative):')
+                    self.assertEqual(sha(inverse[start:end]), '5e842b6cd80d8ad89253bf3af44e725022477f24d0d09dcd04c154b81a62da2d')
+                    inverse = inverse[:start] + inverse[end:]
+                    current_loop = b'for relative, owner, hook_name, hook_sha in g4_for_runtime(sys.implementation.name, tuple(sys.version_info[:2])):'
+                    self.assertEqual(inverse.count(current_loop), 1)
+                    inverse = inverse.replace(current_loop, b'for relative, owner, hook_name, hook_sha in G4:', 1)
                 self.assertEqual(inverse, self.retained[path])
 
     def test_04_historical_gold_and_original_profile_literals_unchanged(self):
@@ -155,9 +166,11 @@ class HybridCurrentCohortTests(unittest.TestCase):
 
     def test_07_complete_current_census_and_explicit_factory_closure(self):
         tests = sorted(p for p in self.raw if p.startswith('tests/') and p.endswith('.py'))
-        self.assertEqual(len(tests), 357)
+        self.assertEqual(len(tests), 359)
         self.assertEqual(tests, [r['path'] for r in self.plan['partition']])
-        self.assertEqual(set(tests) - {p for p in self.retained if p.startswith('tests/') and p.endswith('.py')}, {HYBRID, SELF})
+        self.assertEqual(set(tests) - {p for p in self.retained if p.startswith('tests/') and p.endswith('.py')},
+                         {HYBRID, SELF, 'tests/test_document_citation_revision_source.py',
+                          'tests/test_document_revision_current_witness_source.py'})
         self.assertEqual(self.row(HYBRID)['entry'], self.cold.hybrid_source_entry())
         self.assertEqual(self.row(SELF)['entry'], self.cold.cohort_source_entry())
         for path, owner in ((HYBRID, 'HybridBudgetObservabilitySource'), (SELF, 'HybridCurrentCohortTests')):

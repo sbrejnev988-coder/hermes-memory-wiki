@@ -40,6 +40,32 @@ G4 = (
 )
 
 
+# Same immutable audit functions, independently parsed with the original
+# ast.dump(..., include_attributes=False)/UTF-8/SHA256 recipe. G4 above is
+# retained 3.13/3.14 gold; no AST fields are erased to hide parser drift.
+G4_HOOKS_311 = (
+    '7c8dc8f27cb06bf09739a987d0e3963233a8f82d291ad1b235ccdf2a86ed737d',
+    '67faf09a8af32aeef33544db398e3902d7b4213712052ebce13912449855abc0',
+)
+G4_HOOKS_312 = (
+    '9471efbda4d97c11933044570085c996fc0de38f44e66a64ad3fbde0f18ccbc1',
+    'b7d2d4299e8f1c8b80b34e472f5e252318b06433bcbbb38bf3ef295393dd7f6e',
+)
+
+
+def g4_for_runtime(implementation, version):
+    if (type(implementation) is not str or implementation != 'cpython'
+            or type(version) is not tuple or len(version) != 2
+            or any(type(part) is not int for part in version)):
+        raise RuntimeError('unsupported_g4_hook_runtime')
+    if version in ((3, 13), (3, 14)):
+        return G4
+    if version not in ((3, 11), (3, 12)):
+        raise RuntimeError('unsupported_g4_hook_runtime')
+    hashes = G4_HOOKS_311 if version == (3, 11) else G4_HOOKS_312
+    return tuple((*row[:3], digest) for row, digest in zip(G4, hashes))
+
+
 def tree(relative):
     return ast.parse((SOURCE / relative).read_bytes())
 
@@ -78,7 +104,7 @@ class ReviewBoundaryControls(unittest.TestCase):
                     sys.path[:] = before_path
 
     def test_original_fence_precedes_every_product_setup_operation(self):
-        for relative, owner, hook_name, hook_sha in G4:
+        for relative, owner, hook_name, hook_sha in g4_for_runtime(sys.implementation.name, tuple(sys.version_info[:2])):
             with self.subTest(file=relative):
                 module = tree(relative)
                 hook = function(module.body, hook_name)
@@ -148,7 +174,7 @@ class ReviewBoundaryControls(unittest.TestCase):
         calls = [n for n in ast.walk(test) if isinstance(n, ast.Call) and ast.unparse(n.func) == 'self.assertEqual']
         pin = next(n for n in calls if n.args and 'hashlib.sha256' in ast.unparse(n.args[0]))
         self.assertIsInstance(pin.args[1], ast.Constant)
-        self.assertEqual(pin.args[1].value, '44cdca1b753f13650fcb9c9fb9bdec9192a9f7c11cdffbe91163abe64dd02805')
+        self.assertEqual(pin.args[1].value, '16f06dbffaeccfcce7d34c7180c9929e14d7046fa3d3a1dbf276f35b6007a469')
         text = ast.unparse(test)
         self.assertLess(text.index(pin.args[1].value), text.index('socket.socket()'))
         self.assertIn('with self.assertRaises(NetworkDenied):', text)
