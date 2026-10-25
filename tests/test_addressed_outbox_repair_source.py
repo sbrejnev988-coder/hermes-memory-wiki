@@ -46,6 +46,8 @@ METADATA_CASE_IDS = (
     "test_only_known_completion_retires_and_sets_applied",
     "test_notification_has_only_locked_live_registry_effects",
     "test_removed_native_fence_is_distinguished",
+    "test_progress_bookkeeping_is_native_success_bound_and_fail_closed",
+    "test_removed_progress_reconciliation_is_distinguished",
 )
 NATIVE_OWNER_CASE_IDS = (
     "test_callback_free_real_owner_commits_and_retires",
@@ -56,6 +58,15 @@ NATIVE_OWNER_CASE_IDS = (
     "test_fatal_before_commit_preserves_identity_and_known_rollback",
     "test_postcommit_fatal_preserves_known_commit_not_false_rollback",
     "test_absent_dead_worker_notification_has_no_whole_store_maintenance",
+    "test_failed_progress_clear_before_stage_refuses_and_rolls_back",
+    "test_successful_progress_clear_reconciles_before_stage",
+    "test_progress_install_remove_is_sticky_inside_stage",
+    "test_ordinary_progress_callback_survives_failed_clear",
+    "test_progress_index_and_bool_use_effective_native_count",
+    "test_progress_nonpositive_counts_are_callback_free",
+    "test_invalid_progress_counts_preserve_registration",
+    "test_fatal_progress_index_preserves_identity_and_known_rollback",
+    "test_failed_progress_clear_inside_stage_stays_sticky_after_clear",
 )
 # These public/native cases require a separately admitted actual semantic
 # target/erasure fixture and independent whole-store readback. No permissive
@@ -102,6 +113,35 @@ def _native_chain_present(tree):
     return bool(_calls(start, "_outbox_retry_commit_fence") and fences and callbacks
                 and min(n.lineno for n in fences) > max(n.lineno for n in callbacks)
                 and _calls(commit, "_graph_start_commit") and _calls(commit, "_graph_native_return"))
+
+
+def _progress_reconciliation_present(tree):
+    """AST-only oracle, not execution of the setter or its native dependency."""
+    setter = _native_method(tree, "set_progress_handler")
+    native = _calls(setter, "set_progress_handler")
+    indices = _calls(setter, "index")
+    if len(native) != 1 or len(indices) != 1:
+        return False
+    effect = native[0]
+    if (ast.unparse(effect.func) != "super().set_progress_handler"
+            or [ast.unparse(arg) for arg in effect.args] != ["callback", "n"]
+            or ast.unparse(indices[0]) != "operator.index(n)" or indices[0].lineno >= effect.lineno):
+        return False
+    assignments = [n for n in ast.walk(setter) if isinstance(n, ast.Assign)
+                   and any(ast.unparse(t) == "self._graph_progress" for t in n.targets)]
+    before = [n for n in assignments if n.lineno < effect.lineno]
+    if len(before) != 1 or ast.unparse(before[0].value) != "pending":
+        return False
+    handlers = [h for h in ast.walk(setter) if isinstance(h, ast.ExceptHandler)
+                and ast.unparse(h.type) == "BaseException"]
+    if len(handlers) != 1:
+        return False
+    handler = handlers[0]
+    return (any(ast.unparse(n) == "self._graph_progress = pending" for n in handler.body)
+            and isinstance(handler.body[-1], ast.Raise) and handler.body[-1].exc is None
+            and any(ast.unparse(n.value) == "progress" and n.lineno > effect.lineno for n in assignments)
+            and all(n.lineno < effect.lineno for n in ast.walk(setter) if isinstance(n, ast.Compare)
+                    and any(isinstance(op, ast.Gt) for op in n.ops)))
 
 
 def _forwarded(call):
@@ -512,6 +552,45 @@ class AddressedOutboxMetadataTests(unittest.TestCase):
         self.assertFalse(_native_chain_present(control))
 
 
+    def test_progress_bookkeeping_is_native_success_bound_and_fail_closed(self):
+        self.assertTrue(_progress_reconciliation_present(self.native_tree))
+        setter = _native_method(self.native_tree, "set_progress_handler")
+        text = ast.unparse(setter)
+        self.assertIn("n = operator.index(n)", text)
+        self.assertIn("progress = callback if n > 0 else None", text)
+        self.assertIn("pending = object()", text)
+        self.assertIn("if self._graph_progress is pending:", text)
+        effect = _calls(setter, "set_progress_handler")[0]
+        # User comparisons cannot run after native installation/clear. A native
+        # failure leaves a non-None uncertainty marker, not asserted absence.
+        self.assertLess(_calls(setter, "index")[0].lineno, effect.lineno)
+        handler = next(n for n in ast.walk(setter) if isinstance(n, ast.ExceptHandler))
+        self.assertIn("self._outbox_retry_stage.callbacks_seen = True", ast.unparse(handler))
+        owner = ast.unparse(_method(self.tree, "_claim_transaction"))
+        self.assertIn("c._graph_user_authorizer, c._graph_trace, c._graph_progress", owner)
+        self.assertIn("value is not None", owner)
+        start = ast.unparse(_native_method(self.native_tree, "_graph_start_commit"))
+        self.assertIn("self._graph_progress is not None", start)
+        # The unchanged pure fence consumes the original sticky lifetime; no
+        # new SQL/ACL/lease reader or postcommit rollback claim is introduced.
+        self.assertIn("if stage.callbacks_seen:", ast.unparse(_definition(self.native_tree, "_outbox_retry_commit_fence")))
+
+    def test_removed_progress_reconciliation_is_distinguished(self):
+        self.assertFalse(_progress_reconciliation_present(self.baseline_native_tree))
+        control = copy.deepcopy(self.native_tree)
+        setter = _native_method(control, "set_progress_handler")
+        conversion = next(n for n in setter.body if isinstance(n, ast.Assign)
+                          and ast.unparse(n.value) == "operator.index(n)")
+        conversion.value = ast.copy_location(ast.Name(id="n", ctx=ast.Load()), conversion.value)
+        self.assertTrue(_progress_reconciliation_present(self.native_tree))
+        self.assertFalse(_progress_reconciliation_present(control))
+        control = copy.deepcopy(self.native_tree)
+        handler = next(n for n in ast.walk(_native_method(control, "set_progress_handler"))
+                       if isinstance(n, ast.ExceptHandler))
+        handler.body[0].value = ast.Constant(value=None)
+        self.assertFalse(_progress_reconciliation_present(control))
+
+
 class AddressedOutboxNativeOwnerTests(unittest.TestCase):
     """NOT_RUN real owner component; NOT public admission/semantic target proof.
 
@@ -773,6 +852,268 @@ class AddressedOutboxNativeOwnerTests(unittest.TestCase):
                 with c.m._OUTBOX_WORKERS_LOCK:
                     if c.m._OUTBOX_WORKERS.get(path) is dead:
                         del c.m._OUTBOX_WORKERS[path]
+
+
+    def test_failed_progress_clear_before_stage_refuses_and_rolls_back(self):
+        with self.fixture_factory('outbox-correction02-failed-clear-before-stage') as c:
+            self._seed(c)
+            seen = []
+            def progress():
+                seen.append('progress')
+                return 0
+            c.conn.set_progress_handler(progress, 1)
+            try:
+                # The confirmed premise: native C-int conversion rejects this
+                # clear BEFORE registration changes, with H already installed.
+                with self.assertRaises(OverflowError):
+                    c.conn.set_progress_handler(None, 10**100)
+                self.assertIsNotNone(c.conn._graph_progress)
+                seen.clear()
+                c.conn.execute('SELECT value FROM correction01_retry_native').fetchall()
+                self.assertTrue(seen, 'native H was silently removed')
+                stage, calls = self._stage(c)
+                with self.assertRaisesRegex(RuntimeError, '^outbox_retry_native_commit_late_callback_unsupported$'):
+                    with c.p._claim_transaction(c.conn, _outbox_retry=stage):
+                        self._update(c)
+                        self.assertTrue(stage.callbacks_seen)
+                self.assertEqual(calls, ['original_admission'])
+                self.assertEqual(self._durable(c), [('before',)])
+                self._retired(c, stage, 'rolled_back')
+                before = len(seen)
+                c.conn.execute('SELECT 1').fetchone()
+                self.assertGreater(len(seen), before)
+            finally:
+                c.conn.set_progress_handler(None, 0)
+
+    def test_successful_progress_clear_reconciles_before_stage(self):
+        with self.fixture_factory('outbox-correction02-successful-clear') as c:
+            self._seed(c)
+            seen = []
+            def progress():
+                seen.append('progress')
+                return 0
+            c.conn.set_progress_handler(progress, 1)
+            with self.assertRaises(OverflowError):
+                c.conn.set_progress_handler(None, 10**100)
+            self.assertIsNotNone(c.conn._graph_progress)
+            # callback=None clears even with a positive, representable count.
+            self.assertIsNone(c.conn.set_progress_handler(None, 1))
+            self.assertIsNone(c.conn._graph_progress)
+            seen.clear()
+            stage, calls = self._stage(c)
+            with c.p._claim_transaction(c.conn, _outbox_retry=stage):
+                self._update(c)
+                self.assertFalse(stage.callbacks_seen)
+            self.assertFalse(seen)
+            self.assertEqual(calls, ['original_admission'])
+            self.assertEqual(self._durable(c), [('after',)])
+            self._retired(c, stage, 'committed')
+
+    def test_progress_install_remove_is_sticky_inside_stage(self):
+        with self.fixture_factory('outbox-correction02-sticky-progress') as c:
+            self._seed(c)
+            seen = []
+            def progress():
+                seen.append('progress')
+                return 0
+            stage, calls = self._stage(c)
+            try:
+                with self.assertRaisesRegex(RuntimeError, '^outbox_retry_native_callback_lifetime_unsupported$'):
+                    with c.p._claim_transaction(c.conn, _outbox_retry=stage):
+                        self._update(c)
+                        c.conn.set_progress_handler(progress, 1)
+                        c.conn.execute('SELECT 1').fetchone()
+                        c.conn.set_progress_handler(None, 0)
+                self.assertTrue(seen and stage.callbacks_seen)
+                self.assertIsNone(c.conn._graph_progress)
+                self.assertEqual(calls, ['original_admission'])
+                self.assertEqual(self._durable(c), [('before',)])
+                self._retired(c, stage, 'rolled_back')
+            finally:
+                c.conn.set_progress_handler(None, 0)
+
+    def test_ordinary_progress_callback_survives_failed_clear(self):
+        with self.fixture_factory('outbox-correction02-ordinary-progress') as c:
+            self._seed(c)
+            seen = []
+            def progress():
+                seen.append('progress')
+                return 0
+            c.conn.set_progress_handler(progress, 1)
+            try:
+                with self.assertRaises(OverflowError):
+                    c.conn.set_progress_handler(None, 10**100)
+                seen.clear()
+                # Noncritical ordinary TX still uses the REAL installed H.
+                with c.p._claim_transaction(c.conn):
+                    self._update(c)
+                self.assertTrue(seen)
+                self.assertIsNotNone(c.conn._graph_progress)
+                self.assertEqual(self._durable(c), [('after',)])
+                self.assertIsNone(c.p._claim_tx_connection)
+                self.assertIsNone(c.p._transaction_quarantine)
+            finally:
+                c.conn.set_progress_handler(None, 0)
+
+    def test_progress_index_and_bool_use_effective_native_count(self):
+        class Count:
+            calls = 0
+            def __index__(self):
+                self.calls += 1
+                return 1
+            def __gt__(self, other):
+                raise AssertionError('user comparison is not native index conversion')
+        class IntCount(int):
+            def __gt__(self, other):
+                raise AssertionError('int-subclass comparison must not run')
+            def __index__(self):
+                raise AssertionError('native int conversion ignores subclass override')
+        indexed = Count()
+        for label, n in (('bool', True), ('index', indexed), ('int-subclass', IntCount(1))):
+            with self.subTest(kind=label), self.fixture_factory('outbox-correction02-count-' + label) as c:
+                self._seed(c)
+                seen = []
+                def progress():
+                    seen.append('progress')
+                    return 0
+                try:
+                    self.assertIsNone(c.conn.set_progress_handler(progress, n))
+                    self.assertIs(c.conn._graph_progress, progress)
+                    c.conn.execute('SELECT 1').fetchone()
+                    self.assertTrue(seen)
+                    if n is indexed:
+                        self.assertEqual(indexed.calls, 1)
+                finally:
+                    c.conn.set_progress_handler(None, 0)
+                stage, calls = self._stage(c)
+                with c.p._claim_transaction(c.conn, _outbox_retry=stage):
+                    self._update(c)
+                self.assertEqual(calls, ['original_admission'])
+                self.assertEqual(self._durable(c), [('after',)])
+                self._retired(c, stage, 'committed')
+
+    def test_progress_nonpositive_counts_are_callback_free(self):
+        class Count:
+            def __init__(self, value):
+                self.value, self.calls = value, 0
+            def __index__(self):
+                self.calls += 1
+                return self.value
+            def __gt__(self, other):
+                raise AssertionError('must use effective native count')
+        for index, n in enumerate((0, -1, False, Count(0), Count(-7))):
+            with self.subTest(index=index), self.fixture_factory('outbox-correction02-nonpositive-' + str(index)) as c:
+                self._seed(c)
+                seen = []
+                def progress():
+                    seen.append('progress')
+                    return 0
+                c.conn.set_progress_handler(progress, 1)
+                try:
+                    # Non-None callback with effective n <= 0 is disabled by
+                    # SQLite, not a callback installed for the critical stage.
+                    self.assertIsNone(c.conn.set_progress_handler(progress, n))
+                    self.assertIsNone(c.conn._graph_progress)
+                    if isinstance(n, Count):
+                        self.assertEqual(n.calls, 1)
+                    seen.clear()
+                    stage, calls = self._stage(c)
+                    with c.p._claim_transaction(c.conn, _outbox_retry=stage):
+                        self._update(c)
+                    self.assertFalse(seen or stage.callbacks_seen)
+                    self.assertEqual(calls, ['original_admission'])
+                    self.assertEqual(self._durable(c), [('after',)])
+                    self._retired(c, stage, 'committed')
+                finally:
+                    c.conn.set_progress_handler(None, 0)
+
+    def test_invalid_progress_counts_preserve_registration(self):
+        class IntOnly:
+            def __int__(self):
+                return 1
+        class BadIndex:
+            def __index__(self):
+                return '1'
+        with self.fixture_factory('outbox-correction02-invalid-counts') as c:
+            self._seed(c)
+            seen = []
+            def progress():
+                seen.append('progress')
+                return 0
+            try:
+                for n, error in ((1.0, TypeError), ('1', TypeError), (None, TypeError),
+                                 (IntOnly(), TypeError), (BadIndex(), TypeError),
+                                 (10**100, OverflowError), (-(10**100), OverflowError)):
+                    with self.subTest(kind=type(n).__name__, error=error.__name__):
+                        c.conn.set_progress_handler(progress, 1)
+                        with self.assertRaises(error):
+                            c.conn.set_progress_handler(None, n)
+                        self.assertIsNotNone(c.conn._graph_progress)
+                        seen.clear()
+                        c.conn.execute('SELECT 1').fetchone()
+                        self.assertTrue(seen)
+            finally:
+                c.conn.set_progress_handler(None, 0)
+
+    def test_fatal_progress_index_preserves_identity_and_known_rollback(self):
+        class Cancel(BaseException):
+            pass
+        primary = Cancel('original-progress-index-fatal')
+        class FatalIndex:
+            def __index__(self):
+                raise primary
+            def __gt__(self, other):
+                raise AssertionError('wrong conversion path')
+        with self.fixture_factory('outbox-correction02-fatal-index') as c:
+            self._seed(c)
+            seen = []
+            def progress():
+                seen.append('progress')
+                return 0
+            c.conn.set_progress_handler(progress, 1)
+            stage, calls = self._stage(c)
+            try:
+                try:
+                    with c.p._claim_transaction(c.conn, _outbox_retry=stage):
+                        self._update(c)
+                        c.conn.set_progress_handler(None, FatalIndex())
+                except BaseException as caught:
+                    self.assertIs(caught, primary)
+                else:
+                    self.fail('fatal conversion primary was swallowed')
+                self.assertIs(c.conn._graph_progress, progress)
+                self.assertTrue(seen)
+                self.assertFalse(calls)
+                self.assertEqual(self._durable(c), [('before',)])
+                self._retired(c, stage, 'rolled_back')
+            finally:
+                c.conn.set_progress_handler(None, 0)
+            # A successful clear and a fresh stage retain the healthy path.
+            stage, calls = self._stage(c)
+            with c.p._claim_transaction(c.conn, _outbox_retry=stage):
+                self._update(c)
+            self.assertEqual(calls, ['original_admission'])
+            self.assertEqual(self._durable(c), [('after',)])
+            self._retired(c, stage, 'committed')
+
+    def test_failed_progress_clear_inside_stage_stays_sticky_after_clear(self):
+        with self.fixture_factory('outbox-correction02-sticky-unknown-progress') as c:
+            self._seed(c)
+            stage, calls = self._stage(c)
+            with self.assertRaisesRegex(RuntimeError, '^outbox_retry_native_callback_lifetime_unsupported$'):
+                with c.p._claim_transaction(c.conn, _outbox_retry=stage):
+                    self._update(c)
+                    self.assertFalse(stage.callbacks_seen)
+                    with self.assertRaises(OverflowError):
+                        c.conn.set_progress_handler(None, 10**100)
+                    self.assertIsNotNone(c.conn._graph_progress)
+                    self.assertTrue(stage.callbacks_seen)
+                    c.conn.set_progress_handler(None, 0)
+                    self.assertIsNone(c.conn._graph_progress)
+                    self.assertTrue(stage.callbacks_seen)
+            self.assertEqual(calls, ['original_admission'])
+            self.assertEqual(self._durable(c), [('before',)])
+            self._retired(c, stage, 'rolled_back')
 
 
 def make_native_owner_suite(fixture_factory):

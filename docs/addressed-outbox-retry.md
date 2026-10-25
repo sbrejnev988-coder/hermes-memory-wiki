@@ -132,6 +132,75 @@ Fatal `BaseException` не превращается в публичный ordina
 по себе не устанавливает commit. Прежние native graph/document/event fences и private
 writer/reader classes не переписаны. Их новые совместные runtime-проверки не выполнены.
 
+## Correction02: exception-safe progress registration
+
+Единственный исправляемый остаток `OUTBOX-NATIVE-ADMISSION-001` —
+`CORRECTION01_PROGRESS_NATIVE_STATE_DIVERGENCE`. Родитель подтвердил его по source:
+после штатного `set_progress_handler(H, 1)` неуспешный
+`set_progress_handler(None, 10**100)` мог оставить native H, но заранее записать
+Python `None`. Созданный **после** этого stage и native-start проверяли одно ложное
+зеркало. Это не новый воспроизведённый runtime incident и не утверждение об actual
+late H/COMMIT outcome. Прежнее `correction01-review/REVIEW.json` с `passed=false`
+сохранено; автор не принимает исправление самостоятельно.
+
+Изменён только shared plugin setter и его необходимые stdlib import/tests/docs:
+
+- `operator.index(n)` выполняется один раз **до** native effect. Он разрешает
+  предусмотренные int/bool/`__index__` значения, не заменяется `int(n)`, truthiness
+  или пользовательским `n > 0`. После него `n` — точный int; effective callback
+  рассчитывается до native вызова. C-int range, overflow и собственные connection
+  проверки остаются настоящему `super().set_progress_handler(callback, n)`.
+  Ошибка index-конверсии, включая fatal, не меняет зеркала сама; побочные setter
+  эффекты самого `__index__` не откатываются выдуманным старым snapshot.
+- Исходный flight guard сохранён и повторён после callback-capable conversion.
+  До native вызова зеркало получает отдельный non-None pending/unknown marker,
+  **никогда** ещё не доказанную `None`. Только нормальный native return разрешает
+  опубликовать effective callback/absence. Native exception оставляет unknown,
+  выходит тем же bare re-raise; native outcome не угадывается. Это намеренно
+  консервативно и для failed clear без прежнего H.
+- При успешном `callback=None` clear либо effective `n <= 0` зеркало становится
+  `None`; успешный positive interval сохраняет настоящий callback. Нет лишнего
+  native clear, отключения H ради critical operation или произвольного сравнения
+  после эффекта. Прежняя ссылка удерживается до публикации; если во время native
+  replacement reentrant setter изменил зеркало, результат помечается unknown,
+  а не изображается доказанным порядком двух регистраций.
+- Все настоящие потребители уже трактуют non-None как неподдержанный critical
+  lifetime: initial owner `any(value is not None ...)`, native-start и остальные
+  существующие graph/document/event/terminal guards. Поэтому `__init__.py` и
+  другие owners не изменены. Unknown нельзя превратить в callback-free допуск.
+  Failed native setter внутри stage делает sticky history истинной даже после
+  последующего успешного clear. Успешный clear **до нового** stage восстанавливает
+  обычный healthy path. Ordinary noncritical transactions продолжают использовать
+  фактически установленный native H; marker не вызывает и не отключает его.
+
+Новые prepared controls включены в прежние suites, не в новый runner: failed
+clear **до** stage с наблюдаемым сохранённым H и known rollback; успешный clear
+с healthy commit; progress install/remove в stage; ordinary native H после
+failed clear; bool/index/int-subclass без пользовательского `__gt__`; zero/negative
+и index-zero/negative; невалидные типы/index и positive/negative overflow; exact
+fatal index identity + known rollback + следующий healthy stage; failed setter
+в stage с последующим clear и сохранённой sticky history. Два новых AST controls
+проверяют success-bound публикацию/unknown и различают удалённую conversion либо
+error reconciliation. Это подготовленный oracle, не выполненные TestCases.
+
+Прежние known rollback/postcommit-fatal controls и все UNKNOWN guards сохранены.
+Существующий genuine
+`tests/test_document_native_commit_fence.py::test_native_unknown_keeps_original_primary_exact_owner_and_admissions`
+остаётся отдельным **document** native control, не proof нового outbox UNKNOWN.
+Outbox UNKNOWN/public composition остаётся в `PUBLIC_NATIVE_REQUIREMENTS`,
+NOT_RUN/BLOCKED без собственного допуска и совместимого safety teardown:
+shipped derived fixture удерживает quarantine, но её `safety_close_unknown`
+вызывает guarded `c.close()`, который законно отказывает retained outbox stage.
+Здесь не добавлены raw-setter bypass, permitting stand-in, recovery или новый
+fixture framework ради зелёного результата.
+
+Старые initial SOURCE 26/85 и correction01 SOURCE 33/183 относятся только к своим
+точным прежним input tuples; оба допуска 1/1 spent. Они не объявляются PASS
+correction02. Автор выполняет только inert AST/JSON/hash/Git metadata; новый
+SOURCE, tests/helpers/factories, collection, native/SQL/SPI/SDK и public E2E —
+**NOT_RUN**. Native совместимость нового setter, runtime исход исходного сбоя,
+независимый changed-contract review и acceptance остаются отдельно родителю.
+
 ## Deletes и статусы
 
 Retry delete здесь явно запрещён: `outbox_delete_capability_required`. Текущий delete
@@ -177,7 +246,7 @@ product sources, product import/exec, SQL/native/SDK, worker, network и ENV set
   epoch + counted-own effects, отсутствие raw diagnostic leakage. Эти cases не
   подменяют authority provider/SDK/SQL разрешающим stand-in: authority не исполняется.
 - `make_metadata_suite(main_raw, cache_raw, baseline_main_raw, baseline_cache_raw,
-  native_raw=..., baseline_native_raw=...)` — 13 подготовленных AST/JSON controls:
+  native_raw=..., baseline_native_raw=...)` — 15 подготовленных AST/JSON controls:
   schema/cache, реальные caller edges, ACL/source/target guards, CAS/afterimage,
   original admission после journal tail, native flight до actual commit и после
   callback, callback/setter/completion refusals, known/UNKNOWN retirement,
@@ -185,12 +254,13 @@ product sources, product import/exec, SQL/native/SDK, worker, network и ENV set
   forwarding keyword и native fence. Прежнее требование полного равенства тела
   `_claim_transaction` заменено проверкой явно согласованного extension: старые
   mode/defaults сохранены, unchanged authority/worker/native peers сверяются отдельно.
-- `make_native_owner_suite(fixture_factory)` — 8 подготовленных **настоящих native
-  owner component** cases, не SOURCE: callback-free commit, поздний journal actor
+- `make_native_owner_suite(fixture_factory)` — 17 подготовленных **настоящих native
+  owner component** cases, не SOURCE: прежние 8 — callback-free commit, поздний journal actor
   drift, реальный authorizer/refusal, sticky trace install/remove, native shortcuts,
   fatal rollback, fatal после known commit и отсутствие whole-store maintenance
-  при absent/dead worker. Последний case не запускает thread и сравнивает весь
-  собственный SQL store, включая unaddressed legacy completed payload.
+  при absent/dead worker. Последний из прежних cases не запускает thread и сравнивает весь
+  собственный SQL store, включая unaddressed legacy completed payload. Девять новых
+  correction02 controls перечислены выше; они используют тот же реальный fixture.
   Передаётся прежний shipped
   `tests/ci_owned/derived_claim_materialization_fixture.py:Fixture` при активном
   штатном `derived_case`, с genuine SPI/connection и отдельным native/SQL допуском.

@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import operator
 import os
 import re
 import sqlite3
@@ -1469,10 +1470,44 @@ class _GraphCommitConnection(sqlite3.Connection):
                 or self._outbox_retry_commit_flight is not None
                 or self._prefetch_commit_flight is not None):
             raise RuntimeError('graph_writer_operation_in_flight')
-        if self._outbox_retry_stage is not None and callback is not None and n > 0:
+        # The native C-int converter accepts __index__, not arbitrary > / int.
+        # Resolve user code ONCE, before any native effect, and let the native
+        # setter enforce its own C-int range (also when callback is None).
+        n = operator.index(n)
+        # __index__ may reenter this connection; it cannot borrow a new flight.
+        if (self._graph_commit_flight is not None or self._document_commit_flight is not None
+                or self._event_job_commit_flight is not None
+                or self._outbox_retry_commit_flight is not None
+                or self._prefetch_commit_flight is not None):
+            raise RuntimeError('graph_writer_operation_in_flight')
+        progress = callback if n > 0 else None
+        if self._outbox_retry_stage is not None and progress is not None:
             self._outbox_retry_stage.callbacks_seen = True
-        self._graph_progress = callback if n > 0 else None
-        return super().set_progress_handler(callback, n)
+        # Non-None means callback present OR registration unknown to every
+        # existing critical consumer. Never publish absence before native return.
+        # Keep the previous callback alive through publication: its finalizer
+        # must not run during native replacement with stale Python metadata.
+        _previous_progress = self._graph_progress
+        pending = object()
+        self._graph_progress = pending
+        try:
+            result = super().set_progress_handler(callback, n)
+        except BaseException:
+            # Do not guess whether a failed native call changed registration.
+            # A later successful clear reconciles it, but not this stage's past.
+            self._graph_progress = pending
+            if self._outbox_retry_stage is not None:
+                self._outbox_retry_stage.callbacks_seen = True
+            raise
+        if self._graph_progress is pending:
+            self._graph_progress = progress
+        else:
+            # A reentrant setter completed during native replacement. Its order
+            # relative to that replacement is not proof of the final callback.
+            self._graph_progress = pending
+            if self._outbox_retry_stage is not None:
+                self._outbox_retry_stage.callbacks_seen = True
+        return result
 
     def __setattr__(self, name, value):
         if (name in {'autocommit', 'isolation_level'}
