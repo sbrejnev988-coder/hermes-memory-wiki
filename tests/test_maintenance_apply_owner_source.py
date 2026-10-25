@@ -339,8 +339,8 @@ def definitions(carrier):
     for item in carrier['definitions']:
         raw = item['source'].encode('utf-8')
         assert hashlib.sha256(raw).hexdigest() == item['sha256']
-        if item['owner']:
-            wrapped = ast.parse('class _SourceOwner:\n' + item['source'])
+        if item['source'].startswith((' ', '\t')):
+            wrapped = ast.parse('if True:\n' + item['source'])
             assert len(wrapped.body) == len(wrapped.body[0].body) == 1
             selected = wrapped.body[0].body[0]
             ast.increment_lineno(selected, -1)
