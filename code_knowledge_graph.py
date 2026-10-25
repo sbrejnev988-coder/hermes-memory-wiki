@@ -1344,6 +1344,63 @@ def _event_job_commit_fence(conn, flight, *, admission=True):
         raise TimeoutError('event_job_original_lease_lost')
 
 
+class _OutboxRetryStage:
+    """Private original-admission carrier for ONE standalone shared-owner retry.
+
+    The callable retains the caller's original disclosure/target/job images. It
+    runs only in the provider tail, never inside SQLite's authorizer. This is
+    not a writer capability, a joined stage, or a new authority/receipt API.
+    """
+    __slots__ = ('owner', 'conn', 'thread', 'admit', 'actor', 'references',
+                 'policy_environment', 'callbacks_seen', 'image', 'phase', 'outcome')
+
+    def __init__(self, owner, conn, admit):
+        self.owner, self.conn, self.admit = owner, conn, admit
+        self.thread = threading.get_ident()
+        fields = owner.__dict__
+        self.actor = tuple((key, fields.get(key)) for key in (
+            'bot_id', 'session_id', 'project_scope', 'default_visibility',
+            'origin_chat_hash', '_bot_scope_trusted', 'platform', 'agent_context',
+            'database_instance_id', '_journal_recovery_active'))
+        if any(type(value) not in (str, bool, type(None)) for _, value in self.actor):
+            raise PermissionError('outbox_retry_original_actor_unproven')
+        self.references = tuple((key, fields.get(key)) for key in
+                                ('home', 'root', 'db_path', '_privacy_erasure'))
+        self.policy_environment = tuple(os.environ.get(key) for key in
+                                       ('MEMORY_WIKI_STRICT_RECALL', 'HERMES_SECURITY_STRICT'))
+        # Sticky: a callback cannot run during final reads, remove itself, and
+        # thereby make a callback-free native admission appear proven.
+        self.callbacks_seen = False
+        self.image = None
+        self.phase = 'prepared'
+        self.outcome = None
+
+
+def _outbox_retry_commit_fence(conn, flight):
+    """Pure exact owner/image fence; no SQL, policy callbacks or recapture."""
+    owner, stage, image, thread = flight
+    if (type(stage) is not _OutboxRetryStage or conn._outbox_retry_commit_flight is not flight
+            or conn._outbox_retry_stage is not stage or conn._outbox_retry_commit_image is not image
+            or stage.owner is not owner or stage.conn is not conn or stage.thread != thread
+            or thread != threading.get_ident() or owner._claim_tx_connection is not conn
+            or owner._claim_tx_thread != thread or owner._claim_tx_outbox_retry_stage is not stage
+            or conn is not owner._conn or conn is not owner._owned_conn
+            or stage.phase != 'commit' or stage.image is not image or image[0] is not stage
+            or type(image[1]) is not int or conn.total_changes != image[1]
+            or owner._lifecycle_state not in {'ready', 'idle'}
+            or owner._transaction_quarantine is not None):
+        raise PermissionError('outbox_retry_native_commit_image_changed')
+    fields = owner.__dict__
+    if (any(type(fields.get(key)) is not type(value) or fields.get(key) != value
+            for key, value in stage.actor)
+            or any(fields.get(key) is not value for key, value in stage.references)
+            or stage.policy_environment != tuple(os.environ.get(key) for key in
+                ('MEMORY_WIKI_STRICT_RECALL', 'HERMES_SECURITY_STRICT'))):
+        raise PermissionError('outbox_retry_original_owner_changed')
+    if stage.callbacks_seen:
+        raise RuntimeError('outbox_retry_native_callback_lifetime_unsupported')
+
+
 class _GraphCommitConnection(sqlite3.Connection):
     """Shared native connection keeps supported authorizers behind the fence.
 
@@ -1360,6 +1417,9 @@ class _GraphCommitConnection(sqlite3.Connection):
         self._event_job_commit_image = None
         self._event_job_commit_flight = None
         self._graph_extraction_stage = None
+        self._outbox_retry_stage = None
+        self._outbox_retry_commit_image = None
+        self._outbox_retry_commit_flight = None
         self._graph_commit_flight = None
         self._graph_commit_error = None
         self._graph_native_operation = None
@@ -1374,16 +1434,20 @@ class _GraphCommitConnection(sqlite3.Connection):
     def set_authorizer(self, callback):
         if (self._graph_commit_flight is not None or self._document_commit_flight is not None
                 or self._event_job_commit_flight is not None
+                or self._outbox_retry_commit_flight is not None
                 or self._prefetch_commit_flight is not None):
             raise RuntimeError('graph_writer_operation_in_flight')
         if callback is not None and not callable(callback):
             raise TypeError('authorizer_must_be_callable')
+        if self._outbox_retry_stage is not None and callback is not None:
+            self._outbox_retry_stage.callbacks_seen = True
         self._graph_user_authorizer = callback
         return sqlite3.Connection.set_authorizer(self, self._graph_authorize)
 
     def close(self):
         if (self._graph_commit_flight is not None or self._document_commit_flight is not None
                 or self._event_job_commit_flight is not None
+                or self._outbox_retry_stage is not None
                 or self._prefetch_commit_flight is not None):
             raise RuntimeError('graph_writer_operation_in_flight')
         return super().close()
@@ -1391,18 +1455,30 @@ class _GraphCommitConnection(sqlite3.Connection):
     def set_trace_callback(self, callback):
         if (self._graph_commit_flight is not None or self._document_commit_flight is not None
                 or self._event_job_commit_flight is not None
+                or self._outbox_retry_commit_flight is not None
                 or self._prefetch_commit_flight is not None):
             raise RuntimeError('graph_writer_operation_in_flight')
+        if self._outbox_retry_stage is not None and callback is not None:
+            self._outbox_retry_stage.callbacks_seen = True
         self._graph_trace = callback
         return super().set_trace_callback(callback)
 
     def set_progress_handler(self, callback, n):
         if (self._graph_commit_flight is not None or self._document_commit_flight is not None
                 or self._event_job_commit_flight is not None
+                or self._outbox_retry_commit_flight is not None
                 or self._prefetch_commit_flight is not None):
             raise RuntimeError('graph_writer_operation_in_flight')
+        if self._outbox_retry_stage is not None and callback is not None and n > 0:
+            self._outbox_retry_stage.callbacks_seen = True
         self._graph_progress = callback if n > 0 else None
         return super().set_progress_handler(callback, n)
+
+    def __setattr__(self, name, value):
+        if (name in {'autocommit', 'isolation_level'}
+                and getattr(self, '_outbox_retry_stage', None) is not None):
+            raise RuntimeError('outbox_retry_transaction_mode_unsupported')
+        return super().__setattr__(name, value)
 
     def _graph_native_return(self, operation, *args, **kwargs):
         """Deliver only this native operation's callback cause, exactly once.
@@ -1464,13 +1540,26 @@ class _GraphCommitConnection(sqlite3.Connection):
         flight = self._graph_commit_flight
         document_flight = self._document_commit_flight
         event_job_flight = self._event_job_commit_flight
+        outbox_flight = self._outbox_retry_commit_flight
+        outbox_stage = self._outbox_retry_stage
         if ((flight is not None or document_flight is not None or event_job_flight is not None
+             or outbox_stage is not None
              or self._prefetch_commit_flight is not None)
                 and self._graph_authorizer_depth
                 and action in (sqlite3.SQLITE_TRANSACTION, sqlite3.SQLITE_SAVEPOINT)):
             # Reentrant shared SQL must not finish the transaction INSIDE the
             # user callback, before the outer callback's final admission.
             return sqlite3.SQLITE_DENY
+        if outbox_stage is not None:
+            # No cursor/script/context/base-descriptor shortcut may finish the
+            # owner's body. Only its exact native COMMIT or cleanup is legal.
+            if action == sqlite3.SQLITE_SAVEPOINT:
+                return sqlite3.SQLITE_DENY
+            if action == sqlite3.SQLITE_TRANSACTION:
+                if a == 'COMMIT' and outbox_flight is None:
+                    return sqlite3.SQLITE_DENY
+                if a == 'ROLLBACK' and outbox_stage.phase != 'rollback':
+                    return sqlite3.SQLITE_DENY
         owner = self._graph_effect_owner
         stage = getattr(owner, '_claim_tx_graph_stage', None)
         graph_commit = action == sqlite3.SQLITE_TRANSACTION and a == 'COMMIT' and stage is not None and stage[2]
@@ -1494,6 +1583,8 @@ class _GraphCommitConnection(sqlite3.Connection):
             return sqlite3.SQLITE_DENY
         try:
             callback = self._graph_user_authorizer
+            if outbox_stage is not None and callback is not None:
+                outbox_stage.callbacks_seen = True
             self._graph_authorizer_depth += 1
             try:
                 result = sqlite3.SQLITE_OK if callback is None else callback(action, a, b, database, source)
@@ -1505,6 +1596,10 @@ class _GraphCommitConnection(sqlite3.Connection):
                 return sqlite3.SQLITE_DENY
             if flight is not None:
                 _graph_commit_fence(self, flight)
+            if outbox_flight is not None:
+                _outbox_retry_commit_fence(self, outbox_flight)
+                if callback is not None:
+                    raise RuntimeError('outbox_retry_native_authorizer_lifetime_unsupported')
             if event_job_flight is not None:
                 _event_job_commit_fence(self, event_job_flight,
                     admission=action == sqlite3.SQLITE_TRANSACTION and a == 'COMMIT')
@@ -1556,9 +1651,19 @@ class _GraphCommitConnection(sqlite3.Connection):
 
     def _graph_start_commit(self):
         if (self._graph_commit_flight is not None or self._document_commit_flight is not None
-                or self._event_job_commit_flight is not None):
+                or self._event_job_commit_flight is not None or self._outbox_retry_commit_flight is not None):
             raise RuntimeError('graph_writer_operation_in_flight')
         owner = self._graph_effect_owner
+        outbox_stage = self._outbox_retry_stage
+        if outbox_stage is not None:
+            image = self._outbox_retry_commit_image
+            if (type(outbox_stage) is not _OutboxRetryStage or image is None
+                    or image[0] is not outbox_stage):
+                raise PermissionError('outbox_retry_native_commit_image_missing')
+            if self._graph_trace is not None or self._graph_progress is not None:
+                raise RuntimeError('outbox_retry_native_commit_late_callback_unsupported')
+            self._outbox_retry_commit_flight = (owner, outbox_stage, image, threading.get_ident())
+            _outbox_retry_commit_fence(self, self._outbox_retry_commit_flight)
         stage = getattr(owner, '_claim_tx_graph_stage', None)
         document_stage = getattr(owner, '_claim_tx_document_stage', None)
         event_job_stage = getattr(owner, '_claim_tx_event_job_stage', None)
@@ -1594,7 +1699,7 @@ class _GraphCommitConnection(sqlite3.Connection):
         owner = self._graph_effect_owner
         with _provider_claim_lock(owner):
             if (self._graph_commit_flight is not None or self._document_commit_flight is not None
-                    or self._event_job_commit_flight is not None):
+                    or self._event_job_commit_flight is not None or self._outbox_retry_commit_flight is not None):
                 raise RuntimeError('graph_writer_operation_in_flight')
             terminal = self._prefetch_terminal
             if terminal is not None:
@@ -1614,6 +1719,7 @@ class _GraphCommitConnection(sqlite3.Connection):
                 self._document_commit_flight = None
                 self._event_job_commit_flight = None
                 self._prefetch_commit_flight = None
+                self._outbox_retry_commit_flight = None
 
 
 class _GraphCommitCursor(sqlite3.Cursor):

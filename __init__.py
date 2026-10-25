@@ -1038,6 +1038,7 @@ except ImportError:
 try:
     from .code_knowledge_graph import (
         _GraphCommitConnection,
+        _OutboxRetryStage,
         _owns_graph_writer as _owns_private_graph_writer,
         install_code_graph_schema as _install_code_graph_schema,
         ingest_code_graph_event as _ingest_code_graph_event,
@@ -1061,6 +1062,7 @@ except ImportError:
     try:
         from code_knowledge_graph import (
             _GraphCommitConnection,
+            _OutboxRetryStage,
             _owns_graph_writer as _owns_private_graph_writer,
         install_code_graph_schema as _install_code_graph_schema,
             ingest_code_graph_event as _ingest_code_graph_event,
@@ -3745,6 +3747,24 @@ def _wake_outbox_worker(db_path: Optional[str] = None) -> None:
         worker = _OUTBOX_WORKERS.get(path)
         if worker and worker.get("wake"):
             worker["wake"].set()
+
+
+def _notify_registered_outbox_worker(path: str) -> str:
+    """Notification only: exact original path, no bootstrap/SQL/new thread.
+
+    One registry lock covers identity, liveness and Event.set. Do not call the
+    old starter/wake helpers from here (or nest their lock acquisition).
+    """
+    with _OUTBOX_WORKERS_LOCK:
+        worker = _OUTBOX_WORKERS.get(path)
+        if type(worker) is not dict:
+            return "deferred_no_live_worker"
+        thread, wake = worker.get("thread"), worker.get("wake")
+        if (type(thread) is not threading.Thread or type(wake) is not threading.Event
+                or not thread.is_alive() or _OUTBOX_WORKERS.get(path) is not worker):
+            return "deferred_no_live_worker"
+        wake.set()
+        return "notified"
 
 
 # --- Embedding contract guard: provider routing and vector dimensions must agree. ---
@@ -7424,6 +7444,7 @@ class MemoryWikiProvider(MemoryProvider):
         self._claim_tx_document_stage = None
         self._claim_tx_graph_stage = None
         self._claim_tx_event_job_stage = None
+        self._claim_tx_outbox_retry_stage = None
         self._transaction_quarantine = None
         self._transaction_primary = None
         self._transaction_cleanup_notes = ()
@@ -14884,7 +14905,7 @@ class MemoryWikiProvider(MemoryProvider):
 
 
     @contextmanager
-    def _claim_transaction(self, conn=None, *, join=False, adopt=False, begin="IMMEDIATE", _terminal=None, _document_hook=None, _document_ingest=None, _graph_effect=None, _event_job=None, _rollback_receipt=None):
+    def _claim_transaction(self, conn=None, *, join=False, adopt=False, begin="IMMEDIATE", _terminal=None, _document_hook=None, _document_ingest=None, _graph_effect=None, _event_job=None, _rollback_receipt=None, _outbox_retry=None):
         """One SQLite owner stage; joined callers never commit another owner's TX.
 
         Used by claim/ledger owners and the private writer's native context API.
@@ -14894,6 +14915,11 @@ class MemoryWikiProvider(MemoryProvider):
         """
         if begin not in {"", "IMMEDIATE", "EXCLUSIVE"} or (join and adopt):
             raise ValueError("invalid_claim_transaction_mode")
+        if _outbox_retry is not None and (
+                type(_outbox_retry) is not _OutboxRetryStage or join or adopt or begin != "IMMEDIATE"
+                or any(value is not None for value in (
+                    _terminal, _document_hook, _document_ingest, _graph_effect, _event_job, _rollback_receipt))):
+            raise ValueError("invalid_outbox_retry_transaction_mode")
         if _rollback_receipt is not None and (
                 type(_rollback_receipt) is not list or _rollback_receipt
                 or join or adopt or begin != "IMMEDIATE"
@@ -14902,6 +14928,10 @@ class MemoryWikiProvider(MemoryProvider):
             raise ValueError("invalid_claim_rollback_receipt_mode")
         with self._lock:
             c = self._connect() if conn is None else conn
+            previous_outbox_retry = getattr(self, "_claim_tx_outbox_retry_stage", None)
+            if previous_outbox_retry is not None:
+                # Even ordinary joined writers cannot borrow this narrow TX.
+                raise RuntimeError("outbox_retry_owner_pending")
             self._require_claim_writer(c)
             active = c.in_transaction
             if _document_hook is not None:
@@ -14922,6 +14952,16 @@ class MemoryWikiProvider(MemoryProvider):
             previous_graph_stage = self._claim_tx_graph_stage
             previous_event_job_stage = self._claim_tx_event_job_stage
             previous_prefetch_terminal = c._prefetch_terminal
+            if _outbox_retry is not None and (
+                    type(c) is not _GraphCommitConnection or c is not self._conn or c is not self._owned_conn
+                    or _outbox_retry.owner is not self or _outbox_retry.conn is not c
+                    or _outbox_retry.thread != threading.get_ident() or _outbox_retry.phase != 'prepared'
+                    or _outbox_retry.image is not None or _outbox_retry.outcome is not None
+                    or not callable(_outbox_retry.admit) or active or previous is not None
+                    or previous_thread is not None or previous_document_stage is not None
+                    or previous_graph_stage is not None or previous_event_job_stage is not None
+                    or previous_prefetch_terminal is not None or c._outbox_retry_stage is not None):
+                raise RuntimeError("outbox_retry_standalone_owner_required")
             terminal_native = (_terminal is not None and (_terminal._prefetch_attempt is not None
                                or any(f.graph_attempt is not None for f in _terminal.fences)))
             if terminal_native and previous_prefetch_terminal is not None:
@@ -15016,6 +15056,11 @@ class MemoryWikiProvider(MemoryProvider):
             completed = False
             document_commits = ()
             try:
+                if _outbox_retry is not None:
+                    self._claim_tx_outbox_retry_stage = c._outbox_retry_stage = _outbox_retry
+                    _outbox_retry.phase = 'body'
+                    _outbox_retry.callbacks_seen = any(value is not None for value in
+                        (c._graph_user_authorizer, c._graph_trace, c._graph_progress))
                 if graph_extraction is not None and graph_extraction.fence.provider is self:
                     graph_obligation = graph_extraction.bind_stage(c, graph_stage)
                 if not active:
@@ -15099,6 +15144,19 @@ class MemoryWikiProvider(MemoryProvider):
                         raise RuntimeError('event_job_owner_stage_unproven')
                     c._event_job_commit_image = self._assert_event_job_leases(
                         c, event_job_stage[2], check_callbacks=False, terminal_stage=event_job_stage)
+                if _outbox_retry is not None:
+                    if (self._claim_tx_connection is not c or self._claim_tx_thread != _outbox_retry.thread
+                            or self._claim_tx_outbox_retry_stage is not _outbox_retry
+                            or c._outbox_retry_stage is not _outbox_retry
+                            or document_stage[2] or graph_stage[2] or event_job_stage[2]):
+                        raise RuntimeError('outbox_retry_owner_stage_changed')
+                    # LAST callback-capable tail: recheck the ORIGINAL target,
+                    # actor, source/erasure/policy/epoch and exact job afterimages.
+                    # The returned counter is original_epoch + counted own CAS,
+                    # NOT a freshly adopted total_changes/authority snapshot.
+                    _outbox_retry.image = (_outbox_retry, _outbox_retry.admit())
+                    c._outbox_retry_commit_image = _outbox_retry.image
+                    _outbox_retry.phase = 'commit'
                 commit_attempted = True  # Only immediately before actual commit.
                 if _document_hook is not None:
                     _document_hook.commit_attempted = True
@@ -15107,6 +15165,8 @@ class MemoryWikiProvider(MemoryProvider):
                     self._quarantine_claim_connection(c, "commit_transaction_still_active")
                     raise RuntimeError("claim_commit_transaction_still_active")
                 completed = True
+                if _outbox_retry is not None:
+                    _outbox_retry.outcome = 'committed'
                 # Only the actual owner can drain these callbacks. A legal
                 # child join returns above without committing or publishing.
                 document_commits = tuple(document_stage[2])
@@ -15122,8 +15182,16 @@ class MemoryWikiProvider(MemoryProvider):
                     _terminal.measurement['commit_total_changes'] = c.total_changes
                     _terminal.measurement['native_idle'] = True
             except BaseException as primary:
+                if _outbox_retry is not None and _outbox_retry.outcome == 'committed':
+                    # A journal/retirement failure cannot undo a known native
+                    # commit or turn it into a fictitious rollback/UNKNOWN.
+                    raise
+                if _outbox_retry is not None:
+                    _outbox_retry.phase = 'rollback'
                 rolled_back = self._rollback_claim_transaction(c, primary, commit_attempted=commit_attempted)
                 completed = rolled_back
+                if _outbox_retry is not None:
+                    _outbox_retry.outcome = 'rolled_back' if rolled_back else 'unknown'
                 if _rollback_receipt is not None and rolled_back is True:
                     try:
                         # Publish only AFTER the existing rollback positively
@@ -15136,8 +15204,22 @@ class MemoryWikiProvider(MemoryProvider):
                     _document_hook.rollback_completed = rolled_back
                 raise
             finally:
+                if (_outbox_retry is not None and completed
+                        and getattr(self, "_transaction_quarantine", None) is not c
+                        and (self._claim_tx_outbox_retry_stage is not _outbox_retry
+                             or c._outbox_retry_stage is not _outbox_retry
+                             or self._claim_tx_connection is not c
+                             or self._claim_tx_thread != _outbox_retry.thread)):
+                    self._quarantine_claim_connection(c, 'outbox_retry_retirement_unknown')
                 if completed and getattr(self, "_transaction_quarantine", None) is not c:
                     # Retire only our own exact stage after proved completion.
+                    if _outbox_retry is not None:
+                        if (c._outbox_retry_commit_image is not None
+                                and c._outbox_retry_commit_image[0] is _outbox_retry):
+                            c._outbox_retry_commit_image = None
+                        c._outbox_retry_stage = None
+                        self._claim_tx_outbox_retry_stage = previous_outbox_retry
+                        _outbox_retry.phase = 'retired'
                     if c._prefetch_terminal is _terminal:
                         c._prefetch_terminal = previous_prefetch_terminal
                     # Failed rollback/postcommit keeps owner+primary+admissions.
@@ -25329,7 +25411,9 @@ class MemoryWikiProvider(MemoryProvider):
         policy = _outbox_repair_policy
         result = {"ok": False, "dry_run": dry_run if type(dry_run) is bool else True,
                   "applied": False, "status": "refused", "eligible_count": 0,
-                  "revived_count": 0, "worker_woken": False}
+                  "revived_count": 0, "worker_woken": False, "notification": "not_requested"}
+        retry_stage = None
+        updated = 0
         ids, reason = policy.validate_job_ids(outbox_job_ids)
         if reason:
             return {**result, "error": reason}
@@ -25439,8 +25523,23 @@ class MemoryWikiProvider(MemoryProvider):
                             and disclosure.policy_environment == tuple(os.environ.get(key) for key in
                                 ('MEMORY_WIKI_STRICT_RECALL', 'HERMES_SECURITY_STRICT')))
 
-                updated = 0
-                with self._claim_transaction(c):
+                def final_original_admission():
+                    if not target_current() or not original_current(updated):
+                        raise _DeliveryWithheld("outbox_retry_snapshot_changed")
+                    after = {row["id"]: dict(row) for row in c.execute(query, (*ids, *params)).fetchall()}
+                    if len(after) != len(rows):
+                        raise _DeliveryWithheld("outbox_retry_no_effect")
+                    for row in rows:
+                        expected = {**row, "status": "pending", "attempts": 0,
+                                    "next_retry_at": ts, "updated_at": ts}
+                        if not policy.same_job(expected, after.get(row["id"])):
+                            raise _DeliveryWithheld("outbox_retry_no_effect")
+                    if updated != len(rows) or not original_current(updated):
+                        raise _DeliveryWithheld("outbox_retry_snapshot_changed")
+                    return disclosure.epoch[2] + updated
+
+                retry_stage = _OutboxRetryStage(self, c, final_original_admission)
+                with self._claim_transaction(c, _outbox_retry=retry_stage):
                     # Remote/guard callbacks first, then exact SQL/source/lease
                     # rereads immediately before the conditional native updates.
                     if not target_current() or not original_current(0):
@@ -25476,29 +25575,45 @@ class MemoryWikiProvider(MemoryProvider):
                         raise _DeliveryWithheld("outbox_retry_snapshot_changed")
                 # The real owner returned after COMMIT + journal retirement.
                 # On rollback/error/UNKNOWN execution never reaches this branch.
+                if retry_stage.outcome != 'committed':
+                    raise _DeliveryWithheld("outbox_retry_no_effect")
                 result.update(applied=True, status="addressed_committed", eligible_count=updated,
                               revived_count=updated)
             except Exception as exc:
                 # Preserve the native owner's primary/quarantine internally;
                 # never echo provider exceptions, retained last_error or IDs.
+                if retry_stage is not None and retry_stage.outcome == 'committed':
+                    return {**result, "applied": True, "status": "addressed_committed",
+                            "eligible_count": updated, "revived_count": updated,
+                            **policy.notification_fields("deferred_postcommit_failed"),
+                            "error": "outbox_postcommit_failed"}
                 unknown = getattr(self, "_transaction_quarantine", None) is not None
                 code = (exc.args[0] if type(exc) is _DeliveryWithheld and len(exc.args) == 1
                         and type(exc.args[0]) is str and exc.args[0] in {
                             "outbox_retry_snapshot_changed", "outbox_retry_no_effect"}
                         else "outbox_retry_failed")
+                if (type(exc) is RuntimeError and len(exc.args) == 1 and type(exc.args[0]) is str
+                        and exc.args[0] in {"outbox_retry_native_callback_lifetime_unsupported",
+                            "outbox_retry_native_authorizer_lifetime_unsupported",
+                            "outbox_retry_native_commit_late_callback_unsupported"}):
+                    code = "outbox_retry_callback_lifetime_unsupported"
                 return {**result, "status": "unknown" if unknown else "refused",
                         "applied": None if unknown else False, "revived_count": None if unknown else 0,
                         "error": "outbox_commit_unknown" if unknown else code}
             try:
-                if (c is not self._conn or disclosure.anchor != disclosure._authority()
+                if (retry_stage.outcome != 'committed' or retry_stage.phase != 'retired'
+                        or c is not self._conn or c is not self._owned_conn
+                        or self._transaction_quarantine is not None
+                        or disclosure.anchor != disclosure._authority()
                         or disclosure.erasure != disclosure._erasures()):
-                    return {**result, "error": "outbox_postcommit_context_changed"}
-                _start_outbox_worker(path)
-                _wake_outbox_worker(path)
+                    return {**result, **policy.notification_fields("deferred_context_changed"),
+                            "error": "outbox_postcommit_context_changed"}
+                notification = _notify_registered_outbox_worker(path)
             except Exception:
                 # The queue commit is known, but worker notification is not.
-                return {**result, "error": "outbox_worker_wake_failed"}
-            return {**result, "ok": True, "worker_woken": True}
+                return {**result, **policy.notification_fields("deferred_notification_failed"),
+                        "error": "outbox_worker_notification_failed"}
+            return {**result, **policy.notification_fields(notification)}
 
     def _repair(self, target: str='all', dry_run: bool=True, *, model_scope: bool = False, outbox_job_ids=None) -> Dict[str, Any]:
         target=(target or 'all').lower(); actions=[]

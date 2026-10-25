@@ -80,6 +80,20 @@ def same_epoch(original, current, own_updates=0):
             and current[2] == original[2] + own_updates)
 
 
+def notification_fields(code):
+    """Fixed notification projection, NEVER proof of commit or worker delivery.
+
+    No applied/count fields: only the actual transaction owner may establish
+    those. Absence/death of a worker leaves the committed durable intent alone.
+    """
+    if type(code) is not str or code not in {
+            "notified", "deferred_no_live_worker", "deferred_context_changed",
+            "deferred_postcommit_failed", "deferred_notification_failed"}:
+        raise ValueError("outbox_notification_state_invalid")
+    return {"ok": code in {"notified", "deferred_no_live_worker"},
+            "worker_woken": code == "notified", "notification": code}
+
+
 def job_hint(job):
     """Local negative checks, before any target lookup; never default a hint."""
     if not same_job(job, job):

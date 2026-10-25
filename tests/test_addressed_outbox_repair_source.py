@@ -6,6 +6,8 @@ After separate admission, the existing SOURCE controller may load the exact
 small policy and pass it to make_policy_suite. make_metadata_suite takes raw
 main/cache/baseline bytes for AST/JSON ONLY; it never executes the large main.
 Neither suite proves public/native repair, COMMIT, ACL or lease enforcement.
+The explicit native-owner suite also stays inert until separately admitted;
+it reuses the genuine shipped fixture, never a provider/SDK/authority stand-in.
 """
 from __future__ import annotations
 
@@ -27,6 +29,8 @@ POLICY_CASE_IDS = (
     "test_complete_job_image_detects_every_race",
     "test_original_epoch_allows_only_counted_own_updates",
     "test_diagnostics_never_include_retained_errors_or_text",
+    "test_notification_projection_preserves_deferred_intent",
+    "test_notification_cannot_manufacture_commit_or_accept_unknown_codes",
 )
 METADATA_CASE_IDS = (
     "test_schema_and_cache_additive_parity",
@@ -35,6 +39,35 @@ METADATA_CASE_IDS = (
     "test_conditional_update_and_postcommit_wake_structure",
     "test_worker_and_authority_owners_are_unchanged",
     "test_removed_forwarding_is_distinguished",
+    "test_private_exact_stage_reaches_actual_owner",
+    "test_original_admission_follows_callback_capable_owner_tail",
+    "test_native_flight_covers_callback_and_commit",
+    "test_late_callbacks_and_reentrant_completion_are_refused",
+    "test_only_known_completion_retires_and_sets_applied",
+    "test_notification_has_only_locked_live_registry_effects",
+    "test_removed_native_fence_is_distinguished",
+)
+NATIVE_OWNER_CASE_IDS = (
+    "test_callback_free_real_owner_commits_and_retires",
+    "test_late_journal_actor_change_refuses_original_admission",
+    "test_real_authorizer_lifetime_is_refused_not_disabled",
+    "test_late_trace_install_remove_cannot_hide_callback_lifetime",
+    "test_premature_completion_and_mode_close_shortcuts_are_refused",
+    "test_fatal_before_commit_preserves_identity_and_known_rollback",
+    "test_postcommit_fatal_preserves_known_commit_not_false_rollback",
+    "test_absent_dead_worker_notification_has_no_whole_store_maintenance",
+)
+# These public/native cases require a separately admitted actual semantic
+# target/erasure fixture and independent whole-store readback. No permissive
+# _strict_target/DisclosureFence replacement is provided to make them runnable.
+PUBLIC_NATIVE_REQUIREMENTS = (
+    "real producer-owned failed upsert + callback-free public repair + durable exact afterimage",
+    "journal-tail actor/ACL/source/erasure/target/job drift + whole-batch durable rollback",
+    "last native authorizer actor/ACL mutation OR explicit refusal before it can commit",
+    "rollback denied/fatal + UNKNOWN keeps exact owner/stage/primary, no notify/reconnect",
+    "absent and dead worker + foreign legacy completed $.text row unchanged in whole-store readback",
+    "registered live worker original-path Event.set only; no bootstrap/SQL/thread creation",
+    "public notification failure after known commit stays applied=true; dry-run/refusal/UNKNOWN never notify",
 )
 
 
@@ -48,6 +81,27 @@ def _calls(node, name):
     return [call for call in ast.walk(node) if isinstance(call, ast.Call)
             and ((isinstance(call.func, ast.Attribute) and call.func.attr == name)
                  or (isinstance(call.func, ast.Name) and call.func.id == name))]
+
+
+def _definition(tree, name):
+    return next(node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.ClassDef))
+                and node.name == name)
+
+
+def _native_method(tree, name):
+    return next(node for node in _definition(tree, "_GraphCommitConnection").body
+                if isinstance(node, ast.FunctionDef) and node.name == name)
+
+
+def _native_chain_present(tree):
+    start = _native_method(tree, "_graph_start_commit")
+    authorize = _native_method(tree, "_graph_authorizer_result")
+    commit = _native_method(tree, "commit")
+    fences = _calls(authorize, "_outbox_retry_commit_fence")
+    callbacks = _calls(authorize, "callback")
+    return bool(_calls(start, "_outbox_retry_commit_fence") and fences and callbacks
+                and min(n.lineno for n in fences) > max(n.lineno for n in callbacks)
+                and _calls(commit, "_graph_start_commit") and _calls(commit, "_graph_native_return"))
 
 
 def _forwarded(call):
@@ -207,6 +261,24 @@ class AddressedOutboxPolicyTests(unittest.TestCase):
                 self.assertNotIn(raw, reason)
 
 
+    def test_notification_projection_preserves_deferred_intent(self):
+        self.assertEqual(self.policy.notification_fields("notified"),
+                         {"ok": True, "worker_woken": True, "notification": "notified"})
+        self.assertEqual(self.policy.notification_fields("deferred_no_live_worker"),
+                         {"ok": True, "worker_woken": False, "notification": "deferred_no_live_worker"})
+        for code in ("deferred_context_changed", "deferred_postcommit_failed", "deferred_notification_failed"):
+            self.assertEqual(self.policy.notification_fields(code),
+                             {"ok": False, "worker_woken": False, "notification": code})
+
+    def test_notification_cannot_manufacture_commit_or_accept_unknown_codes(self):
+        for code in ("notified", "deferred_no_live_worker", "deferred_notification_failed"):
+            fields = self.policy.notification_fields(code)
+            self.assertFalse(set(fields) & {"applied", "revived_count", "eligible_count", "status"})
+        for code in (None, True, 1, [], {}, "not_requested", "committed", "unknown", " notified"):
+            with self.assertRaisesRegex(ValueError, "^outbox_notification_state_invalid$"):
+                self.policy.notification_fields(code)
+
+
 class AddressedOutboxMetadataTests(unittest.TestCase):
     __test__ = False
     tree = None
@@ -274,7 +346,10 @@ class AddressedOutboxMetadataTests(unittest.TestCase):
         transaction = next(node for node in ast.walk(retry) if isinstance(node, ast.With)
                            and any(_calls(item.context_expr, "_claim_transaction") for item in node.items))
         self.assertTrue(_calls(transaction, "same_job"))
-        for wake in _calls(retry, "_start_outbox_worker") + _calls(retry, "_wake_outbox_worker"):
+        self.assertFalse(_calls(retry, "_start_outbox_worker") + _calls(retry, "_wake_outbox_worker"))
+        wakes = _calls(retry, "_notify_registered_outbox_worker")
+        self.assertEqual(len(wakes), 1)
+        for wake in wakes:
             self.assertGreater(wake.lineno, transaction.end_lineno)
             self.assertEqual(ast.unparse(wake.args[0]), "path")
         response_keys = {key.value for node in ast.walk(retry) if isinstance(node, ast.Dict)
@@ -286,13 +361,26 @@ class AddressedOutboxMetadataTests(unittest.TestCase):
                              & {"id", "object_id", "payload_json", "last_error", "failed_seen"})
 
     def test_worker_and_authority_owners_are_unchanged(self):
-        for name in ("_outbox_process_scoped", "_outbox_enqueue", "_delete_claim_vector_targets"):
+        for name in ("_outbox_process_scoped", "_outbox_enqueue", "_delete_claim_vector_targets",
+                     "_ensure_outbox", "_start_outbox_worker", "_wake_outbox_worker", "_outbox_worker_loop"):
             current = next(node for node in self.tree.body if isinstance(node, ast.FunctionDef) and node.name == name)
             before = next(node for node in self.baseline_tree.body if isinstance(node, ast.FunctionDef) and node.name == name)
             self.assertEqual(ast.dump(current, include_attributes=False), ast.dump(before, include_attributes=False))
-        for name in ("_claim_transaction", "_require_model_mutable_claim", "_claim_metadata_eligibility_sql", "_claim_visibility_sql"):
+        for name in ("_require_model_mutable_claim", "_claim_metadata_eligibility_sql", "_claim_visibility_sql",
+                     "_require_claim_writer", "_rollback_claim_transaction", "_claim_journal_pending_commit"):
             self.assertEqual(ast.dump(_method(self.tree, name), include_attributes=False),
                              ast.dump(_method(self.baseline_tree, name), include_attributes=False))
+        # The owner body is deliberately extended by correction01, NOT claimed
+        # byte-unchanged. Existing call modes/defaults remain literal prefixes.
+        current = _method(self.tree, "_claim_transaction").args
+        before = _method(self.baseline_tree, "_claim_transaction").args
+        self.assertEqual([arg.arg for arg in current.kwonlyargs[:-1]], [arg.arg for arg in before.kwonlyargs])
+        self.assertEqual(current.kwonlyargs[-1].arg, "_outbox_retry")
+        self.assertEqual([ast.dump(v) for v in current.kw_defaults[:-1]], [ast.dump(v) for v in before.kw_defaults])
+        for name in ("_graph_commit_fence", "_document_commit_fence", "_event_job_commit_fence",
+                     "_GraphWriterConnection", "_GraphWriterCursor", "_GraphCommitCursor", "_GraphReaderConnection"):
+            self.assertEqual(ast.dump(_definition(self.native_tree, name), include_attributes=False),
+                             ast.dump(_definition(self.baseline_native_tree, name), include_attributes=False))
 
     def test_removed_forwarding_is_distinguished(self):
         actual = _calls(_method(self.tree, "_repair"), "_repair_failed_outbox")[0]
@@ -300,6 +388,399 @@ class AddressedOutboxMetadataTests(unittest.TestCase):
         control.keywords = [keyword for keyword in control.keywords if keyword.arg != "outbox_job_ids"]
         self.assertTrue(_forwarded(actual))
         self.assertFalse(_forwarded(control))
+
+
+    def test_private_exact_stage_reaches_actual_owner(self):
+        retry = _method(self.tree, "_repair_failed_outbox")
+        stage = _calls(retry, "_OutboxRetryStage")
+        self.assertEqual(len(stage), 1)
+        self.assertEqual([ast.unparse(arg) for arg in stage[0].args], ["self", "c", "final_original_admission"])
+        owner = _calls(retry, "_claim_transaction")[0]
+        self.assertEqual([(k.arg, ast.unparse(k.value)) for k in owner.keywords], [("_outbox_retry", "retry_stage")])
+        tx = _method(self.tree, "_claim_transaction")
+        text = ast.unparse(tx)
+        for condition in ("type(_outbox_retry) is not _OutboxRetryStage", "join or adopt",
+                          "_outbox_retry.owner is not self", "_outbox_retry.conn is not c",
+                          "_outbox_retry.thread != threading.get_ident()", "outbox_retry_owner_pending",
+                          "_rollback_receipt", "outbox_retry_standalone_owner_required"):
+            self.assertIn(condition, text)
+        stage_type = _definition(self.native_tree, "_OutboxRetryStage")
+        self.assertIn("__slots__", ast.unparse(stage_type))
+        self.assertFalse(_calls(stage_type, "execute") + _calls(stage_type, "connect"))
+
+    def test_original_admission_follows_callback_capable_owner_tail(self):
+        tx = _method(self.tree, "_claim_transaction")
+        admit = _calls(tx, "admit")
+        original = next(call for call in admit if ast.unparse(call.func) == "_outbox_retry.admit")
+        for name in ("_claim_journal_pending_commit", "_assert_graph_effects", "_assert_event_job_leases",
+                     "_assert_ingest_authority", "prefetch_ready"):
+            self.assertTrue(all(call.lineno < original.lineno for call in _calls(tx, name)), name)
+        self.assertLess(original.lineno, _calls(tx, "commit")[0].lineno)
+        retry = _method(self.tree, "_repair_failed_outbox")
+        final = next(
+            node for node in ast.walk(retry) if isinstance(node, ast.FunctionDef) and node.name == "final_original_admission")
+        for name in ("target_current", "original_current", "same_job", "execute", "fetchall"):
+            self.assertTrue(_calls(final, name), name)
+        self.assertEqual(ast.unparse(next(node.value for node in final.body if isinstance(node, ast.Return))),
+                         "disclosure.epoch[2] + updated")
+        self.assertFalse(_calls(final, "_DisclosureFence") + _calls(final, "_epoch"))
+
+    def test_native_flight_covers_callback_and_commit(self):
+        self.assertTrue(_native_chain_present(self.native_tree))
+        fence = _definition(self.native_tree, "_outbox_retry_commit_fence")
+        text = ast.unparse(fence)
+        for field in ("stage.owner", "stage.conn", "stage.thread", "stage.image", "stage.actor",
+                      "stage.references", "stage.policy_environment", "conn.total_changes",
+                      "owner._claim_tx_outbox_retry_stage", "conn._outbox_retry_commit_flight"):
+            self.assertIn(field, text)
+        self.assertFalse(_calls(fence, "execute") + _calls(fence, "admit") + _calls(fence, "_authority"))
+        commit = _native_method(self.native_tree, "commit")
+        wrapper = _calls(commit, "_graph_native_return")[0]
+        self.assertEqual(ast.unparse(wrapper.args[0]), "super().commit")
+        self.assertLess(_calls(commit, "_graph_start_commit")[0].lineno, wrapper.lineno)
+        self.assertTrue(any(isinstance(n, ast.Assign) and any(
+            ast.unparse(t) == "self._outbox_retry_commit_flight" for t in n.targets)
+            and isinstance(n.value, ast.Constant) and n.value.value is None
+            for node in ast.walk(commit) if isinstance(node, ast.Try) for n in node.finalbody))
+
+    def test_late_callbacks_and_reentrant_completion_are_refused(self):
+        start = ast.unparse(_native_method(self.native_tree, "_graph_start_commit"))
+        for field in ("_graph_trace", "_graph_progress", "outbox_retry_native_commit_late_callback_unsupported"):
+            self.assertIn(field, start)
+        authorize = ast.unparse(_native_method(self.native_tree, "_graph_authorizer_result"))
+        for field in ("outbox_stage.callbacks_seen = True", "_graph_authorizer_depth", "SQLITE_SAVEPOINT",
+                      "a == 'ROLLBACK'", "a == 'COMMIT'", "outbox_flight is None", "'rollback'"):
+            self.assertIn(field, authorize)
+        for name in ("set_authorizer", "set_trace_callback", "set_progress_handler"):
+            text = ast.unparse(_native_method(self.native_tree, name))
+            self.assertIn("self._outbox_retry_commit_flight is not None", text)
+            self.assertIn("callbacks_seen = True", text)
+        self.assertIn("self._outbox_retry_stage is not None", ast.unparse(_native_method(self.native_tree, "close")))
+        self.assertIn("outbox_retry_transaction_mode_unsupported", ast.unparse(_native_method(self.native_tree, "__setattr__")))
+        self.assertIn("if stage.callbacks_seen:", ast.unparse(_definition(self.native_tree, "_outbox_retry_commit_fence")))
+
+    def test_only_known_completion_retires_and_sets_applied(self):
+        tx = _method(self.tree, "_claim_transaction")
+        text = ast.unparse(tx)
+        self.assertLess(_calls(tx, "commit")[0].lineno, next(node.lineno for node in ast.walk(tx)
+            if isinstance(node, ast.Assign) and any(ast.unparse(t) == "_outbox_retry.outcome" for t in node.targets)
+            and ast.unparse(node.value) == "'committed'"))
+        self.assertIn("'rolled_back' if rolled_back else 'unknown'", text)
+        self.assertIn("if completed and getattr(self, '_transaction_quarantine', None) is not c:", text)
+        self.assertIn("outbox_retry_retirement_unknown", text)
+        handler = next(node for node in ast.walk(tx) if isinstance(node, ast.ExceptHandler)
+                       and ast.unparse(node.type) == "BaseException" and _calls(node, "_rollback_claim_transaction"))
+        known = handler.body[0]
+        self.assertIsInstance(known, ast.If)
+        self.assertIn("_outbox_retry.outcome == 'committed'", ast.unparse(known.test))
+        self.assertIsInstance(known.body[0], ast.Raise)
+        retry = ast.unparse(_method(self.tree, "_repair_failed_outbox"))
+        self.assertIn("retry_stage.outcome != 'committed'", retry)
+        for fragment in ("'applied': None if unknown else False", "deferred_postcommit_failed", "deferred_notification_failed"):
+            self.assertIn(fragment, retry)
+
+    def test_notification_has_only_locked_live_registry_effects(self):
+        notify = _definition(self.tree, "_notify_registered_outbox_worker")
+        locks = [node for node in ast.walk(notify) if isinstance(node, ast.With)]
+        self.assertEqual(len(locks), 1)
+        self.assertEqual(ast.unparse(locks[0].items[0].context_expr), "_OUTBOX_WORKERS_LOCK")
+        self.assertEqual({call.func.attr for call in ast.walk(notify)
+                          if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)}, {"get", "is_alive", "set"})
+        self.assertFalse(_calls(notify, "_outbox_db_path") + _calls(notify, "_ensure_outbox")
+                         + _calls(notify, "_start_outbox_worker") + _calls(notify, "Thread"))
+        self.assertEqual(len(_calls(notify, "is_alive")), 1)
+        self.assertEqual(len(_calls(notify, "set")), 1)
+        self.assertIn("_OUTBOX_WORKERS.get(path) is not worker", ast.unparse(notify))
+        self.assertIn("deferred_no_live_worker", ast.unparse(notify))
+        self.assertFalse(any(isinstance(n, ast.Delete) for n in ast.walk(notify)))
+        for node in ast.walk(notify):
+            if isinstance(node, ast.Assign):
+                self.assertTrue(all(isinstance(target, (ast.Name, ast.Tuple)) for target in node.targets))
+        for call in _calls(notify, "get"):
+            if ast.unparse(call.func.value) == "_OUTBOX_WORKERS":
+                self.assertEqual(ast.unparse(call.args[0]), "path")
+
+    def test_removed_native_fence_is_distinguished(self):
+        actual = self.native_tree
+        control = copy.deepcopy(actual)
+        authorize = _native_method(control, "_graph_authorizer_result")
+        class RemoveFence(ast.NodeTransformer):
+            def visit_Expr(self, node):
+                return None if _calls(node, "_outbox_retry_commit_fence") else node
+        RemoveFence().visit(authorize)
+        self.assertTrue(_native_chain_present(actual))
+        self.assertFalse(_native_chain_present(control))
+
+
+class AddressedOutboxNativeOwnerTests(unittest.TestCase):
+    """NOT_RUN real owner component; NOT public admission/semantic target proof.
+
+    After a separate native grant, pass the shipped ci_owned
+    derived_claim_materialization_fixture.Fixture with its existing derived_case
+    active. Its real provider/SPI/connection are reused, not replaced. The tiny
+    table/admission below measures only the NEW owner/native stage contract;
+    it deliberately does not impersonate DisclosureFence, ACL or _strict_target.
+    """
+    __test__ = False
+    fixture_factory = None
+
+    @classmethod
+    def setUpClass(cls):
+        if cls.fixture_factory is None:
+            raise RuntimeError("NOT_RUN: separately admitted genuine native fixture required")
+
+    def _seed(self, c):
+        import sqlite3
+        import sys
+        self.assertIs(c.m.MemoryProvider, sys.modules['agent.memory_provider'].MemoryProvider)
+        self.assertEqual(c.m.MemoryWikiProvider.__bases__, (c.m.MemoryProvider,))
+        self.assertIs(type(c.p), c.m.MemoryWikiProvider)
+        self.assertIs(type(c.conn), c.code._GraphCommitConnection)
+        self.assertIsInstance(c.conn, sqlite3.Connection)
+        self.assertIs(c.conn, c.p._conn)
+        self.assertIs(c.conn, c.p._owned_conn)
+        self.assertTrue(c.path.resolve().is_relative_to(c.home.resolve()))
+        with c.p._claim_transaction(c.conn):
+            c.conn.execute('CREATE TABLE correction01_retry_native(value TEXT NOT NULL)')
+            c.conn.execute("INSERT INTO correction01_retry_native VALUES('before')")
+
+    def _durable(self, c):
+        import sqlite3
+        reader = sqlite3.connect(c.path.resolve().as_uri() + '?mode=ro', uri=True)
+        try:
+            return reader.execute('SELECT value FROM correction01_retry_native').fetchall()
+        finally:
+            reader.close()
+
+    def _stage(self, c):
+        expected, actor = c.conn.total_changes + 1, c.p.session_id
+        calls = []
+        def original_admission():
+            if c.p.session_id != actor:
+                raise PermissionError('original_session_changed')
+            self.assertEqual(c.conn.execute('SELECT value FROM correction01_retry_native').fetchone()[0], 'after')
+            self.assertEqual(c.conn.total_changes, expected)
+            calls.append('original_admission')
+            return expected
+        return c.code._OutboxRetryStage(c.p, c.conn, original_admission), calls
+
+    def _update(self, c):
+        self.assertEqual(c.conn.execute("UPDATE correction01_retry_native SET value='after'").rowcount, 1)
+
+    def _retired(self, c, stage, outcome):
+        self.assertEqual(stage.outcome, outcome)
+        self.assertEqual(stage.phase, 'retired')
+        self.assertFalse(c.conn.in_transaction)
+        self.assertIsNone(c.p._transaction_quarantine)
+        self.assertIsNone(c.p._claim_tx_connection)
+        self.assertIsNone(c.p._claim_tx_outbox_retry_stage)
+        self.assertIsNone(c.conn._outbox_retry_stage)
+        self.assertIsNone(c.conn._outbox_retry_commit_image)
+        self.assertIsNone(c.conn._outbox_retry_commit_flight)
+
+    def test_callback_free_real_owner_commits_and_retires(self):
+        with self.fixture_factory('outbox-correction01-native-healthy') as c:
+            self._seed(c)
+            stage, calls = self._stage(c)
+            with c.p._claim_transaction(c.conn, _outbox_retry=stage):
+                self._update(c)
+                self.assertEqual(self._durable(c), [('before',)])
+            self.assertEqual(calls, ['original_admission'])
+            self.assertEqual(self._durable(c), [('after',)])
+            self._retired(c, stage, 'committed')
+
+    def test_late_journal_actor_change_refuses_original_admission(self):
+        with self.fixture_factory('outbox-correction01-journal-actor') as c:
+            self._seed(c)
+            stage, calls = self._stage(c)
+            actor, pending = c.p.session_id, c.p._claim_journal_pending_commit
+            def late(conn):
+                image = pending(conn)
+                c.p.session_id = 'late-withdrawn-actor'
+                return image
+            c._mp.setattr(c.p, '_claim_journal_pending_commit', late)
+            try:
+                with self.assertRaisesRegex(PermissionError, '^original_session_changed$'):
+                    with c.p._claim_transaction(c.conn, _outbox_retry=stage):
+                        self._update(c)
+                self.assertFalse(calls)
+                self.assertEqual(self._durable(c), [('before',)])
+                self._retired(c, stage, 'rolled_back')
+            finally:
+                c.p.session_id = actor
+                c._mp.setattr(c.p, '_claim_journal_pending_commit', pending)
+
+    def test_real_authorizer_lifetime_is_refused_not_disabled(self):
+        import sqlite3
+        with self.fixture_factory('outbox-correction01-native-authorizer') as c:
+            self._seed(c)
+            stage, calls = self._stage(c)
+            seen = []
+            def authorizer(action, first, second, database, trigger):
+                seen.append((action, first))
+                return sqlite3.SQLITE_OK
+            c.conn.set_authorizer(authorizer)
+            try:
+                with self.assertRaisesRegex(RuntimeError, '^outbox_retry_native_callback_lifetime_unsupported$'):
+                    with c.p._claim_transaction(c.conn, _outbox_retry=stage):
+                        self._update(c)
+                self.assertTrue(seen and calls)
+                # Explicit early native refusal is truthful: do not claim that
+                # this case executed a last SQLITE_TRANSACTION/COMMIT callback.
+                self.assertNotIn((sqlite3.SQLITE_TRANSACTION, 'COMMIT'), seen)
+                self.assertIs(c.conn._graph_user_authorizer, authorizer)
+                self.assertEqual(self._durable(c), [('before',)])
+                self._retired(c, stage, 'rolled_back')
+                # Same real authorizer still works for ordinary nonoutbox TX.
+                with c.p._claim_transaction(c.conn):
+                    self._update(c)
+                self.assertIn((sqlite3.SQLITE_TRANSACTION, 'COMMIT'), seen)
+            finally:
+                c.conn.set_authorizer(None)
+
+    def test_late_trace_install_remove_cannot_hide_callback_lifetime(self):
+        with self.fixture_factory('outbox-correction01-sticky-trace') as c:
+            self._seed(c)
+            stage, calls = self._stage(c)
+            trace = []
+            with self.assertRaisesRegex(RuntimeError, '^outbox_retry_native_callback_lifetime_unsupported$'):
+                with c.p._claim_transaction(c.conn, _outbox_retry=stage):
+                    self._update(c)
+                    c.conn.set_trace_callback(trace.append)
+                    c.conn.execute('SELECT 1').fetchone()
+                    c.conn.set_trace_callback(None)
+            self.assertTrue(trace and calls and stage.callbacks_seen)
+            self.assertIsNone(c.conn._graph_trace)
+            self.assertEqual(self._durable(c), [('before',)])
+            self._retired(c, stage, 'rolled_back')
+
+    def test_premature_completion_and_mode_close_shortcuts_are_refused(self):
+        import sqlite3
+        with self.fixture_factory('outbox-correction01-native-shortcuts') as c:
+            self._seed(c)
+            stage, calls = self._stage(c)
+            cursor = c.conn.cursor()
+            try:
+                with c.p._claim_transaction(c.conn, _outbox_retry=stage):
+                    self._update(c)
+                    operations = (c.conn.commit, c.conn.rollback, c.conn.close,
+                                  lambda: c.conn.execute('COMMIT'), lambda: cursor.execute('END'),
+                                  lambda: c.conn.executescript('SELECT 1;'),
+                                  lambda: setattr(c.conn, 'isolation_level', None),
+                                  lambda: c.conn.execute('SAVEPOINT correction01'))
+                    for operation in operations:
+                        with self.assertRaises((RuntimeError, PermissionError, sqlite3.DatabaseError)):
+                            operation()
+                    self.assertEqual(self._durable(c), [('before',)])
+            finally:
+                cursor.close()
+            self.assertEqual(calls, ['original_admission'])
+            self.assertEqual(self._durable(c), [('after',)])
+            self._retired(c, stage, 'committed')
+
+    def test_fatal_before_commit_preserves_identity_and_known_rollback(self):
+        class Cancel(BaseException):
+            pass
+        with self.fixture_factory('outbox-correction01-native-fatal') as c:
+            self._seed(c)
+            stage, calls = self._stage(c)
+            primary = Cancel('original-fatal')
+            pending = c.p._claim_journal_pending_commit
+            def late(conn):
+                raise primary
+            c._mp.setattr(c.p, '_claim_journal_pending_commit', late)
+            try:
+                with c.p._claim_transaction(c.conn, _outbox_retry=stage):
+                    self._update(c)
+            except BaseException as caught:
+                self.assertIs(caught, primary)
+            else:
+                self.fail('fatal primary was swallowed')
+            finally:
+                c._mp.setattr(c.p, '_claim_journal_pending_commit', pending)
+            self.assertFalse(calls)
+            self.assertEqual(self._durable(c), [('before',)])
+            self._retired(c, stage, 'rolled_back')
+
+    def test_postcommit_fatal_preserves_known_commit_not_false_rollback(self):
+        class Cancel(BaseException):
+            pass
+        with self.fixture_factory('outbox-correction01-native-postcommit-fatal') as c:
+            self._seed(c)
+            stage, calls = self._stage(c)
+            primary = Cancel('known-commit-postcommit-fatal')
+            committed = c.p._claim_journal_committed
+            def after(image):
+                raise primary
+            c._mp.setattr(c.p, '_claim_journal_committed', after)
+            try:
+                with c.p._claim_transaction(c.conn, _outbox_retry=stage):
+                    self._update(c)
+            except BaseException as caught:
+                self.assertIs(caught, primary)
+            else:
+                self.fail('fatal postcommit primary was swallowed')
+            finally:
+                c._mp.setattr(c.p, '_claim_journal_committed', committed)
+            self.assertEqual(calls, ['original_admission'])
+            self.assertEqual(self._durable(c), [('after',)])
+            self._retired(c, stage, 'committed')
+
+
+    def test_absent_dead_worker_notification_has_no_whole_store_maintenance(self):
+        import sqlite3
+        import threading
+        with self.fixture_factory('outbox-correction01-notify-absence') as c:
+            self._seed(c)
+            # Unaddressed legacy payload: the OLD starter would scrub $.text
+            # on its absent/dead-worker branch. No worker is started here.
+            with c.p._claim_transaction(c.conn):
+                c.conn.execute('''INSERT INTO index_outbox
+                    (id,operation,object_type,object_id,payload_json,payload_hash,attempts,status,
+                     last_error,created_at,updated_at,worker_id,lease_until,next_retry_at)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                    ('ffffffffffffff01', 'embed_and_upsert', 'claim', 'unaddressed-fixture-object',
+                     '{"collection":"old-physical","text":"legacy-retained-sentinel"}',
+                     None, 3, 'completed', 'retained-error', 1, 2, '', 0, 0))
+            def whole_state():
+                reader = sqlite3.connect(c.path.resolve().as_uri() + '?mode=ro', uri=True)
+                try:
+                    tables = [row[0] for row in reader.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")]
+                    return {name: sorted(reader.execute('SELECT * FROM "' + name.replace('"', '""') + '"').fetchall(), key=repr)
+                            for name in tables}
+                finally:
+                    reader.close()
+            path = str(c.path.resolve())
+            with c.m._OUTBOX_WORKERS_LOCK:
+                self.assertNotIn(path, c.m._OUTBOX_WORKERS)
+            before, counter = whole_state(), c.conn.total_changes
+            self.assertEqual(c.m._notify_registered_outbox_worker(path), 'deferred_no_live_worker')
+            self.assertEqual(whole_state(), before)
+            self.assertEqual(c.conn.total_changes, counter)
+            dead = {'thread': threading.Thread(), 'wake': threading.Event(), 'worker_id': 'own-never-started'}
+            with c.m._OUTBOX_WORKERS_LOCK:
+                c.m._OUTBOX_WORKERS[path] = dead
+            try:
+                self.assertEqual(c.m._notify_registered_outbox_worker(path), 'deferred_no_live_worker')
+                self.assertFalse(dead['wake'].is_set())
+                self.assertFalse(dead['thread'].is_alive())
+                self.assertEqual(whole_state(), before)
+                self.assertEqual(c.conn.total_changes, counter)
+                with c.m._OUTBOX_WORKERS_LOCK:
+                    self.assertIs(c.m._OUTBOX_WORKERS[path], dead)
+            finally:
+                with c.m._OUTBOX_WORKERS_LOCK:
+                    if c.m._OUTBOX_WORKERS.get(path) is dead:
+                        del c.m._OUTBOX_WORKERS[path]
+
+
+def make_native_owner_suite(fixture_factory):
+    """ONLY with separate native/SQL/SPI admission and existing fixture setup."""
+    class BoundNativeOwnerTests(AddressedOutboxNativeOwnerTests):
+        pass
+    BoundNativeOwnerTests.fixture_factory = staticmethod(fixture_factory)
+    return unittest.TestSuite(BoundNativeOwnerTests(name) for name in NATIVE_OWNER_CASE_IDS)
 
 
 def make_policy_suite(policy):
@@ -310,7 +791,7 @@ def make_policy_suite(policy):
     return unittest.TestSuite(BoundPolicyTests(name) for name in POLICY_CASE_IDS)
 
 
-def make_metadata_suite(main_raw, cache_raw, baseline_main_raw, baseline_cache_raw):
+def make_metadata_suite(main_raw, cache_raw, baseline_main_raw, baseline_cache_raw, *, native_raw, baseline_native_raw):
     """Raw bytes -> AST/JSON; no product compile/exec/import or test autorun."""
     class BoundMetadataTests(AddressedOutboxMetadataTests):
         pass
@@ -318,4 +799,6 @@ def make_metadata_suite(main_raw, cache_raw, baseline_main_raw, baseline_cache_r
     BoundMetadataTests.cache = json.loads(cache_raw)
     BoundMetadataTests.baseline_tree = ast.parse(baseline_main_raw)
     BoundMetadataTests.baseline_cache = json.loads(baseline_cache_raw)
+    BoundMetadataTests.native_tree = ast.parse(native_raw)
+    BoundMetadataTests.baseline_native_tree = ast.parse(baseline_native_raw)
     return unittest.TestSuite(BoundMetadataTests(name) for name in METADATA_CASE_IDS)

@@ -66,10 +66,71 @@ payload/hash, status, attempts, timestamps, worker/lease, retry time и retained
 нет принятия нового epoch после ожидания. Допускается только собственное подтверждённое
 приращение `total_changes`, а не чужие изменения или дополнительные trigger effects.
 
-Start/wake существующего worker находятся после успешного возврата настоящего owner
-из COMMIT/retirement и используют исходный DB path. Dry-run, отказ, no-effect,
-rollback и UNKNOWN не будят worker. Worker повторно проверяет canonical state обычным
-путём; сам `_outbox_process_scoped` не изменён. Пробуждение не доказывает delivery.
+Notification находится после успешного возврата настоящего owner из COMMIT/retirement
+и использует исходный DB path. Новый `_notify_registered_outbox_worker(path)` только
+читает registry и проверяет точные штатные `Thread`/`Event`, liveness и identity
+под **одним** `_OUTBOX_WORKERS_LOCK`, затем вызывает `Event.set`. Нет повторного
+path resolver, SQL, `_ensure_outbox`, starter, нового thread или вложенного wake-lock.
+Отсутствующий/мёртвый worker даёт `notification="deferred_no_live_worker"`,
+`worker_woken=false`, `ok=true`: собственный retry batch уже committed, durable
+intent сохранён, а не выполнен. Bootstrap/restart не входит в этот вызов.
+Dry-run, отказ, no-effect, rollback и UNKNOWN worker не будят. Штатные
+`_start_outbox_worker`, `_ensure_outbox`, `_wake_outbox_worker`, worker loop и
+`_outbox_process_scoped` не изменены. Уже живой worker продолжает свой обычный
+namespace lifecycle; notification не доказывает delivery или дальнейший write-set.
+
+## Correction01: последний callback и настоящий COMMIT
+
+Исходные `d6fb…`/`a3b8…`, отрицательное SOURCE-review и прежний policy PASS сохраняются.
+Два исправляемых findings — **условные подтверждённые по source механизмы**, не
+воспроизведённые runtime incidents: `OUTBOX-NATIVE-ADMISSION-001` и
+`OUTBOX-STARTER-SCOPE-002`.
+
+Для первого добавлен только plugin-private `_OutboxRetryStage` из
+`code_knowledge_graph.py` и необязательный `_claim_transaction(..., _outbox_retry=...)`.
+Это не Hermes Core/SDK и не graph/document/event/terminal capability. Stage держит
+точные provider/connection/thread, original-admission closure и исходные actor/reference/
+policy значения. Он допускается только для отдельного idle shared owner с `BEGIN IMMEDIATE`.
+Join/adopt, другая connection/thread, повторное использование и сочетание с document,
+graph, event, terminal либо rollback receipt явно запрещены. Чужой ordinary writer
+также не может присоединиться к незавершённому narrow outbox stage.
+
+После yield, callback-capable journal/hook/owner/lease tail владелец вызывает именно
+**первоначальный** `final_original_admission`. Повторно проверяются target, ACL/actor,
+source images, erasure, policy, epoch и полный адресный job afterimage. Возвращаемый
+SQL counter равен `original_epoch.total_changes + подтверждённые собственные CAS`,
+а не новому snapshot. Новые исходные claims/ledger/epoch не принимаются.
+Затем настоящая `_GraphCommitConnection.commit` вооружает точный native flight до
+`super().commit`. Pure fence проверяет owner/stage/image/actor/policy/counter на входе
+и после native authorizer, не вызывая из SQLite SQL, target reader или authority callback.
+
+Critical user authorizer/trace/progress lifetimes не поддерживаются этим stage.
+Они **отказывают**, а не отключаются: pre-existing либо установленный в stage
+callback оставляет sticky `callbacks_seen`; его последующее удаление не очищает
+признак. Trace/progress отдельно запрещены на native entry. Поздний authorizer
+проверяется также после callback перед native effect. Поэтому корректный отказ может
+случиться **до** actual `SQLITE_TRANSACTION/COMMIT` callback; такой отказ нельзя
+называть исполнением последнего callback. Обычный callback-free lawful upsert имеет
+положительный путь; ordinary nonoutbox callback semantics не переопределяются.
+Это поддерживаемый in-process контракт, не защита от прямой замены внутреннего
+authorizer через raw setter descriptor, private-field monkeypatch, сигналов,
+произвольного host profiling или OS-level атак. Raw COMMIT shortcuts, в отличие
+от замены самого authorizer, проходят через установленный native fence.
+
+SQL/cursor/script/context shortcuts не завершают тело stage: premature COMMIT/END,
+SAVEPOINT и не-владельческий ROLLBACK запрещены native authorizer. Reentrant completion
+из authorizer также запрещён. Setter/close/transaction-mode guards защищают новый
+lifetime; callbacks не могут снять fence во время native flight. Только сам owner
+переводит stage в rollback. Исходный `_rollback_claim_transaction` не изменён.
+Retirement разрешён после подтверждённого COMMIT либо rollback и только для своего
+точного stage. UNKNOWN сохраняет owner/stage/primary и quarantine без reconnect.
+Fatal `BaseException` не превращается в публичный ordinary refusal.
+
+После известного native COMMIT ошибка journal/notification не изображает rollback:
+`applied=true` и собственные counts сохраняются, notification остаётся deferred.
+При неизвестном native outcome сохраняется `applied=null`; success notification сам
+по себе не устанавливает commit. Прежние native graph/document/event fences и private
+writer/reader classes не переписаны. Их новые совместные runtime-проверки не выполнены.
 
 ## Deletes и статусы
 
@@ -86,15 +147,20 @@ refusal законного upsert: current owned producer-shaped upsert имее
 | Исход | `ok` | `applied` | Смысл |
 |---|---|---|---|
 | `addressed_preflight` | true | false | Собственный batch допущен к моменту проверки; не изменение |
-| `addressed_committed` | true | true | Retry state committed, worker notification вернулся; не delivery |
+| `addressed_committed` + `notified` | true | true | Retry committed; Event.set вернулся; не delivery |
+| `addressed_committed` + `deferred_no_live_worker` | true | true | Retry committed; worker отсутствует/мёртв; нет bootstrap |
 | `refused` | false | false | Нет подтверждённого retry effect |
 | `unknown` / `outbox_commit_unknown` | false | null | Native outcome не доказан; primary/owner/quarantine сохранены |
-| Commit + wake/context error | false | true | Собственный commit известен, notification не подтверждён |
+| Commit + journal/notification/context error | false | true | Commit известен; typed deferred notification; не rollback |
 
 Ошибки возвращаются только фиксированными кодами, в том числе
 `outbox_payload_invalid`, `outbox_target_missing_or_invalid`, `outbox_target_mismatch`,
 `outbox_claim_changed`, `outbox_job_not_failed`, `outbox_job_leased`,
-`outbox_retry_snapshot_changed`, `outbox_retry_no_effect`, `outbox_retry_failed`.
+`outbox_retry_snapshot_changed`, `outbox_retry_no_effect`, `outbox_retry_failed`,
+`outbox_retry_callback_lifetime_unsupported`, `outbox_postcommit_failed`,
+`outbox_worker_notification_failed`. Notification ошибки имеют фиксированные состояния
+`deferred_context_changed`, `deferred_postcommit_failed`, `deferred_notification_failed`;
+до commit notification равен `not_requested`.
 Повтор UNKNOWN не является способом снять quarantine.
 
 ## Подготовленные регрессии и граница доказательства
@@ -103,15 +169,42 @@ refusal законного upsert: current owned producer-shaped upsert имее
 product sources, product import/exec, SQL/native/SDK, worker, network и ENV setup.
 `__test__=False`; suite создаётся только явным вызовом после отдельного допуска.
 
-- `make_policy_suite(policy)` — 10 отдельных SOURCE policy cases: healthy current
+- `make_policy_suite(policy)` — 12 подготовленных SOURCE policy cases: прежние 10
+  сохранены, добавлены typed notification/deferred и запрет выдумывать commit/counts.
+  Проверяются healthy current
   producer shape, literal IDs, malformed payload, bound target/alias, historical
   delete refusal, failed/lease, stale source labels, все поля job race, original
   epoch + counted-own effects, отсутствие raw diagnostic leakage. Эти cases не
   подменяют authority provider/SDK/SQL разрешающим stand-in: authority не исполняется.
-- `make_metadata_suite(main_raw, cache_raw, baseline_main_raw, baseline_cache_raw)` —
-  6 отдельных AST/JSON controls: schema/cache, реальные caller edges, native/ACL/source
-  guard wiring, conditional UPDATE/postcommit wake, неизменённые worker/authority
-  owners, различающий локальный control с удалённым forwarding keyword.
+- `make_metadata_suite(main_raw, cache_raw, baseline_main_raw, baseline_cache_raw,
+  native_raw=..., baseline_native_raw=...)` — 13 подготовленных AST/JSON controls:
+  schema/cache, реальные caller edges, ACL/source/target guards, CAS/afterimage,
+  original admission после journal tail, native flight до actual commit и после
+  callback, callback/setter/completion refusals, known/UNKNOWN retirement,
+  locked registry-only notification. Есть различающие AST controls с удалёнными
+  forwarding keyword и native fence. Прежнее требование полного равенства тела
+  `_claim_transaction` заменено проверкой явно согласованного extension: старые
+  mode/defaults сохранены, unchanged authority/worker/native peers сверяются отдельно.
+- `make_native_owner_suite(fixture_factory)` — 8 подготовленных **настоящих native
+  owner component** cases, не SOURCE: callback-free commit, поздний journal actor
+  drift, реальный authorizer/refusal, sticky trace install/remove, native shortcuts,
+  fatal rollback, fatal после known commit и отсутствие whole-store maintenance
+  при absent/dead worker. Последний case не запускает thread и сравнивает весь
+  собственный SQL store, включая unaddressed legacy completed payload.
+  Передаётся прежний shipped
+  `tests/ci_owned/derived_claim_materialization_fixture.py:Fixture` при активном
+  штатном `derived_case`, с genuine SPI/connection и отдельным native/SQL допуском.
+  Маленькая собственная SQL table и тестовый original-admission callback проверяют
+  только stage owner; они **не** подменяют настоящие public ACL/DisclosureFence/target
+  и не доказывают lawful public repair. Source imports при collection отсутствуют.
+- `PUBLIC_NATIVE_REQUIREMENTS` оставляет 7 явных NOT_RUN требований для actual public
+  semantic/erasure fixture, включая whole-store readback чужого legacy completed
+  payload при absent/dead worker, настоящий healthy producer upsert, late source/
+  target drift, UNKNOWN и notification failure. Готового разрешающего stand-in для
+  этих недостающих ролей нет. UNKNOWN safety teardown прежней document fixture не
+  переносится автоматически: close guard намеренно удерживает новый stage, поэтому
+  нужен separately admitted base-descriptor safety close **после** snapshot, без
+  очистки quarantine/owner/stage. Он не реализован как production recovery.
 
 Для будущего малого SOURCE packet родитель использует существующий `devtools/harness.py`
 и его source bootstrap/loader с **полными точными малыми** `outbox_repair_policy.py` и
