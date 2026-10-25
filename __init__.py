@@ -10615,6 +10615,10 @@ class MemoryWikiProvider(MemoryProvider):
                     captures = getattr(self, "_document_scan_recovery_captures", None)
                     if isinstance(captures, dict):
                         captures.pop(capture_id, None)
+        # This dispatch owns one passive receipt, never provider-global state.
+        # Only the canonical maintenance owner can record its actual COMMIT;
+        # a recursive retry/new request gets a fresh, empty receipt.
+        _maintenance_commit = []
         try:
             if tool_name == "memory_wiki_query":
                 requested = max(1, min(int(a.get("limit", 10) or 10), 200))
@@ -11006,7 +11010,7 @@ class MemoryWikiProvider(MemoryProvider):
             if tool_name == "memory_wiki_evaluate_retrieval": return tool_result(success=True, **self._evaluate_retrieval(int(a.get("limit",10)), int(a.get("max_chars",3800))))
             if tool_name == "memory_wiki_rewrite_claim": return tool_result(success=True, **self._rewrite_claim(a))
             if tool_name == "memory_wiki_explain_recall": return tool_result(success=True, explanations=self._explain_recall(a.get("query",""), int(a.get("limit",10)), a.get("topic")))
-            if tool_name == "memory_wiki_vacuum": return tool_result(success=True, **self._vacuum(a.get("mode") or "suggest", int(a.get("limit",120)), float(a.get("similarity",.82)), int(a.get("max_pairs",2500)), model_scope=not _journal_replay))
+            if tool_name == "memory_wiki_vacuum": return tool_result(success=True, **self._vacuum(a.get("mode") or "suggest", int(a.get("limit",120)), float(a.get("similarity",.82)), int(a.get("max_pairs",2500)), model_scope=not _journal_replay, _commit_receipt=_maintenance_commit))
             if tool_name == "memory_wiki_review_queue": return tool_result(success=True, **self._review_queue(a.get("mode") or "list", a.get("item_id") or "", a.get("claim") or "", a.get("topic") or "", a.get("reason") or "", int(a.get("limit",20))))
             if tool_name == "memory_wiki_lint_claim": return tool_result(success=True, **self._lint_claim(a.get("claim") or "", a.get("topic") or "general"))
             if tool_name == "memory_wiki_why_believe": return tool_result(success=True, **self._why_believe(a.get("claim_id") or ""))
@@ -11040,8 +11044,8 @@ class MemoryWikiProvider(MemoryProvider):
                 a.get("outcome") or "", a.get("answer_id") or "", a.get("notes") or "",
                 a.get("recall_event_ids") or [],
             ))
-            if tool_name == "memory_wiki_normalize_topics": return tool_result(success=True, **self._normalize_topics(a.get("mode") or "suggest", int(a.get("limit",100)), model_scope=not _journal_replay))
-            if tool_name == "memory_wiki_immune_scan": return tool_result(success=True, **self._immune_scan(a.get("mode") or "suggest", int(a.get("limit",100)), model_scope=not _journal_replay))
+            if tool_name == "memory_wiki_normalize_topics": return tool_result(success=True, **self._normalize_topics(a.get("mode") or "suggest", int(a.get("limit",100)), model_scope=not _journal_replay, _commit_receipt=_maintenance_commit))
+            if tool_name == "memory_wiki_immune_scan": return tool_result(success=True, **self._immune_scan(a.get("mode") or "suggest", int(a.get("limit",100)), model_scope=not _journal_replay, _commit_receipt=_maintenance_commit))
             if tool_name == "memory_wiki_compress_topic": return tool_result(success=True, **self._compress_topic(a.get("topic") or "general", a.get("mode") or "suggest", int(a.get("limit",30)), model_scope=not _journal_replay))
             if tool_name == "memory_wiki_resolve_by_policy": return tool_result(success=True, **self._resolve_by_policy(a.get("contradiction_id") or "", a.get("policy") or "prefer_explicit_user"))
             if tool_name == "memory_wiki_repair": return tool_result(success=True, **self._repair(a.get("target") or "all", bool(a.get("dry_run", True)), model_scope=not _journal_replay))
@@ -11211,6 +11215,9 @@ class MemoryWikiProvider(MemoryProvider):
                 return tool_result(success=True, distribution=dist, secret_index_entries=total_secrets)
             return tool_error(f"unknown memory-wiki tool: {tool_name}")
         except sqlite3.OperationalError as e:
+            committed_error = self._maintenance_committed_error(_maintenance_commit, e)
+            if committed_error is not None:
+                return committed_error
             if (self._lifecycle_state == "quarantined"
                     or getattr(self, "_transaction_quarantine", None) is not None):
                 return tool_error(_safe_exception_label(e) + "; connection quarantined; transaction outcome UNKNOWN")
@@ -11233,6 +11240,9 @@ class MemoryWikiProvider(MemoryProvider):
                     pass
             return tool_error(_safe_exception_label(e))
         except sqlite3.DatabaseError as e:
+            committed_error = self._maintenance_committed_error(_maintenance_commit, e)
+            if committed_error is not None:
+                return committed_error
             if (self._lifecycle_state == "quarantined"
                     or getattr(self, "_transaction_quarantine", None) is not None):
                 return tool_error(_safe_exception_label(e) + "; connection quarantined; transaction outcome UNKNOWN")
@@ -11253,6 +11263,9 @@ class MemoryWikiProvider(MemoryProvider):
                 pass
             return tool_error(f"{_safe_exception_label(e)}; provider connection/database error after reconnect. Run direct quick_check and restart Hermes/plugin runtime if the DB is valid.")
         except _DocumentRecoveryHistoryOverflow as e:
+            committed_error = self._maintenance_committed_error(_maintenance_commit, e)
+            if committed_error is not None:
+                return committed_error
             if (self._lifecycle_state == "quarantined"
                     or getattr(self, "_transaction_quarantine", None) is not None):
                 return tool_error(_safe_exception_label(e) + "; connection quarantined; transaction outcome UNKNOWN")
@@ -11260,6 +11273,9 @@ class MemoryWikiProvider(MemoryProvider):
             # Ordinary native tool_error envelopes remain error-only.
             return tool_result(success=False, error="document recovery reference file identity history exceeds journal limit")
         except Exception as e:
+            committed_error = self._maintenance_committed_error(_maintenance_commit, e)
+            if committed_error is not None:
+                return committed_error
             return tool_error(_public_tool_error(e))
 
     # ----- db ------------------------------------------------------------
@@ -14780,6 +14796,30 @@ class MemoryWikiProvider(MemoryProvider):
 
 
 
+    def _maintenance_committed_error(self, receipt, primary: Exception):
+        """Terminal error for this dispatch's positively known canonical COMMIT.
+
+        The passive receipt comes from the exact standalone shared TX owner,
+        not idle/close, a caller argument, or an FTS rollback. It grants no
+        authority to recover derivatives or replay committed maintenance.
+        """
+        if type(receipt) is not list or len(receipt) != 1:
+            return None
+        observed = receipt[0]
+        if type(observed) is not tuple or len(observed) != 3:
+            return None
+        provider, conn, stage = observed
+        if (provider is not self or type(stage) is not tuple or len(stage) != 3
+                or stage[0] is not conn or stage[1] != threading.get_ident()):
+            return None
+        return tool_result(
+            success=False, error="maintenance_postcommit_failed",
+            canonical_outcome="committed", retryable=False,
+            derived_outcome=("unknown" if getattr(self, "_transaction_quarantine", None) is not None
+                             else "incomplete"),
+            detail=_public_tool_error(primary),
+        )
+
     def _release_connection_for_retry(self, primary: BaseException) -> bool:
         """Existing tool retry is allowed only after proven idle-owner close."""
         with self._lock:
@@ -14853,13 +14893,15 @@ class MemoryWikiProvider(MemoryProvider):
 
 
     @contextmanager
-    def _claim_transaction(self, conn=None, *, join=False, adopt=False, begin="IMMEDIATE", _terminal=None, _document_hook=None, _document_ingest=None, _graph_effect=None, _event_job=None, _rollback_receipt=None):
+    def _claim_transaction(self, conn=None, *, join=False, adopt=False, begin="IMMEDIATE", _terminal=None, _document_hook=None, _document_ingest=None, _graph_effect=None, _event_job=None, _rollback_receipt=None, _commit_receipt=None):
         """One SQLite owner stage; joined callers never commit another owner's TX.
 
         Used by claim/ledger owners and the private writer's native context API.
         This is process-local bookkeeping, not permission or a recovery service.
         An optional empty plain list observes only this standalone shared
         owner's confirmed rollback; it never grants writer/cleanup authority.
+        A separate empty plain list may observe this exact owner's successful
+        canonical COMMIT for maintenance's non-retryable postcommit handoff.
         """
         if begin not in {"", "IMMEDIATE", "EXCLUSIVE"} or (join and adopt):
             raise ValueError("invalid_claim_transaction_mode")
@@ -14869,6 +14911,12 @@ class MemoryWikiProvider(MemoryProvider):
                 or any(value is not None for value in (
                     _terminal, _document_hook, _document_ingest, _graph_effect, _event_job))):
             raise ValueError("invalid_claim_rollback_receipt_mode")
+        if _commit_receipt is not None and (
+                type(_commit_receipt) is not list or _commit_receipt
+                or join or adopt or begin != "IMMEDIATE"
+                or any(value is not None for value in (
+                    _terminal, _document_hook, _document_ingest, _graph_effect, _event_job))):
+            raise ValueError("invalid_claim_commit_receipt_mode")
         with self._lock:
             c = self._connect() if conn is None else conn
             self._require_claim_writer(c)
@@ -14906,6 +14954,12 @@ class MemoryWikiProvider(MemoryProvider):
                     or previous_document_stage is not None or previous_graph_stage is not None
                     or previous_event_job_stage is not None or previous_prefetch_terminal is not None):
                 raise RuntimeError("claim_rollback_receipt_requires_standalone_owner")
+            if _commit_receipt is not None and (
+                    c is not self._conn or c is not self._owned_conn
+                    or previous is not None or previous_thread is not None
+                    or previous_document_stage is not None or previous_graph_stage is not None
+                    or previous_event_job_stage is not None or previous_prefetch_terminal is not None):
+                raise RuntimeError("claim_commit_receipt_requires_standalone_owner")
             owns = not active or adopt
             if _terminal is not None:
                 if (type(_terminal) is not _TerminalDelivery or _current_delivery(self) is not _terminal
@@ -15076,6 +15130,10 @@ class MemoryWikiProvider(MemoryProvider):
                     self._quarantine_claim_connection(c, "commit_transaction_still_active")
                     raise RuntimeError("claim_commit_transaction_still_active")
                 completed = True
+                if _commit_receipt is not None:
+                    # Actual c.commit() returned and its TX ended. Record the
+                    # exact owner BEFORE fallible journal/derivative work.
+                    _commit_receipt.append((self, c, document_stage))
                 # Only the actual owner can drain these callbacks. A legal
                 # child join returns above without committing or publishing.
                 document_commits = tuple(document_stage[2])
@@ -16093,7 +16151,7 @@ class MemoryWikiProvider(MemoryProvider):
 
     def _lint_claim(self, claim: str, topic: str = "") -> Dict[str, Any]: return lint_claim_text(claim, topic)
 
-    def _normalize_topics(self, mode: str = "suggest", limit: int = 100, *, model_scope: bool = False) -> Dict[str, Any]:
+    def _normalize_topics(self, mode: str = "suggest", limit: int = 100, *, model_scope: bool = False, _commit_receipt=None) -> Dict[str, Any]:
         mode='apply' if mode=='apply' else 'suggest'; limit=max(1,min(int(limit or 100),1000)); c=self._connect(); fixes=[]
         rows=c.execute("SELECT id,claim,topic FROM claims WHERE status='active' ORDER BY updated_at DESC LIMIT ?", (limit*5,)).fetchall()
         for r in rows:
@@ -16101,18 +16159,21 @@ class MemoryWikiProvider(MemoryProvider):
             if nt != r['topic'] and len(fixes)<limit: fixes.append({"id":r['id'],"old_topic":r['topic'],"new_topic":nt,"claim":short(r['claim'],180)})
         applied=0
         if mode=='apply':
-            if model_scope:
-                for fix in fixes:
-                    self._require_model_mutable_claim(fix['id'], conn=c)
-            with c:
-                for f in fixes:
-                    cur = c.execute("UPDATE claims SET topic=?, updated_at=? WHERE id=?", (f['new_topic'], now(), f['id']))
-                    applied += int(cur.rowcount or 0)
-                    self._add_change('topic_normalize', f['id'], f"{f['old_topic']} -> {f['new_topic']}")
-            self._rebuild_fts(); self._render_all()
+            # Own the exact preflight handle through commit and derivatives.
+            # A nested apply must refuse, not commit/publish its caller's TX.
+            with self._lock:
+                with self._claim_transaction(c, _commit_receipt=_commit_receipt):
+                    if model_scope:
+                        for fix in fixes:
+                            self._require_model_mutable_claim(fix['id'], conn=c)
+                    for f in fixes:
+                        cur = c.execute("UPDATE claims SET topic=?, updated_at=? WHERE id=?", (f['new_topic'], now(), f['id']))
+                        applied += int(cur.rowcount or 0)
+                        self._add_change('topic_normalize', f['id'], f"{f['old_topic']} -> {f['new_topic']}", conn=c)
+                self._rebuild_fts(); self._render_all()
         return {"mode":mode,"fixes":fixes,"applied":applied}
 
-    def _immune_scan(self, mode: str = "suggest", limit: int = 100, *, model_scope: bool = False) -> Dict[str, Any]:
+    def _immune_scan(self, mode: str = "suggest", limit: int = 100, *, model_scope: bool = False, _commit_receipt=None) -> Dict[str, Any]:
         mode='apply' if mode=='apply' else 'suggest'; limit=max(1,min(int(limit or 100),500)); c=self._connect(); actions=[]
         for r in c.execute("SELECT * FROM claims WHERE status='active' ORDER BY updated_at DESC LIMIT 2000").fetchall():
             lint=lint_claim_text(r['claim'], r['topic']); act=''
@@ -16122,16 +16183,18 @@ class MemoryWikiProvider(MemoryProvider):
             if act and len(actions)<limit: actions.append({"action":act,"id":r['id'],"topic":r['topic'],"suggested_topic":lint['topic'],"issues":lint['issues'],"claim":short(redact_secrets(r['claim']),220)})
         applied={"retired":0,"uncertain":0,"retopic":0,"queued":0}
         if mode=='apply':
-            if model_scope:
-                for action in actions:
-                    self._require_model_mutable_claim(action['id'], conn=c)
-            with c:
-                for a in actions:
-                    if a['action']=='retire_secret': c.execute("UPDATE claims SET status='retired', updated_at=? WHERE id=?", (now(),a['id'])); applied['retired']+=1
-                    elif a['action']=='retopic': c.execute("UPDATE claims SET topic=?, updated_at=? WHERE id=?", (a['suggested_topic'],now(),a['id'])); applied['retopic']+=1
-                    else: c.execute("UPDATE claims SET status='uncertain', salience=salience*0.8, updated_at=? WHERE id=?", (now(),a['id'])); applied['uncertain']+=1
-                    self._add_change('immune_'+a['action'], a['id'], ', '.join(a['issues']))
-            self._rebuild_fts(); self._render_all()
+            # Keep the same owner/handle for required change-log writes too.
+            with self._lock:
+                with self._claim_transaction(c, _commit_receipt=_commit_receipt):
+                    if model_scope:
+                        for action in actions:
+                            self._require_model_mutable_claim(action['id'], conn=c)
+                    for a in actions:
+                        if a['action']=='retire_secret': c.execute("UPDATE claims SET status='retired', updated_at=? WHERE id=?", (now(),a['id'])); applied['retired']+=1
+                        elif a['action']=='retopic': c.execute("UPDATE claims SET topic=?, updated_at=? WHERE id=?", (a['suggested_topic'],now(),a['id'])); applied['retopic']+=1
+                        else: c.execute("UPDATE claims SET status='uncertain', salience=salience*0.8, updated_at=? WHERE id=?", (now(),a['id'])); applied['uncertain']+=1
+                        self._add_change('immune_'+a['action'], a['id'], ', '.join(a['issues']), conn=c)
+                self._rebuild_fts(); self._render_all()
         return {"mode":mode,"actions":actions,"applied":applied}
 
     def _compress_topic(self, topic: str, mode: str = "suggest", limit: int = 30, *, model_scope: bool = False) -> Dict[str, Any]:
@@ -20321,7 +20384,9 @@ class MemoryWikiProvider(MemoryProvider):
                 "cache_entries": len(state["cache"]),
                 "circuit_open_s": round(max(0.0, state["circuit_until"] - time.monotonic()), 3),
             })
-            status["cost_usd"] = round(float(status.get("cost_usd", 0.0)), 6)
+            cost = status.get("cost_usd")
+            status["cost_usd"] = (round(cost, 6) if type(cost) in (int, float) and cost >= 0
+                                  and (type(cost) is int or math.isfinite(cost)) else None)
             return status
 
     def _rerank_rows(self, query: str, scored: List[Dict[str, Any]], query_mode: str, *, _disclosure=None) -> List[Dict[str, Any]]:
@@ -20553,6 +20618,24 @@ class MemoryWikiProvider(MemoryProvider):
         request_accounted = False
         response_received = False  # Local effect evidence, independent of optional telemetry.
         stored_cache_entry = None
+        usage = None
+
+        def account_usage():
+            # Called once under _RERANK_LOCK, with the logical request outcome.
+            # Match the physical observer's primitive, bounded numeric grammar;
+            # never coerce optional provider data or infer free billing. Totals
+            # stay unknown after any coverage gap, including an earlier retry.
+            for target, field in (("search_units", "search_units"), ("cost_usd", "cost")):
+                value = usage.get(field) if type(usage) is dict else None
+                valid = (type(value) in (int, float) and 0 <= value <= 1e12
+                         and math.isfinite(value) and (field == "cost" or type(value) is int))
+                total = stats[target]
+                if not valid or total is None:
+                    stats[target] = None
+                else:
+                    total += value
+                    stats[target] = total if type(total) is int or math.isfinite(total) else None
+
         try:
             obj: Dict[str, Any] = {}
             last_error = ""
@@ -20594,6 +20677,7 @@ class MemoryWikiProvider(MemoryProvider):
             if not obj:
                 raise RuntimeError(last_error or "empty rerank response")
 
+            usage = obj.get("usage") if attempt == 0 else None
             api_results = obj.get("results")
             if not isinstance(api_results, list):
                 raise ValueError("invalid_rerank_results")
@@ -20619,18 +20703,16 @@ class MemoryWikiProvider(MemoryProvider):
             cached_meta = [(cid, round(float(score), 6), int(rank)) for cid, score, rank in ranked]
 
             latency_ms = int((time.monotonic() - started) * 1000)
-            usage = obj.get("usage") or {}
             check_document_disclosure()
             with _RERANK_LOCK:
                 _semantic_io_check("rerank")
                 if state.get("generation") == generation:
                     state["failure_count"] = 0
                     state["circuit_until"] = 0.0
+                account_usage()
                 stats["requests"] += 1
                 stats["successes"] += 1
                 request_accounted = True
-                stats["search_units"] += int(usage.get("search_units") or 0)
-                stats["cost_usd"] += float(usage.get("cost") or 0.0)
                 stats["last_latency_ms"] = latency_ms
                 stats["last_error"] = ""
                 if settings['RERANK_CACHE_TTL'] > 0 and state.get("generation") == generation:
@@ -20652,6 +20734,7 @@ class MemoryWikiProvider(MemoryProvider):
                     # Refused admission is not a provider/circuit failure. A response
                     # already received remains an actual request, never a new retry.
                     if response_received and not request_accounted:
+                        account_usage()
                         stats["requests"] += 1
                         request_accounted = True
                     if stored_cache_entry is not None and cache.get(cache_key) is stored_cache_entry:
@@ -20675,15 +20758,18 @@ class MemoryWikiProvider(MemoryProvider):
                 _hybrid_http_valid(observation, False)
             latency_ms = int((time.monotonic() - started) * 1000)
             with _RERANK_LOCK:
-                if state.get("generation") == generation:
-                    state["failure_count"] += 1
-                stats["requests"] += 1
-                stats["failures"] += 1
+                if not request_accounted:
+                    account_usage()
+                    if state.get("generation") == generation:
+                        state["failure_count"] += 1
+                    stats["requests"] += 1
+                    stats["failures"] += 1
+                    request_accounted = True
+                    if state.get("generation") == generation and state["failure_count"] >= settings['RERANK_CIRCUIT_FAILURES']:
+                        state["circuit_until"] = time.monotonic() + settings['RERANK_CIRCUIT_SECONDS']
+                        state["failure_count"] = 0
                 stats["last_latency_ms"] = latency_ms
                 stats["last_error"] = _semantic_io_label(exc)
-                if state.get("generation") == generation and state["failure_count"] >= settings['RERANK_CIRCUIT_FAILURES']:
-                    state["circuit_until"] = time.monotonic() + settings['RERANK_CIRCUIT_SECONDS']
-                    state["failure_count"] = 0
             _stage_receipt("rerank", "failed", ("cancelled" if _prefetch_cancelled() else "deadline" if _prefetch_budget_expired() else "timeout") if isinstance(exc, TimeoutError) else _semantic_io_label(exc), elapsed_ms=latency_ms, safe_candidate_count=len(prefix))
             return original
 
@@ -22192,7 +22278,7 @@ class MemoryWikiProvider(MemoryProvider):
             return "general"
         return t
 
-    def _vacuum(self, mode: str = "suggest", limit: int = 120, similarity: float = .82, max_pairs: int = 2500, *, model_scope: bool = False) -> Dict[str, Any]:
+    def _vacuum(self, mode: str = "suggest", limit: int = 120, similarity: float = .82, max_pairs: int = 2500, *, model_scope: bool = False, _commit_receipt=None) -> Dict[str, Any]:
         mode = "apply" if mode == "apply" else "suggest"; limit=max(1,min(limit,1000)); similarity=max(.55,min(float(similarity),.98)); max_pairs=max(100,min(max_pairs,20000))
         c=self._connect(); rows=[self._rowdict(r) for r in c.execute("SELECT * FROM claims WHERE status='active' ORDER BY pinned DESC, salience DESC, confidence DESC, updated_at DESC LIMIT ?", (min(5000, max(limit*20, 500)),)).fetchall() if self._claim_visible(r)]
         actions=[]; seen_pairs=0
@@ -22233,32 +22319,35 @@ class MemoryWikiProvider(MemoryProvider):
         stale_cons=[dict(r) for r in c.execute("SELECT * FROM contradictions WHERE status='open' AND (claim_a NOT IN (SELECT id FROM claims WHERE status='active') OR claim_b NOT IN (SELECT id FROM claims WHERE status='active')) LIMIT ?", (limit,)).fetchall() if self._contradiction_visible(r,c)]
         applied={"merged":0,"topic_fixes":0,"resolved_contradictions":0,"retired_artifacts":0}
         if mode == "apply":
-            if model_scope:
-                for claim_id in {*(item['id'] for item in artifact_fixes), *(item['id'] for item in topic_fixes),
-                                 *(item['merge_id'] for item in actions), *(item['keep_id'] for item in actions)}:
-                    self._require_model_mutable_claim(claim_id, conn=c)
-                for contradiction in stale_cons:
-                    self._require_model_mutable_claim(str(contradiction['claim_a']), conn=c)
-                    self._require_model_mutable_claim(str(contradiction['claim_b']), conn=c)
-            with c:
-                for a in artifact_fixes[:limit]:
-                    row=c.execute('SELECT * FROM claims WHERE id=?',(a['id'],)).fetchone()
-                    if row is not None and self._claim_visible(row):
-                        c.execute("UPDATE claims SET status='retired', salience=0.0, quality=0.0, updated_at=? WHERE id=?", (now(), a["id"])); applied["retired_artifacts"]+=1
-                for a in actions[:limit]:
-                    row=c.execute("SELECT * FROM claims WHERE id=?",(a["merge_id"],)).fetchone()
-                    keep_row=c.execute("SELECT * FROM claims WHERE id=?",(a["keep_id"],)).fetchone()
-                    if row and keep_row and row["status"] == "active" and self._claim_visible(row) and self._claim_visible(keep_row) and self._claims_share_visibility_partition(row,keep_row):
-                        c.execute("UPDATE claims SET status='superseded', updated_at=? WHERE id=?", (now(), a["merge_id"])); self._add_evidence(a["keep_id"], f"vacuum merged {a['merge_id']}: {a['reason']} sim={a['similarity']}", "note", "memory_wiki_vacuum", commit=False); applied["merged"]+=1
-                for f in topic_fixes:
-                    row=c.execute('SELECT * FROM claims WHERE id=?',(f['id'],)).fetchone()
-                    if row is None or not self._claim_visible(row): continue
-                    before = c.total_changes
-                    c.execute("UPDATE claims SET topic=?, updated_at=? WHERE id=? AND topic=?", (f["new_topic"], now(), f["id"], f["old_topic"]))
-                    if c.total_changes > before: applied["topic_fixes"] += 1
-                for k in stale_cons:
-                    c.execute("UPDATE contradictions SET status='resolved', resolution=?, resolved_at=? WHERE id=?", ("vacuum: endpoint claim not active", now(), k["id"])); applied["resolved_contradictions"] += 1
-            self._rebuild_fts(); self._render_all()
+            with self._lock:
+                with self._claim_transaction(c, _commit_receipt=_commit_receipt):
+                    if model_scope:
+                        for claim_id in {*(item['id'] for item in artifact_fixes), *(item['id'] for item in topic_fixes),
+                                         *(item['merge_id'] for item in actions), *(item['keep_id'] for item in actions)}:
+                            self._require_model_mutable_claim(claim_id, conn=c)
+                        for contradiction in stale_cons:
+                            self._require_model_mutable_claim(str(contradiction['claim_a']), conn=c)
+                            self._require_model_mutable_claim(str(contradiction['claim_b']), conn=c)
+                    for a in artifact_fixes[:limit]:
+                        row=c.execute('SELECT * FROM claims WHERE id=?',(a['id'],)).fetchone()
+                        if row is not None and self._claim_visible(row):
+                            c.execute("UPDATE claims SET status='retired', salience=0.0, quality=0.0, updated_at=? WHERE id=?", (now(), a["id"])); applied["retired_artifacts"]+=1
+                    for a in actions[:limit]:
+                        row=c.execute("SELECT * FROM claims WHERE id=?",(a["merge_id"],)).fetchone()
+                        keep_row=c.execute("SELECT * FROM claims WHERE id=?",(a["keep_id"],)).fetchone()
+                        if row and keep_row and row["status"] == "active" and self._claim_visible(row) and self._claim_visible(keep_row) and self._claims_share_visibility_partition(row,keep_row):
+                            c.execute("UPDATE claims SET status='superseded', updated_at=? WHERE id=?", (now(), a["merge_id"])); self._add_evidence(a["keep_id"], f"vacuum merged {a['merge_id']}: {a['reason']} sim={a['similarity']}", "note", "memory_wiki_vacuum", commit=False, conn=c); applied["merged"]+=1
+                    for f in topic_fixes:
+                        row=c.execute('SELECT * FROM claims WHERE id=?',(f['id'],)).fetchone()
+                        if row is None or not self._claim_visible(row): continue
+                        before = c.total_changes
+                        c.execute("UPDATE claims SET topic=?, updated_at=? WHERE id=? AND topic=?", (f["new_topic"], now(), f["id"], f["old_topic"]))
+                        if c.total_changes > before: applied["topic_fixes"] += 1
+                    for k in stale_cons:
+                        c.execute("UPDATE contradictions SET status='resolved', resolution=?, resolved_at=? WHERE id=?", ("vacuum: endpoint claim not active", now(), k["id"])); applied["resolved_contradictions"] += 1
+                # FTS replacement owns its separate EXCLUSIVE stage only after
+                # this mutation owner has committed and retired successfully.
+                self._rebuild_fts(); self._render_all()
         return {"mode":mode,"similarity":similarity,"pairs_checked":min(seen_pairs,max_pairs),"suggestions":len(actions)+len(artifact_fixes),"actions":actions[:limit],"artifact_fixes":artifact_fixes,"topic_fixes":topic_fixes,"stale_contradictions":stale_cons,"applied":applied,"dashboard":str(self.dashboard_dir/"index.md")}
 
     def _import(self, payload: Dict[str, Any]) -> Dict[str, Any]:

@@ -21,9 +21,9 @@ REVIEW = 'tests/test_foundation_ci_review_boundaries.py'
 HYBRID = 'tests/test_hybrid_budget_observability_source.py'
 SELF = 'tests/test_hybrid_current_cohort.py'
 OLD_PIN = '8007b015f204a0b673e7cf41410fe609f60b8151bd39d9042a53336de7fdaf09'
-CURRENT_PIN = '44cdca1b753f13650fcb9c9fb9bdec9192a9f7c11cdffbe91163abe64dd02805'
+CURRENT_PIN = 'd865f28021c5704095228e7697b5e58e52730142dcc4762bc1e9877c72d27b2b'
 OLD_CRLF = '6c1de6f456837b6c8e0bebe1e54e7030771c811bfd2191af4857cfee0e102479'
-CURRENT_CRLF = 'cdf6ccc05ece2d823522203656308581dd9b0db4829f963c7b499d285aacb5dc'
+CURRENT_CRLF = '9a46737147cdc2f0965c13e77b0c6a679d3e15cd44461327b5477a3e415bf63f'
 
 
 def sha(raw):
