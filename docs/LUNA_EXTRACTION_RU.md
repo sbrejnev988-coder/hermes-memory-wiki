@@ -48,6 +48,29 @@ readback SQLite. Ни accepted, ни assistant «verified» speech не уста
 verified fact. Extraction остаётся chat-scoped, evidence сохраняет source
 quote/speaker/index/time и extractor origin; writer/quality/ACL не обходятся.
 
+## Текущий лимит входа
+
+По уточнению владельца предел одного выбранного сообщения повышен с 6000 до
+**25 000 Unicode code points** — не байтов, токенов или визуальных grapheme clusters.
+Суммарный raw-бюджет остаётся **48 000 символов**, окно — последние **32 целых
+сообщения** с прежними индексами. Whitespace учитывается до trim. При превышении
+размера выбранного сообщения или всего окна выполняется прежний полный отказ,
+а не обрезка текста, отрицания или части выбранного диалога. Сообщения старше
+last-32 window по-прежнему вне контракта.
+
+Выходные бюджеты не увеличены: evidence quote по-прежнему до **6000 символов**
+в schema, shape, LLM-нормализации и heuristic-кандидатах; до 20 entries, прежние
+claim/response bounds и profile-local output token settings. Больший вход сам
+по себе не доказывает большее число или лучшее качество извлечённых фактов и
+не закрывает authorization/refusal-provenance blockers.
+
+`tests/test_extractor_input_budget_source.py` готовит отдельный пакет для
+input/quote бюджета: 14 pure SOURCE и 3 STATIC controls через прежний bootstrap.
+Его исполнение и приёмка должны быть привязаны к exact revision; это не новый
+прогон прежних Luna/AU03 controls, настоящего provider/SDK/SQL/model или loaded
+Gateway. Раздел Correction01 ниже сохраняет историческую границу 6000 и своё
+прежнее evidence; её PASS не переносится на увеличенный ввод.
+
 ## Реально установленная граница capability
 
 При разработке прочитан actual PM workspace
@@ -93,7 +116,7 @@ grounded/rejected; actual_model/model_capability/server_schema_enforced
 original `_admit`, erasure и terminal fences оставить неизменными. Статическая
 проверка wiring не доказывает исполнение provider lifecycle.
 
-## Correction01: raw speech и полное выбранное source-window
+## Correction01: raw speech и полное выбранное source-window (история)
 
 Независимое review исходного `f7c9d2547bd1a7d0cb63cedeca5858f3be2a3ca6`
 сохраняется с `passed=false`: LUNA-S1 (caller делал `str(content)` раньше
