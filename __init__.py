@@ -447,38 +447,54 @@ def _hybrid_scope(purpose, *, new=False):
 
 
 @contextmanager
-def _observed_semantic_http(request, *, timeout, stage, _before_dispatch=None):
-    # Metadata never licenses dispatch. Recheck the admitted owner/cancel/budget
-    # immediately before the unchanged transport; gates do not count as HTTP.
-    _semantic_io_check("embedding" if stage == "health_models" else stage)
+def _observed_semantic_http(request, *, timeout, stage, _before_dispatch=None, _dispatch_state=None):
+    # Metadata never licenses dispatch. The private caller-owned effect flag is
+    # separate from the optional row; neither is an admission capability.
+    checked_stage = "embedding" if stage == "health_models" else stage
+    _semantic_io_check(checked_stage)
     effective = _prefetch_network_timeout(timeout)
-    if effective <= 0.0:
+    if not math.isfinite(effective) or effective <= 0.0:
         raise TimeoutError("semantic_io_deadline")
     row = _hybrid_http_start(stage, effective)
-    try:
-        # Prepare actual owner/route/key/body inputs before final admission.
-        _health_http_check(request.get_method(), request.full_url, dict(request.header_items()), request.data)
+
+    def admit():
+        nonlocal effective
         if _before_dispatch is not None:
-            _before_dispatch()  # Same original document read-set, after body/route preparation.
-        # SQL read admission may wait: reclamp the SAME Event/deadline afterwards.
-        # This check reads the owner first, then the SAME Event/deadline. Nothing
-        # blocking is prepared between this gate/reclamp and adapter entry.
-        _semantic_io_check("embedding" if stage == "health_models" else stage)
+            _before_dispatch()  # SAME original read-set; never recapture after preparation.
+        # Read admission may wait: check the original owner/Event/deadline and
+        # reclamp afterwards, including at the actual lower opener boundary.
+        _semantic_io_check(checked_stage)
         effective = _prefetch_network_timeout(effective)
-        if effective <= 0.0:
+        if not math.isfinite(effective) or effective <= 0.0:
             raise TimeoutError("semantic_io_deadline")
-        # The row is the collector's own primitive dict. Keep this small update
-        # nonblocking: a metadata lock here could outlive the admitted lease.
-        # Gates refuse before this adapter-attempt marker, not after it.
+        return effective  # The lower helper requires numeric timeout, not a void guard.
+
+    def final_admission():
+        admitted_timeout = admit()
+        if _dispatch_state is not None:
+            _dispatch_state["attempts"] += 1
+        # Primitive, nonblocking observation only AFTER final admission. This
+        # marks an admitted lower attempt, not proof of bytes on the wire.
         try:
             if row is not None:
-                row.update(http_issued=True, timeout_s=effective)
+                row.update(http_issued=True, timeout_s=admitted_timeout)
         except Exception:
             pass
-        with _urlopen_no_redirect(request, timeout=effective) as response:
+        return admitted_timeout
+
+    try:
+        _health_http_check(request.get_method(), request.full_url, dict(request.header_items()), request.data)
+        admit()
+        # The existing helper prepares the actual original/no-proxy/no-redirect
+        # opener (or selects the injected transport) BEFORE this numeric gate.
+        # Cooperative snapshot only: not an atomic SQL-to-wire lease.
+        with _urlopen_no_redirect(request, timeout=effective, _before_dispatch=final_admission) as response:
             yield response, row
     except BaseException as exc:
-        _hybrid_http_finish(row, exc)
+        try:
+            _hybrid_http_finish(row, exc)
+        except BaseException:
+            pass  # Optional diagnostics cannot replace the exact pending primary.
         raise
     else:
         _hybrid_http_finish(row)
@@ -4318,7 +4334,7 @@ def _fuse_rerank_order(original, prefix, ranked, *, query_mode, settings, order_
 _RERANK_LOCK = threading.RLock()
 _RERANK_CACHE: Dict[str, Tuple[float, List[Tuple[str, float, int]]]] = {}
 _RERANK_STATS: Dict[str, Any] = {
-    "requests": 0, "successes": 0, "failures": 0, "cache_hits": 0,
+    "requests": 0, "successes": 0, "failures": 0, "local_failures": 0, "cache_hits": 0,
     "skipped": 0, "search_units": 0, "cost_usd": 0.0,
     "last_latency_ms": 0, "last_error": "",
 }
@@ -20617,8 +20633,19 @@ class MemoryWikiProvider(MemoryProvider):
         observation = None
         request_accounted = False
         response_received = False  # Local effect evidence, independent of optional telemetry.
+        dispatch_state = {"attempts": 0}  # Admitted lower attempts, NOT telemetry or wire proof.
+        attempt_started = 0
+        local_io_failure = False
         stored_cache_entry = None
         usage = None
+
+        def check_rerank_io():
+            nonlocal local_io_failure
+            try:
+                _semantic_io_check("rerank")
+            except BaseException:
+                local_io_failure = True
+                raise
 
         def account_usage():
             # Called once under _RERANK_LOCK, with the logical request outcome.
@@ -20639,8 +20666,9 @@ class MemoryWikiProvider(MemoryProvider):
         try:
             obj: Dict[str, Any] = {}
             last_error = ""
-            admitted_data = _semantic_request_bytes(payload, ensure_ascii=False, check=lambda: _semantic_io_check("rerank"))
+            admitted_data = _semantic_request_bytes(payload, ensure_ascii=False, check=check_rerank_io)
             for attempt in range(RERANK_RETRY_COUNT):
+                attempt_started = dispatch_state["attempts"]
                 req = urllib.request.Request(
                     settings['RERANK_URL'],
                     data=admitted_data,
@@ -20652,14 +20680,17 @@ class MemoryWikiProvider(MemoryProvider):
                     if request_timeout <= 0.0:
                         raise TimeoutError("rerank skipped because prefetch budget expired")
                     with _observed_semantic_http(req, timeout=request_timeout, stage="rerank",
-                                                 _before_dispatch=check_document_disclosure) as (response, observation):
+                                                 _before_dispatch=check_document_disclosure,
+                                                 _dispatch_state=dispatch_state) as (response, observation):
                         response_received = True
-                        obj = _semantic_response_json(response, check=lambda: _semantic_io_check("rerank"))
+                        obj = _semantic_response_json(response, check=check_rerank_io)
                         _hybrid_http_response(observation, obj)
-                    _semantic_io_check("rerank")
+                    check_rerank_io()
                     check_document_disclosure()
                     break
                 except urllib.error.HTTPError as exc:
+                    if dispatch_state["attempts"] == attempt_started:
+                        raise  # Local preparation/admission is never a provider retry.
                     # Rerank providers may echo the query or a document in the
                     # response body. Never persist that body in status or logs.
                     if not _semantic_close_http_error(exc, "rerank"):
@@ -20670,6 +20701,9 @@ class MemoryWikiProvider(MemoryProvider):
                 except _SemanticIOError:
                     raise
                 except Exception as exc:
+                    if (dispatch_state["attempts"] == attempt_started or local_io_failure
+                            or _prefetch_cancelled() or _prefetch_budget_expired()):
+                        raise
                     last_error = _semantic_io_label(exc)
                     if attempt + 1 >= RERANK_RETRY_COUNT:
                         raise
@@ -20705,7 +20739,7 @@ class MemoryWikiProvider(MemoryProvider):
             latency_ms = int((time.monotonic() - started) * 1000)
             check_document_disclosure()
             with _RERANK_LOCK:
-                _semantic_io_check("rerank")
+                check_rerank_io()
                 if state.get("generation") == generation:
                     state["failure_count"] = 0
                     state["circuit_until"] = 0.0
@@ -20733,7 +20767,7 @@ class MemoryWikiProvider(MemoryProvider):
                 with _RERANK_LOCK:
                     # Refused admission is not a provider/circuit failure. A response
                     # already received remains an actual request, never a new retry.
-                    if response_received and not request_accounted:
+                    if (response_received or dispatch_state["attempts"]) and not request_accounted:
                         account_usage()
                         stats["requests"] += 1
                         request_accounted = True
@@ -20753,19 +20787,21 @@ class MemoryWikiProvider(MemoryProvider):
                 return []
             if fatal:
                 raise
+            local_failure = (dispatch_state["attempts"] == attempt_started or local_io_failure
+                             or _prefetch_cancelled() or _prefetch_budget_expired())
             # Cancellation after valid ranking is discard, not invalid response.
-            if isinstance(exc, ValueError) and observation is not None and observation.get("response_valid") is None:
+            if not local_failure and isinstance(exc, ValueError) and observation is not None and observation.get("response_valid") is None:
                 _hybrid_http_valid(observation, False)
             latency_ms = int((time.monotonic() - started) * 1000)
             with _RERANK_LOCK:
                 if not request_accounted:
                     account_usage()
-                    if state.get("generation") == generation:
+                    if not local_failure and state.get("generation") == generation:
                         state["failure_count"] += 1
                     stats["requests"] += 1
-                    stats["failures"] += 1
+                    stats["local_failures" if local_failure else "failures"] += 1
                     request_accounted = True
-                    if state.get("generation") == generation and state["failure_count"] >= settings['RERANK_CIRCUIT_FAILURES']:
+                    if not local_failure and state.get("generation") == generation and state["failure_count"] >= settings['RERANK_CIRCUIT_FAILURES']:
                         state["circuit_until"] = time.monotonic() + settings['RERANK_CIRCUIT_SECONDS']
                         state["failure_count"] = 0
                 stats["last_latency_ms"] = latency_ms
