@@ -45,6 +45,7 @@ CASE_IDS = (
     'test_F01_disabled_and_broken_collector_not_authority',
     'test_F01_row_update_error_does_not_erase_attempt',
     'test_F01_pending_primary_identity_survives_collector_fault',
+    'test_F01_ordinary_primary_fresh_finish_failure_identity',
     'test_F01_nonfinite_timeout_never_enters_lower',
 )
 SQL_CONNECT_ATTEMPTS = 0
@@ -350,6 +351,35 @@ class SemanticFinalOpenerAdmissionSource(unittest.TestCase):
                     self.call(body_error=primary if phase == 'body' else None)
                 self.assertIs(caught.exception, primary)
                 self.assertEqual(len(self.lower_calls), int(phase in ('lower', 'body')))
+
+    def test_F01_ordinary_primary_fresh_finish_failure_identity(self):
+        # Pair with the unchanged fatal-primary control: ordinary unwind must
+        # retain the old finish API, including a NEW fatal from diagnostics.
+        for phase in ('read', 'prepare', 'lower', 'body'):
+            for diagnostic_type in (RuntimeError, Fatal, KeyboardInterrupt):
+                self.fresh()
+                primary = TimeoutError('synthetic ordinary primary')
+                diagnostic = diagnostic_type('synthetic fresh finish failure')
+                finishes = []
+                def fail():
+                    raise primary
+                def finish(row, exc=None):
+                    finishes.append((row, exc))
+                    raise diagnostic
+                self.ns['_hybrid_http_finish'] = finish
+                if phase == 'read':
+                    self.on_read = fail
+                elif phase == 'prepare':
+                    self.after_prepare = fail
+                elif phase == 'lower':
+                    self.lower_error = primary
+                with self.assertRaises(diagnostic_type) as caught:
+                    self.call(body_error=primary if phase == 'body' else None)
+                self.assertIs(caught.exception, diagnostic)
+                self.assertEqual(len(finishes), 1)
+                self.assertIs(finishes[0][1], primary)
+                self.assertEqual(len(self.lower_calls), int(phase in ('lower', 'body')))
+                self.assertIs(self.work['http'][0]['http_issued'], phase in ('lower', 'body'))
 
     def test_F01_nonfinite_timeout_never_enters_lower(self):
         for timeout in (float('inf'), float('nan'), 0.0, -1.0):

@@ -292,7 +292,10 @@ def test_real_rerank_guard_cache_and_malformed_fallback(fleet, monkeypatch):
     monkeypatch.setattr(mw, "RERANK_RETRY_COUNT", 1)
     sent = []
     malformed = False
-    def rerank(req, timeout):
+    def rerank(req, timeout, *, _before_dispatch=None):
+        if _before_dispatch is not None:
+            timeout = _before_dispatch()
+        assert type(timeout) is float and 0 < timeout < float('inf')
         docs = json.loads(req.data)["documents"]
         sent.extend(docs)
         results = [{"index": i, "relevance_score": .9-i*.01} for i in range(len(docs))]

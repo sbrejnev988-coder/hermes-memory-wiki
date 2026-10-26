@@ -19,8 +19,8 @@ __test__ = False
 POLICY = b'* text=auto eol=lf\n'
 PUBLIC = {
     '__init__.py': (
-        'd865f28021c5704095228e7697b5e58e52730142dcc4762bc1e9877c72d27b2b',
-        '9a46737147cdc2f0965c13e77b0c6a679d3e15cd44461327b5477a3e415bf63f'),
+        '5beed7af404d51f6e3a231f5f1b6b95e04542e78ea7d01c31dece6b1f0aa8e3e',
+        '861de7b3745d210e85477dd69de1a862d9c6c9532479812e9a91b2d0aef828a0'),
     'tests/fixtures/g4_original_boundary_gold.txt': (
         'bea163fe1ccbfd1963946e255abe9affcd73a148d1be9dae1a891b2f6b5476b8',
         'a4da8a8125ae9b5c68438a34478126e704696a5890ad1de1e1fc2f8788d5f61d'),

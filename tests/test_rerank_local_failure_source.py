@@ -46,6 +46,7 @@ CASE_IDS = (
     'test_F03_cache_and_disclosure_late_fences',
     'test_F03_optional_usage_unknown_zero_and_independent_fields',
     'test_F03_fatal_identity_and_diagnostic_precedence',
+    'test_F03_finish_precedence_at_owning_caller',
     'test_F03_local_status_foreign_profile_and_generation',
     'test_F03_remote_then_local_retry_preparation_stops_once',
     'test_F03_late_receipt_error_no_double_accounting',
@@ -382,6 +383,42 @@ class RerankLocalFailureCases:
             self.assertEqual(self.state['stats']['local_failures'], 0)
             self.assertEqual(self.state['failure_count'], 0)
             self.assertEqual(self.state['cache'], {})
+
+    def test_F03_finish_precedence_at_owning_caller(self):
+        # The real rerank caller must not turn a fresh finish fatal into its
+        # ordinary local fallback; a pending fatal still owns exact identity.
+        for phase in ('prepare', 'lower', 'response'):
+            for primary_type in (TimeoutError, Fatal):
+                for diagnostic_type in (Fatal, KeyboardInterrupt):
+                    self.fresh()
+                    primary = primary_type('synthetic pending primary')
+                    diagnostic = diagnostic_type('synthetic fresh finish fatal')
+                    finishes = []
+                    def fail():
+                        raise primary
+                    def finish(row, exc=None):
+                        finishes.append((row, exc))
+                        raise diagnostic
+                    self.ns['_hybrid_http_finish'] = finish
+                    if phase == 'prepare':
+                        self.after_prepare = fail
+                    elif phase == 'lower':
+                        self.actions = [primary]
+                    else:
+                        self.after_response = fail
+                    expected = primary if primary_type is Fatal else diagnostic
+                    with self.assertRaises(type(expected)) as caught:
+                        self.call()
+                    self.assertIs(caught.exception, expected)
+                    self.assertEqual(len(finishes), 1)
+                    self.assertIs(finishes[0][1], primary)
+                    self.counts(0, 0, 0, int(phase != 'prepare'))
+                    self.assertEqual(self.state['stats']['local_failures'], 0)
+                    self.assertEqual(self.state['failure_count'], 0)
+                    self.assertEqual(self.state['circuit_until'], 0.0)
+                    self.assertEqual(self.state['cache'], {})
+                    self.assertEqual(self.clock.sleeps, [])
+                    self.assertEqual(self.events, [])
 
     def test_F03_local_status_foreign_profile_and_generation(self):
         self.query += ' \ud800'

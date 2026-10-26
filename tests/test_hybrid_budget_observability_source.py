@@ -54,6 +54,8 @@ EXPECTED_REASONS = (
 
 # Exact baseline AST fingerprints, populated from the pinned baseline, not from
 # execution or from candidate behavior. These controls are STATIC only.
+# Preserve this historical before-gold; the two intentional SEM changes below
+# have separate current expectations, not a reinterpretation of old evidence.
 BASELINE_AST = {
     "_PrefetchAttempt": "7569d709b0f5ba83fb48b93fcd6e0f97feb4f7b302dbce67b8c20aa8dee602a5",
     "_bounded_prefetch_callback": "c07f80c5c4e9247a9f1c0f599b745223c4f19b25b882cf8a4cc81a5e34a4b059",
@@ -77,6 +79,14 @@ BASELINE_AST = {
     "assignment:PREFETCH_FALLBACK_RESERVE_SECONDS": "ce405144068322f35b977dfced12b7552e3174c40d6eaad9dfe168aed655f081",
     "assignment:RERANK_MIN_CANDIDATES": "e75ecc0fbb5ee93a9975abe6911b12c1b4e1d9a02294540b91591478e090d4a1",
     "assignment:_RERANK_STATS": "785b20de2a6d75b7c3322568fd6b214d4831474671d93f0233671203a502b859",
+}
+
+
+# Original _fingerprint recipe, measured by CPython 3.14.9 AST metadata only.
+# Other parser/native/CI qualification is not implied by these current values.
+SEM_CURRENT_AST = {
+    "_observed_semantic_http": "39d58781093f58ae4c9c78e35ebc5834b2dcde6ff8c268e88ec9f70f8a9292cb",
+    "assignment:_RERANK_STATS": "bb88f0a69a01f6628c5f59fd50243ee97b9cf289c510d184f3e4a1d8894450ec",
 }
 
 
@@ -244,6 +254,10 @@ class HybridBudgetObservabilitySource(unittest.TestCase):
         self.stop = _TransportStop("synthetic adapter denied; no HTTP")
 
         def deny_adapter(*args, **kwargs):
+            # At this synthetic effect seam, invoke the real wrapper's numeric
+            # final gate before observing the denied lower attempt.
+            if kwargs.get("_before_dispatch") is not None:
+                kwargs["timeout"] = kwargs["_before_dispatch"]()
             self.boundary.append(("adapter_denied", args, kwargs))
             raise self.stop
 
@@ -675,6 +689,8 @@ class HybridBudgetObservabilitySource(unittest.TestCase):
         self.assertEqual(payload["model"], "synthetic/model")
         self.assertGreater(self.boundary[2][2]["timeout"], 0.0)
         self.assertLess(self.boundary[2][2]["timeout"], 5.5)
+        self.assertIs(type(self.boundary[2][2]["timeout"]), float)
+        self.assertTrue(math.isfinite(self.boundary[2][2]["timeout"]))
         self.assertTrue(self.boundary[-1][1]["http_issued"])
         self.assertIs(self.boundary[-1][2], self.stop)
         self.assertEqual(self.state["stats"]["requests"], 0)
@@ -697,6 +713,7 @@ class HybridBudgetObservabilitySource(unittest.TestCase):
                     node = self._assignment(qualified.split(":")[1])
                 else:
                     node = self._function(qualified)
+                expected = SEM_CURRENT_AST.get(qualified, expected)
                 self.assertEqual(_fingerprint(node), expected)
         stats = ast.literal_eval(self._assignment("_RERANK_STATS").value)
         self.assertTrue(all(type(value) in (int, float, str) for value in stats.values()))
@@ -722,7 +739,7 @@ class HybridBudgetObservabilitySource(unittest.TestCase):
             # The original function initializes this local before its try.
             args=ast.arguments(posonlyargs=[], args=[ast.arg(arg="request_accounted")], vararg=None,
                 kwonlyargs=[], kw_defaults=[], kwarg=None, defaults=[ast.Constant(value=False)]),
-            body=[wrapped], decorator_list=[], returns=None), rerank)
+            body=[self._function("account_usage", rerank), wrapped], decorator_list=[], returns=None), rerank)
         ast.fix_missing_locations(probe)
         self._exec([probe], self.ns)
         for diagnostic_type in (RuntimeError, _TransportStop):
@@ -735,6 +752,7 @@ class HybridBudgetObservabilitySource(unittest.TestCase):
                     raise secondary
                 self.ns.update(pending_primary=primary, _disclosure=types.SimpleNamespace(ok=False),
                     response_received=True, request_accounted=False, stored_cache_entry=None,
+                    usage=None, dispatch_state={"attempts": 1},
                     cache=self.state["cache"], cache_key="unused-synthetic-key", stats=self.state["stats"],
                     state=self.state, prefix=self.rows, original=self.rows, _stage_receipt=failed_diagnostic)
                 with self.assertRaises(_TransportStop) as caught:
@@ -743,6 +761,8 @@ class HybridBudgetObservabilitySource(unittest.TestCase):
                 self.assertEqual(self.state["stats"]["requests"], 1)
                 self.assertEqual(self.state["skip_reasons"]["document_disclosure_changed"], 1)
                 self.assertEqual(self.state["stats"]["skipped"], 1)
+                self.assertIsNone(self.state["stats"]["search_units"])
+                self.assertIsNone(self.state["stats"]["cost_usd"])
                 self.assertEqual(self.boundary, [])
         # With no pending primary, an actual cancellation is not swallowed.
         cancellation = _TransportStop("owned fresh cancellation")

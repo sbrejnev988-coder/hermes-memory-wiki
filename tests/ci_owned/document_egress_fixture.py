@@ -365,8 +365,10 @@ class Fixture:
             if len(self._observer_errors) < 8:
                 self._observer_errors.append(type(exc).__name__)
 
-    def transport(self, request, timeout):
+    def transport(self, request, timeout, *, _before_dispatch=None):
         """Authored streams под настоящими current HTTP/codec/admission helpers."""
+        if _before_dispatch is not None:
+            timeout = _before_dispatch()
         require(timeout > 0, 'positive_transport_timeout')
         url, method = request.full_url, request.get_method()
         body = json.loads(request.data) if request.data is not None else None

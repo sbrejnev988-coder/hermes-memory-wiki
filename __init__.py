@@ -491,10 +491,13 @@ def _observed_semantic_http(request, *, timeout, stage, _before_dispatch=None, _
         with _urlopen_no_redirect(request, timeout=effective, _before_dispatch=final_admission) as response:
             yield response, row
     except BaseException as exc:
-        try:
-            _hybrid_http_finish(row, exc)
-        except BaseException:
-            pass  # Optional diagnostics cannot replace the exact pending primary.
+        if isinstance(exc, Exception):
+            _hybrid_http_finish(row, exc)  # Preserve ordinary-unwind diagnostic failures.
+        else:
+            try:
+                _hybrid_http_finish(row, exc)
+            except BaseException:
+                pass  # Optional diagnostics cannot replace the exact pending fatal.
         raise
     else:
         _hybrid_http_finish(row)

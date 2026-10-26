@@ -249,7 +249,10 @@ def test_rerank_circuit_isolated_between_profile_homes(tmp_path, monkeypatch):
         def __enter__(self): return self
         def __exit__(self, *args): self.close()
     requests = []
-    def fake_urlopen(req, timeout):
+    def fake_urlopen(req, timeout, *, _before_dispatch=None):
+        if _before_dispatch is not None:
+            timeout = _before_dispatch()
+        assert type(timeout) is float and 0 < timeout < float('inf')
         home = module._QDRANT_PROFILE_SCOPE.get()["__home"]
         requests.append(Path(home).name)
         if home.endswith("profile-a"):

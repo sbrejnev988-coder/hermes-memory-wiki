@@ -213,7 +213,9 @@ class RerankUsageAccountingSource(unittest.TestCase):
         return True  # Synthetic cleanup observer, not actual HTTPError I/O proof.
 
     @contextmanager
-    def adapter(self, request, *, timeout):
+    def adapter(self, request, *, timeout, _before_dispatch=None):
+        if _before_dispatch is not None:
+            timeout = _before_dispatch()
         payload = json.loads(request.data)
         self.dispatches.append({'payload': payload, 'timeout': timeout})
         action = self.actions.pop(0) if self.actions else self.body(n=len(payload['documents']))
@@ -379,9 +381,12 @@ class RerankUsageAccountingSource(unittest.TestCase):
             raise primary
         self.ns['_semantic_request_bytes'] = denied
         self.assertEqual(self.call(), self.rows)
-        self.counts(1, 0, 1, 0)
+        self.counts(1, 0, 0, 0)  # SEM-F03: local preparation is not provider failure.
         self.usage(None, None)
-        self.assertEqual(self.state['failure_count'], 1)
+        self.assertEqual(self.state['stats']['local_failures'], 1)
+        self.assertEqual(self.state['failure_count'], 0)
+        self.assertEqual(self.state['circuit_until'], 0.0)
+        self.assertEqual(self.clock.sleeps, [])
         self.assertEqual(self.routes, [])
 
     def test_invalid_rank_matrix_is_one_failure(self):
@@ -546,7 +551,11 @@ class RerankUsageAccountingSource(unittest.TestCase):
         event.clear()
         self.after_response = event.set
         self.assertEqual(self.call(), self.rows)
-        self.counts(1, 0, 1, 1)
+        self.counts(1, 0, 0, 1)  # SEM-F03: late cancellation is a local discard.
+        self.assertEqual(self.state['stats']['local_failures'], 1)
+        self.assertEqual(self.state['failure_count'], 0)
+        self.assertEqual(self.state['circuit_until'], 0.0)
+        self.assertEqual(self.clock.sleeps, [])
         self.usage(None, None)
         self.assertEqual(self.state['cache'], {})
         self.assertIsNone(self.work['http'][0]['response_valid'])
@@ -556,13 +565,21 @@ class RerankUsageAccountingSource(unittest.TestCase):
         self.ns['_PREFETCH_LOCAL'].deadline = 102.0
         self.before_route = lambda: setattr(self.clock, 'now', 101.875)
         self.assertEqual(self.call(), self.rows)
-        self.counts(1, 0, 1, 0)
+        self.counts(1, 0, 0, 0)  # Local final-admission refusal, no admitted attempt.
+        self.assertEqual(self.state['stats']['local_failures'], 1)
+        self.assertEqual(self.state['failure_count'], 0)
+        self.assertEqual(self.state['circuit_until'], 0.0)
+        self.assertEqual(self.clock.sleeps, [])
         self.assertEqual(self.state['cache'], {})
         self.fresh()
         self.ns['_PREFETCH_LOCAL'].deadline = 102.0
         self.after_response = lambda: setattr(self.clock, 'now', 102.0)
         self.assertEqual(self.call(), self.rows)
-        self.counts(1, 0, 1, 1)
+        self.counts(1, 0, 0, 1)  # Admitted response discarded at the local deadline.
+        self.assertEqual(self.state['stats']['local_failures'], 1)
+        self.assertEqual(self.state['failure_count'], 0)
+        self.assertEqual(self.state['circuit_until'], 0.0)
+        self.assertEqual(self.clock.sleeps, [])
         self.usage(None, None)
         self.assertIn(('rerank', 'failed', 'deadline'), self.events)
 
@@ -657,18 +674,20 @@ class RerankUsageAccountingSource(unittest.TestCase):
         self.assertEqual(self.state['circuit_until'], 0.0)
 
     def test_STATIC_scope_and_consumer_wiring(self):
-        static = SOURCE_CARRIER['static']
-        self.assertTrue(static['outside_two_methods_raw_equal'])
-        self.assertEqual(static['changed_product_definitions'], ['_rerank_status', '_rerank_rows'])
+        # Current SEM scope; original AU05 carrier/gold remain historical.
+        static = SOURCE_CARRIER['static']['sem_boundaries']
+        self.assertTrue(static['outside_three_product_spans_raw_equal'])
+        self.assertEqual(static['changed_product_definitions'],
+                         ['_observed_semantic_http', 'assignment:_RERANK_STATS', 'MemoryWikiProvider._rerank_rows'])
         self.assertTrue(static['full_logical_tree_changed_paths_exact'])
-        self.assertTrue(static['all_usage_consumers_reviewed'])
+        self.assertTrue(static['usage_consumer_AST_equal_to_SEM_baseline'])
         self.assertFalse(static['large_main_runtime_binding'])
 
     def test_STATIC_fixed_safety_wrappers(self):
-        static = SOURCE_CARRIER['static']
-        self.assertTrue(static['fixed_wrappers_raw_equal'])
+        static = SOURCE_CARRIER['static']['sem_boundaries']
+        self.assertTrue(static['lower_helpers_raw_equal'])
         self.assertTrue(static['disclosure_body_raw_equal'])
-        self.assertTrue(static['retry_loop_AST_equal'])
+        self.assertTrue(static['retry_loop_AST_equal_to_SEM_baseline'])
         self.assertTrue(static['rank_validation_AST_equal'])
         self.assertTrue(static['predispatch_prefix_raw_equal'])
         self.assertTrue(static['semantic_io_raw_equal'])
