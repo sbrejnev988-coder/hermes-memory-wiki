@@ -125,7 +125,10 @@ def _lexical_sentence_spans(
 _DEFAULT_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 _DEFAULT_MODEL = "openai/gpt-4.1-mini"
 _MAX_MESSAGES = 32
-_MAX_MESSAGE_CHARS = 6000
+_MAX_MESSAGE_CHARS = 25000
+# Input capacity and output evidence are independent budgets. A larger source
+# message must not silently expand quote/schema acceptance or response size.
+_MAX_EVIDENCE_QUOTE_CHARS = 6000
 _MAX_TRANSCRIPT_CHARS = 48000
 _MAX_RESPONSE_BYTES = 256 * 1024
 _MAX_ENTRIES = 20
@@ -500,7 +503,8 @@ def _heuristic_extract(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
                 occupied.append(match.span())
                 raw_claim = " ".join(str(match.group(1)).split()).strip(" -:,.\t\r\n")
                 evidence_quote = match.group(0).strip()
-                if (not (10 < len(raw_claim) <= 2000) or _TRIVIAL_RE.match(raw_claim)
+                if (not (10 < len(raw_claim) <= 2000)
+                        or len(evidence_quote) > _MAX_EVIDENCE_QUOTE_CHARS or _TRIVIAL_RE.match(raw_claim)
                         or any(start <= match.start(1) < end for start, end in quoted_spans)
                         or not _claim_supported(raw_claim, evidence_quote)):
                     continue
@@ -680,7 +684,7 @@ def _entry_shape_valid(entry: Any) -> bool:
         or type(entry["confidence"]) not in {int, float} or not 0 <= entry["confidence"] <= 1
         or entry["type"] not in _VALID_TYPES or entry["speaker"] not in {"user", "assistant"}
         or not 10 < len(entry["claim"]) <= 2000 or not 1 <= len(entry["topic"]) <= 120
-        or not 5 <= len(entry["evidence_quote"]) <= _MAX_MESSAGE_CHARS
+        or not 5 <= len(entry["evidence_quote"]) <= _MAX_EVIDENCE_QUOTE_CHARS
         or len(entry["event_at"]) > 120
     )
 
@@ -1055,7 +1059,7 @@ def _normalize_llm_entry(
     claim = " ".join(str(entry.get("claim") or "").split()).strip()
     claim_type = str(entry.get("type") or "").casefold()
     topic = " ".join(str(entry.get("topic") or "general").split()).strip()
-    if (not (10 < len(claim) <= 2000) or not (5 <= len(quote) <= _MAX_MESSAGE_CHARS)
+    if (not (10 < len(claim) <= 2000) or not (5 <= len(quote) <= _MAX_EVIDENCE_QUOTE_CHARS)
             or claim_type not in _VALID_TYPES or not topic or len(topic) > 120
             or quote not in source_message["content"] or _TRIVIAL_RE.match(quote)
             or (reject_secret_material and (
@@ -1085,7 +1089,7 @@ def _response_schema() -> Dict[str, Any]:
     properties = {
         "claim": {"type": "string", "maxLength": 2000}, "type": {"type": "string", "enum": sorted(_VALID_TYPES)},
         "topic": {"type": "string", "maxLength": 120},
-        "evidence_quote": {"type": "string", "maxLength": _MAX_MESSAGE_CHARS},
+        "evidence_quote": {"type": "string", "maxLength": _MAX_EVIDENCE_QUOTE_CHARS},
         "speaker": {"type": "string", "enum": ["user", "assistant"]},
         "message_index": {"type": "integer", "minimum": 0}, "event_at": {"type": "string", "maxLength": 120},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1},

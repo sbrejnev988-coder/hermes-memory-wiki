@@ -168,7 +168,8 @@ class LunaSourceScopeTests(unittest.TestCase):
         assert diagnostic["actual_model"] == diagnostic["model_capability"] == "UNKNOWN"
 
     def test_original_caps_and_closed_refusal_diagnostics(self):
-        assert (self.x._MAX_MESSAGES, self.x._MAX_MESSAGE_CHARS, self.x._MAX_TRANSCRIPT_CHARS) == (32, 6000, 48000)
+        assert (self.x._MAX_MESSAGES, self.x._MAX_MESSAGE_CHARS, self.x._MAX_TRANSCRIPT_CHARS) == (32, 25000, 48000)
+        assert self.x._MAX_EVIDENCE_QUOTE_CHARS == 6000
         for code in ("source_message_budget_exceeded", "source_transcript_budget_exceeded"):
             assert code in self.x.ExtractionBoundaryError.CODES
             assert self.x._extraction_error_code(self.x.ExtractionBoundaryError(code)) == code
@@ -219,7 +220,7 @@ class LunaSourceScopeTests(unittest.TestCase):
 
     def test_actual_caller_preserves_raw_budget_before_whitespace_trim(self):
         text = "Project Aster uses violet channel."
-        for raw in (text + " " * (6001 - len(text)), denial_text(6001)):
+        for raw in (text + " " * (25001 - len(text)), denial_text(25001)):
             receiver, sent = self.invoke([{"role": "user", "content": raw},
                                          {"role": "user", "content": "Remember: Aster uses Qdrant."}], caller=True)
             assert sent == receiver.callbacks == [] and receiver.sql_refusals == 1
@@ -229,11 +230,11 @@ class LunaSourceScopeTests(unittest.TestCase):
             assert "Qdrant" not in receiver.audits[0][2]
 
     def test_message_exact_and_plus_one_refuse_whole_not_remaining_positive(self):
-        text = bounded_text(6000, "Remember: Project Aster uses violet channel. ")
+        text = bounded_text(25000, "Remember: Project Aster uses violet channel. ")
         result, sent, callbacks = self.invoke([{"role": "user", "content": text}], [self.peer["entry"]()])
         assert len(sent) == 1 and len(callbacks) == 1 and result["extracted"] == 1
         transcript = json.loads(sent[0][1][1]["content"].split("TRANSCRIPT_JSON:\n", 1)[1])
-        assert transcript[0]["content"] == text.strip() and len(transcript[0]["content"]) <= 6000
+        assert transcript[0]["content"] == text.strip() and len(transcript[0]["content"]) <= 25000
         for enabled in (False, True):
             result, sent, callbacks = self.invoke([
                 {"role": "user", "content": text + "."},
@@ -243,10 +244,10 @@ class LunaSourceScopeTests(unittest.TestCase):
 
     def test_trailing_denial_exact_whitespace_and_plus_one_no_positive(self):
         row = self.peer["entry"](claim="Aster uses Qdrant.", evidence_quote="Aster uses Qdrant")
-        for length in (6000, 6001, 6040):
+        for length in (25000, 25001, 25040):
             result, sent, callbacks = self.invoke([{"role": "user", "content": denial_text(length)}], [row])
             assert callbacks == [] and result["entries"] == []
-            if length == 6000:
+            if length == 25000:
                 assert len(sent) == 1 and ", or not really." in sent[0][1][1]["content"]
                 assert result["llm_diagnostics"]["rejected"] == 1
             else:
@@ -290,7 +291,7 @@ class LunaSourceScopeTests(unittest.TestCase):
         tail = [{"role": "user", "content": "Remember: Aster uses Qdrant."}]
         tail += [{"role": "assistant", "content": "Ordinary complete context."} for _ in range(31)]
         # An older message is deliberately outside the last-32-message contract.
-        exchanges = [{"role": "user", "content": denial_text(6001)}, *tail]
+        exchanges = [{"role": "user", "content": denial_text(25001)}, *tail]
         normalized = self.x._normalize_exchanges(exchanges)
         assert len(normalized) == 32 and [m["message_index"] for m in normalized] == list(range(1, 33))
         assert normalized[0]["content"] == tail[0]["content"]
@@ -317,7 +318,7 @@ class LunaSourceScopeTests(unittest.TestCase):
     def test_score_known_refusal_is_zero_without_lifecycle_exception(self):
         complete = [{"role": "user", "content": "Remember: Aster uses Qdrant."}]
         assert self.x.extractor_score_session(complete)["total"] > 0
-        oversized = [{"role": "user", "content": denial_text(6001)}, *complete]
+        oversized = [{"role": "user", "content": denial_text(25001)}, *complete]
         transcript = complete + [{"role": "assistant", "content": bounded_text(6000)} for _ in range(8)]
         for exchanges in (oversized, transcript):
             assert self.x.extractor_score_session(exchanges) == {"total": 0.0}
