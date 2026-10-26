@@ -1393,6 +1393,47 @@ def _codex_content(settings: ExtractionSettings, messages: List[Dict[str, Any]],
         reset_hermes_home_override(home_token)
 
 
+def _openrouter_response_content(response: Any) -> str:
+    """Accept one completed, ordinary OpenRouter assistant text choice.
+
+    Optional refusal omission is legacy-compatible, NOT known-null provenance or
+    a strict no-refusal/checkpoint guarantee. JSON/schema/grounding stay with the
+    existing downstream consumer; provider error payloads are never rendered.
+    """
+    if getattr(response, "error", None) is not None:
+        raise ExtractionBoundaryError("response_completion_unconfirmed")
+    choices = getattr(response, "choices", None)
+    if type(choices) is not list or len(choices) != 1:
+        raise ExtractionBoundaryError("response_choice_invalid")
+    choice = choices[0]
+    if getattr(choice, "error", None) is not None:
+        raise ExtractionBoundaryError("response_completion_unconfirmed")
+    reason = getattr(choice, "finish_reason", None)
+    if type(reason) is not str:
+        raise ExtractionBoundaryError("response_completion_unconfirmed")
+    if reason == "length":
+        raise ExtractionBoundaryError("response_truncated")
+    if reason == "content_filter":
+        raise ExtractionBoundaryError("response_refused")
+    if reason != "stop":
+        raise ExtractionBoundaryError("response_completion_unconfirmed")
+    message = getattr(choice, "message", None)
+    role = getattr(message, "role", None)
+    tool_calls = getattr(message, "tool_calls", None)
+    if (type(role) is not str or role != "assistant"
+            or (tool_calls is not None and (type(tool_calls) is not list or len(tool_calls) != 0))
+            or getattr(message, "function_call", None) is not None):
+        raise ExtractionBoundaryError("response_non_text")
+    # Refusal is optional on the ordinary non-streaming OpenRouter shape.
+    # Absence of refusal remains unknown; any explicitly non-null value vetoes.
+    if getattr(message, "refusal", None) is not None:
+        raise ExtractionBoundaryError("response_refused")
+    content = getattr(message, "content", None)
+    if type(content) is not str or not content.strip():
+        raise ExtractionBoundaryError("response_text_invalid")
+    return content
+
+
 def _openrouter_content(settings: ExtractionSettings, messages: List[Dict[str, Any]]) -> str:
     """Explicit paid route, using only the owner's existing native .env secrets."""
     from agent.secret_scope import build_profile_secret_scope
@@ -1454,9 +1495,7 @@ def _openrouter_content(settings: ExtractionSettings, messages: List[Dict[str, A
             response_format={"type": "json_schema", "json_schema": _response_schema()},
         )
         check_deadline()
-        if response.choices[0].message.tool_calls:
-            raise ValueError("OpenRouter non-text response")
-        return response.choices[0].message.content
+        return _openrouter_response_content(response)
     finally:
         if client is not None:
             client.close()
