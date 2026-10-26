@@ -2594,6 +2594,25 @@ def _ingest_transaction(provider, conn, hook, *, source_id, _replay_reference=No
         _document_recovery_file_identities(conn, source_id)
 
 
+class _DocumentPublicationNotReady(RuntimeError):
+    """A candidate cannot replace an already usable active document revision."""
+
+
+def _document_publication_status(existing: Any, candidate_status: Any) -> str:
+    """Keep a usable active source unless its candidate explicitly reports ok.
+
+    The extractor always emits status. Missing/false/invalid status is not proof
+    of completeness for replacement, even though legacy initial ingests keep
+    their old default. Use row indexing: standalone callers may use sqlite3.Row.
+    Unit count is not completeness; an explicitly ok empty document is lawful.
+    """
+    if (existing is not None and int(existing["active"] or 0)
+            and str(existing["status"] or "").strip().lower() == "ok"
+            and (not isinstance(candidate_status, str) or candidate_status.strip().lower() != "ok")):
+        raise _DocumentPublicationNotReady("document_publication_incomplete")
+    return str(candidate_status or "ok").strip().lower()
+
+
 def _embed_ingest_result(provider: Any, args: Dict[str, Any], source_id: str,
                          result: Dict[str, Any]) -> Dict[str, Any]:
     """Hand off requested embedding after the ingest stage exits, without relabelling it."""
@@ -2691,6 +2710,7 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
     payload["file_hash"] = str(snapshot_meta["file_hash"])
     payload["mtime_ns"] = int(snapshot_meta["mtime_ns"])
     payload["file_size"] = int(snapshot_meta["size_bytes"])
+    candidate_status = payload.get("status")
     extraction_payload, xlsx_context = _document_extraction_payload(payload)
     if payload.get("parser") == "stdlib-xlsx-ooxml":
         # The SAME typed, redacted representation feeds cache and materialization.
@@ -2708,10 +2728,10 @@ def ingest_document(provider: Any, args: Dict[str, Any], *, _commit_hook=None, _
     parser_version = str(payload.get("parser_version") or "")
     revision_id = "docrev_" + _sha(f"{source_id}\0{file_hash}\0{parser}\0{parser_version}\0{extraction_fp}\0{material_fp}")[:28]
     existing = conn.execute("SELECT * FROM document_sources WHERE source_id=?", (source_id,)).fetchone()
-    extractor_status = str(payload.get("status") or "ok").strip().lower()
     same_identity = _assert_ingest_source_scope(provider, existing, scope_id, repository_id)
     _assert_ingest_path_alias_owner(provider, conn, path, source_id, scope_id, repository_id,
                                     opened_identity=file_identity)
+    extractor_status = _document_publication_status(existing, candidate_status)
     representation_current = _xlsx_unchanged_eligible(existing, payload, cache_reused=cache_reused)
     if (existing and representation_current and same_identity and str(existing["revision_id"] or "") == revision_id
             and str(existing["file_hash"] or "") == file_hash
