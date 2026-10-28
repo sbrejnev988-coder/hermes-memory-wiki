@@ -505,6 +505,69 @@ Every returned evidence string passes the provider recall guard, and claims rece
 
 Automatic prefetch and explicit `memory_wiki_recall` add one daily SQLite aggregate per fixed operation, outcome, and latency bucket. `memory_wiki_health.metrics.online_recall` reports sample counts, hit/empty/fallback/error counts, mean latency, and p50/p95 **bucket upper bounds** for up to the last seven days; `window_days` gives the actual window when retention is shorter. These are runtime measurements, not answer-quality scores. The metrics table has no query, result text, owner/session ID, trace ID, arbitrary label, or exception field. A busy database drops the sample without changing recall. Data older than the configured retention is pruned during recording. The provider cannot measure host time-to-first-token or model cost unless Hermes supplies those signals separately.
 
+### Health: nullable score и границы metadata-оценки
+
+`memory_wiki_health` выполняет локальный metadata-аудит, **не** запускает
+`evaluate_retrieval`, search/pack, embedding, rerank или repair. Это не обещание
+hard read-only: cold connect/migration, public dispatcher и прежние optional
+readers фоновых/online-метрик сохраняют собственные lifecycle-эффекты и guards.
+Существующий отказ `shared_claim_scope_unavailable` для mixed-scope базы не снят.
+
+Все прежние response keys сохранены, но это **осознанное nullable API-изменение**:
+`health_score` теперь `null`, а не среднее локальных эвристик с подставной оценкой
+retrieval. Default-аудит не квалифицирует operational пути и потому не выдаёт
+числовой overall health. Клиент должен сначала проверить `assessment.version`
+(`memory-wiki.health-assessment/v1`), `status`, `complete`, `reasons` и
+`unknown_components`; нельзя заменять `null` нулём/единицей, форматировать его
+как float или считать `success=true` доказательством здоровья. `DEGRADED`
+означает наблюдённые дефекты даже при неизвестных остальных компонентах;
+`UNKNOWN` — отсутствие полной квалификации, **не** PASS. Оба состояния имеют
+`complete=false`. Extraction, persistence, FTS integrity, vector coverage,
+document retrieval и rerank остаются явно непроверенными; revisions, enabled
+settings и job summaries не доказывают исправность этих путей.
+
+`limit` (1–1000) ограничивает только примеры. `metrics.claims` и
+`metrics.active_claims` — точные SQL aggregate populations. Metadata и active
+content сканируются независимо, каждое окно — не более 20 000 строк в порядке
+`updated_at DESC, id ASC`; artifact pollution относится только к top-80 active
+по `salience DESC, confidence DESC, id ASC`. `metrics.scan_coverage` для каждого
+окна содержит `population_total`, `scanned`, `scan_limit`, `denominator`
+(размер запланированного окна), `window_complete`, `complete` (весь population
+прочитан) и `truncated`. Полное top-80 окно не означает полный active corpus.
+Это граница количества материализованных строк, не latency deadline и не
+атомарный cross-store snapshot; concurrent изменения могут дать неполноту.
+
+Счётчики findings не равны длине capped display lists и не экстраполируются на
+непрочитанный хвост. `schema_anomalies` считает отдельные повреждённые поля,
+`raw_blobs` — отдельные JSON/multiline и ephemeral findings (одна строка может
+дать два); остальные content-счётчики — подходящие строки scanned active окна.
+Прежние content-hygiene коэффициенты сохранены. `metrics.health_components`
+сохраняет шесть прежних имён; `retrieval_quality=null`, остальные значения
+nullable при недостаточном покрытии/отсутствии active observations. Подробности
+в `assessment.components`: `scope`, `complete`, `score` и `observed_score`
+показывают именно локальные эвристики на наблюдённом окне, не probability of
+truth и не оценку реальных моделей. `artifact_pollution` квалифицирует своё
+top-80 окно, а legacy имя `db_health` — только schema/claim metadata, не SQLite
+integrity. Ни `OBSERVED`, ни числовой component не заменяют overall qualification.
+
+Явный `memory_wiki_evaluate_retrieval` остаётся отдельной операцией с прежними
+ACL/privacy gates и `record_retrieval=False` для search и pack. При непустом
+наборе сохраняются настоящий numeric `score` (включая `0.0` при провале),
+`passed`/`failed`/`leak_cases` и результаты; assessment версии
+`memory-wiki.retrieval-assessment/v1` имеет `PASS`/`FAIL` только на выбранных
+не более чем 100 cases (`scope=selected_cases`, явный `denominator`). Без cases:
+`score=null`, `status=UNKNOWN`, `reasons=["no_cases"]`; прежние `summary`,
+`cases` и `results` сохранены. Исключение не заменяется фиктивным score.
+Даже PASS этого finite набора не аттестует extractor/vector/native runtime.
+JSON transport допускает null; внешним numeric-only consumers нужна адаптация.
+Core-клиенты этим изменением не редактируются, native compatibility не заявлена.
+
+Prepared stdlib SOURCE-регрессии: `tests/test_health_assessment_source.py`,
+явная `build_suite(owners_source, helper_source=None, scratch=None)`. Обычная
+collection инертна. Parent связывает extracted owners с raw SHA полного source
+и AST fidelity до исполнения под существующим SOURCE controller; наличие
+этих тестов само по себе не означает выполненный SOURCE/native/Linux gate.
+
 ### Evidence-backed living observations
 
 When the append-only event ledger is enabled, startup migration installs a derived observation index with current records, immutable bounded version history, and stable event links. Consolidation runs in bounded batches after host turn capture, host memory mutations, and maintenance. It is deterministic and does not call an LLM or synthesize text: every observation copies guard-safe text from a supporting event. Exact owner predicates are applied in SQL before limits, expired evidence disappears immediately, source deletion removes derived history, and transient guard failures use bounded retry state instead of permanent rejection.
@@ -1123,7 +1186,7 @@ should inspect both values.
 | `memory_wiki_decay_archive` | Archive claims below decay threshold |
 | `memory_wiki_gc` | Garbage collect stale/low-salience claims |
 | `memory_wiki_doctor` | Read-only checks of journal, schema, and indexes by default; `repair=true` also runs write probes, WAL checkpoints, and repairs |
-| `memory_wiki_health` | Database statistics and FTS index status |
+| `memory_wiki_health` | Bounded local metadata findings/coverage; versioned assessment and nullable overall score, not a live retrieval/FTS integrity test |
 | `memory_wiki_snapshot` | Full DB snapshot export |
 | `memory_wiki_maintenance` | Rebuild FTS, scan contradictions, render pages, and process one bounded semantic-outbox batch (no arguments) |
 

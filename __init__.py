@@ -22551,61 +22551,104 @@ class MemoryWikiProvider(MemoryProvider):
 
 
     def _health(self, limit: int = 100) -> Dict[str, Any]:
+        """Bounded local metadata observations, not an operational retrieval test.
+
+        `limit` caps examples only. Counts describe the fixed scanned windows;
+        exact aggregate populations and coverage disclose any unexamined tail.
+        The legacy component names describe content hygiene, not truth or live
+        extractor/vector/document/rerank qualification. Cold connect/migration
+        and the existing optional metrics readers are not a hard read-only API.
+        """
         c = self._connect(); limit=max(1,min(limit,1000)); cols=set(self._cols("claims"))
         required={"normalized_claim","type","source_type","last_verified_at","verification_status","quality_flags","source_ref","derived_from","review_state"}
-        issues=[]; metrics={"claims": c.execute("SELECT count(*) n FROM claims").fetchone()["n"], "schema_missing": sorted(required-cols)}
+        population = c.execute("SELECT count(*) n, sum(CASE WHEN status='active' THEN 1 ELSE 0 END) active FROM claims").fetchone()
+        issues=[]; metrics={"claims":int(population["n"]), "active_claims":int(population["active"] or 0), "schema_missing":sorted(required-cols)}
+        counts={"low_quality":0,"bad_topics":0,"raw_blobs":0,"secret_hits":0,"schema_anomalies":0}
         bad=[]; topics=[]; blobs=[]; secrets=[]; schema_anomalies=[]
-        # Metadata corruption is often old and low-salience, so scan the full bounded table
-        # instead of only the freshest rows; output remains capped by `limit`.
-        for r in c.execute("SELECT id,status,topic,claim FROM claims ORDER BY updated_at DESC LIMIT 20000").fetchall():
+        scan_limit=20000; metadata_scanned=0; active_scanned=0
+        for r in c.execute("SELECT id,status,topic,claim FROM claims ORDER BY updated_at DESC, id ASC LIMIT ?", (scan_limit,)).fetchall():
+            metadata_scanned += 1
             status = str(r["status"] or "")
-            if status not in VALID_CLAIM_STATUSES and len(schema_anomalies) < limit:
-                schema_anomalies.append({"id":r["id"],"field":"status","value":short(status,80),"suggested":"uncertain","claim":short(r["claim"],180)})
+            if status not in VALID_CLAIM_STATUSES:
+                counts["schema_anomalies"] += 1
+                if len(schema_anomalies) < limit:
+                    schema_anomalies.append({"id":r["id"],"field":"status","value":short(status,80),"suggested":"uncertain","claim":short(r["claim"],180)})
             topic_reason = topic_integrity_reason(r["topic"])
-            if topic_reason and len(schema_anomalies) < limit:
-                suggested = "config" if str(r["claim"] or "").lower().startswith("hermes env/config metadata") else self._infer_topic(r["claim"])
-                schema_anomalies.append({"id":r["id"],"field":"topic","value":short(r["topic"],80),"suggested":suggested,"reason":topic_reason,"claim":short(r["claim"],180)})
-        for r in c.execute("SELECT * FROM claims WHERE status='active' ORDER BY updated_at DESC LIMIT ?", (max(limit*10, limit),)).fetchall():
+            if topic_reason:
+                counts["schema_anomalies"] += 1
+                if len(schema_anomalies) < limit:
+                    suggested = "config" if str(r["claim"] or "").lower().startswith("hermes env/config metadata") else self._infer_topic(r["claim"])
+                    schema_anomalies.append({"id":r["id"],"field":"topic","value":short(r["topic"],80),"suggested":suggested,"reason":topic_reason,"claim":short(r["claim"],180)})
+        for r in c.execute("SELECT * FROM claims WHERE status='active' ORDER BY updated_at DESC, id ASC LIMIT ?", (scan_limit,)).fetchall():
+            active_scanned += 1
             q = claim_quality(r["claim"], r["topic"]); bad_frag, why = is_bad_claim_fragment(r["claim"])
             if r["id"].startswith("c_summary_"):
                 bad_frag = False; why = ""
-            if (q < 0.28 or bad_frag) and len(bad) < limit:
-                bad.append({"id":r["id"],"topic":r["topic"],"quality":q,"reason":why or "low quality","claim":short(r["claim"],240)})
-            if ((r["topic"] in BAD_TOPICS or str(r["topic"]).isdigit()) and r["topic"] not in CANONICAL_TOPICS) and len(topics) < limit:
-                topics.append({"id":r["id"],"topic":r["topic"],"suggested_topic":self._infer_topic(r["claim"]),"claim":short(r["claim"],220)})
+            if q < 0.28 or bad_frag:
+                counts["low_quality"] += 1
+                if len(bad) < limit:
+                    bad.append({"id":r["id"],"topic":r["topic"],"quality":q,"reason":why or "low quality","claim":short(r["claim"],240)})
+            if (r["topic"] in BAD_TOPICS or str(r["topic"]).isdigit()) and r["topic"] not in CANONICAL_TOPICS:
+                counts["bad_topics"] += 1
+                if len(topics) < limit:
+                    topics.append({"id":r["id"],"topic":r["topic"],"suggested_topic":self._infer_topic(r["claim"]),"claim":short(r["claim"],220)})
             claim_s = str(r["claim"])
-            if not r["id"].startswith("c_summary_") and str(r["type"] if "type" in r.keys() else "") != "task_result" and (claim_s.startswith("{") or "\n" in claim_s) and len(blobs) < limit:
-                blobs.append({"id":r["id"],"topic":r["topic"],"claim":short(r["claim"],240)})
-            if not r["id"].startswith("c_summary_") and str(r["type"] if "type" in r.keys() else "") != "task_result" and is_ephemeral_fragment(r["claim"]) and len(blobs) < limit:
-                blobs.append({"id":r["id"],"topic":r["topic"],"claim":short(r["claim"],240),"reason":"system/tool artifact"})
-            if (redact_secrets(r["claim"]) != r["claim"] or redact_secrets(str(r["evidence"] or "")) != str(r["evidence"] or "")) and len(secrets) < limit:
-                secrets.append({"id":r["id"],"topic":r["topic"],"claim":short(redact_secrets(r["claim"]),240)})
-        metrics.update({"low_quality":len(bad),"bad_topics":len(topics),"raw_blobs":len(blobs),"secret_hits":len(secrets),"schema_anomalies":len(schema_anomalies)})
+            if not r["id"].startswith("c_summary_") and str(r["type"] if "type" in r.keys() else "") != "task_result" and (claim_s.startswith("{") or "\n" in claim_s):
+                counts["raw_blobs"] += 1
+                if len(blobs) < limit:
+                    blobs.append({"id":r["id"],"topic":r["topic"],"claim":short(r["claim"],240)})
+            if not r["id"].startswith("c_summary_") and str(r["type"] if "type" in r.keys() else "") != "task_result" and is_ephemeral_fragment(r["claim"]):
+                counts["raw_blobs"] += 1
+                if len(blobs) < limit:
+                    blobs.append({"id":r["id"],"topic":r["topic"],"claim":short(r["claim"],240),"reason":"system/tool artifact"})
+            if redact_secrets(r["claim"]) != r["claim"] or redact_secrets(str(r["evidence"] or "")) != str(r["evidence"] or ""):
+                counts["secret_hits"] += 1
+                if len(secrets) < limit:
+                    secrets.append({"id":r["id"],"topic":r["topic"],"claim":short(redact_secrets(r["claim"]),240)})
+        metrics.update(counts)
         if metrics["schema_missing"]: issues.append("schema migration incomplete")
-        if schema_anomalies: issues.append("claim metadata anomalies need integrity repair")
-        if bad: issues.append("low-quality/fragment claims need curation")
-        if topics: issues.append("bad topics need retopic")
-        if blobs: issues.append("raw logs/json blobs should be summarized or retired")
-        if secrets: issues.append("potential secrets require scrub")
-        top_artifacts=0
-        for r in c.execute("SELECT * FROM claims WHERE status='active' ORDER BY salience DESC, confidence DESC LIMIT 80").fetchall():
+        if counts["schema_anomalies"]: issues.append("claim metadata anomalies need integrity repair")
+        if counts["low_quality"]: issues.append("low-quality/fragment claims need curation")
+        if counts["bad_topics"]: issues.append("bad topics need retopic")
+        if counts["raw_blobs"]: issues.append("raw logs/json blobs should be summarized or retired")
+        if counts["secret_hits"]: issues.append("potential secrets require scrub")
+        top_artifacts=0; top_scanned=0
+        for r in c.execute("SELECT * FROM claims WHERE status='active' ORDER BY salience DESC, confidence DESC, id ASC LIMIT 80").fetchall():
+            top_scanned += 1
             if not r['id'].startswith('c_summary_') and (is_ephemeral_fragment(r['claim']) or str(r['trust_class'] if 'trust_class' in r.keys() else '') in ('tool_log','raw_blob','secret')):
                 top_artifacts += 1
-        eval_score = 1.0
-        try:
-            eval_score = float(self._evaluate_retrieval(5, 2500).get('score', 1.0))
-        except Exception:
-            eval_score = 0.75
-        components={
-            'db_health': 0.0 if metrics['schema_missing'] else (1.0 - min(1.0, len(schema_anomalies)*0.10)),
-            'secret_health': 1.0 - min(1.0, len(secrets)*0.10),
-            'semantic_quality': 1.0 - min(1.0, len(bad)*0.03 + len(topics)*0.02 + len(blobs)*0.04),
-            'artifact_pollution': 1.0 - min(1.0, top_artifacts*0.06),
-            'retrieval_quality': eval_score,
-            'contradiction_health': 1.0 - min(1.0, c.execute("SELECT count(*) n FROM contradictions WHERE status='open'").fetchone()['n']*0.015),
+        def coverage(total, scanned, bound):
+            return {"population_total":total,"scanned":scanned,"scan_limit":bound,
+                    "denominator":min(total,bound),"complete":scanned==total,
+                    "window_complete":scanned==min(total,bound),"truncated":scanned<total}
+        scan_coverage={
+            "metadata":coverage(metrics["claims"],metadata_scanned,scan_limit),
+            "active":coverage(metrics["active_claims"],active_scanned,scan_limit),
+            "top_active":coverage(metrics["active_claims"],top_scanned,80),
         }
-        metrics.update({'top_artifacts':top_artifacts,'health_components':components})
-        score = sum(components.values()) / max(1, len(components))
+        open_contradictions=int(c.execute("SELECT count(*) n FROM contradictions WHERE status='open'").fetchone()['n'])
+        observed_components={
+            'db_health': 0.0 if metrics['schema_missing'] else (1.0 - min(1.0, counts['schema_anomalies']*0.10)),
+            'secret_health': 1.0 - min(1.0, counts['secret_hits']*0.10),
+            'semantic_quality': 1.0 - min(1.0, counts['low_quality']*0.03 + counts['bad_topics']*0.02 + counts['raw_blobs']*0.04),
+            'artifact_pollution': 1.0 - min(1.0, top_artifacts*0.06),
+            'contradiction_health': 1.0 - min(1.0, open_contradictions*0.015),
+        }
+        component_complete={
+            'db_health':scan_coverage['metadata']['complete'],
+            'secret_health':scan_coverage['active']['complete'] and active_scanned>0,
+            'semantic_quality':scan_coverage['active']['complete'] and active_scanned>0,
+            'artifact_pollution':scan_coverage['top_active']['window_complete'] and top_scanned>0,
+            'contradiction_health':True,
+        }
+        components={key:value if component_complete[key] else None for key,value in observed_components.items()}
+        components['retrieval_quality']=None  # Explicit evaluation is a separate operation.
+        metrics.update({'top_artifacts':top_artifacts,'open_contradictions':open_contradictions,
+                        'health_components':components,'scan_coverage':scan_coverage})
+        degraded_reasons=[key+"_observed" for key,value in counts.items() if value]
+        if metrics['schema_missing']: degraded_reasons.append('schema_missing')
+        if top_artifacts: degraded_reasons.append('top_artifacts_observed')
+        if open_contradictions: degraded_reasons.append('open_contradictions_observed')
         db_path = str(self.db_path.expanduser().resolve())
         db_instance = self._meta_text("database_instance_id")
         journal_mode = str(c.execute("PRAGMA journal_mode").fetchone()[0]).lower()
@@ -22630,8 +22673,10 @@ class MemoryWikiProvider(MemoryProvider):
             coordination_status = "unverified"
         if expected_bots and consumer_count < expected_bots:
             issues.append(f"only {consumer_count}/{expected_bots} memory consumers reported in the last 24h")
+            degraded_reasons.append("expected_consumers_missing")
         if coordination_status == "isolated":
             issues.append("database path or database_instance_id differs from the configured shared-memory identity")
+            degraded_reasons.append("shared_memory_identity_mismatch")
         metrics.update({
             "sqlite_latest_revision": sqlite_revision,
             "fts_latest_revision": fts_revision,
@@ -22666,7 +22711,35 @@ class MemoryWikiProvider(MemoryProvider):
             "origin_chat_hash": self._chat_hash(self.session_id),
             "project_id": self.project_scope,
         }
-        return {"version":PLUGIN_VERSION,"health_score":round(score,3),"metrics":metrics,"shared_memory":shared_memory,"issues":issues,"schema_anomalies":schema_anomalies,"low_quality":bad,"bad_topics":topics,"raw_blobs":blobs,"secret_hits":secrets}
+        if metrics["outbox_failed_count"]:
+            degraded_reasons.append("failed_outbox_jobs_observed")
+        component_scopes={"db_health":"metadata","secret_health":"active",
+                          "semantic_quality":"active","artifact_pollution":"top_active",
+                          "contradiction_health":"open_contradictions_aggregate"}
+        component_observed={"db_health":True,"secret_health":active_scanned>0,
+                            "semantic_quality":active_scanned>0,"artifact_pollution":top_scanned>0,
+                            "contradiction_health":True}
+        evidence={key:{"status":"DEGRADED" if value<1.0 else "OBSERVED" if component_complete[key] else "UNKNOWN",
+                       "score":components[key],"observed_score":value if component_observed[key] else None,
+                       "complete":component_complete[key],"scope":component_scopes[key]}
+                  for key,value in observed_components.items()}
+        unknown_components=[key for key,complete in component_complete.items() if not complete]
+        # Stored revisions, job summaries and local hygiene cannot attest these
+        # paths. Do not probe them or fold a synthetic substitute into a mean.
+        for key in ("retrieval_quality","extraction","persistence","fts_integrity",
+                    "vector_coverage","document_retrieval","rerank"):
+            unknown_components.append(key)
+            evidence[key]={"status":"UNKNOWN","score":None,"complete":False,
+                           "reasons":["not_checked_by_metadata_health"]}
+        reasons=degraded_reasons+["operational_components_not_checked"]
+        if not scan_coverage["metadata"]["complete"] or not scan_coverage["active"]["complete"]:
+            reasons.append("bounded_scan_incomplete")
+        if not active_scanned: reasons.append("no_active_claim_observations")
+        assessment={"version":"memory-wiki.health-assessment/v1",
+                    "status":"DEGRADED" if degraded_reasons else "UNKNOWN",
+                    "complete":False,"scope":"bounded_local_metadata",
+                    "reasons":reasons,"unknown_components":unknown_components,"components":evidence}
+        return {"version":PLUGIN_VERSION,"health_score":None,"assessment":assessment,"metrics":metrics,"shared_memory":shared_memory,"issues":issues,"schema_anomalies":schema_anomalies,"low_quality":bad,"bad_topics":topics,"raw_blobs":blobs,"secret_hits":secrets}
 
     def _explain_recall(self, query: str, limit: int = 10, topic: Optional[str]=None) -> List[Dict[str, Any]]:
         rows = self._model_safe_claim_rows(self._search(query, limit, True, topic, record_retrieval=False)); qt=tokens(query); out=[]
@@ -25280,7 +25353,11 @@ class MemoryWikiProvider(MemoryProvider):
         limit=max(1,min(int(limit or 10),50)); max_chars=max(800,min(int(max_chars or 3800),12000)); c=self._connect()
         cases=[dict(r) for r in c.execute("SELECT * FROM retrieval_eval_cases ORDER BY updated_at DESC LIMIT 100").fetchall()]
         if not cases:
-            return {"cases":0,"score":0.0,"results":[],"summary":{"passed":0,"failed":0}}
+            return {"cases":0,"score":None,"results":[],"summary":{"passed":0,"failed":0},
+                    "passed":0,"failed":0,"leak_cases":0,
+                    "assessment":{"version":"memory-wiki.retrieval-assessment/v1","status":"UNKNOWN",
+                                  "complete":False,"scope":"selected_cases","denominator":0,"case_limit":100,
+                                  "reasons":["no_cases"],"unknown_components":["retrieval_quality"]}}
         results=[]; passed=0; leak_cases=0
         for case in cases:
             q=case['query']
@@ -25301,7 +25378,10 @@ class MemoryWikiProvider(MemoryProvider):
             if artifact_hits or secret_leak or forbidden: leak_cases+=1
             results.append({"id":case['id'],"query":q,"ok":ok,"topics":sorted(topics),"misses":misses,"bad_topics":bad_topics,"missing_text":missing_text,"forbidden":forbidden,"artifact_hits":artifact_hits,"secret_leak":secret_leak,"rows":len(rows),"pack_chunks":pack.get('chunk_count',0)})
         score=round(passed/max(1,len(cases)),3)
-        return {"cases":len(cases),"passed":passed,"failed":len(cases)-passed,"score":score,"leak_cases":leak_cases,"results":results}
+        return {"cases":len(cases),"passed":passed,"failed":len(cases)-passed,"score":score,"leak_cases":leak_cases,"results":results,
+                "assessment":{"version":"memory-wiki.retrieval-assessment/v1","status":"PASS" if passed==len(cases) else "FAIL",
+                              "complete":True,"scope":"selected_cases","denominator":len(cases),"case_limit":100,
+                              "reasons":[] if passed==len(cases) else ["evaluated_cases_failed"],"unknown_components":[]}}
 
     def _migrate_secrets_from_claims(self, apply:bool=True, limit:int=100)->Dict[str,Any]:
         candidates=[]
