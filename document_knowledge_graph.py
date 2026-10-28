@@ -3970,6 +3970,25 @@ def document_source(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     return _disclosed_document_output(provider, out, disclosure)
 
 
+def _document_lookup_revision(source: Any, args: Dict[str, Any]) -> str:
+    """Bind a read to its authorized current source, never to a historical row.
+
+    Call only AFTER source/connector authorization. Presence is distinct from
+    omission: no coercion, whitespace repair, case folding or latest adoption.
+    Error text deliberately contains neither the supplied nor current revision.
+    """
+    if "expected_revision_id" in args:
+        expected = args["expected_revision_id"]
+        if type(expected) is not str or re.fullmatch(r"docrev_[0-9a-f]{28}", expected) is None:
+            raise ValueError("invalid expected_revision_id")
+    revision_id = source["revision_id"]
+    if type(revision_id) is not str or re.fullmatch(r"docrev_[0-9a-f]{28}", revision_id) is None:
+        raise ValueError("document revision unavailable")
+    if "expected_revision_id" in args and args["expected_revision_id"] != revision_id:
+        raise ValueError("document revision mismatch")
+    return revision_id
+
+
 def document_unit_context(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     source_id = str(args.get("source_id") or "").strip()
     unit_id = str(args.get("unit_id") or "").strip()
@@ -3978,23 +3997,24 @@ def document_unit_context(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]
     if not source_id: raise ValueError("source_id is required")
     conn = provider._connect(); install_document_graph_schema(conn)
     disclosure = _document_disclosure(provider, conn)
-    source = conn.execute("SELECT scope_id,repository_id,parser,extension,metadata_json FROM document_sources WHERE source_id=? AND active=1", (source_id,)).fetchone()
+    source = conn.execute("SELECT scope_id,repository_id,parser,extension,metadata_json,revision_id FROM document_sources WHERE source_id=? AND active=1", (source_id,)).fetchone()
     if not source: raise ValueError("document source not found")
     disclosure.documents(disclosure.watch("document_sources", "source_id", [source_id]))
     _assert_source_access(provider, source)
     _assert_connector_owner(provider, source_id)
+    revision_id = _document_lookup_revision(source, args)
     xlsx_context = _stored_xlsx_context(source)
     if unit_id:
-        target = conn.execute("SELECT ordinal FROM document_units WHERE source_id=? AND unit_id=? AND active=1", (source_id, unit_id)).fetchone()
+        target = conn.execute("SELECT ordinal FROM document_units WHERE source_id=? AND revision_id=? AND unit_id=? AND active=1", (source_id, revision_id, unit_id)).fetchone()
     elif anchor:
-        target = conn.execute("SELECT ordinal FROM document_units WHERE source_id=? AND anchor=? AND active=1", (source_id, anchor)).fetchone()
+        target = conn.execute("SELECT ordinal FROM document_units WHERE source_id=? AND revision_id=? AND anchor=? AND active=1", (source_id, revision_id, anchor)).fetchone()
     else:
         raise ValueError("unit_id or anchor is required")
     if not target: raise ValueError("document unit not found")
     ordinal = int(target[0]); rows = conn.execute(
-        "SELECT unit_id,parent_unit_id,unit_type,anchor,ordinal,title,unit_text,locator_json,metadata_json FROM document_units "
-        "WHERE source_id=? AND active=1 AND ordinal BETWEEN ? AND ? ORDER BY ordinal",
-        (source_id, max(0, ordinal-radius), ordinal+radius),
+        "SELECT unit_id,source_id,revision_id,parent_unit_id,unit_type,anchor,ordinal,title,unit_text,locator_json,metadata_json FROM document_units "
+        "WHERE source_id=? AND revision_id=? AND active=1 AND ordinal BETWEEN ? AND ? ORDER BY ordinal",
+        (source_id, revision_id, max(0, ordinal-radius), ordinal+radius),
     ).fetchall()
     units = []
     disclosure.documents(disclosure.watch("document_units", "unit_id", [r['unit_id'] for r in rows]))
@@ -4003,7 +4023,7 @@ def document_unit_context(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]
         item["unit_text"] = _clean(item.get("unit_text"), 20_000)
         item = _hydrate_document_unit(item, xlsx_context)
         units.append(item)
-    out = {"source_id": source_id, "target_ordinal": ordinal, "units": units}
+    out = {"source_id": source_id, "revision_id": revision_id, "target_ordinal": ordinal, "units": units}
     if source["parser"] == "stdlib-xlsx-ooxml" and xlsx_context is None:
         out["xlsx_identity_state"] = "legacy_or_withheld"
     return _disclosed_document_output(provider, out, disclosure)
@@ -4015,18 +4035,19 @@ def document_neighbors(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
     if not source_id or not anchor: raise ValueError("source_id and anchor are required")
     conn = provider._connect(); install_document_graph_schema(conn)
     disclosure = _document_disclosure(provider, conn)
-    source = conn.execute("SELECT scope_id,repository_id FROM document_sources WHERE source_id=? AND active=1", (source_id,)).fetchone()
+    source = conn.execute("SELECT scope_id,repository_id,revision_id FROM document_sources WHERE source_id=? AND active=1", (source_id,)).fetchone()
     if not source: raise ValueError("document source not found")
     disclosure.documents(disclosure.watch("document_sources", "source_id", [source_id]))
     _assert_source_access(provider, source)
     _assert_connector_owner(provider, source_id)
+    revision_id = _document_lookup_revision(source, args)
     queue = deque([(anchor, 0)]); seen = {anchor}; found = []
     while queue and len(found) < limit:
         node, depth = queue.popleft()
         if depth >= hops: continue
         rows = conn.execute(
-            "SELECT edge_id,source_anchor,predicate,target_anchor,evidence,confidence FROM document_edges WHERE source_id=? AND active=1 AND (source_anchor=? OR target_anchor=?) LIMIT ?",
-            (source_id, node, node, limit-len(found)),
+            "SELECT edge_id,source_id,revision_id,source_anchor,predicate,target_anchor,evidence,confidence FROM document_edges WHERE source_id=? AND revision_id=? AND active=1 AND (source_anchor=? OR target_anchor=?) LIMIT ?",
+            (source_id, revision_id, node, node, limit-len(found)),
         ).fetchall()
         for raw in rows:
             edge = _row(raw); found.append(edge)
@@ -4034,7 +4055,7 @@ def document_neighbors(provider: Any, args: Dict[str, Any]) -> Dict[str, Any]:
             if other not in seen: seen.add(other); queue.append((other, depth+1))
     disclosure.watch("document_edges", "edge_id", [r['edge_id'] for r in found])
     return _disclosed_document_output(provider, {
-        "source_id": source_id, "anchor": anchor, "hops": hops,
+        "source_id": source_id, "revision_id": revision_id, "anchor": anchor, "hops": hops,
         "edges": found[:limit], "nodes": sorted(seen),
     }, disclosure)
 
