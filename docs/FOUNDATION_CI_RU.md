@@ -545,3 +545,40 @@ readonly census, deadline/report/capture/ownership budget проверяются
 Core/trust origins/closures и разные ordinary/hosted CORE_SHA сохранены. Real
 parser/FD/HANDLE, SQL/SPI, native/Linux/FULL/hosted/CI/installed/loaded gates имеют
 свои прежние закрытые prerequisites и не квалифицируются этой SOURCE дельтой.
+
+
+## DOCREV-CACHE-01: текущий оракул кеша version-bound lookup (CODE-only)
+
+Отдельная test-only дельта строится на `70d150f9`: его первоначальное независимое
+CODE-ревью завершилось HOLD B01 из-за прежнего current-cache pin. Родитель
+подтвердил несовместимость по исходникам и отдельно принял владение миграцией
+текущего тестового входа. Это не повтор исходной пятифайловой фазы и не новый
+SOURCE/native допуск; её исходные verdict, границы и расход сохраняются.
+
+`CURRENT_CACHE_SHA256_SOURCE_DOCREV_70D150F9` содержит заранее проверенный literal
+SHA256 кеша `70d150f9`:
+`674d9e94ca1e7c0bc86561b0d217edb2a7a5d6844f296b69c05a87b43707cd14`.
+Только три текущих места использования имени — `_schemas`, его `record_property`
+и завершающая проверка MCP translation — переведены на новый pin. Expected не
+вычисляется из actual/HEAD во время теста. Исторические `CACHE_SHA256`,
+`CURRENT_CACHE_SHA256_SOURCE_20261009` и `CURRENT_CACHE_SHA256_SOURCE_20261023`,
+metadata gold и весь прежний текст этого guide сохранены.
+
+Полные dictionary/order/manifest/SDK/readonly assertions, setup/cleanup,
+ordinary collection и behavioral bodies не ослаблены. Изменены три `Name` loads
+и добавлена одна literal declaration; обратная миграция должна восстановить
+полные исходные bytes и AST, а не только число assertions. Продукт, schema cache,
+public dispatch, guards и все прочие mode/blob entries этой дельтой не меняются.
+
+Существующий `COLD_LANES.json` оставлен на прежнем snapshot: его raw pin этого
+теста не переносит qualification на новые bytes. Остальные уже существовавшие
+provider-pin/current-partition gaps тоже не закрыты. Это отдельная граница
+будущей квалификации, не наблюдённый native/CI failure и не разрешение менять
+historical descriptor, assertions или admission ради GREEN.
+
+Все 20 подготовленных document-revision regressions, обычные native package
+tests, genuine export, SQL/SDK/bootstrap, Linux/Windows runtime, CI/FULL,
+publication/install/loaded здесь **NOT_RUN**. Published/installed checkpoint
+`59fe/b0b7` не изменяется. Составная узкая CODE-приёмка возможна только после
+полного review этой двухфайловой дельты, закрытия B01 и parent readback вместе
+с первоначальным пятифайловым review; исходный HOLD остаётся неизменной историей.
