@@ -40,6 +40,20 @@ def load_wiki(home):
     return m, importlib.import_module(name + '.document_knowledge_graph'), importlib.import_module(name + '.document_extractors')
 
 
+def _cleanup_failed_setup(fixture, primary):
+    """Unwind before unittest re-raises KeyboardInterrupt past doCleanups."""
+    try:
+        fixture.close_fixture()
+    except BaseException as secondary:
+        # Retain exact cleanup evidence without replacing the pending primary
+        # or its explicit cause; notes are diagnostic and must not take over.
+        fixture._setup_cleanup_error = secondary
+        try:
+            primary.add_note('G1 setup cleanup raised ' + type(secondary).__name__)
+        except BaseException:
+            pass
+
+
 def authored(tag, count=4):
     return '\n\n'.join(
         f'{tag} section {index}: The operations manual records a daily backup schedule, '
@@ -103,30 +117,42 @@ class DocumentStateG1(unittest.TestCase):
         self.home.mkdir()
         self.stack = ExitStack()
         self.p = None
+        self._fixture_closed = False
+        self._setup_cleanup_error = None
         # Register before changing context or importing the product: partial
         # setup failures must restore every already-acquired native token.
         self.addCleanup(self.close_fixture)
-        values = {'HERMES_HOME': str(self.home), 'HOME': str(self.home), 'USERPROFILE': str(self.home),
-                  'LOCALAPPDATA': str(self.home), 'TMP': str(self.home), 'TEMP': str(self.home),
-                  'TMPDIR': str(self.home), 'MEMORY_WIKI_DOCUMENT_CHUNK_MAX_UNITS': '1'}
-        self.stack.enter_context(mock.patch.dict(os.environ, values))
-        self.home_token = set_hermes_home_override(self.home)
-        self.stack.callback(reset_hermes_home_override, self.home_token)
-        self.secret_token = set_secret_scope({}, profile_home=str(self.home))
-        self.stack.callback(reset_secret_scope, self.secret_token)
-        self.m, self.d, self.e = load_wiki(self.home)
-        self.stack.enter_context(mock.patch.object(self.d, '_extract',
-            side_effect=lambda path, args: self.e.extract_document(path, self.d._worker_options(args))))
-        self.p = self.m.MemoryWikiProvider()
-        self.p.initialize('g1-fixture-session', hermes_home=str(self.home),
-                          bot_id='g1-fixture-bot', project_id='g1-fixture-project')
-        self.db = self.p._connect()
-        self.d.install_document_graph_schema(self.db)
-        self.db.commit()
-        self.path = self.home / 'cache/documents/manual.txt'
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            values = {'HERMES_HOME': str(self.home), 'HOME': str(self.home), 'USERPROFILE': str(self.home),
+                      'LOCALAPPDATA': str(self.home), 'TMP': str(self.home), 'TEMP': str(self.home),
+                      'TMPDIR': str(self.home), 'MEMORY_WIKI_DOCUMENT_CHUNK_MAX_UNITS': '1'}
+            self.stack.enter_context(mock.patch.dict(os.environ, values))
+            self.home_token = set_hermes_home_override(self.home)
+            self.stack.callback(reset_hermes_home_override, self.home_token)
+            self.secret_token = set_secret_scope({}, profile_home=str(self.home))
+            self.stack.callback(reset_secret_scope, self.secret_token)
+            self.m, self.d, self.e = load_wiki(self.home)
+            self.stack.enter_context(mock.patch.object(self.d, '_extract',
+                side_effect=lambda path, args: self.e.extract_document(path, self.d._worker_options(args))))
+            self.p = self.m.MemoryWikiProvider()
+            self.p.initialize('g1-fixture-session', hermes_home=str(self.home),
+                              bot_id='g1-fixture-bot', project_id='g1-fixture-project')
+            self.db = self.p._connect()
+            self.d.install_document_graph_schema(self.db)
+            self.db.commit()
+            self.path = self.home / 'cache/documents/manual.txt'
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except BaseException as primary:
+            _cleanup_failed_setup(self, primary)
+            raise
 
     def close_fixture(self):
+        if self._fixture_closed:
+            return
+        # A regular setup error is also followed by unittest.doCleanups.
+        # Retire before the attempt: neither tokens nor an uncertain close is
+        # retried merely because that second cleanup callback is reached.
+        self._fixture_closed = True
         try:
             if self.p is not None and self.p._conn is not None:
                 self.p._conn.close(); self.p._conn = None
