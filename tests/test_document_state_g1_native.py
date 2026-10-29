@@ -21,8 +21,11 @@ OBSERVATIONS = []
 SNAPSHOT_COUNTS = {}
 
 
-def load_wiki():
-    name = 'g1_native_wiki'
+def load_wiki(home):
+    # Import-time profile policy belongs to this exact synthetic home. Reusing
+    # one module for a later home must not borrow the first home's authority.
+    name = 'g1_native_wiki_' + hashlib.sha256(
+        str(Path(home).resolve()).encode('utf-8')).hexdigest()
     if name not in sys.modules:
         spec = importlib.util.spec_from_file_location(name, SOURCE / '__init__.py',
             submodule_search_locations=[str(SOURCE)])
@@ -94,18 +97,24 @@ class DocumentStateG1(unittest.TestCase):
             cls.addClassCleanup(owned.cleanup)
 
     def setUp(self):
-        from hermes_constants import set_hermes_home_override
-        from agent.secret_scope import set_secret_scope
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+        from agent.secret_scope import set_secret_scope, reset_secret_scope
         self.home = self.fixture_root / self._testMethodName
         self.home.mkdir()
         self.stack = ExitStack()
+        self.p = None
+        # Register before changing context or importing the product: partial
+        # setup failures must restore every already-acquired native token.
+        self.addCleanup(self.close_fixture)
         values = {'HERMES_HOME': str(self.home), 'HOME': str(self.home), 'USERPROFILE': str(self.home),
                   'LOCALAPPDATA': str(self.home), 'TMP': str(self.home), 'TEMP': str(self.home),
                   'TMPDIR': str(self.home), 'MEMORY_WIKI_DOCUMENT_CHUNK_MAX_UNITS': '1'}
         self.stack.enter_context(mock.patch.dict(os.environ, values))
         self.home_token = set_hermes_home_override(self.home)
+        self.stack.callback(reset_hermes_home_override, self.home_token)
         self.secret_token = set_secret_scope({}, profile_home=str(self.home))
-        self.m, self.d, self.e = load_wiki()
+        self.stack.callback(reset_secret_scope, self.secret_token)
+        self.m, self.d, self.e = load_wiki(self.home)
         self.stack.enter_context(mock.patch.object(self.d, '_extract',
             side_effect=lambda path, args: self.e.extract_document(path, self.d._worker_options(args))))
         self.p = self.m.MemoryWikiProvider()
@@ -116,16 +125,15 @@ class DocumentStateG1(unittest.TestCase):
         self.db.commit()
         self.path = self.home / 'cache/documents/manual.txt'
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.addCleanup(self.close_fixture)
 
     def close_fixture(self):
-        from hermes_constants import reset_hermes_home_override
-        from agent.secret_scope import reset_secret_scope
-        if self.p._conn is not None:
-            self.p._conn.close(); self.p._conn = None
-        reset_secret_scope(self.secret_token)
-        reset_hermes_home_override(self.home_token)
-        self.stack.close()
+        try:
+            if self.p is not None and self.p._conn is not None:
+                self.p._conn.close(); self.p._conn = None
+        finally:
+            # ExitStack drains native-token resets and ENV restoration even if
+            # connection cleanup or a later reset raises; no guard is replaced.
+            self.stack.close()
 
     def ingest(self, text, path=None):
         path = path or self.path
