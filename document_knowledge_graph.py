@@ -2279,7 +2279,7 @@ def _assert_ingest_path_alias_owner(provider: Any, conn: sqlite3.Connection, pat
                     continue
             except OSError as exc:
                 raise PermissionError("cannot verify indexed document path ownership") from exc
-        _assert_connector_owner(provider, str(row["source_id"]))
+        _assert_connector_owner(provider, str(row["source_id"]), _conn=conn)
         if str(row["scope_id"] or "") != scope_id or str(row["repository_id"] or "") != repository_id:
             # Explicit migrations must use the indexed source path, not create
             # a second path-derived identity for the same Windows file.

@@ -11,8 +11,10 @@ from __future__ import annotations
 import contextvars
 import hashlib
 import os
+import re
 import shutil
 import sqlite3
+import stat
 import time
 import urllib.parse
 import uuid
@@ -22,8 +24,10 @@ from typing import Any
 
 try:
     from . import document_knowledge_graph as documents
+    from . import source_file_observation as file_observation
 except ImportError:
     import document_knowledge_graph as documents
+    import source_file_observation as file_observation
 
 
 MAX_RECORD_BYTES = 1_000_000
@@ -77,8 +81,11 @@ def _sha(value: str) -> str:
 
 
 def _source_key(provider: Any, uri: str, scope_id: str, repository_id: str,
-                namespace: str = "record") -> str:
-    salt = str(provider.database_instance_id or provider._meta_text("database_instance_id") or "")
+                namespace: str = "record", *, _existing_only: bool = False) -> str:
+    # Observation must never reach the historical lazy metadata fallback, even
+    # if the provider identity changes between its preflight and this lookup.
+    salt = (str(getattr(provider, "database_instance_id", "") or "") if _existing_only
+            else str(provider.database_instance_id or provider._meta_text("database_instance_id") or ""))
     if not salt:
         raise ValueError("connector_identity_unavailable")
     # Separate unverified caller-supplied records from trusted fetchers. A
@@ -285,6 +292,200 @@ class _RecordCommitHook:
         except Exception:
             pass
         return 'unknown'
+
+
+class _ObservationAuthorityChanged(PermissionError):
+    """Private refusal; never include source rows or underlying error text."""
+
+
+def _observation_actor(provider):
+    return (documents._document_embedding_actor(provider),
+            str(getattr(provider, "db_path", "") or ""),
+            str(getattr(provider, "database_instance_id", "") or ""))
+
+
+def _observation_connection_current(provider, conn, actor):
+    # Never call _connect here: a cold/retired handle is a refusal, not permission
+    # to bootstrap SQLite, schema, replay or a new writer. The original provider
+    # lock is held for this entire synchronous operation.
+    return (isinstance(conn, sqlite3.Connection)
+            and getattr(provider, "_conn", None) is conn
+            and getattr(provider, "_owned_conn", None) is conn
+            and getattr(provider, "_lifecycle_state", "") in {"ready", "idle"}
+            and getattr(provider, "_transaction_quarantine", None) is None
+            and not conn.in_transaction and _observation_actor(provider) == actor
+            and bool(actor[0][0]) and bool(actor[1]) and bool(actor[2].strip()))
+
+
+def _observation_rows(provider, conn, disclosure, key, scope_id, repository_id, owner):
+    links = disclosure.watch("external_sources", "source_key", [key])
+    if len(links) != 1:
+        raise _ObservationAuthorityChanged()
+    link = links[0]
+    if (link["source_type"] != "local_file" or link["status"] != "active"
+            or link["owner_bot_id"] != owner or link["scope_id"] != scope_id
+            or link["repository_id"] != repository_id
+            or re.fullmatch(r"docsrc_[0-9a-f]{24}", str(link["document_source_id"])) is None):
+        raise _ObservationAuthorityChanged()
+    sources = disclosure.watch("document_sources", "source_id", [link["document_source_id"]])
+    if len(sources) != 1:
+        raise _ObservationAuthorityChanged()
+    source = sources[0]
+    if (source["active"] != 1 or source["scope_id"] != scope_id
+            or source["repository_id"] != repository_id):
+        raise _ObservationAuthorityChanged()
+    documents._assert_source_access(provider, source)
+    documents._assert_connector_owner(provider, source["source_id"], _conn=conn)
+    # Missing registration is NOT owner authorization. Nor may a surviving link
+    # hide a retired/foreign sibling. No new source/alias is enrolled here.
+    all_links = disclosure.watch("external_sources", "document_source_id", [source["source_id"]])
+    if len(all_links) != 1 or all_links[0] != link:
+        raise _ObservationAuthorityChanged()
+    revisions = disclosure.watch("document_revisions", "revision_id", [source["revision_id"]])
+    if len(revisions) > 1 or (revisions and revisions[0]["source_id"] != source["source_id"]):
+        raise _ObservationAuthorityChanged()
+    disclosure.documents([source])
+    if not disclosure.ok:
+        raise _ObservationAuthorityChanged()
+    return dict(link), dict(source), dict(revisions[0]) if revisions else None
+
+
+def _observation_stamp(info):
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError("observation_nonregular_descriptor")
+    device, inode = documents._file_identity(info)
+    return device, inode, int(info.st_size), info.st_mtime_ns, info.st_ctime_ns
+
+
+def _observe_file_bytes(provider, conn, path, source_id, scope_id, repository_id, max_bytes, authorize):
+    """Read one existing guarded descriptor twice; no snapshots or parser work."""
+    fd, primary = None, None
+    reading = False
+    try:
+        authorize()
+        checked = documents._allowed_path(path)
+        if checked.suffix.lower() not in documents._SUPPORTED_EXTENSIONS:
+            return "unsupported", None
+        path_before = _observation_stamp(checked.stat(follow_symlinks=False))
+        fd = documents._open_allowed_file(checked)
+        opened = _observation_stamp(os.fstat(fd))
+        authorize()
+        # Retain the existing ledger veto on both OS branches. On Windows its
+        # absence is not authority: the real alias guard also checks legacy
+        # live paths/history/active orphans, without enrolling a new identity.
+        identity_key = f"file_identity_owner:{opened[0]}:{opened[1]}"
+        identity_owner = conn.execute(
+            "SELECT value FROM document_graph_meta WHERE key=?", (identity_key,)).fetchone()
+        if identity_owner is not None and str(identity_owner[0]) != source_id:
+            raise _ObservationAuthorityChanged()
+        try:
+            documents._assert_ingest_path_alias_owner(
+                provider, conn, checked, source_id, scope_id, repository_id,
+                opened_identity=opened[:2])
+        except PermissionError:
+            # This is an ownership refusal, not a locked/unavailable disk.
+            raise _ObservationAuthorityChanged() from None
+        authorize()  # Keep ORIGINAL actor/owner/rows after the existing guard.
+        # Do not compare Windows path-stat and FD-fstat timestamp domains.
+        if path_before[:3] != opened[:3]:
+            return "unstable", None
+        if opened[2] > max_bytes:
+            return "too_large", None
+        reading = True
+        first_hash = file_observation.hash_exact_bytes(
+            lambda count: os.read(fd, count), size=opened[2], max_bytes=max_bytes)
+        middle = _observation_stamp(os.fstat(fd))
+        if middle != opened or first_hash is None:
+            return "unstable", None
+        authorize()
+        os.lseek(fd, 0, os.SEEK_SET)
+        second_hash = file_observation.hash_exact_bytes(
+            lambda count: os.read(fd, count), size=opened[2], max_bytes=max_bytes)
+        after_read = _observation_stamp(os.fstat(fd))
+        checked = documents._allowed_path(path)
+        path_after = _observation_stamp(checked.stat(follow_symlinks=False))
+        final_descriptor = _observation_stamp(os.fstat(fd))
+        authorize()
+        if file_observation.stable_file_hash(
+                (path_before, opened, middle, after_read, path_after, final_descriptor),
+                first_hash, second_hash):
+            return "stable", first_hash
+        return "unstable", None
+    except _ObservationAuthorityChanged as error:
+        primary = error
+        raise
+    except (OSError, ValueError, RuntimeError) as error:
+        return ("unstable" if reading else file_observation.file_error_state(error)), None
+    except BaseException as error:
+        primary = error
+        raise
+    finally:
+        if fd is not None:
+            file_observation.finish_descriptor(lambda: os.close(fd), primary)
+
+
+def observe_local_file(provider: Any, args: dict[str, Any]) -> dict[str, Any]:
+    """Read-only saved-file check of one already owned local connector.
+
+    Internal Python API only; no MCP registration, watch, indexing or mutation.
+    source_key selects registration before any document exists/path I/O. A cold
+    provider, unproven native read fence or changed original tuple fails closed.
+    """
+    if (type(args) is not dict or set(args) - {"source_key", "scope_id", "repository_id"}
+            or type(args.get("source_key")) is not str
+            or re.fullmatch(r"ext_[0-9a-f]{20}", args["source_key"]) is None
+            or any(type(args.get(k, "")) is not str for k in ("scope_id", "repository_id"))):
+        return file_observation.unobserved_result("invalid_request", time.time())
+    conn, lock = getattr(provider, "_conn", None), getattr(provider, "_lock", None)
+    if conn is None or lock is None:
+        return file_observation.unobserved_result("unavailable_at_check", time.time())
+    try:
+        with lock:
+            actor = _observation_actor(provider)
+            if not _observation_connection_current(provider, conn, actor):
+                return file_observation.unobserved_result("unavailable_at_check", time.time())
+            owner = _owner(provider)
+            if owner != actor[0][1]:
+                raise _ObservationAuthorityChanged()
+            with documents._document_profile_scope(Path(provider.home)):
+                scope_id, repository_id = _scope(provider, args.get("scope_id", ""),
+                                                  args.get("repository_id", ""))
+                disclosure = documents._document_disclosure(provider, conn)
+                if not disclosure.ok:
+                    return file_observation.unobserved_result("unavailable_at_check", time.time())
+                key = args["source_key"]
+                original = _observation_rows(provider, conn, disclosure, key, scope_id, repository_id, owner)
+                link, source, revision = original
+                # These operations are lexical only. Never resolve/stat a caller
+                # path to discover whether an unregistered source exists.
+                path = documents._absolute_unresolved(source["source_path"])
+                if (str(path) != source["source_path"] or documents._source_id(path) != source["source_id"]
+                        or _source_key(provider, path.as_uri(), scope_id, repository_id,
+                                       "local_file", _existing_only=True) != key):
+                    raise _ObservationAuthorityChanged()
+
+                def authorize():
+                    if (not _observation_connection_current(provider, conn, actor)
+                            or _scope(provider, scope_id, repository_id) != (scope_id, repository_id)
+                            or _observation_rows(provider, conn, disclosure, key, scope_id, repository_id, owner) != original
+                            or not disclosure.finish()):
+                        raise _ObservationAuthorityChanged()
+
+                authorize()
+                indexed = file_observation.indexed_revision_evidence(source, revision, link)
+                max_bytes = documents._env_int("MEMORY_WIKI_DOCUMENT_MAX_BYTES",
+                                               128 * 1024 * 1024, 1_000_000, 2_000_000_000)
+                disk_state, digest = _observe_file_bytes(
+                    provider, conn, path, source["source_id"], scope_id, repository_id, max_bytes, authorize)
+                checked_at = time.time()  # Unix seconds at the end of this disk sample, not a lease.
+                payload = file_observation.observation_result(indexed, disk_state, digest, checked_at)
+                authorize()  # Retain ORIGINAL actor/connection/rows through final disclosure.
+                return payload
+    except (PermissionError, _ObservationAuthorityChanged):
+        return file_observation.unobserved_result("not_authorized", time.time())
+    except Exception:
+        # No raw OS/SQLite errors, paths, foreign identifiers or partial hashes.
+        return file_observation.unobserved_result("unavailable_at_check", time.time())
 
 
 def sync_local_file(provider: Any, args: dict[str, Any]) -> dict[str, Any]:
