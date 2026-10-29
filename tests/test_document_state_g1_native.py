@@ -225,7 +225,9 @@ class DocumentStateG1(unittest.TestCase):
         self.assertEqual(len(linked), 3)
         self.assertEqual(len({row['embedding_claim_id'] for row in linked}), 3)
         archive, retire, erase = [row['embedding_claim_id'] for row in linked]
-        with self.db:
+        # The authenticated intent reads the principal through provider._connect.
+        # Register the real owner while retaining the SQLite lock through COMMIT.
+        with self.p._claim_transaction(self.db):
             self.db.execute("UPDATE claims SET status='archived' WHERE id=?", (archive,))
             self.db.execute("UPDATE claims SET status='retired' WHERE id=?", (retire,))
             self.p._privacy_erasure.append(self.p, self.m.normalize_claim(linked[2]['embedding_text']),
