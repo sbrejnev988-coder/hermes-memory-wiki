@@ -24502,6 +24502,15 @@ class MemoryWikiProvider(MemoryProvider):
         if mode == 'apply_with_backup':
             backup=self._backup('transaction_'+batch_id)
             mode='apply'
+        def _repair_refused(result):
+            # Only explicit repair refusal fields; ordinary results without ok
+            # remain best-effort compatible. Do not recurse through user data.
+            return isinstance(result, dict) and (
+                result.get('ok') is False or bool(result.get('error'))
+                or any(isinstance(action, dict) and (
+                    action.get('ok') is False or bool(action.get('error')))
+                    for action in (result.get('actions') or ()))
+            )
         for op in ops:
             name=str(op.get('tool') or op.get('operation') or '').strip()
             args=dict(op.get('args') or {k:v for k,v in op.items() if k not in ('tool','operation','args')})
@@ -24521,7 +24530,10 @@ class MemoryWikiProvider(MemoryProvider):
                     elif name in ('memory_wiki_immune_scan','immune_scan'):
                         results.append({'operation':name,'result':self._immune_scan('suggest',int(args.get('limit',100)))})
                     elif name in ('memory_wiki_repair','repair'):
-                        results.append({'operation':name,'result':self._repair(args.get('target') or 'all', True)})
+                        res=self._repair(args.get('target') or 'all', True, outbox_job_ids=args.get('outbox_job_ids'))
+                        entry={'operation':name,'result':res}
+                        if _repair_refused(res): entry['error']='repair_returned_failure'
+                        results.append(entry)
                     elif name in ('memory_wiki_update_claim','update_claim','memory_wiki_rewrite_claim','rewrite_claim'):
                         cid=args.get('claim_id') or ''; results.append({'operation':name,'before':self._table_row('claims', cid),'dry_run':True})
                     else:
@@ -24541,9 +24553,13 @@ class MemoryWikiProvider(MemoryProvider):
                     elif name in ('memory_wiki_immune_scan','immune_scan'):
                         res=self._immune_scan('apply',int(args.get('limit',100)), model_scope=model_scope)
                     elif name in ('memory_wiki_repair','repair'):
-                        res=self._repair(args.get('target') or 'all', False, model_scope=model_scope)
+                        res=self._repair(args.get('target') or 'all', False, model_scope=model_scope, outbox_job_ids=args.get('outbox_job_ids'))
                     else:
                         raise ValueError(f'unsupported transaction operation: {name}')
+                    if name in ('memory_wiki_repair','repair') and _repair_refused(res):
+                        results.append({'operation':name,'result':res,'error':'repair_returned_failure'})
+                        if stop_on_error: break
+                        continue
                     after_count=sum(1 for row in self._connect().execute("SELECT * FROM claims") if self._claim_visible(row))
                     mid=self._record_mutation('transaction_operation','batch',batch_id,{"claims":before_count},{"claims":after_count,"result":res},reason or name,batch_id,False)
                     results.append({'operation':name,'mutation_id':mid,'result':res})

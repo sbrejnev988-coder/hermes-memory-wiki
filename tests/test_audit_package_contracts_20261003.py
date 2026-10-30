@@ -34,6 +34,8 @@ CURRENT_CACHE_SHA256_SOURCE_20261009 = "30731adc9248f79f7cdfa81ef3b0899fa36b8314
 CURRENT_CACHE_SHA256_SOURCE_20261023 = "5b13d3ca3f01af8beebd3accd974bb324140f63dc2973014ad54e2c43e9cdefc"
 # Current document-revision schema source binding; historical pins stay literal.
 CURRENT_CACHE_SHA256_SOURCE_DOCREV_70D150F9 = "674d9e94ca1e7c0bc86561b0d217edb2a7a5d6844f296b69c05a87b43707cd14"
+# Owner-authorized current addressed-outbox cache; all historical pins remain.
+CURRENT_CACHE_SHA256_SOURCE_OUTBOX_20261030 = "d83fedcdb659bb3431a862722b418bcd3a455d112cdcef60893cae38eeb8f001"
 METADATA_SHA256 = {
     "pyproject.toml": "2183b46a908452a4b2feb7899e89511d9b9612060b295c6bf48adce3a97e4eac",
     "plugin.yaml": "51981b06b363ce2c2efbcf57405d7a2571d8ccaa60894177a1a28b567e7fbc41",
@@ -65,7 +67,7 @@ def _source(relative: str) -> Path:
 
 def _schemas(provider):
     expected_bytes = _source("mcp-wrapper/tool_schemas.json").read_bytes()
-    assert sha256(expected_bytes).hexdigest() == CURRENT_CACHE_SHA256_SOURCE_DOCREV_70D150F9, "frozen cache changed"
+    assert sha256(expected_bytes).hexdigest() == CURRENT_CACHE_SHA256_SOURCE_OUTBOX_20261030, "frozen cache changed"
     expected = json.loads(expected_bytes)
     actual = provider.get_tool_schemas()
     # Compare every full native dictionary, not a lossy projection or just names.
@@ -124,7 +126,7 @@ def test_native_metadata_info_schemas_are_readonly(record_property):
     record_property("provider_source", str(Path(PACKAGE.__file__).resolve()))
     record_property("native_provider_source", str(Path(inspect.getfile(MemoryProvider)).resolve()))
     record_property("native_tool_result_source", str(Path(inspect.getfile(tool_result)).resolve()))
-    record_property("schema_cache_sha256", CURRENT_CACHE_SHA256_SOURCE_DOCREV_70D150F9)
+    record_property("schema_cache_sha256", CURRENT_CACHE_SHA256_SOURCE_OUTBOX_20261030)
 
 
 def test_packaged_entrypoint_resolves_without_activation():
@@ -173,7 +175,7 @@ def test_mcp_schema_translation_keeps_full_native_parameters_without_cache_write
             pytest.fail("MCP full-dict translation drift: " + row["name"])
         assert wrapper.plugin_name(expected["name"]) == row["name"]
     assert wrapper._PROVIDER is None and wrapper._SCHEMAS is None
-    assert sha256(_source("mcp-wrapper/tool_schemas.json").read_bytes()).hexdigest() == CURRENT_CACHE_SHA256_SOURCE_DOCREV_70D150F9
+    assert sha256(_source("mcp-wrapper/tool_schemas.json").read_bytes()).hexdigest() == CURRENT_CACHE_SHA256_SOURCE_OUTBOX_20261030
 
 
 @pytest.fixture

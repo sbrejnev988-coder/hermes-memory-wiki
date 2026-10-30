@@ -331,3 +331,56 @@ native fixture, installer/scanner или qualification gates. Актуально
 SOURCE/native/SQL/SDK/FULL/Linux/CI и installed/loaded остаются **NOT_RUN**.
 Независимое CODE-review, parent acceptance и fleet update выполняет родитель в
 своей lane; этот candidate ничего не устанавливает и не публикует.
+
+
+## Current correction01: три HOLD findings одним блоком
+
+Этот source-only блок исправляет `OUTBOX-NESTED-CALLER-001`,
+`CURRENT-CACHE-ORACLE-002` и `CURRENT-MODULE-INVENTORY-003` после review 45d3.
+Исторический 45d3/c9, его HOLD, donor receipts и прежние отказы не переписываются.
+
+Оба nested alias (`repair`, `memory_wiki_repair`) в `_transaction` передают
+`args.get('outbox_job_ids')` буквально в suggest и apply: без trim/coercion/copy
+списка IDs. Только для repair классифицируются явные `ok is False`, непустой
+`error`, а также такие же поля непосредственных action records. Это не
+рекурсивный отказ по произвольным вложенным данным и не blanket denial обычных
+repair результатов без `ok`. Refusal остаётся в `results[].result`, но operation
+получает стабильный `error=repair_returned_failure` до success post-count и
+`_record_mutation`. Существующие `errors`, audit partial, public success=false и
+journal error boundary теперь видят его. Предварительный apply count не является
+успехом и сохранён. Suggest остаётся best-effort даже при stop_on_error=true;
+apply сохраняет прежнюю stop policy. Multi-apply с repair по-прежнему отвергается
+перед эффектом atomic-vocabulary guard: тест не обходит его ради continuation.
+Fatal/UNKNOWN, privacy/revision/observation owners и callee admission не меняются.
+
+Адресный test-owner handoff добавляет отдельный current cache pin для addressed
+outbox; все прежние cache constants и полное сравнение dictionaries сохранены.
+Обычный document egress fixture теперь имеет полный runtime38 roster с
+`outbox_repair_policy.py`. Его current fingerprint заморожен после final initializer
+тем же SHA256(sorted JSON name->raw-SHA, separators=(',', ':')) рецептом. Старый
+complete37 observation gold сохранён именованной historical константой. Expected
+не вычисляется из текущих inputs при исполнении. Setup/cleanup/guards не меняются.
+
+Из исходных 49 test methods изменён только разрешённый metadata exemption:
+`test_current_baseline_retained_guards_are_unchanged` включает `_transaction` в
+исчерпывающий список намеренно изменённых owners. Остальные 48 methods и все
+прежние helpers/factories/setup сохранены по AST. Добавлены 2 metadata methods и
+9 native composition methods: итого 60 prepared methods (12 policy, 20 metadata,
+19 native owner, 9 nested caller). Literal rosters проверяются отдельно от запуска.
+
+Новая suite использует тот же genuine derived_case/Fixture, настоящие provider,
+`_transaction` loop, `_repair`, public dispatcher и journal failure classifier.
+Только retry/FTS/claim outcomes и audit/mutation/journal IO имеют явно authored
+seams; `_connect` recorder делегирует настоящему connection. Нет fake owning
+class, разрешающего ACL/target guard или нового loader. Controls покрывают оба
+режима/alias, healthy literal IDs, typed/action/top-level refusal до success tail,
+public success и before/error против before/after, ordinary repair без IDs,
+nonrepair suggest best-effort, прежний atomic multi-apply отказ/claim batch и
+identity fatal primary. Это не durable journal IO или реальный retry admission.
+
+Все 60 test bodies/factories, 7 public/native obligations, SQL/SDK/native, Linux,
+SOURCE behavior, FULL/E2E, CI/models/network/build/install/loaded/restart остаются
+**NOT_RUN**. UNKNOWN safety-teardown hold прежний. Инертные AST/JSON/raw/Git checks
+не означают TestCase PASS. Immutable correction commit, exact path/diff bindings,
+metadata exits и ресурсы находятся в correction01/PARENT_RESULT2.json. Независимый delta
+review и приёмка принадлежат родителю; блок ничего не публикует и не устанавливает.

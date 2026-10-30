@@ -57,6 +57,8 @@ METADATA_CASE_IDS = (
     "test_current_baseline_retained_guards_are_unchanged",
     "test_current_commit_receipt_remains_disjoint_and_native_bound",
     "test_current_schema_and_policy_module_wiring",
+    "test_nested_transaction_forwards_literal_ids_in_both_modes",
+    "test_nested_refusal_precedes_success_postprocessing",
 )
 NATIVE_OWNER_CASE_IDS = (
     "test_callback_free_real_owner_commits_and_retires",
@@ -605,7 +607,7 @@ class AddressedOutboxMetadataTests(unittest.TestCase):
     def test_current_baseline_retained_guards_are_unchanged(self):
         # CURRENT bodies, not the old donor; no product/helper execution.
         changed = {"__init__", "get_tool_schemas", "handle_tool_call",
-                   "_claim_transaction", "_repair_failed_outbox", "_repair"}
+                   "_claim_transaction", "_repair_failed_outbox", "_repair", "_transaction"}
         current = _definition(self.tree, "MemoryWikiProvider")
         before = _definition(self.baseline_tree, "MemoryWikiProvider")
         methods = {n.name: n for n in current.body if isinstance(n, ast.FunctionDef)}
@@ -655,6 +657,40 @@ class AddressedOutboxMetadataTests(unittest.TestCase):
         before, after = _repair_schema(self.baseline_tree), _repair_schema(self.tree)
         self.assertEqual(after["required"], before["required"])
         self.assertEqual({k: v for k, v in after["properties"].items() if k != "outbox_job_ids"}, before["properties"])
+
+
+    def test_nested_transaction_forwards_literal_ids_in_both_modes(self):
+        tx = _method(self.tree, "_transaction")
+        calls = _calls(tx, "_repair")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual({ast.literal_eval(call.args[1]) for call in calls}, {True, False})
+        for call in calls:
+            keyword = next(k for k in call.keywords if k.arg == "outbox_job_ids")
+            self.assertEqual(ast.unparse(keyword.value), "args.get('outbox_job_ids')")
+            control = copy.deepcopy(call)
+            control.keywords = [k for k in control.keywords if k.arg != "outbox_job_ids"]
+            self.assertTrue(_forwarded(call))
+            self.assertFalse(_forwarded(control))
+
+    def test_nested_refusal_precedes_success_postprocessing(self):
+        tx = _method(self.tree, "_transaction")
+        classifier = next(n for n in tx.body if isinstance(n, ast.FunctionDef) and n.name == "_repair_refused")
+        text = ast.unparse(classifier)
+        self.assertIn("result.get('ok') is False", text)
+        self.assertIn("action.get('ok') is False", text)
+        self.assertIn("result.get('error')", text)
+        self.assertIn("action.get('error')", text)
+        self.assertEqual(len(_calls(tx, "_repair_refused")), 2)
+        guarded = next(n for n in ast.walk(tx) if isinstance(n, ast.If)
+                       and _calls(n.test, "_repair_refused")
+                       and any(isinstance(b, ast.Continue) for b in ast.walk(n)))
+        self.assertIn("name in ('memory_wiki_repair', 'repair')", ast.unparse(guarded.test))
+        self.assertTrue(any(isinstance(b, ast.Break) for b in ast.walk(guarded)))
+        after = next(n for n in ast.walk(tx) if isinstance(n, ast.Assign)
+                     and any(isinstance(t, ast.Name) and t.id == "after_count" for t in n.targets))
+        self.assertLess(guarded.end_lineno, after.lineno)
+        self.assertLess(guarded.end_lineno, _calls(tx, "_record_mutation")[0].lineno)
+        self.assertIn("repair_returned_failure", ast.unparse(guarded))
 
 
 class AddressedOutboxNativeOwnerTests(unittest.TestCase):
@@ -1260,3 +1296,305 @@ def make_metadata_suite(main_raw, cache_raw, baseline_main_raw, baseline_cache_r
     BoundMetadataTests.native_tree = ast.parse(native_raw)
     BoundMetadataTests.baseline_native_tree = ast.parse(baseline_native_raw)
     return unittest.TestSuite(BoundMetadataTests(name) for name in METADATA_CASE_IDS)
+
+
+NESTED_CALLER_CASE_IDS = (
+    "test_nested_healthy_literal_ids_modes_and_aliases",
+    "test_nested_typed_and_action_refusals_skip_success_tail",
+    "test_nested_wrong_target_top_level_error_is_failure",
+    "test_public_envelope_and_real_journal_classifier_compose",
+    "test_ordinary_repair_without_ids_remains_healthy",
+    "test_ordinary_nonrepair_suggest_best_effort_is_preserved",
+    "test_multi_apply_repair_still_refused_before_any_effect",
+    "test_ordinary_atomic_claim_batch_preserves_both_policies",
+    "test_nested_fatal_primary_is_not_collected_as_ordinary_error",
+)
+
+
+class AddressedOutboxNestedCallerTests(unittest.TestCase):
+    """PREPARED / NOT_RUN genuine owning loops and dispatcher/classifier.
+
+    Use the SAME separately admitted derived_case/Fixture as the owner suite.
+    No extracted/fake provider class or substitute transaction/journal loop.
+    Authored retry/FTS/claim outcomes and audit/mutation/journal IO recorders are
+    explicit seams. Native SQL, locks, SDK, ACL, public entry and _repair remain
+    genuine. These controls do NOT qualify the replaced retry admission/COMMIT,
+    durable journal IO, real target or any of the seven public-native obligations.
+    """
+    __test__ = False
+    fixture_factory = None
+
+    @classmethod
+    def setUpClass(cls):
+        if cls.fixture_factory is None:
+            raise RuntimeError("NOT_RUN: separately admitted genuine fixture required")
+
+    def _prepare(self, c):
+        import sys
+        self.assertIs(type(c.p), c.m.MemoryWikiProvider)
+        self.assertIs(c.m.MemoryProvider, sys.modules['agent.memory_provider'].MemoryProvider)
+        self.assertIs(c.m.tool_result, sys.modules['tools.registry'].tool_result)
+        self.assertIs(c.conn, c.p._owned_conn)
+        self.assertFalse(c.conn.in_transaction)
+        for name in ('_transaction', '_repair', 'handle_tool_call', '_should_journal_tool',
+                     '_journal_operation', '_journal_operation_locked', '_journal_operation_captured_locked'):
+            self.assertIs(getattr(c.p, name).__func__, getattr(c.m.MemoryWikiProvider, name))
+        events = []
+        original_connect = c.p._connect
+        def connect(*args, **kwargs):
+            events.append(('connect',))
+            return original_connect(*args, **kwargs)
+        def audit(operation, status, detail):
+            events.append(('audit', operation, status))
+        def mutation(*args, **kwargs):
+            events.append(('mutation',))
+            return 'prepared-mutation-id'
+        def append(operation, payload, *, phase, **kwargs):
+            events.append(('journal', phase))
+            return {'seq': sum(e[0] == 'journal' for e in events)}
+        def checkpoint(*args, **kwargs):
+            events.append(('checkpoint',))
+            return {}
+        # IO seams only; actual original _connect is always called.
+        c._mp.setattr(c.p, '_connect', connect)
+        c._mp.setattr(c.p, '_audit', audit)
+        c._mp.setattr(c.p, '_record_mutation', mutation)
+        c._mp.setattr(c.p, '_append_journal_event', append)
+        c._mp.setattr(c.p, '_checkpoint_after_journal_mutation', checkpoint)
+        return events
+
+    def _operation(self, alias, ids, target='outbox'):
+        return {'tool': alias, 'args': {'target': target, 'outbox_job_ids': ids}}
+
+    def _assert_outcome(self, outcome, events, *, failed, dry_run):
+        self.assertEqual(outcome['mode'], 'suggest' if dry_run else 'apply')
+        self.assertFalse(outcome['atomic'])
+        self.assertEqual(outcome['partial_commit_possible'], not dry_run)
+        self.assertEqual(len(outcome['results']), 1)
+        row = outcome['results'][0]
+        self.assertEqual(row['result']['target'], 'outbox')
+        self.assertEqual(row['result']['dry_run'], dry_run)
+        self.assertEqual(outcome['errors'], [row] if failed else [])
+        self.assertEqual([e for e in events if e[0] == 'audit'],
+                         [('audit', 'transaction', 'partial' if failed else 'ok')])
+        if failed:
+            self.assertEqual(row['error'], 'repair_returned_failure')
+            self.assertNotIn('mutation_id', row)
+            self.assertNotIn(('mutation',), events)
+            retry = next(i for i, e in enumerate(events) if e[0] == 'retry')
+            audit = next(i for i, e in enumerate(events) if e[0] == 'audit')
+            self.assertNotIn(('connect',), events[retry + 1:audit])
+        else:
+            self.assertNotIn('error', row)
+            self.assertEqual('mutation_id' in row, not dry_run)
+            self.assertEqual(events.count(('mutation',)), int(not dry_run))
+
+    def test_nested_healthy_literal_ids_modes_and_aliases(self):
+        with self.fixture_factory('nested-healthy') as c:
+            events = self._prepare(c)
+            def retry(dry_run=True, *, outbox_job_ids=None):
+                events.append(('retry', dry_run, outbox_job_ids))
+                return {'ok': True, 'applied': not dry_run, 'revived_count': int(not dry_run)}
+            c._mp.setattr(c.p, '_repair_failed_outbox', retry)
+            for mode in ('suggest', 'apply'):
+                for alias in ('repair', 'memory_wiki_repair'):
+                    ids = ['fedcba9876543210', '0123456789abcdef']
+                    before = list(ids)
+                    events.clear()
+                    with self.subTest(mode=mode, alias=alias):
+                        result = c.p._transaction([self._operation(alias, ids)], mode, model_scope=True)
+                        self._assert_outcome(result, events, failed=False, dry_run=mode == 'suggest')
+                        calls = [e for e in events if e[0] == 'retry']
+                        self.assertEqual(len(calls), 1)
+                        self.assertIs(calls[0][2], ids)
+                        self.assertEqual(calls[0][1], mode == 'suggest')
+                        self.assertEqual(ids, before)
+                        self.assertEqual(result['results'][0]['operation'], alias)
+
+    def test_nested_typed_and_action_refusals_skip_success_tail(self):
+        with self.fixture_factory('nested-refusal') as c:
+            events = self._prepare(c)
+            state = {}
+            def retry(dry_run=True, *, outbox_job_ids=None):
+                events.append(('retry', dry_run, outbox_job_ids))
+                return dict(state)
+            c._mp.setattr(c.p, '_repair_failed_outbox', retry)
+            for refusal in ({'ok': False, 'applied': False},
+                            {'error': 'prepared-typed-refusal'},
+                            {'ok': True, 'error': 'prepared-action-error'}):
+                state.clear()
+                state.update(refusal)
+                for mode in ('suggest', 'apply'):
+                    for alias in ('repair', 'memory_wiki_repair'):
+                        for stop in (False, True):
+                            ids = ['0123456789abcdef']
+                            events.clear()
+                            with self.subTest(refusal=refusal, mode=mode, alias=alias, stop=stop):
+                                result = c.p._transaction([self._operation(alias, ids)], mode,
+                                                         stop_on_error=stop, model_scope=True)
+                                self._assert_outcome(result, events, failed=True, dry_run=mode == 'suggest')
+                                self.assertIs(result['stop_on_error'], stop)
+                                self.assertIs(next(e for e in events if e[0] == 'retry')[2], ids)
+                                action = result['results'][0]['result']['actions'][0]
+                                for key, value in refusal.items():
+                                    self.assertEqual(action[key], value)
+
+    def test_nested_wrong_target_top_level_error_is_failure(self):
+        with self.fixture_factory('nested-wrong-target') as c:
+            events = self._prepare(c)
+            for mode in ('suggest', 'apply'):
+                for alias in ('repair', 'memory_wiki_repair'):
+                    events.clear()
+                    with self.subTest(mode=mode, alias=alias):
+                        result = c.p._transaction([self._operation(alias, ['0123456789abcdef'], 'fts')], mode)
+                        row = result['results'][0]
+                        self.assertEqual(result['errors'], [row])
+                        self.assertEqual(row['error'], 'repair_returned_failure')
+                        self.assertEqual(row['result']['error'], 'outbox_job_ids_only_for_outbox')
+                        self.assertNotIn('mutation_id', row)
+                        self.assertEqual(events.count(('connect',)), int(mode == 'apply'))
+                        self.assertEqual(events[-1], ('audit', 'transaction', 'partial'))
+                        self.assertNotIn(('mutation',), events)
+
+    def test_public_envelope_and_real_journal_classifier_compose(self):
+        with self.fixture_factory('nested-public-journal') as c:
+            events = self._prepare(c)
+            state = {'failed': False}
+            def retry(dry_run=True, *, outbox_job_ids=None):
+                events.append(('retry', dry_run, outbox_job_ids))
+                return {'ok': not state['failed'], 'applied': not dry_run and not state['failed']}
+            c._mp.setattr(c.p, '_repair_failed_outbox', retry)
+            for failed in (False, True):
+                state['failed'] = failed
+                for mode in ('suggest', 'apply'):
+                    for alias in ('repair', 'memory_wiki_repair'):
+                        ids = ['fedcba9876543210', '0123456789abcdef']
+                        args = {'operations': [self._operation(alias, ids)], 'mode': mode}
+                        events.clear()
+                        with self.subTest(failed=failed, mode=mode, alias=alias):
+                            self.assertEqual(c.p._should_journal_tool('memory_wiki_transaction', args), mode == 'apply')
+                            envelope = c.p.handle_tool_call('memory_wiki_transaction', args)
+                            result = c.p._journal_result_dict(envelope)
+                            self.assertIs(result['success'], not failed)
+                            self._assert_outcome(result, events, failed=failed, dry_run=mode == 'suggest')
+                            self.assertIs(next(e for e in events if e[0] == 'retry')[2], ids)
+                            phases = [e[1] for e in events if e[0] == 'journal']
+                            self.assertEqual(phases, [] if mode == 'suggest' else
+                                             ['before', 'error' if failed else 'after'])
+                            self.assertEqual(events.count(('checkpoint',)), int(mode == 'apply' and not failed))
+
+    def test_ordinary_repair_without_ids_remains_healthy(self):
+        with self.fixture_factory('nested-ordinary-repair') as c:
+            events = self._prepare(c)
+            def rebuild():
+                events.append(('rebuild',))
+            c._mp.setattr(c.p, '_rebuild_fts', rebuild)
+            for mode in ('suggest', 'apply'):
+                for alias in ('repair', 'memory_wiki_repair'):
+                    events.clear()
+                    with self.subTest(mode=mode, alias=alias):
+                        result = c.p._transaction([{'operation': alias, 'args': {'target': 'fts'}}], mode)
+                        self.assertEqual(result['errors'], [])
+                        self.assertNotIn('ok', result['results'][0]['result'])
+                        self.assertEqual(result['results'][0]['result']['actions'],
+                                         [{'action': 'rebuild_claims_fts', 'applied': mode == 'apply'}])
+                        self.assertEqual(events.count(('rebuild',)), int(mode == 'apply'))
+                        self.assertEqual(events.count(('mutation',)), int(mode == 'apply'))
+                        self.assertEqual(events[-1], ('audit', 'transaction', 'ok'))
+
+    def test_ordinary_nonrepair_suggest_best_effort_is_preserved(self):
+        with self.fixture_factory('nested-ordinary-suggest') as c:
+            events = self._prepare(c)
+            def compile_topic(topic, *args, **kwargs):
+                events.append(('compile', topic))
+                if topic == 'bad':
+                    raise ValueError('authored ordinary failure')
+                return {'topic': topic, 'ok': True}
+            c._mp.setattr(c.p, '_compile_topic', compile_topic)
+            operations = [{'tool': 'compile_topic', 'args': {'topic': topic}} for topic in ('bad', 'good')]
+            for stop in (False, True):
+                events.clear()
+                with self.subTest(stop=stop):
+                    result = c.p._transaction(operations, 'suggest', stop_on_error=stop)
+                    self.assertEqual([r['operation'] for r in result['results']], ['compile_topic'] * 2)
+                    self.assertEqual(result['results'][0]['error'], 'ValueError')
+                    self.assertEqual(result['results'][1]['result'], {'topic': 'good', 'ok': True})
+                    self.assertEqual(result['errors'], [result['results'][0]])
+                    self.assertEqual([e for e in events if e[0] == 'compile'], [('compile', 'bad'), ('compile', 'good')])
+                    self.assertNotIn(('mutation',), events)
+                    self.assertEqual(events[-1], ('audit', 'transaction', 'partial'))
+
+    def test_multi_apply_repair_still_refused_before_any_effect(self):
+        with self.fixture_factory('nested-multi-deny') as c:
+            events = self._prepare(c)
+            for alias in ('repair', 'memory_wiki_repair'):
+                for stop in (False, True):
+                    events.clear()
+                    with self.subTest(alias=alias, stop=stop):
+                        operations = [self._operation(alias, ['0123456789abcdef']), {'tool': 'update_claim'}]
+                        result = c.p._transaction(operations, 'apply', stop_on_error=stop)
+                        self.assertEqual(result['errors'], [{'error': 'unsupported_atomic_transaction_operation'}])
+                        self.assertEqual(result['results'], [])
+                        self.assertFalse(result['partial_commit_possible'])
+                        self.assertEqual(events, [])
+
+    def test_ordinary_atomic_claim_batch_preserves_both_policies(self):
+        with self.fixture_factory('nested-ordinary-atomic') as c:
+            events = self._prepare(c)
+            operations = [{'tool': 'update_claim', 'args': {'claim_id': cid}} for cid in ('a', 'b')]
+            state = {'failed': False}
+            def atomic(ops, batch_id, reason):
+                self.assertEqual(ops, operations)
+                self.assertEqual(reason, 'prepared-reason')
+                events.append(('atomic',))
+                if state['failed']:
+                    raise ValueError('authored atomic refusal')
+                return {'results': [{'operation': 'update_claim', 'id': cid} for cid in ('a', 'b')],
+                        'changed_claim_ids': ['a', 'b'], 'render_error': None}
+            c._mp.setattr(c.p, '_atomic_claim_batch', atomic)
+            for failed in (False, True):
+                state['failed'] = failed
+                for stop in (False, True):
+                    events.clear()
+                    with self.subTest(failed=failed, stop=stop):
+                        result = c.p._transaction(operations, 'apply', 'prepared-reason', stop)
+                        self.assertTrue(result['atomic'])
+                        self.assertIs(result['rolled_back'], failed)
+                        self.assertFalse(result['partial_commit_possible'])
+                        self.assertEqual(result['errors'], [{'error': 'ValueError'}] if failed else [])
+                        self.assertEqual(events.count(('atomic',)), 1)
+                        self.assertNotIn(('mutation',), events)
+                        if failed:
+                            self.assertEqual(result['results'], [])
+                            self.assertFalse(any(e[0] == 'audit' for e in events))
+                        else:
+                            self.assertEqual(result['changed_claim_ids'], ['a', 'b'])
+                            self.assertEqual(events[-1], ('audit', 'transaction', 'ok'))
+
+    def test_nested_fatal_primary_is_not_collected_as_ordinary_error(self):
+        class Cancel(BaseException):
+            pass
+        with self.fixture_factory('nested-fatal-primary') as c:
+            events = self._prepare(c)
+            primary = Cancel('authored fatal primary')
+            def retry(dry_run=True, *, outbox_job_ids=None):
+                events.append(('retry', dry_run, outbox_job_ids))
+                raise primary
+            c._mp.setattr(c.p, '_repair_failed_outbox', retry)
+            for mode in ('suggest', 'apply'):
+                for alias in ('repair', 'memory_wiki_repair'):
+                    events.clear()
+                    with self.subTest(mode=mode, alias=alias):
+                        with self.assertRaises(Cancel) as caught:
+                            c.p._transaction([self._operation(alias, ['0123456789abcdef'])], mode)
+                        self.assertIs(caught.exception, primary)
+                        self.assertFalse(any(e[0] in {'audit', 'mutation', 'journal'} for e in events))
+                        self.assertEqual(events[-1][0], 'retry')
+
+
+def make_nested_caller_suite(fixture_factory):
+    """ONLY after native/SQL/SPI admission, with the unchanged shipped fixture."""
+    class BoundNestedCallerTests(AddressedOutboxNestedCallerTests):
+        pass
+    BoundNestedCallerTests.fixture_factory = staticmethod(fixture_factory)
+    return unittest.TestSuite(BoundNestedCallerTests(name) for name in NESTED_CALLER_CASE_IDS)
