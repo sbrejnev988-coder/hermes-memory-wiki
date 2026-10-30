@@ -17,7 +17,7 @@ __test__ = False
 _G1 = _RAW = _BASELINE = None
 ORACLE_MIGRATION = (
     ("        self.visible('PRIVACYBOOK', a['revision_id'])\n",
-     "        # Retained links to erased/missing claims must veto public disclosure.\n        # A nonempty result here would contradict the privacy fixture itself.\n        withheld = self.d.query_documents(self.p, {'query': 'PRIVACYBOOK', 'limit': 20})\n        self.assertEqual(withheld.get('disclosure_status'), 'withheld', withheld)\n        self.assertEqual(withheld['results'], [], withheld)\n"),
+     "        # Retained links to erased/missing claims must veto public disclosure.\n        # A nonempty result here would contradict the privacy fixture itself.\n        withheld = self.d.query_documents(self.p, {'query': 'PRIVACYBOOK', 'limit': 20})\n        self.assertEqual(withheld.get('disclosure'), 'withheld', withheld)\n        self.assertEqual(withheld['results'], [], withheld)\n"),
     ("        archive, retire, erase = [row['embedding_claim_id'] for row in linked]\n",
      "        # Positive visibility belongs to the healthy cohort, before erasure.\n        self.visible('PRIVACYBOOK', a['revision_id'])\n        archive, retire, erase = [row['embedding_claim_id'] for row in linked]\n"),
 )

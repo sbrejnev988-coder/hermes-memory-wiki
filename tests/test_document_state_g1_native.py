@@ -265,7 +265,7 @@ class DocumentStateG1(unittest.TestCase):
         # Retained links to erased/missing claims must veto public disclosure.
         # A nonempty result here would contradict the privacy fixture itself.
         withheld = self.d.query_documents(self.p, {'query': 'PRIVACYBOOK', 'limit': 20})
-        self.assertEqual(withheld.get('disclosure_status'), 'withheld', withheld)
+        self.assertEqual(withheld.get('disclosure'), 'withheld', withheld)
         self.assertEqual(withheld['results'], [], withheld)
         self.observe(revision=a['revision_id'], archived=archive, retired=retire, erased=erase,
                      pending_after=out['pending_after'], skipped=out['skipped_reasons'], ledger_hashes=ledger)
