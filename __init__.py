@@ -262,6 +262,11 @@ except ImportError:
         GraphExtraction as _GraphExtraction, GRAPH_EXTRACTION as _GRAPH_EXTRACTION, graph_sql as _graph_sql)
 
 
+try:
+    from . import outbox_repair_policy as _outbox_repair_policy
+except ImportError:
+    import outbox_repair_policy as _outbox_repair_policy
+
 
 # Physical work is separate from the delivered search/FTS receipt. Only this
 # small, primitive collector is shared with workers; never share search dicts.
@@ -1052,6 +1057,7 @@ except ImportError:
 try:
     from .code_knowledge_graph import (
         _GraphCommitConnection,
+        _OutboxRetryStage,
         _owns_graph_writer as _owns_private_graph_writer,
         install_code_graph_schema as _install_code_graph_schema,
         ingest_code_graph_event as _ingest_code_graph_event,
@@ -1075,6 +1081,7 @@ except ImportError:
     try:
         from code_knowledge_graph import (
             _GraphCommitConnection,
+            _OutboxRetryStage,
             _owns_graph_writer as _owns_private_graph_writer,
         install_code_graph_schema as _install_code_graph_schema,
             ingest_code_graph_event as _ingest_code_graph_event,
@@ -3759,6 +3766,24 @@ def _wake_outbox_worker(db_path: Optional[str] = None) -> None:
         worker = _OUTBOX_WORKERS.get(path)
         if worker and worker.get("wake"):
             worker["wake"].set()
+
+
+def _notify_registered_outbox_worker(path: str) -> str:
+    """Notification only: exact original path, no bootstrap/SQL/new thread.
+
+    One registry lock covers identity, liveness and Event.set. Do not call the
+    old starter/wake helpers from here (or nest their lock acquisition).
+    """
+    with _OUTBOX_WORKERS_LOCK:
+        worker = _OUTBOX_WORKERS.get(path)
+        if type(worker) is not dict:
+            return "deferred_no_live_worker"
+        thread, wake = worker.get("thread"), worker.get("wake")
+        if (type(thread) is not threading.Thread or type(wake) is not threading.Event
+                or not thread.is_alive() or _OUTBOX_WORKERS.get(path) is not worker):
+            return "deferred_no_live_worker"
+        wake.set()
+        return "notified"
 
 
 # --- Embedding contract guard: provider routing and vector dimensions must agree. ---
@@ -7438,6 +7463,7 @@ class MemoryWikiProvider(MemoryProvider):
         self._claim_tx_document_stage = None
         self._claim_tx_graph_stage = None
         self._claim_tx_event_job_stage = None
+        self._claim_tx_outbox_retry_stage = None
         self._transaction_quarantine = None
         self._transaction_primary = None
         self._transaction_cleanup_notes = ()
@@ -10291,7 +10317,7 @@ class MemoryWikiProvider(MemoryProvider):
             {"name":"memory_wiki_immune_scan","description":"Scan memory database for quality issues and report findings.","parameters":P({"mode":{"type":"string","enum":["suggest","apply"],"default":"suggest"},"limit":{"type":"integer","default":100}})},
             {"name":"memory_wiki_compress_topic","description":"Create a synthetic summary claim for a topic and optionally supersede older low-priority claims.","parameters":P({"topic":{"type":"string"},"mode":{"type":"string","enum":["suggest","apply"],"default":"suggest"},"limit":{"type":"integer","default":30}}, ["topic"])},
             {"name":"memory_wiki_resolve_by_policy","description":"Resolve contradiction using policy: prefer_explicit_user, prefer_recent, prefer_verified, prefer_environment_probe.","parameters":P({"contradiction_id":{"type":"string"},"policy":{"type":"string","default":"prefer_explicit_user"}}, ["contradiction_id"])},
-            {"name":"memory_wiki_repair","description":"Run targeted self-healing repairs: fts, dashboards, integrity, outbox, or all.","parameters":P({"target":{"type":"string","enum":["fts","dashboards","integrity","outbox","all"],"default":"all"},"dry_run":{"type":"boolean","default":True}})},
+            {"name":"memory_wiki_repair","description":"Run targeted self-healing repairs: fts, dashboards, integrity, outbox, or all.","parameters":P({"target":{"type":"string","enum":["fts","dashboards","integrity","outbox","all"],"default":"all"},"dry_run":{"type":"boolean","default":True},"outbox_job_ids":{"type":"array","minItems":1,"maxItems":100,"uniqueItems":True,"items":{"type":"string","minLength":16,"maxLength":16,"pattern":"^[0-9a-f]{16}$"},"description":"Exact failed outbox job IDs; required for outbox retry/preflight. Applies only to outbox (including that action in all); never grants ownership."}})},
             {"name":"memory_wiki_audit_log","description":"Show recent memory-wiki write/repair/backup/restore audit events.","parameters":P({"limit":{"type":"integer","default":50}})},
             {"name":"memory_wiki_write_firewall","description":"Check a candidate through source policy and quality lint, or queue/apply it as unverified current-chat memory.","parameters":P({"claim":{"type":"string"},"topic":{"type":"string","default":"general"},"evidence":{"type":"string","default":""},"source":{"type":"string","default":"tool","description":"Used only for check mode; mutation provenance is assigned by the host."},"mode":{"type":"string","enum":["check","queue","apply"],"default":"check"},"confidence":{"type":"number","default":0.75},"salience":{"type":"number","default":0.7}}, ["claim"])},
             {"name":"memory_wiki_mutation_log","description":"Return transactional mutation log entries with before/after metadata for undo/audit.","parameters":P({"limit":{"type":"integer","default":50},"target_table":{"type":"string","default":""},"target_id":{"type":"string","default":""},"since_seconds":{"type":"integer","default":0}}, [])},
@@ -10415,6 +10441,29 @@ class MemoryWikiProvider(MemoryProvider):
                     return tool_result(success=False, error="invalid_arguments")
                 outcome = self._reindex(a.get("limit", 0), a.get("force", False),
                                         current_scope_only=True, dry_run=a.get("dry_run", False))
+                return tool_result(success=bool(outcome.get("ok")), **outcome)
+
+        if tool_name == "memory_wiki_repair":
+            repair_target = a.get("target") or "all"
+            if type(repair_target) is not str:
+                return tool_result(success=False, error="outbox_retry_arguments_invalid")
+            repair_target = repair_target.lower()
+            if "outbox_job_ids" in a and repair_target not in {"outbox", "all"}:
+                return tool_result(success=False, error="outbox_job_ids_only_for_outbox")
+            if repair_target in {"outbox", "all"} and type(a.get("dry_run", True)) is not bool:
+                return tool_result(success=False, error="outbox_retry_arguments_invalid")
+            if "outbox_job_ids" in a:
+                _ids, reason = _outbox_repair_policy.validate_job_ids(a["outbox_job_ids"])
+                if reason:
+                    return tool_result(success=False, error=reason)
+            if repair_target == "outbox":
+                # Addressed queue state is not a whole-store recovery image.
+                # Avoid lazy migration, foreign-claim census and journal/export
+                # before the real caller/lease/source/target-aware admission.
+                if set(a) - {"target", "dry_run", "outbox_job_ids"}:
+                    return tool_result(success=False, error="outbox_retry_arguments_invalid")
+                outcome = self._repair("outbox", a.get("dry_run", True), model_scope=True,
+                                       outbox_job_ids=a.get("outbox_job_ids"))
                 return tool_result(success=bool(outcome.get("ok")), **outcome)
 
         # Secret value writes, migrations and scrub passes are local-admin only.
@@ -11067,7 +11116,10 @@ class MemoryWikiProvider(MemoryProvider):
             if tool_name == "memory_wiki_immune_scan": return tool_result(success=True, **self._immune_scan(a.get("mode") or "suggest", int(a.get("limit",100)), model_scope=not _journal_replay, _commit_receipt=_maintenance_commit))
             if tool_name == "memory_wiki_compress_topic": return tool_result(success=True, **self._compress_topic(a.get("topic") or "general", a.get("mode") or "suggest", int(a.get("limit",30)), model_scope=not _journal_replay))
             if tool_name == "memory_wiki_resolve_by_policy": return tool_result(success=True, **self._resolve_by_policy(a.get("contradiction_id") or "", a.get("policy") or "prefer_explicit_user"))
-            if tool_name == "memory_wiki_repair": return tool_result(success=True, **self._repair(a.get("target") or "all", bool(a.get("dry_run", True)), model_scope=not _journal_replay))
+            if tool_name == "memory_wiki_repair":
+                outcome = self._repair(a.get("target") or "all", bool(a.get("dry_run", True)),
+                                       model_scope=not _journal_replay, outbox_job_ids=a.get("outbox_job_ids"))
+                return tool_result(success=bool(outcome.get("ok", True)) and not bool(outcome.get("error")), **outcome)
             if tool_name == "memory_wiki_audit_log":
                 shared_audit = os.environ.get("MEMORY_WIKI_ALLOW_SHARED_AUDIT_LOG", "0").lower() in {"1","true","yes","on"}
                 return tool_result(success=True, events=self._audit_log(int(a.get("limit",50)), include_shared=shared_audit))
@@ -14912,7 +14964,7 @@ class MemoryWikiProvider(MemoryProvider):
 
 
     @contextmanager
-    def _claim_transaction(self, conn=None, *, join=False, adopt=False, begin="IMMEDIATE", _terminal=None, _document_hook=None, _document_ingest=None, _graph_effect=None, _event_job=None, _rollback_receipt=None, _commit_receipt=None):
+    def _claim_transaction(self, conn=None, *, join=False, adopt=False, begin="IMMEDIATE", _terminal=None, _document_hook=None, _document_ingest=None, _graph_effect=None, _event_job=None, _rollback_receipt=None, _commit_receipt=None, _outbox_retry=None):
         """One SQLite owner stage; joined callers never commit another owner's TX.
 
         Used by claim/ledger owners and the private writer's native context API.
@@ -14924,6 +14976,11 @@ class MemoryWikiProvider(MemoryProvider):
         """
         if begin not in {"", "IMMEDIATE", "EXCLUSIVE"} or (join and adopt):
             raise ValueError("invalid_claim_transaction_mode")
+        if _outbox_retry is not None and (
+                type(_outbox_retry) is not _OutboxRetryStage or join or adopt or begin != "IMMEDIATE"
+                or any(value is not None for value in (
+                    _terminal, _document_hook, _document_ingest, _graph_effect, _event_job, _rollback_receipt, _commit_receipt))):
+            raise ValueError("invalid_outbox_retry_transaction_mode")
         if _rollback_receipt is not None and (
                 type(_rollback_receipt) is not list or _rollback_receipt
                 or join or adopt or begin != "IMMEDIATE"
@@ -14938,6 +14995,10 @@ class MemoryWikiProvider(MemoryProvider):
             raise ValueError("invalid_claim_commit_receipt_mode")
         with self._lock:
             c = self._connect() if conn is None else conn
+            previous_outbox_retry = getattr(self, "_claim_tx_outbox_retry_stage", None)
+            if previous_outbox_retry is not None:
+                # Even ordinary joined writers cannot borrow this narrow TX.
+                raise RuntimeError("outbox_retry_owner_pending")
             self._require_claim_writer(c)
             active = c.in_transaction
             if _document_hook is not None:
@@ -14958,6 +15019,16 @@ class MemoryWikiProvider(MemoryProvider):
             previous_graph_stage = self._claim_tx_graph_stage
             previous_event_job_stage = self._claim_tx_event_job_stage
             previous_prefetch_terminal = c._prefetch_terminal
+            if _outbox_retry is not None and (
+                    type(c) is not _GraphCommitConnection or c is not self._conn or c is not self._owned_conn
+                    or _outbox_retry.owner is not self or _outbox_retry.conn is not c
+                    or _outbox_retry.thread != threading.get_ident() or _outbox_retry.phase != 'prepared'
+                    or _outbox_retry.image is not None or _outbox_retry.outcome is not None
+                    or not callable(_outbox_retry.admit) or active or previous is not None
+                    or previous_thread is not None or previous_document_stage is not None
+                    or previous_graph_stage is not None or previous_event_job_stage is not None
+                    or previous_prefetch_terminal is not None or c._outbox_retry_stage is not None):
+                raise RuntimeError("outbox_retry_standalone_owner_required")
             terminal_native = (_terminal is not None and (_terminal._prefetch_attempt is not None
                                or any(f.graph_attempt is not None for f in _terminal.fences)))
             if terminal_native and previous_prefetch_terminal is not None:
@@ -15058,6 +15129,11 @@ class MemoryWikiProvider(MemoryProvider):
             completed = False
             document_commits = ()
             try:
+                if _outbox_retry is not None:
+                    self._claim_tx_outbox_retry_stage = c._outbox_retry_stage = _outbox_retry
+                    _outbox_retry.phase = 'body'
+                    _outbox_retry.callbacks_seen = any(value is not None for value in
+                        (c._graph_user_authorizer, c._graph_trace, c._graph_progress))
                 if graph_extraction is not None and graph_extraction.fence.provider is self:
                     graph_obligation = graph_extraction.bind_stage(c, graph_stage)
                 if not active:
@@ -15141,6 +15217,19 @@ class MemoryWikiProvider(MemoryProvider):
                         raise RuntimeError('event_job_owner_stage_unproven')
                     c._event_job_commit_image = self._assert_event_job_leases(
                         c, event_job_stage[2], check_callbacks=False, terminal_stage=event_job_stage)
+                if _outbox_retry is not None:
+                    if (self._claim_tx_connection is not c or self._claim_tx_thread != _outbox_retry.thread
+                            or self._claim_tx_outbox_retry_stage is not _outbox_retry
+                            or c._outbox_retry_stage is not _outbox_retry
+                            or document_stage[2] or graph_stage[2] or event_job_stage[2]):
+                        raise RuntimeError('outbox_retry_owner_stage_changed')
+                    # LAST callback-capable tail: recheck the ORIGINAL target,
+                    # actor, source/erasure/policy/epoch and exact job afterimages.
+                    # The returned counter is original_epoch + counted own CAS,
+                    # NOT a freshly adopted total_changes/authority snapshot.
+                    _outbox_retry.image = (_outbox_retry, _outbox_retry.admit())
+                    c._outbox_retry_commit_image = _outbox_retry.image
+                    _outbox_retry.phase = 'commit'
                 commit_attempted = True  # Only immediately before actual commit.
                 if _document_hook is not None:
                     _document_hook.commit_attempted = True
@@ -15149,6 +15238,8 @@ class MemoryWikiProvider(MemoryProvider):
                     self._quarantine_claim_connection(c, "commit_transaction_still_active")
                     raise RuntimeError("claim_commit_transaction_still_active")
                 completed = True
+                if _outbox_retry is not None:
+                    _outbox_retry.outcome = 'committed'
                 if _commit_receipt is not None:
                     # Actual c.commit() returned and its TX ended. Record the
                     # exact owner BEFORE fallible journal/derivative work.
@@ -15168,8 +15259,16 @@ class MemoryWikiProvider(MemoryProvider):
                     _terminal.measurement['commit_total_changes'] = c.total_changes
                     _terminal.measurement['native_idle'] = True
             except BaseException as primary:
+                if _outbox_retry is not None and _outbox_retry.outcome == 'committed':
+                    # A journal/retirement failure cannot undo a known native
+                    # commit or turn it into a fictitious rollback/UNKNOWN.
+                    raise
+                if _outbox_retry is not None:
+                    _outbox_retry.phase = 'rollback'
                 rolled_back = self._rollback_claim_transaction(c, primary, commit_attempted=commit_attempted)
                 completed = rolled_back
+                if _outbox_retry is not None:
+                    _outbox_retry.outcome = 'rolled_back' if rolled_back else 'unknown'
                 if _rollback_receipt is not None and rolled_back is True:
                     try:
                         # Publish only AFTER the existing rollback positively
@@ -15182,8 +15281,22 @@ class MemoryWikiProvider(MemoryProvider):
                     _document_hook.rollback_completed = rolled_back
                 raise
             finally:
+                if (_outbox_retry is not None and completed
+                        and getattr(self, "_transaction_quarantine", None) is not c
+                        and (self._claim_tx_outbox_retry_stage is not _outbox_retry
+                             or c._outbox_retry_stage is not _outbox_retry
+                             or self._claim_tx_connection is not c
+                             or self._claim_tx_thread != _outbox_retry.thread)):
+                    self._quarantine_claim_connection(c, 'outbox_retry_retirement_unknown')
                 if completed and getattr(self, "_transaction_quarantine", None) is not c:
                     # Retire only our own exact stage after proved completion.
+                    if _outbox_retry is not None:
+                        if (c._outbox_retry_commit_image is not None
+                                and c._outbox_retry_commit_image[0] is _outbox_retry):
+                            c._outbox_retry_commit_image = None
+                        c._outbox_retry_stage = None
+                        self._claim_tx_outbox_retry_stage = previous_outbox_retry
+                        _outbox_retry.phase = 'retired'
                     if c._prefetch_terminal is _terminal:
                         c._prefetch_terminal = previous_prefetch_terminal
                     # Failed rollback/postcommit keeps owner+primary+admissions.
@@ -25495,81 +25608,225 @@ class MemoryWikiProvider(MemoryProvider):
             self._rebuild_fts(); self._render_all()
         return {'fix_count':len(fixes), 'fixes':fixes[:50]}
 
-    def _repair_failed_outbox(self, dry_run: bool=True, limit: int=5000) -> Dict[str, Any]:
-        """Safely revive failed semantic-index jobs after Qdrant recovery.
+    def _repair_failed_outbox(self, dry_run: bool=True, limit: int=100, *, outbox_job_ids=None) -> Dict[str, Any]:
+        """Retry exact caller-owned failed claim jobs, never a corpus inventory.
 
-        Only embed/upsert/delete jobs whose target resolves to the current online
-        collection are reset. Payloads are never returned, preventing secret or
-        claim-text leakage in diagnostics.
+        A hint is not ownership, source or target authority. Preserve its bytes;
+        the unchanged worker still hydrates canonical SQLite state on delivery.
+        Historical deletes require a capability the current delete worker seam
+        cannot supply, so their original durable intent remains untouched.
         """
-        c = self._connect()
-        limit = max(1, min(int(limit or 5000), 50000))
-        online = _active_collection_name()
-        rows = c.execute(
-            """SELECT id,operation,object_id,payload_json,attempts,last_error
-               FROM index_outbox WHERE status='failed'
-               ORDER BY updated_at,id LIMIT ?""",
-            (limit,),
-        ).fetchall()
-        eligible = []
-        skipped = []
-        for row in rows:
+        policy = _outbox_repair_policy
+        result = {"ok": False, "dry_run": dry_run if type(dry_run) is bool else True,
+                  "applied": False, "status": "refused", "eligible_count": 0,
+                  "revived_count": 0, "worker_woken": False, "notification": "not_requested"}
+        retry_stage = None
+        updated = 0
+        ids, reason = policy.validate_job_ids(outbox_job_ids)
+        if reason:
+            return {**result, "error": reason}
+        if (type(dry_run) is not bool or type(limit) is not int
+                or not 1 <= limit <= policy.MAX_JOB_IDS or len(ids) > limit):
+            return {**result, "error": "outbox_retry_arguments_invalid"}
+        c = getattr(self, "_conn", None)
+        if c is None or _set_native_home is None:
+            return {**result, "error": "outbox_initialized_native_owner_required"}
+        # Hold the existing provider lock through preflight and the owning TX;
+        # BEGIN IMMEDIATE excludes a second connection's lease or source edit.
+        with self._lock:
             try:
-                payload = json.loads(row["payload_json"] or "{}")
-            except Exception:
-                payload = {}
-            target = str(payload.get("collection") or online)
-            item = {
-                "id": str(row["id"]),
-                "operation": str(row["operation"]),
-                "object_id": str(row["object_id"]),
-                "attempts": int(row["attempts"] or 0),
-                "last_error": short(str(row["last_error"] or ""), 180),
-                "target_collection": target,
-            }
-            if str(row["operation"]) not in {"upsert", "embed_and_upsert", "delete"}:
-                item["reason"] = "unsupported_operation"
-                skipped.append(item)
-            elif target not in {online, _qdrant_alias(), _physical_collection_name()}:
-                item["reason"] = "stale_collection_target"
-                skipped.append(item)
-            else:
-                eligible.append(item)
-        if not dry_run and eligible:
-            ts = now()
-            ids = [item["id"] for item in eligible]
-            with c:
-                for item in eligible:
-                    row = c.execute(
-                        "SELECT payload_json FROM index_outbox WHERE id=?",
-                        (item["id"],),
-                    ).fetchone()
-                    try:
-                        payload = json.loads((row["payload_json"] if row else "") or "{}")
-                    except Exception:
-                        payload = {}
-                    payload["collection"] = online
-                    c.execute(
-                        """UPDATE index_outbox SET status='pending',attempts=0,last_error='',
-                            worker_id='',lease_until=0,next_retry_at=?,updated_at=?,payload_json=?
-                            WHERE id=?""",
-                        (ts, ts, json.dumps(payload, ensure_ascii=False), item["id"]),
-                    )
-            _start_outbox_worker(str(self.db_path))
-            _wake_outbox_worker(str(self.db_path))
-            self._audit("repair_outbox", "ok", f"revived={len(ids)} skipped={len(skipped)}")
-        return {
-            "dry_run": dry_run,
-            "online_collection": online,
-            "failed_seen": len(rows),
-            "eligible_count": len(eligible),
-            "skipped_count": len(skipped),
-            "eligible": eligible[:100],
-            "skipped": skipped[:100],
-        }
+                if c.in_transaction:
+                    return {**result, "error": "outbox_idle_owner_required"}
+                self._require_claim_writer(c)
+                home = Path(self.home).resolve()
+                path = str(Path(self.db_path).resolve())
+                if (Path(_native_home()).resolve() != home or _bound_profile_home().resolve() != home
+                        or not SEMANTIC_ENABLED or not EMBED_CONTRACT_VALID or not _semantic_profile_ready()):
+                    return {**result, "error": "outbox_profile_contract_unproven"}
+                disclosure = _DisclosureFence(self, c)
+                if not disclosure.ok:
+                    return {**result, "error": "outbox_source_authority_unproven"}
+                visibility, params = self._claim_visibility_sql(prefix="claims.")
+                eligibility = self._claim_metadata_eligibility_sql("scoped_reindex", prefix="claims.")
+                # ACL + mutable ownership + metadata policy BEFORE payload/error
+                # hydration. A missing, foreign or unsupported object is the
+                # same unavailable batch; no foreign IDs or totals are emitted.
+                columns = ",".join("jobs." + key for key in policy.JOB_FIELDS)
+                query = ("SELECT " + columns + " FROM index_outbox AS jobs JOIN claims "
+                         "ON claims.id=jobs.object_id WHERE jobs.id IN ("
+                         + ",".join("?" for _ in ids) + ") AND jobs.object_type='claim' "
+                         "AND claims.visibility_scope IN ('chat','private') AND "
+                         + eligibility + " AND " + visibility + " ORDER BY jobs.id")
+                rows = [dict(row) for row in c.execute(query, (*ids, *params)).fetchall()]
+                if len(rows) != len(ids):
+                    return {**result, "error": "outbox_jobs_unavailable"}
+                originals = disclosure.claims([{"id": row["object_id"]} for row in rows],
+                                              purpose="scoped_reindex")
+                claims = {row["id"]: row for row in originals}
+                if not disclosure.finish() or len(claims) != len({r["object_id"] for r in rows}):
+                    return {**result, "error": "outbox_source_changed"}
+                for row in rows:
+                    current = self._require_model_mutable_claim(row["object_id"], conn=c)
+                    if dict(current) != claims[row["object_id"]]:
+                        return {**result, "error": "outbox_source_changed"}
+                    _hint, reason = policy.job_hint(row)
+                    if reason:
+                        return {**result, "error": reason}
 
-    def _repair(self, target: str='all', dry_run: bool=True, *, model_scope: bool = False) -> Dict[str, Any]:
+                # Use the already shipped positive physical-target binding;
+                # alias capability caches and fallback online names are not proof.
+                from .current_scope_reindex import _strict_target
+                manifest = _embedding_manifest()
+                manifest_hash = _manifest_hash(manifest)
+                endpoint = _normalized_qdrant_endpoint()
+                target, binding = _strict_target(sys.modules[__name__], manifest, manifest_hash)
+                alias = _qdrant_alias() if binding == "configured_alias" else ""
+                vector_target_hash = _claim_vector_target_hash(
+                    collection=target, endpoint=endpoint, manifest_hash=manifest_hash)
+
+                def target_current():
+                    if (_manifest_hash(_embedding_manifest()) != manifest_hash
+                            or _normalized_qdrant_endpoint() != endpoint
+                            or not _profile_endpoint_allowed(endpoint)
+                            or not _profile_target_allowed(target)
+                            or _strict_target(sys.modules[__name__], manifest, manifest_hash) != (target, binding)):
+                        return False
+                    config = _collection_config(target)
+                    return (isinstance(config, dict) and type(config.get("size")) is int
+                            and config["size"] == QDRANT_VECTOR_SIZE
+                            and str(config.get("distance", "")).lower() == "cosine")
+
+                if not target_current() or not disclosure.finish():
+                    return {**result, "error": "outbox_target_unproven"}
+                for row in rows:
+                    reason = policy.retry_reason(row, claims[row["object_id"]], collection=target,
+                                                 alias=alias, endpoint=endpoint, manifest_hash=manifest_hash,
+                                                 vector_target_hash=vector_target_hash)
+                    if reason:
+                        return {**result, "error": reason}
+                if dry_run:
+                    return {**result, "ok": True, "status": "addressed_preflight", "eligible_count": len(rows)}
+
+                # Retain the original disclosure authority and COMPLETE source
+                # images inside the writer TX, not a new post-wait fence. finish()
+                # is deliberately idle-reader-only; do not weaken it to admit a
+                # writer. Only exact, row-counted own outbox updates may advance
+                # total_changes; meta/data_version/source/erasure stay original.
+                def original_current(own_updates):
+                    if (not disclosure.ok or disclosure.anchor != disclosure._authority()
+                            or not policy.same_epoch(disclosure.epoch, disclosure._epoch(), own_updates)
+                            or disclosure.erasure != disclosure._erasures()
+                            or disclosure.policy_environment != tuple(os.environ.get(key) for key in
+                                ('MEMORY_WIKI_STRICT_RECALL', 'HERMES_SECURITY_STRICT'))):
+                        return False
+                    for key, original in disclosure.images.items():
+                        if disclosure._read(*key) != original:
+                            return False
+                    for cid, original in claims.items():
+                        if dict(self._require_model_mutable_claim(cid, conn=c)) != original:
+                            return False
+                    return (disclosure.anchor == disclosure._authority()
+                            and policy.same_epoch(disclosure.epoch, disclosure._epoch(), own_updates)
+                            and disclosure.erasure == disclosure._erasures()
+                            and disclosure.policy_environment == tuple(os.environ.get(key) for key in
+                                ('MEMORY_WIKI_STRICT_RECALL', 'HERMES_SECURITY_STRICT')))
+
+                def final_original_admission():
+                    if not target_current() or not original_current(updated):
+                        raise _DeliveryWithheld("outbox_retry_snapshot_changed")
+                    after = {row["id"]: dict(row) for row in c.execute(query, (*ids, *params)).fetchall()}
+                    if len(after) != len(rows):
+                        raise _DeliveryWithheld("outbox_retry_no_effect")
+                    for row in rows:
+                        expected = {**row, "status": "pending", "attempts": 0,
+                                    "next_retry_at": ts, "updated_at": ts}
+                        if not policy.same_job(expected, after.get(row["id"])):
+                            raise _DeliveryWithheld("outbox_retry_no_effect")
+                    if updated != len(rows) or not original_current(updated):
+                        raise _DeliveryWithheld("outbox_retry_snapshot_changed")
+                    return disclosure.epoch[2] + updated
+
+                retry_stage = _OutboxRetryStage(self, c, final_original_admission)
+                with self._claim_transaction(c, _outbox_retry=retry_stage):
+                    # Remote/guard callbacks first, then exact SQL/source/lease
+                    # rereads immediately before the conditional native updates.
+                    if not target_current() or not original_current(0):
+                        raise _DeliveryWithheld("outbox_retry_snapshot_changed")
+                    current_rows = {row["id"]: dict(row) for row in c.execute(query, (*ids, *params)).fetchall()}
+                    if len(current_rows) != len(rows) or any(
+                            not policy.same_job(row, current_rows.get(row["id"])) for row in rows):
+                        raise _DeliveryWithheld("outbox_retry_snapshot_changed")
+                    ts = now()
+                    match = " AND ".join(key + " IS ?" for key in policy.JOB_FIELDS)
+                    for row in rows:
+                        cursor = c.execute(
+                            "UPDATE index_outbox SET status='pending',attempts=0,next_retry_at=?,updated_at=? "
+                            "WHERE status='failed' AND worker_id='' AND lease_until=0 AND " + match,
+                            (ts, ts, *(row[key] for key in policy.JOB_FIELDS)))
+                        try:
+                            if cursor.rowcount != 1:
+                                raise _DeliveryWithheld("outbox_retry_no_effect")
+                        finally:
+                            cursor.close()
+                        updated += 1
+                    # Detect triggers/reentrant edits as well as source/owner or
+                    # erasure changes, rolling back the ENTIRE addressed batch.
+                    if not target_current() or not original_current(updated):
+                        raise _DeliveryWithheld("outbox_retry_snapshot_changed")
+                    after = {row["id"]: dict(row) for row in c.execute(query, (*ids, *params)).fetchall()}
+                    for row in rows:
+                        expected = {**row, "status": "pending", "attempts": 0,
+                                    "next_retry_at": ts, "updated_at": ts}
+                        if not policy.same_job(expected, after.get(row["id"])):
+                            raise _DeliveryWithheld("outbox_retry_no_effect")
+                    if not original_current(updated):
+                        raise _DeliveryWithheld("outbox_retry_snapshot_changed")
+                # The real owner returned after COMMIT + journal retirement.
+                # On rollback/error/UNKNOWN execution never reaches this branch.
+                if retry_stage.outcome != 'committed':
+                    raise _DeliveryWithheld("outbox_retry_no_effect")
+                result.update(applied=True, status="addressed_committed", eligible_count=updated,
+                              revived_count=updated)
+            except Exception as exc:
+                # Preserve the native owner's primary/quarantine internally;
+                # never echo provider exceptions, retained last_error or IDs.
+                if retry_stage is not None and retry_stage.outcome == 'committed':
+                    return {**result, "applied": True, "status": "addressed_committed",
+                            "eligible_count": updated, "revived_count": updated,
+                            **policy.notification_fields("deferred_postcommit_failed"),
+                            "error": "outbox_postcommit_failed"}
+                unknown = getattr(self, "_transaction_quarantine", None) is not None
+                code = (exc.args[0] if type(exc) is _DeliveryWithheld and len(exc.args) == 1
+                        and type(exc.args[0]) is str and exc.args[0] in {
+                            "outbox_retry_snapshot_changed", "outbox_retry_no_effect"}
+                        else "outbox_retry_failed")
+                if (type(exc) is RuntimeError and len(exc.args) == 1 and type(exc.args[0]) is str
+                        and exc.args[0] in {"outbox_retry_native_callback_lifetime_unsupported",
+                            "outbox_retry_native_authorizer_lifetime_unsupported",
+                            "outbox_retry_native_commit_late_callback_unsupported"}):
+                    code = "outbox_retry_callback_lifetime_unsupported"
+                return {**result, "status": "unknown" if unknown else "refused",
+                        "applied": None if unknown else False, "revived_count": None if unknown else 0,
+                        "error": "outbox_commit_unknown" if unknown else code}
+            try:
+                if (retry_stage.outcome != 'committed' or retry_stage.phase != 'retired'
+                        or c is not self._conn or c is not self._owned_conn
+                        or self._transaction_quarantine is not None
+                        or disclosure.anchor != disclosure._authority()
+                        or disclosure.erasure != disclosure._erasures()):
+                    return {**result, **policy.notification_fields("deferred_context_changed"),
+                            "error": "outbox_postcommit_context_changed"}
+                notification = _notify_registered_outbox_worker(path)
+            except Exception:
+                # The queue commit is known, but worker notification is not.
+                return {**result, **policy.notification_fields("deferred_notification_failed"),
+                        "error": "outbox_worker_notification_failed"}
+            return {**result, **policy.notification_fields(notification)}
+
+    def _repair(self, target: str='all', dry_run: bool=True, *, model_scope: bool = False, outbox_job_ids=None) -> Dict[str, Any]:
         target=(target or 'all').lower(); actions=[]
+        if outbox_job_ids is not None and target not in ('all', 'outbox'):
+            return {'target':target, 'dry_run':dry_run, 'actions':[], 'error':'outbox_job_ids_only_for_outbox'}
         def act(name, fn=None, run_when_dry=False):
             entry={'action':name,'applied':not dry_run}
             if fn and (run_when_dry or not dry_run):
@@ -25584,7 +25841,7 @@ class MemoryWikiProvider(MemoryProvider):
         if target in ('all','dashboards'):
             act('render_topic_pages', self._render_all); act('render_active_dashboard', self._render_active_dashboard)
         if target in ('all','outbox'):
-            act('revive_failed_outbox', lambda: self._repair_failed_outbox(dry_run), run_when_dry=True)
+            act('revive_failed_outbox', lambda: self._repair_failed_outbox(dry_run, outbox_job_ids=outbox_job_ids), run_when_dry=True)
         if target in ('all','integrity'):
             def preserve():
                 self._preserve_db_files('repair')
@@ -25592,8 +25849,11 @@ class MemoryWikiProvider(MemoryProvider):
             def optimize():
                 c=self._connect(); c.execute('PRAGMA optimize'); self._checkpoint_wal('TRUNCATE')
             act('sqlite_optimize_checkpoint', optimize)
-        if not dry_run: self._audit('repair','ok',f'target={target} actions={len(actions)}')
-        return {'target':target,'dry_run':dry_run,'actions':actions}
+        ok = all(entry.get('ok', True) for entry in actions)
+        if not dry_run and target != 'outbox': self._audit('repair','ok' if ok else 'partial',f'target={target} actions={len(actions)}')
+        result = {'target':target,'dry_run':dry_run,'actions':actions}
+        if target in ('all','outbox'): result['ok'] = ok
+        return result
 
     def _audit_log(self, limit:int=50, *, include_shared: bool=False)->List[Dict[str,Any]]:
         try:
