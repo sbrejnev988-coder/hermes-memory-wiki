@@ -8,12 +8,19 @@ from __future__ import annotations
 import ast
 from contextlib import ExitStack
 import contextvars
+import hashlib
 import os
 import unittest
 from unittest import mock
 
 __test__ = False
 _G1 = _RAW = _BASELINE = None
+ORACLE_MIGRATION = (
+    ("        self.visible('PRIVACYBOOK', a['revision_id'])\n",
+     "        # Retained links to erased/missing claims must veto public disclosure.\n        # A nonempty result here would contradict the privacy fixture itself.\n        withheld = self.d.query_documents(self.p, {'query': 'PRIVACYBOOK', 'limit': 20})\n        self.assertEqual(withheld.get('disclosure_status'), 'withheld', withheld)\n        self.assertEqual(withheld['results'], [], withheld)\n"),
+    ("        archive, retire, erase = [row['embedding_claim_id'] for row in linked]\n",
+     "        # Positive visibility belongs to the healthy cohort, before erasure.\n        self.visible('PRIVACYBOOK', a['revision_id'])\n        archive, retire, erase = [row['embedding_claim_id'] for row in linked]\n"),
+)
 METHODS = (
     'test_keyboard_interrupt_unwinds_before_unittest_cleanup',
     'test_primary_identity_cause_and_secondary_evidence',
@@ -21,7 +28,7 @@ METHODS = (
     'test_cleanup_error_is_visible_and_not_retried',
     'test_successful_cleanup_restores_context_and_runs_once',
     'test_static_acquisition_is_inside_local_fatal_unwind',
-    'test_static_original_eight_method_bodies_preserved',
+    'test_static_original_eight_business_contracts_preserved',
 )
 
 
@@ -173,15 +180,35 @@ class CleanupCases(unittest.TestCase):
         self.assertTrue({'set_hermes_home_override', 'set_secret_scope', 'load_wiki',
                          'self.m.MemoryWikiProvider', 'self.p.initialize'} <= called)
 
-    def test_static_original_eight_method_bodies_preserved(self):
+    def test_static_original_eight_business_contracts_preserved(self):
         def bodies(raw):
             text = raw.decode('utf-8')
             tree = ast.parse(text)
             cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == 'DocumentStateG1')
             return {n.name: ast.get_source_segment(text, n) for n in cls.body
                     if isinstance(n, ast.FunctionDef) and n.name.startswith('test_')}
-        self.assertEqual(len(bodies(_RAW)), 8)
-        self.assertEqual(bodies(_BASELINE), bodies(_RAW))
+        original, current = bodies(_BASELINE), bodies(_RAW)
+        self.assertEqual(len(original), 8)
+        self.assertEqual(original.keys(), current.keys())
+        target = 'test_aba_partial_embeddings_preserve_archived_retired_erased_authority'
+        self.assertEqual(hashlib.sha256(original[target].encode()).hexdigest(),
+                         'a40c79325aa5cc2baf08f47ec1e0bc751d6198a6927c607fb3ed74809e6805f8')
+        for name in original.keys() - {target}:
+            self.assertEqual(original[name], current[name], name)
+        expected = original[target]
+        # Approved test-oracle migration from exact 1743: not a new product
+        # contract. Missing erased links deliberately require fail-closed output.
+        for old, new in ORACLE_MIGRATION:
+            self.assertEqual(expected.count(old), 1)
+            expected = expected.replace(old, new, 1)
+        self.assertEqual(current[target], expected)
+        # Byte-exact inverse also protects every pre-existing privacy/ledger,
+        # owner-TX, pending-count and anti-resurrection assertion in this body.
+        retained = current[target]
+        for old, new in reversed(ORACLE_MIGRATION):
+            self.assertEqual(retained.count(new), 1)
+            retained = retained.replace(new, old, 1)
+        self.assertEqual(retained, original[target])
 
 
 def make_suite(g1, raw, baseline):

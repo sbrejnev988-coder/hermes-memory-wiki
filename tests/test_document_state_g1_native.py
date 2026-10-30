@@ -224,6 +224,8 @@ class DocumentStateG1(unittest.TestCase):
         linked = [row for row in self.chunks(a['revision_id']) if row['embedding_claim_id']]
         self.assertEqual(len(linked), 3)
         self.assertEqual(len({row['embedding_claim_id'] for row in linked}), 3)
+        # Positive visibility belongs to the healthy cohort, before erasure.
+        self.visible('PRIVACYBOOK', a['revision_id'])
         archive, retire, erase = [row['embedding_claim_id'] for row in linked]
         # The authenticated intent reads the principal through provider._connect.
         # Register the real owner while retaining the SQLite lock through COMMIT.
@@ -260,7 +262,11 @@ class DocumentStateG1(unittest.TestCase):
         self.assertIsNone(self.db.execute('SELECT id FROM claims WHERE id=?', (erase,)).fetchone())
         self.assertEqual(ledger, {str(p.relative_to(self.home)): hashlib.sha256(p.read_bytes()).hexdigest()
                   for p in self.p._privacy_erasure.dir.iterdir() if p.is_file()})
-        self.visible('PRIVACYBOOK', a['revision_id'])
+        # Retained links to erased/missing claims must veto public disclosure.
+        # A nonempty result here would contradict the privacy fixture itself.
+        withheld = self.d.query_documents(self.p, {'query': 'PRIVACYBOOK', 'limit': 20})
+        self.assertEqual(withheld.get('disclosure_status'), 'withheld', withheld)
+        self.assertEqual(withheld['results'], [], withheld)
         self.observe(revision=a['revision_id'], archived=archive, retired=retire, erased=erase,
                      pending_after=out['pending_after'], skipped=out['skipped_reasons'], ledger_hashes=ledger)
 
