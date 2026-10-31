@@ -329,7 +329,7 @@ class G4Tests(unittest.TestCase):
         self.assertEqual(ast.dump(protected, include_attributes=False), ast.dump(actual, include_attributes=False))
         # Raw current binding, not a claim of native provider initialization.
         self.assertEqual(hashlib.sha256((SOURCE/'__init__.py').read_bytes()).hexdigest(),
-                         '41becd5515db95f0b090889a92729426230ef599c3f1fcd567abe9e1b93e64ec')
+                         '6a8fe25695fbbdf06323332e54edbf1ab86d378b536ff24f094a6024e82f60a0')
         NETWORK_EXPECTED = True
         try:
             with self.assertRaises(NetworkDenied):

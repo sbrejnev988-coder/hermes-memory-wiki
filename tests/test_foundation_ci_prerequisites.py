@@ -91,7 +91,7 @@ def historical_method_dumps(module, name):
                 and ast.unparse(n.args[0]) == "hashlib.sha256((SOURCE / '__init__.py').read_bytes()).hexdigest()"]
         if (len(pins) != 1 or not isinstance(pins[0].args[1], ast.Constant)
                 or type(pins[0].args[1].value) is not str
-                or pins[0].args[1].value != '41becd5515db95f0b090889a92729426230ef599c3f1fcd567abe9e1b93e64ec'):
+                or pins[0].args[1].value != '6a8fe25695fbbdf06323332e54edbf1ab86d378b536ff24f094a6024e82f60a0'):
             raise RuntimeError('g4_current_literal_pin')
         pins[0].args[1].value = '8007b015f204a0b673e7cf41410fe609f60b8151bd39d9042a53336de7fdaf09'
     return [ast.dump(node, include_attributes=False) for node in ast.walk(module)

@@ -40,7 +40,7 @@ import uuid
 import urllib.request
 import urllib.error
 import urllib.parse
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from contextlib import contextmanager, nullcontext, ExitStack
 from types import MappingProxyType, CodeType, FunctionType, ModuleType
 import struct
@@ -9892,8 +9892,9 @@ class MemoryWikiProvider(MemoryProvider):
     def _extract_session_claims(self, messages: List[Dict[str, Any]]) -> None:
         """Extract and persist structured claims without breaking session end."""
         try:
-            exchanges = []
-            for message in messages[-32:]:
+            # Tool/protocol frames must not consume the dialogue window.
+            exchanges = deque(maxlen=32)
+            for message in messages:
                 role = str(message.get("role", "")).lower()
                 content = message.get("content", "")
                 if type(content) is not str:
@@ -9909,6 +9910,7 @@ class MemoryWikiProvider(MemoryProvider):
                         if key in message:
                             exchange[key] = message.get(key)
                     exchanges.append(exchange)
+            exchanges = list(exchanges)
             if not exchanges:
                 return
 
