@@ -37,10 +37,10 @@ def _record(**values):
         stream.write(json.dumps(values) + '\n')
 
 
-def _external(owner):
+def _external(owner, database):
     provider = object.__new__(plugin.MemoryWikiProvider)
     owner.original_init(provider)
-    provider.db_path = ':memory:'
+    provider.db_path = database
     connection = owner.original_connect(provider)
     assert id(provider) not in owner._owned
     return provider, connection
@@ -49,7 +49,7 @@ def _external(owner):
 @pytest.mark.parametrize('pointer', ['absent', 'previous', 'newer'])
 @pytest.mark.parametrize('refusal', ['worker', 'close-error'])
 def test_owner_keeps_pending_handles_and_singleton_policy_until_safe_retry(
-    pointer, refusal, own_native_provider_connections,
+    pointer, refusal, own_native_provider_connections, tmp_path,
 ):
     owner = own_native_provider_connections
     initial = getattr(__main__, '_memory_wiki_instance', _MISSING)
@@ -61,10 +61,10 @@ def test_owner_keeps_pending_handles_and_singleton_policy_until_safe_retry(
             del __main__._memory_wiki_instance
         previous = _MISSING
         if pointer == 'previous':
-            previous, external_connection = _external(owner)
+            previous, external_connection = _external(owner, tmp_path / 'previous.sqlite3')
             externals.append((previous, external_connection))
         provider = plugin.MemoryWikiProvider()
-        provider.db_path = ':memory:'
+        provider.db_path = tmp_path / 'owned.sqlite3'
         acquired = provider._connect()
         connections.append(acquired)
         assert isinstance(acquired, sqlite3.Connection)
@@ -89,7 +89,7 @@ def test_owner_keeps_pending_handles_and_singleton_policy_until_safe_retry(
         expected_during_refusal = provider
         expected_after_retry = previous
         if pointer == 'newer':
-            external, external_connection = _external(owner)
+            external, external_connection = _external(owner, tmp_path / 'newer.sqlite3')
             externals.append((external, external_connection))
             expected_during_refusal = expected_after_retry = external
         owned_entry = owner._owned[id(provider)]
@@ -155,12 +155,14 @@ def test_owner_keeps_pending_handles_and_singleton_policy_until_safe_retry(
 
 
 def test_worker_marker_does_not_transfer_a_borrowed_sqlite_handle(
-    own_native_provider_connections,
+    own_native_provider_connections, tmp_path,
 ):
     owner = own_native_provider_connections
     previous = getattr(__main__, '_memory_wiki_instance', _MISSING)
-    connection = sqlite3.connect(':memory:')
+    database = tmp_path / 'borrowed.sqlite3'
+    connection = sqlite3.connect(database)
     provider = plugin.MemoryWikiProvider()
+    provider.db_path = database
     worker = plugin._background_jobs.Worker(provider, plugin)
     assert worker.thread.ident is None
     assert not worker.thread.is_alive()
@@ -233,8 +235,14 @@ def test_partial_native_initialization_has_a_same_item_finalizer_oracle(
         provider.initialize('same-item-partial-chat', bot_id='same-item-partial-bot')
     assert denied == ['claims']
     connection = holder['connection']
-    assert provider._conn is connection
-    assert connection.execute('SELECT 1').fetchone()[0] == 1
-    with pytest.raises(sqlite3.OperationalError, match='no such table: claims'):
-        provider.shutdown()
-    assert connection.execute('SELECT 1').fetchone()[0] == 1
+    # ADJ-INIT also applies to this same-owner partial-initialize consumer.
+    _closed(connection)
+    assert provider._conn is None
+    assert provider._owned_conn is None
+    assert provider._lifecycle_state == 'failed'
+    assert provider._degraded is True
+    assert provider._background_worker is None
+    provider.shutdown()
+    _closed(connection)
+    assert provider._conn is None
+    assert provider._owned_conn is None

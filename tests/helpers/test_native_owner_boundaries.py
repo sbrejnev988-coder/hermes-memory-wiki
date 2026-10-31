@@ -101,19 +101,29 @@ def test_file_sqlite_is_closed_after_failure_inside_actual_migration(
             return real_migrate()
         finally:
             connection.set_authorizer(None)
+            # Observe partial schema before initialize owns failure cleanup.
+            holder['tables'] = {row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'")}
 
     monkeypatch.setattr(provider, '_migrate', fail_during_migration)
     with pytest.raises(sqlite3.DatabaseError, match='not authorized'):
         provider.initialize('partial-file-chat', bot_id='partial-file-bot')
     assert denied == ['claims']
     connection = holder['connection']
-    tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    tables = holder['tables']
     assert 'meta' in tables and 'recovery_artifacts' in tables
     assert 'claims' not in tables
-    with pytest.raises(sqlite3.OperationalError, match='no such table: claims'):
-        provider.shutdown()
-    assert connection.execute('SELECT 1').fetchone()[0] == 1
-    assert provider._conn is connection
+    # ADJ-INIT: initialize owns cleanup on refusal; not fixture-only close.
+    _closed(connection)
+    assert provider._conn is None
+    assert provider._owned_conn is None
+    assert provider._lifecycle_state == 'failed'
+    assert provider._degraded is True
+    assert provider._background_worker is None
+    provider.shutdown()
+    _closed(connection)
+    assert provider._conn is None
+    assert provider._owned_conn is None
 
 
 @pytest.mark.parametrize('pointer', ['absent', 'previous', 'newer'])
@@ -153,16 +163,16 @@ def test_multiple_owned_connections_close_without_closing_external_provider(
         # Real constructor outside the ownership wrapper; genuine negative owner.
         external = object.__new__(plugin.MemoryWikiProvider)
         owner.original_init(external)
-        external.db_path = ':memory:'
+        external.db_path = tmp_path / 'external.sqlite3'
         external._connect()
         holder['external'] = external
         holder['expected'] = external
 
     if pointer == 'previous':
         external_provider()
-    for _ in range(2):
+    for index in range(2):
         provider = plugin.MemoryWikiProvider()
-        provider.db_path = ':memory:'
+        provider.db_path = tmp_path / f'owned-{index}.sqlite3'
         connection = provider._connect()
         assert connection.execute('SELECT 1').fetchone()[0] == 1
         holder['owned'].append((provider, connection))
@@ -172,7 +182,8 @@ def test_multiple_owned_connections_close_without_closing_external_provider(
 
 def test_borrowed_sqlite_connection_is_not_closed(tmp_path, monkeypatch, request):
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
-    connection = sqlite3.connect(':memory:')
+    database = tmp_path / 'borrowed.sqlite3'
+    connection = sqlite3.connect(database)
     holder = {}
 
     def verify():
@@ -187,5 +198,32 @@ def test_borrowed_sqlite_connection_is_not_closed(tmp_path, monkeypatch, request
     request.node.addfinalizer(verify)
     provider = plugin.MemoryWikiProvider()
     holder['provider'] = provider
+    provider.db_path = database
     provider._conn = connection
     assert provider._connect() is connection
+    # File equality admits this read; it does not issue writer ownership.
+    with pytest.raises(RuntimeError, match='^claim_mutation_transaction_not_owned$'):
+        with provider._claim_transaction(connection):
+            pass
+    assert connection.in_transaction is False
+
+
+@pytest.mark.parametrize('database_kind', ['memory', 'different-file'])
+def test_borrowed_connection_without_matching_file_identity_is_refused(
+    database_kind, tmp_path,
+):
+    """Genuine negative: correcting positives never makes identity optional."""
+    provider = plugin.MemoryWikiProvider()
+    provider.db_path = tmp_path / 'configured.sqlite3'
+    database = ':memory:' if database_kind == 'memory' else tmp_path / 'actual.sqlite3'
+    connection = sqlite3.connect(database)
+    try:
+        provider._conn = connection
+        with pytest.raises(RuntimeError, match='^provider_connection_identity_unavailable$'):
+            provider._connect()
+        assert provider._conn is connection
+        assert provider._owned_conn is None
+        assert connection.execute('SELECT 1').fetchone()[0] == 1
+    finally:
+        connection.close()
+        provider._conn = None
