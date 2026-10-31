@@ -270,9 +270,26 @@ def test_genuine_fallback_mixed_ordinary_shared_survives_Core(fleet):
     bid = created["block_id"]
     assert call("memory_wiki_shared_block_grant", block_id=bid, principal_type="bot", principal_id="owner")["status"] == "granted"
     assert call("memory_wiki_shared_block_attach", block_id=bid, principal_type="bot")["status"] == "attached"
-    full, ids = fallback(p, 4000)
-    fragment = p._shared_prefetch_fragments(1000)[0]["line"]
+    # R1: shared claim IDs are structural accounting, not inline claim tokens.
+    # Keep the genuine request/fallback/finally lifetime without the ordinary-only
+    # fallback() helper oracle; no guard, renderer or accounting stand-in.
+    request = mw._new_recall_request(p, "orchid")
+    token = mw._RECALL_REQUEST.set(request)
+    try:
+        full = p._lexical_prefetch_fallback("orchid", delivery_budget=4000)
+    finally:
+        mw._RECALL_REQUEST.reset(token)
+    ids = request["emitted_ids"]
+    fragments = p._shared_prefetch_fragments(1000)
+    assert len(fragments) == 1
+    shared_fragment = fragments[0]
+    assert shared_fragment["block_id"] == bid
+    assert shared_fragment["claim_id"] == shared
+    fragment = shared_fragment["line"]
     body = fallback_enclosure(full, 4000)
     assert claim_line(p, stored(p, ordinary)) in body and fragment in body
     assert ordinary in ids
+    assert ids == [shared, ordinary]
+    assert f"`{mw._context_data(ordinary)}`" in body
+    assert mw._context_data(bid) in fragment
     assert stored(p, shared)["visibility_scope"] == "private"
