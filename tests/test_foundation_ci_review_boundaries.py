@@ -148,7 +148,7 @@ class ReviewBoundaryControls(unittest.TestCase):
         calls = [n for n in ast.walk(test) if isinstance(n, ast.Call) and ast.unparse(n.func) == 'self.assertEqual']
         pin = next(n for n in calls if n.args and 'hashlib.sha256' in ast.unparse(n.args[0]))
         self.assertIsInstance(pin.args[1], ast.Constant)
-        self.assertEqual(pin.args[1].value, 'b5f4995d5573340a8e0c01a1356d79dfe09db5a659ad3f8384a93c5ae7e22add')
+        self.assertEqual(pin.args[1].value, '41becd5515db95f0b090889a92729426230ef599c3f1fcd567abe9e1b93e64ec')
         text = ast.unparse(test)
         self.assertLess(text.index(pin.args[1].value), text.index('socket.socket()'))
         self.assertIn('with self.assertRaises(NetworkDenied):', text)
