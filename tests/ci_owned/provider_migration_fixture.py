@@ -58,8 +58,8 @@ class MigrationFixture:
         self.embedding_posts = []
         self.qdrant_requests = []
         self.created_collections = set()
-        self.foreign_text = 'Owner B only: migration cobalt nebula receiver calibration.'
-        self.own_text = 'Owner A only: migration amber cactus receiver calibration.'
+        self.foreign_text = 'User prefers cobalt nebula receiver calibration diagrams for migration runbooks.'
+        self.own_text = 'User prefers amber cactus receiver calibration diagrams for migration runbooks.'
         self.before_request = None
         self.fail_request = None
         self.responses = []
@@ -123,7 +123,9 @@ class MigrationFixture:
                 ('b_private', self.old_b, self.foreign_text, 'private'),
                 ('b_chat', self.old_b, self.foreign_text + ' Chat-only operating note.', 'chat'),
             ):
-                cid = provider._add_claim(text, topic='general', source='memory_tool:synthetic',
+                gate = self.old.memory_gate_decision(text, 'preferences', 'memory_tool:synthetic')
+                assert gate['action'] == 'accept', gate['reason']
+                cid = provider._add_claim(text, topic='preferences', source='memory_tool:synthetic',
                     confidence=.95, salience=.95, visibility_scope=scope)
                 assert cid.startswith('c_'), cid
                 self.ids[label] = cid
