@@ -5362,9 +5362,12 @@ def _qdrant_upsert(claim_id: str, vector: List[float], payload: dict, collection
         _debug_log(f"qdrant vector size mismatch: expected={QDRANT_VECTOR_SIZE}, actual={len(vector)}")
         return False
     coll = collection or _active_collection_name()
-    if (str((payload or {}).get("manifest_hash") or _manifest_hash(_embedding_manifest()))
-            != _manifest_hash(_embedding_manifest())
-            or not _claim_collection_manifest_compatible(coll, _manifest_hash(_embedding_manifest()))):
+    # The same lower helper also serves canonical episode payloads. Keep their
+    # existing isolated episode target/manifest fences, not the claim namespace.
+    if ((payload or {}).get("object_type") != "episode"
+            and (str((payload or {}).get("manifest_hash") or _manifest_hash(_embedding_manifest()))
+                 != _manifest_hash(_embedding_manifest())
+                 or not _claim_collection_manifest_compatible(coll, _manifest_hash(_embedding_manifest())))):
         _debug_log("qdrant claim write refused incompatible manifest target")
         return False
     if coll != _qdrant_alias() and not (
@@ -26045,7 +26048,7 @@ class MemoryWikiProvider(MemoryProvider):
         IDs, mutate their scopes or treat a different chat's metadata as a grant.
         """
         from .provider_migration import orchestrate
-        return orchestrate(self, sys.modules[__name__], owners, limit)
+        return orchestrate(self, _runtime_module(), owners, limit)
 
     def _reindex(self, limit: int = 0, force: bool = False, *,
                  current_scope_only: bool = False, dry_run: bool = False,
@@ -26059,7 +26062,7 @@ class MemoryWikiProvider(MemoryProvider):
                     or type(limit) is not int or limit < 0):
                 return {"ok": False, "error": "invalid_arguments"}
             from .provider_migration import migrate
-            return migrate(self, sys.modules[__name__], limit)
+            return migrate(self, _runtime_module(), limit)
         if dry_run and not current_scope_only:
             return {"ok": False, "error": "dry_run_requires_current_scope_only"}
         if current_scope_only:

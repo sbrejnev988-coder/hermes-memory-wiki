@@ -308,7 +308,8 @@ class MigrationFixture:
                         with Path(destination).open('a',encoding='utf-8') as stream:
                             stream.write(json.dumps(record,sort_keys=True)+'\n')
                     for name in sorted(self.created_collections):
-                        assert name.startswith('migration_claims_' + self.namespace + '_')
+                        assert name.startswith(('migration_claims_' + self.namespace + '_',
+                                                'migration_episodes_' + self.namespace + '_'))
                         response = current._qdrant_req('DELETE', '/collections/' + name)
                         assert isinstance(response, dict) and response.get('status') == 'ok'
                 assert all(response.closed for response in self.responses)

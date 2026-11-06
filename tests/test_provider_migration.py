@@ -247,3 +247,22 @@ def test_provider_migration_outstanding_delete_cannot_race_alias_cutover(provide
     assert result['error'] == 'migration_claim_deletes_not_quiescent' and result['alias_switched'] is False
     assert f.alias() == f.old_target and f.old_unchanged()
     assert f.a._conn.execute("SELECT COUNT(*) FROM index_outbox WHERE operation='delete' AND status='pending'").fetchone()[0] > 0
+
+
+def test_provider_migration_keeps_canonical_episode_upsert_separate(provider_migration_case):
+    # Low-level regression for the OTHER caller of the shared HTTP upsert.
+    # Real Qdrant, canonical episode payload, no claim/episode authority mock;
+    # this is not an end-to-end episode capture/retention qualification.
+    f = provider_migration_case
+    target = f.m._episodic_collection_name()
+    eid = 'e_synthetic_migration_namespace'
+    payload = f.m._qdrant_episode_payload(eid, 'Synthetic episode namespace control.', {
+        'role':'user','visibility_scope':'chat','owner_bot_id':f.a.bot_id,
+        'owner_chat_hash':f.a._chat_hash(f.a.session_id),'collection':target,
+        'created_at':f.m.now(),'expires_at':f.m.now()+3600})
+    assert payload['object_type'] == 'episode'
+    assert f.m._qdrant_upsert(eid, _fixture.VECTOR_OPENROUTER, payload, target)
+    response = f.m._qdrant_req('POST','/collections/'+target+'/points',{
+        'ids':[f.m._qdrant_point_id(eid)],'with_payload':True,'with_vector':False})
+    assert response['result'][0]['payload'] == payload
+    assert f.alias() == f.old_target and f.old_unchanged()
