@@ -192,7 +192,8 @@ class MigrationFixture:
         assert module.EMBED_CONTRACT_VALID
         original = module._urlopen_no_redirect
         self.mp.setattr(module, '_urlopen_no_redirect',
-                        lambda request, timeout, m=module, op=original: self.transport(m, op, request, timeout))
+                        lambda request, timeout, *, _before_dispatch=None, m=module, op=original:
+                        self.transport(m, op, request, timeout, _before_dispatch=_before_dispatch))
         self.modules.append(module)
         return module
 
@@ -208,21 +209,29 @@ class MigrationFixture:
         conn.execute('PRAGMA temp_store=MEMORY')
         return provider
 
-    def transport(self, module, opener, request, timeout):
+    def transport(self, module, opener, request, timeout, *, _before_dispatch=None):
         url = request.full_url
         method = request.get_method()
         body = json.loads(request.data) if request.data is not None else None
         if url.startswith(self.vector_url + '/'):
             assert not request.has_header('Authorization') and not request.has_header('Api-key')
             event = (method, urllib.parse.urlsplit(url).path, body)
-            self.qdrant_requests.append(event)
             if self.before_request is not None:
                 self.before_request(event)
             if self.fail_request is not None:
                 self.fail_request(event)
-            return opener(request, timeout=timeout)  # Real Qdrant HTTP, not a dictionary stand-in.
+            # The real lower opener owns the original final admission. Pass the
+            # callback literally; never skip it or call it twice in this wrapper.
+            response = opener(request, timeout=timeout, _before_dispatch=_before_dispatch)
+            self.qdrant_requests.append(event)
+            return response  # Real Qdrant HTTP, not a dictionary stand-in.
         assert url.startswith(module.EMBED_URL + '/')
         assert request.get_header('Authorization') == 'Bearer ' + INERT_AUTH
+        # This branch IS the terminal synthetic transport. Admit before its
+        # counters/response and retain the callback's clamped numeric timeout.
+        if _before_dispatch is not None:
+            remaining = _before_dispatch()
+            assert isinstance(remaining, (float, int)) and 0 < remaining <= timeout
         if method == 'GET' and urllib.parse.urlsplit(url).path.endswith('/models'):
             payload = {'data': [{'id': MODEL}]}
         else:
