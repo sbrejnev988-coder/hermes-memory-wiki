@@ -3079,6 +3079,11 @@ def _outbox_process_scoped(batch_size=50, *, db_path: Optional[str] = None, work
                         else:
                             claim_target_collection = _claim_outbox_collection(payload)
                     claim_target_manifest = _manifest_hash(_embedding_manifest())
+                    # A provider change must not write new vectors into the old
+                    # alias target while a shared migration is still incomplete.
+                    # Refuse before registry intent, raw hydration or embedding.
+                    if not _claim_collection_manifest_compatible(claim_target_collection, claim_target_manifest):
+                        raise RuntimeError("claim_target_manifest_mismatch")
                     claim_target_payload = _claim_target_payload(
                         collection=claim_target_collection,
                         endpoint=claim_target_endpoint,
@@ -5331,6 +5336,25 @@ def _qdrant_visibility_filter(
     return {"should": should}
 
 
+def _claim_collection_manifest_compatible(collection: str, manifest_hash: str) -> bool:
+    """A write target's manifest is not proved by equal vector dimensions."""
+    target = str(collection or "")
+    if target == _qdrant_alias():
+        target = _qdrant_alias_target(_qdrant_alias())
+    if not target or not _is_managed_claim_collection(target) or not _profile_target_allowed(target):
+        return False
+    if not re.fullmatch(r"[0-9a-f]{12}", str(manifest_hash)):
+        return False
+    base = _qdrant_collection()
+    if re.fullmatch(r".+_[0-9a-f]{12}", base):
+        if not base.endswith("_" + manifest_hash):
+            return False
+        expected = re.escape(base)
+    else:
+        expected = re.escape(base + "_" + manifest_hash)
+    return bool(re.fullmatch(expected + r"(?:_force_[0-9]+)?", target))
+
+
 def _qdrant_upsert(claim_id: str, vector: List[float], payload: dict, collection: str = None,
                    *, create_collection: bool = True, before_write=None, _admit=None) -> bool:
     """Сохранить вектор в настоящем Qdrant."""
@@ -5338,6 +5362,11 @@ def _qdrant_upsert(claim_id: str, vector: List[float], payload: dict, collection
         _debug_log(f"qdrant vector size mismatch: expected={QDRANT_VECTOR_SIZE}, actual={len(vector)}")
         return False
     coll = collection or _active_collection_name()
+    if (str((payload or {}).get("manifest_hash") or _manifest_hash(_embedding_manifest()))
+            != _manifest_hash(_embedding_manifest())
+            or not _claim_collection_manifest_compatible(coll, _manifest_hash(_embedding_manifest()))):
+        _debug_log("qdrant claim write refused incompatible manifest target")
+        return False
     if coll != _qdrant_alias() and not (
         _ensure_collection(coll) if create_collection else _ensure_collection(coll, create=False)
     ):
@@ -10333,7 +10362,7 @@ class MemoryWikiProvider(MemoryProvider):
             {"name":"memory_wiki_journal_status","description":"Inspect append-only JSONL journal health, hash chain and recent events.","parameters":P({"verify":{"type":"boolean","default":True},"limit":{"type":"integer","default":5}}, [])},
             {"name":"memory_wiki_journal_checkpoint","description":"Write a logical JSON checkpoint of SQLite tables for journal-based recovery. Secret values are always excluded.","parameters":P({"name":{"type":"string","default":"manual"}}, [])},
             {"name":"memory_wiki_semantic_status","description":"Check embedding (:4000) and Qdrant (:6333) health and point count.","parameters":P({}, [])},
-            {"name":"memory_wiki_reindex","description":"Re-index active claims into Qdrant. Opt in with current_scope_only=true for caller-visible, in-place updates of the existing owned target; dry_run=true performs read-only preflight (no embedding, creation or writes). Scope-only force is refused; default full-index behavior is unchanged.","parameters":P({"limit":{"type":"integer","default":0},"force":{"type":"boolean","default":False},"current_scope_only":{"type":"boolean","default":False},"dry_run":{"type":"boolean","default":False}}, [])},
+            {"name":"memory_wiki_reindex","description":"Re-index active claims into Qdrant. current_scope_only=true updates only a compatible owned active target; dry_run=true is its read-only preflight. provider_migration=true instead contributes ONLY this native caller's authorized claims to a resumable new-manifest shared staging index; other owners must contribute under their own permissions. Atomic alias activation requires complete ID/revision/ACL validation. Migration cannot combine with scope-only, dry-run or force. Default legacy full-index behavior is unchanged.","parameters":P({"limit":{"type":"integer","default":0},"force":{"type":"boolean","default":False},"current_scope_only":{"type":"boolean","default":False},"dry_run":{"type":"boolean","default":False},"provider_migration":{"type":"boolean","default":False}}, [])},
             {"name":"memory_wiki_debug_search","description":"Search with full breakdown: FTS rank, vector rank, RRF score per claim.","parameters":P({"query":{"type":"string"},"limit":{"type":"integer","default":10},"topic":{"type":"string","default":""}}, ["query"])},
             {"name":"memory_wiki_compare_search","description":"Compare FTS-only vs vector-only vs hybrid retrieval.","parameters":P({"query":{"type":"string"},"limit":{"type":"integer","default":10},"topic":{"type":"string","default":""}}, ["query"])},
             {"name":"memory_wiki_query_mode","description":"Detect query type (technical/semantic/mixed) without searching.","parameters":P({"query":{"type":"string"}}, ["query"])},
@@ -10432,8 +10461,19 @@ class MemoryWikiProvider(MemoryProvider):
         if tool_name == "memory_wiki_reindex":
             # New booleans are exact, not truthy/coerced authority. Dispatch the
             # opt-in before lazy migration and full-corpus journal/checkpoints.
-            if any(type(a.get(key, False)) is not bool for key in ("current_scope_only", "dry_run")):
+            if any(type(a.get(key, False)) is not bool for key in ("current_scope_only", "dry_run", "provider_migration")):
                 return tool_result(success=False, error="invalid_arguments")
+            if a.get("provider_migration", False):
+                if (set(a) - {"limit", "force", "current_scope_only", "dry_run", "provider_migration"}
+                        or type(a.get("limit", 0)) is not int or a.get("limit", 0) < 0
+                        or type(a.get("force", False)) is not bool
+                        or a.get("force", False) or a.get("current_scope_only", False)
+                        or a.get("dry_run", False)):
+                    return tool_result(success=False, error="invalid_arguments")
+                # Content-free migration checkpoints are not a whole-corpus
+                # journal image. Actor/SID/owner grants are never tool arguments.
+                outcome = self._reindex(a.get("limit", 0), provider_migration=True)
+                return tool_result(success=bool(outcome.get("ok")), **outcome)
             if a.get("dry_run", False) and not a.get("current_scope_only", False):
                 return tool_result(success=False, error="dry_run_requires_current_scope_only")
             if a.get("current_scope_only", False):
@@ -25998,11 +26038,28 @@ class MemoryWikiProvider(MemoryProvider):
             "last_prefetch": dict(getattr(self, "_last_prefetch_diagnostics", {}) or {}),
         }
 
+    def migrate_embedding_index(self, *, owners, limit: int = 0) -> Dict[str,Any]:
+        """Host-only orchestration over already authorized native owner objects.
+
+        Not a model-facing tool. Never construct owners from persisted consumer
+        IDs, mutate their scopes or treat a different chat's metadata as a grant.
+        """
+        from .provider_migration import orchestrate
+        return orchestrate(self, sys.modules[__name__], owners, limit)
+
     def _reindex(self, limit: int = 0, force: bool = False, *,
-                 current_scope_only: bool = False, dry_run: bool = False) -> Dict[str,Any]:
+                 current_scope_only: bool = False, dry_run: bool = False,
+                 provider_migration: bool = False) -> Dict[str,Any]:
         """Build an immutable collection, retry failed IDs, then atomically switch the alias."""
-        if type(current_scope_only) is not bool or type(dry_run) is not bool:
+        if (type(current_scope_only) is not bool or type(dry_run) is not bool
+                or type(provider_migration) is not bool):
             return {"ok": False, "error": "invalid_arguments"}
+        if provider_migration:
+            if (current_scope_only or dry_run or type(force) is not bool or force
+                    or type(limit) is not int or limit < 0):
+                return {"ok": False, "error": "invalid_arguments"}
+            from .provider_migration import migrate
+            return migrate(self, sys.modules[__name__], limit)
         if dry_run and not current_scope_only:
             return {"ok": False, "error": "dry_run_requires_current_scope_only"}
         if current_scope_only:

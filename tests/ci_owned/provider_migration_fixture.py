@@ -57,6 +57,7 @@ class MigrationFixture:
         self.modules = []
         self.embedding_posts = []
         self.qdrant_requests = []
+        self.created_collections = set()
         self.foreign_text = 'Owner B only: migration cobalt nebula receiver calibration.'
         self.own_text = 'Owner A only: migration amber cactus receiver calibration.'
         self.before_request = None
@@ -65,7 +66,10 @@ class MigrationFixture:
         self.native = sys.modules['hermes_constants']
         self._native_token = None
         self._main_before = getattr(sys.modules['__main__'], '_memory_wiki_instance', None)
-        self.vector_url = os.environ['MW_MIGRATION_TEST_QDRANT_URL'].rstrip('/')
+        supplied = os.environ.get('MW_MIGRATION_TEST_QDRANT_URL')
+        if not supplied:
+            pytest.skip('requires explicit owned isolated Qdrant via MW_MIGRATION_TEST_QDRANT_URL')
+        self.vector_url = supplied.rstrip('/')
         self.namespace = hashlib.sha256(str(root).encode()).hexdigest()[:8]
         parsed = urllib.parse.urlsplit(self.vector_url)
         assert parsed.scheme == 'http' and parsed.hostname == '127.0.0.1'
@@ -224,6 +228,9 @@ class MigrationFixture:
             # callback literally; never skip it or call it twice in this wrapper.
             response = opener(request, timeout=timeout, _before_dispatch=_before_dispatch)
             self.qdrant_requests.append(event)
+            parts = urllib.parse.urlsplit(url).path.split('/')
+            if method == 'PUT' and len(parts) == 3 and parts[1] == 'collections':
+                self.created_collections.add(parts[2])
             return response  # Real Qdrant HTTP, not a dictionary stand-in.
         assert url.startswith(module.EMBED_URL + '/')
         assert request.get_header('Authorization') == 'Bearer ' + INERT_AUTH
@@ -254,19 +261,48 @@ class MigrationFixture:
     def old_unchanged(self):
         return self.m._qdrant_claim_state(self.old_target) == self.old_state
 
+    @staticmethod
+    def _release_provider(provider):
+        if getattr(provider, '_conn', None) is not None:
+            provider.shutdown()
+
     def close(self):
         try:
-            refreshes = {m._refresh_openrouter_health for m in self.modules}
-            for worker in threading.enumerate():
-                args = getattr(worker, '_args', ())
-                if (worker.name == 'memory-wiki-openrouter-health' and args
-                        and args[0] in refreshes):
-                    worker.join(timeout=5)
-                    assert not worker.is_alive(), 'owned health refresh did not finish'
-            for p in reversed(self.providers):
-                if getattr(p, '_conn', None) is not None:
-                    p.shutdown()
-            assert all(response.closed for response in self.responses)
+            # Every acquired provider closes in its real native home, including
+            # when Qdrant readback/disposal raises. Reset native tokens last.
+            with ExitStack() as release:
+                for provider in self.providers:
+                    release.callback(self._release_provider, provider)
+                self.before_request = self.fail_request = None
+                refreshes = {m._refresh_openrouter_health for m in self.modules}
+                for worker in threading.enumerate():
+                    args = getattr(worker, '_args', ())
+                    if (worker.name == 'memory-wiki-openrouter-health' and args
+                            and args[0] in refreshes):
+                        worker.join(timeout=5)
+                        assert not worker.is_alive(), 'owned health refresh did not finish'
+                current = getattr(self, 'm', None) or getattr(self, 'old', None)
+                if current is not None:
+                    # Preserve actual metadata effects before disposing this
+                    # case's owned synthetic vector namespace. Never live data.
+                    states = {name: current._qdrant_claim_state(name) for name in sorted(self.created_collections)}
+                    destination = os.environ.get('MW_MIGRATION_EFFECTS_OUT')
+                    if destination:
+                        record = {'event':'before_fixture_disposal','home':str(self.home),
+                            'sqlite_version':sqlite3.sqlite_version,
+                            'native_SPI_origin':sys.modules['agent.memory_provider'].__file__,
+                            'trust_origin':sys.modules['hermes_trust_core'].__file__,
+                            'synthetic_ids':getattr(self,'ids',{}),'states':states,
+                            'embedding_providers':[r['provider'] for r in self.embedding_posts],
+                            'real_Qdrant_HTTP_requests':len(self.qdrant_requests),
+                            'embedding_transport':'synthetic; no paid Nous/OpenRouter inference'}
+                        with Path(destination).open('a',encoding='utf-8') as stream:
+                            stream.write(json.dumps(record,sort_keys=True)+'\n')
+                    for name in sorted(self.created_collections):
+                        assert name.startswith('migration_claims_' + self.namespace + '_')
+                        response = current._qdrant_req('DELETE', '/collections/' + name)
+                        assert isinstance(response, dict) and response.get('status') == 'ok'
+                assert all(response.closed for response in self.responses)
         finally:
             if self._native_token is not None:
                 self.native.reset_hermes_home_override(self._native_token)

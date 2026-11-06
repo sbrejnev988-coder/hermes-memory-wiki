@@ -39,7 +39,7 @@ def test_claim_upsert_needs_exact_payload_readback(tmp_path, monkeypatch):
         "c_synthetic_missing_payload", [0.0, 1.0, 0.0],
         {"id": "c_synthetic_missing_payload", "visibility_scope": "private",
          "origin_bot_id": "bot-a", "origin_session_id": "chat-a"},
-        collection="synthetic_claims",
+        collection=module._physical_collection_name(),
     )
     assert ok is False
     assert any(method == "POST" and path.endswith("/points") for method, path in calls)

@@ -1941,7 +1941,7 @@
   },
   {
     "name": "memory_wiki_reindex",
-    "description": "Re-index active claims into Qdrant. Opt in with current_scope_only=true for caller-visible, in-place updates of the existing owned target; dry_run=true performs read-only preflight (no embedding, creation or writes). Scope-only force is refused; default full-index behavior is unchanged.",
+    "description": "Re-index active claims into Qdrant. current_scope_only=true updates only a compatible owned active target; dry_run=true is its read-only preflight. provider_migration=true instead contributes ONLY this native caller's authorized claims to a resumable new-manifest shared staging index; other owners must contribute under their own permissions. Atomic alias activation requires complete ID/revision/ACL validation. Migration cannot combine with scope-only, dry-run or force. Default legacy full-index behavior is unchanged.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -1958,6 +1958,10 @@
           "default": false
         },
         "dry_run": {
+          "type": "boolean",
+          "default": false
+        },
+        "provider_migration": {
           "type": "boolean",
           "default": false
         }
