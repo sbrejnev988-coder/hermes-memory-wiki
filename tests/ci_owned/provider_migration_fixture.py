@@ -32,6 +32,9 @@ class Response:
     def __init__(self, payload):
         raw = json.dumps(payload).encode('utf-8')
         self._stream = io.BytesIO(raw)
+        # The real semantic_io framing guard explicitly admits a BytesIO fp.
+        # A read() method alone is not a completed/known-length response.
+        self.fp = self._stream
         self.headers = {'Content-Length': str(len(raw))}
         self.status = 200
         self.closed = False
@@ -57,6 +60,7 @@ class MigrationFixture:
         self.modules = []
         self.embedding_posts = []
         self.qdrant_requests = []
+        self.public_outcomes = []
         self.created_collections = set()
         self.foreign_text = 'User prefers cobalt nebula receiver calibration diagrams for migration runbooks.'
         self.own_text = 'User prefers amber cactus receiver calibration diagrams for migration runbooks.'
@@ -255,7 +259,9 @@ class MigrationFixture:
 
     def public(self, owner='a', **args):
         p = self.a if owner == 'a' else self.b
-        return json.loads(p.handle_tool_call('memory_wiki_reindex', args))
+        raw = p.handle_tool_call('memory_wiki_reindex', args)
+        self.public_outcomes.append({'owner':owner,'raw_tool_result':raw})
+        return json.loads(raw)
 
     def alias(self):
         return self.m._qdrant_alias_target()
@@ -295,6 +301,7 @@ class MigrationFixture:
                             'native_SPI_origin':sys.modules['agent.memory_provider'].__file__,
                             'trust_origin':sys.modules['hermes_trust_core'].__file__,
                             'synthetic_ids':getattr(self,'ids',{}),'states':states,
+                            'public_outcomes':self.public_outcomes,
                             'embedding_providers':[r['provider'] for r in self.embedding_posts],
                             'real_Qdrant_HTTP_requests':len(self.qdrant_requests),
                             'embedding_transport':'synthetic; no paid Nous/OpenRouter inference'}
