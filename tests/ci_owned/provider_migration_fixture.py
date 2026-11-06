@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import sqlite3
 import sys
+import threading
 import urllib.parse
 
 import pytest
@@ -135,8 +136,10 @@ class MigrationFixture:
                         status='write_pending')
                 fence = self.old._DisclosureFence(provider, conn)
                 image = fence.index_claim(row, 'full_reindex')
-                vector = self.old._embed_document(image['normalized_claim'], _admit=fence.admit_index)
-                assert vector == VECTOR_NOUS
+                # Old vectors are synthetic fixture data. Nous' real leaf is
+                # curl-based; never execute it merely to seed this old index.
+                vector = list(VECTOR_NOUS)
+                fence.admit_index()
                 payload = self.old._qdrant_claim_payload(cid, image['normalized_claim'], image)
                 payload.pop('claim')
                 assert self.old._qdrant_upsert(cid, vector, payload, self.old_target,
@@ -220,7 +223,7 @@ class MigrationFixture:
             return opener(request, timeout=timeout)  # Real Qdrant HTTP, not a dictionary stand-in.
         assert url.startswith(module.EMBED_URL + '/')
         assert request.get_header('Authorization') == 'Bearer ' + INERT_AUTH
-        if method == 'GET' and url.endswith('/models'):
+        if method == 'GET' and urllib.parse.urlsplit(url).path.endswith('/models'):
             payload = {'data': [{'id': MODEL}]}
         else:
             assert method == 'POST' and url.endswith('/embeddings')
@@ -244,6 +247,13 @@ class MigrationFixture:
 
     def close(self):
         try:
+            refreshes = {m._refresh_openrouter_health for m in self.modules}
+            for worker in threading.enumerate():
+                args = getattr(worker, '_args', ())
+                if (worker.name == 'memory-wiki-openrouter-health' and args
+                        and args[0] in refreshes):
+                    worker.join(timeout=5)
+                    assert not worker.is_alive(), 'owned health refresh did not finish'
             for p in reversed(self.providers):
                 if getattr(p, '_conn', None) is not None:
                     p.shutdown()
