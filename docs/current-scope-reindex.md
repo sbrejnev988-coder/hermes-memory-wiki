@@ -74,6 +74,12 @@ operation lock. Это координация штатных writers плаги�
 registry позволяет согласованный откат и privacy cleanup. Async claim writer
 не записывает в него новые несовместимые embeddings во время ожидания.
 
+Незавершённые claim DELETE jobs (`pending` / `processing` / `failed`) дают
+`migration_claim_deletes_not_quiescent` до alias POST: уже выданный worker мог
+бы изменить staging без новой claim revision. Мигратор не исполняет чужую
+очередь вместо её владельца. Сначала нужно штатно завершить/разрешить эти
+удаления; повторная проверка под тем же SQLite writer lock обязательна.
+
 `completed` относится к проверенному миграционному snapshot. Это не установка,
 не restart и не доказательство работоспособности live-бота. Для приёмки нужен
 непустой настоящий vector/hybrid поиск; FTS или rerank сами по себе недостаточны.

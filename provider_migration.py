@@ -33,6 +33,7 @@ _ERRORS = frozenset({
     'migration_point_delivery_unconfirmed', 'migration_alias_outcome_unknown',
     'migration_pending_write_outcome_unknown', 'migration_target_state_unproven',
     'migration_alias_changed', 'migration_invalid_owner_participants',
+    'migration_claim_deletes_not_quiescent',
 })
 
 
@@ -307,6 +308,13 @@ def migrate(provider: Any, module: Any, limit: int = 0):
                 cut = _snapshot(provider, module, conn)
                 if cut != before:
                     raise Refused('migration_source_changed')
+                # Already leased legacy deletes can mutate shared staging
+                # without a new claim revision. Their ACK needs this SQLite
+                # writer slot. Never drain another owner's work from this chat.
+                if conn.execute("""SELECT 1 FROM index_outbox
+                        WHERE object_type='claim' AND operation='delete'
+                          AND status IN ('pending','processing','failed') LIMIT 1""").fetchone():
+                    raise Refused('migration_claim_deletes_not_quiescent')
                 if module._qdrant_claim_state(target) != expected:
                     raise Refused('migration_target_state_unproven')
                 active = _alias(module)

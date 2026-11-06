@@ -233,3 +233,17 @@ def test_provider_migration_uncertain_point_delivery_does_not_auto_retry_or_swit
     assert second['status'] == 'refused' and second['error'] == 'migration_pending_write_outcome_unknown', second
     assert len(f.embedding_posts) == count and hits == [True]
     assert f.alias() == f.old_target and f.old_unchanged()
+
+
+def test_provider_migration_outstanding_delete_cannot_race_alias_cutover(provider_migration_case):
+    f = provider_migration_case
+    first = f.public(provider_migration=True)
+    assert first['status'] == 'awaiting_authorized_owners', first
+    with f.a._claim_transaction(f.a._conn):
+        f.m._outbox_enqueue('delete','claim',f.ids['a_private'],
+            {'collection':first['collection'],'reason':'claim_content_rewritten'},conn=f.a._conn)
+    result = f.public('b',provider_migration=True)
+    assert result['status'] == 'refused', result
+    assert result['error'] == 'migration_claim_deletes_not_quiescent' and result['alias_switched'] is False
+    assert f.alias() == f.old_target and f.old_unchanged()
+    assert f.a._conn.execute("SELECT COUNT(*) FROM index_outbox WHERE operation='delete' AND status='pending'").fetchone()[0] > 0
