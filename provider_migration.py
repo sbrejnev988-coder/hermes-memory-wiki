@@ -252,7 +252,7 @@ def migrate(provider: Any, module: Any, limit: int = 0):
 
         # Existing native cross-process lock; no stale PID/TTL takeover and no
         # new privilege. Its order matches ordinary journaled native mutations.
-        with provider._lock, provider._journal_operation_scope():
+        with provider._journal_operation_scope(), provider._lock:
             current()
             source = _alias(module)
             initial = _snapshot(provider, module, conn)
