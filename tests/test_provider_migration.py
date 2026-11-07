@@ -431,3 +431,192 @@ def test_provider_migration_alias_response_loss_resume_stays_unknown(provider_mi
     assert len(f.embedding_posts) == count
     assert sum(method == 'POST' and path == '/collections/aliases' for method,path,_ in f.qdrant_requests) == posts
     assert f.old_unchanged()
+
+
+def _d1_concurrent_public_writer_and_migration(f, *, fatal=None):
+    """Exercise the native journal; this helper does not replace either lock.
+
+    The ordinary writer owns the genuine journal scope first. Only a call
+    from the actual migration body releases its wait. The old lock ordering
+    therefore forms the same journal/provider cycle as the retained SOURCE
+    countercontrol. A native admission must provide an outer process deadline:
+    Python cannot safely interrupt another thread blocked in a genuine RLock.
+    """
+    from contextlib import contextmanager
+    import time
+    from agent.memory_provider import spawn_context_thread
+
+    writer_inside = threading.Event()
+    migration_seeking_journal = threading.Event()
+    release_writer = threading.Event()
+    results, errors, homes = {}, {}, {}
+    original_scope = f.a._journal_operation_scope
+    source = Path(f.m.__file__).resolve().parent
+    deadline = time.monotonic() + 30.0
+    started = []
+    writer = migrator = None
+
+    def remaining():
+        return max(0.0, deadline - time.monotonic())
+
+    def owning_call_on_stack(path, name):
+        frame = sys._getframe(1)
+        try:
+            for _ in range(32):
+                if frame is None:
+                    break
+                if frame.f_code.co_name == name and Path(frame.f_code.co_filename).resolve() == path:
+                    return True
+                frame = frame.f_back
+            return False
+        finally:
+            del frame
+
+    @contextmanager
+    def observed_scope():
+        current = threading.current_thread()
+        is_migration = current is migrator and owning_call_on_stack(
+            source / 'provider_migration.py', 'migrate')
+        if is_migration and not migration_seeking_journal.is_set():
+            # Signal before the real acquire. Do not report entry until the
+            # unchanged native scope has actually yielded below.
+            migration_seeking_journal.set()
+            release_writer.set()
+        with original_scope():
+            if current is writer and not writer_inside.is_set() and owning_call_on_stack(
+                    source / '__init__.py', '_journal_operation'):
+                writer_inside.set()
+                assert release_writer.wait(remaining()), 'D1 writer schedule deadline'
+                assert migration_seeking_journal.is_set(), 'migration owner was not reached'
+            if is_migration:
+                results['migration_scope_entered'] = True
+            yield
+
+    def in_native_home(role, callback):
+        try:
+            actual = Path(f.native.get_hermes_home()).resolve()
+            assert actual == f.home.resolve(), 'native thread did not inherit its fixture home'
+            homes[role] = str(actual)
+            results[role] = callback()
+        except BaseException as exc:
+            # Retain the actual object for the fatal-identity assertion. Never
+            # serialize exception args, locals or fabricated API outcomes.
+            errors[role] = exc
+            locations = []
+            traceback = exc.__traceback__
+            while traceback is not None and len(locations) < 32:
+                code = traceback.tb_frame.f_code
+                locations.append({'file': code.co_filename, 'function': code.co_qualname,
+                                  'line': traceback.tb_lineno})
+                traceback = traceback.tb_next
+            f.public_outcomes.append({'owner': 'a', 'D1_exception_observation': {
+                'role': role, 'type': type(exc).__name__, 'locations': locations,
+            }})
+
+    def ordinary_write():
+        return json.loads(f.a.handle_tool_call('memory_wiki_update_claim', {
+            'claim_id': f.ids['a_private'], 'salience': 0.812,
+        }))
+
+    writer = spawn_context_thread(
+        lambda: in_native_home('writer', ordinary_write),
+        name='memory-wiki-D1-journal-writer', daemon=False,
+    )
+    migrator = spawn_context_thread(
+        lambda: in_native_home('migration', lambda: f.public(provider_migration=True)),
+        name='memory-wiki-D1-provider-migration', daemon=False,
+    )
+    previous_before_request = f.before_request
+    fault_hits = []
+
+    def fail_owned_alias_read(event):
+        method, path, _ = event
+        if (threading.current_thread() is migrator and method == 'GET'
+                and path == '/aliases'):
+            fault_hits.append(True)
+            raise fatal
+        if previous_before_request is not None:
+            previous_before_request(event)
+
+    with f.mp.context() as patch:
+        patch.setattr(f.a, '_journal_operation_scope', observed_scope)
+        if fatal is not None:
+            f.before_request = fail_owned_alias_read
+        try:
+            writer.start()
+            started.append(writer)
+            assert writer_inside.wait(remaining()), 'genuine journal writer was not reached'
+            migrator.start()
+            started.append(migrator)
+            for thread in started:
+                thread.join(timeout=remaining())
+        finally:
+            # This is only a cancellation/unwind signal, not a counterfeit
+            # migration-reached marker. It also releases a setup-failed writer.
+            release_writer.set()
+            cleanup_deadline = time.monotonic() + 5.0
+            for thread in started:
+                thread.join(timeout=max(0.0, cleanup_deadline - time.monotonic()))
+            f.before_request = previous_before_request
+
+    assert len(started) == 2
+    assert all(not thread.is_alive() for thread in started), 'native D1 worker did not join'
+    assert set(homes) == {'writer', 'migration'}
+    assert migration_seeking_journal.is_set() and results.get('migration_scope_entered') is True
+    assert 'writer' not in errors, type(errors.get('writer')).__name__
+    assert results['writer']['success'] is True and results['writer']['updated'] is True
+    assert results['writer']['id'] == f.ids['a_private']
+    row = f.a._conn.execute('SELECT salience FROM claims WHERE id=?', (f.ids['a_private'],)).fetchone()
+    assert row['salience'] == 0.812
+    assert f.a._conn.in_transaction is False
+    if fatal is None:
+        assert errors == {}, [type(error).__name__ for error in errors.values()]
+        assert fault_hits == []
+    else:
+        assert set(errors) == {'migration'}
+        assert errors['migration'] is fatal
+        assert fault_hits == [True]
+    # This is a test observation, not a synthetic public response. The existing
+    # fixture retains it together with real Qdrant effects before disposal.
+    f.public_outcomes.append({'owner': 'a', 'D1_test_observation': {
+        'writer_entered_genuine_scope': writer_inside.is_set(),
+        'migration_owner_reached': migration_seeking_journal.is_set(),
+        'migration_scope_entered': results['migration_scope_entered'],
+        'native_home_by_role': homes, 'threads_joined': True,
+        'writer_public_result': results['writer'],
+        'fatal_identity_preserved': fatal is not None and errors.get('migration') is fatal,
+    }})
+    return results
+
+
+def test_provider_migration_concurrent_journal_writer_no_deadlock(provider_migration_case):
+    f = provider_migration_case
+    result = _d1_concurrent_public_writer_and_migration(f)['migration']
+    assert result['status'] == 'awaiting_authorized_owners', result
+    assert result['alias_switched'] is False and result['own_ready_count'] == 2
+    assert f.alias() == f.old_target and f.old_unchanged()
+    assert set(f.m._qdrant_claim_state(result['collection'])) == {f.ids['a_private'], f.ids['a_chat']}
+    final = f.public('b', provider_migration=True)
+    assert final['status'] == 'completed' and final['alias_switched'] is True, final
+    assert final['migration_id'] == result['migration_id']
+    assert f.alias() == result['collection'] and f.old_unchanged()
+    assert set(f.m._qdrant_claim_state(final['collection'])) == set(f.ids.values())
+    assert len(f.embedding_posts) == 4
+    assert all(f.foreign_text not in request['input'] for request in f.embedding_posts[:2])
+
+
+def test_provider_migration_concurrent_journal_fatal_release(provider_migration_case):
+    f = provider_migration_case
+    fatal = BaseException('owned synthetic D1 pre-wire fatal')
+    _d1_concurrent_public_writer_and_migration(f, fatal=fatal)
+    assert f.embedding_posts == [] and f.qdrant_requests == []
+    assert f.alias() == f.old_target and f.old_unchanged()
+    # The real journal and provider locks must be reusable from another thread,
+    # not merely reentrant from the failed migration's thread.
+    recovered = json.loads(f.a.handle_tool_call('memory_wiki_update_claim', {
+        'claim_id': f.ids['a_private'], 'salience': 0.913,
+    }))
+    assert recovered['success'] is True and recovered['updated'] is True
+    assert f.a._conn.execute('SELECT salience FROM claims WHERE id=?',
+                            (f.ids['a_private'],)).fetchone()['salience'] == 0.913
+    assert f.a._conn.in_transaction is False
