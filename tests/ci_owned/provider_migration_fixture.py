@@ -66,6 +66,7 @@ class MigrationFixture:
         self.own_text = 'User prefers amber cactus receiver calibration diagrams for migration runbooks.'
         self.before_request = None
         self.fail_request = None
+        self.after_request = None
         self.responses = []
         self.native = sys.modules['hermes_constants']
         self._native_token = None
@@ -237,6 +238,12 @@ class MigrationFixture:
             parts = urllib.parse.urlsplit(url).path.split('/')
             if method == 'PUT' and len(parts) == 3 and parts[1] == 'collections':
                 self.created_collections.add(parts[2])
+            if self.after_request is not None:
+                try:
+                    self.after_request(event)
+                except BaseException:
+                    response.close()
+                    raise
             return response  # Real Qdrant HTTP, not a dictionary stand-in.
         assert url.startswith(module.EMBED_URL + '/')
         assert request.get_header('Authorization') == 'Bearer ' + INERT_AUTH
@@ -281,7 +288,7 @@ class MigrationFixture:
             with ExitStack() as release:
                 for provider in self.providers:
                     release.callback(self._release_provider, provider)
-                self.before_request = self.fail_request = None
+                self.before_request = self.fail_request = self.after_request = None
                 refreshes = {m._refresh_openrouter_health for m in self.modules}
                 for worker in threading.enumerate():
                     args = getattr(worker, '_args', ())

@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 import sqlite3
 import sys
+import threading
+import contextvars
 import pytest
 
 _SPEC = importlib.util.spec_from_file_location(
@@ -266,3 +268,166 @@ def test_provider_migration_keeps_canonical_episode_upsert_separate(provider_mig
         'ids':[f.m._qdrant_point_id(eid)],'with_payload':True,'with_vector':False})
     assert response['result'][0]['payload'] == payload
     assert f.alias() == f.old_target and f.old_unchanged()
+
+
+@pytest.mark.parametrize('phase', ['after-selection', 'after-intent'])
+def test_provider_migration_session_switch_before_hydration_has_no_raw_read(provider_migration_case, phase):
+    f = provider_migration_case
+    # Import the actual coordinator using its real package, not a stand-in.
+    module = importlib.import_module(f.m.__name__ + '.provider_migration')
+    switched, raw_after = [], []
+    def switch():
+        if not switched:
+            f.a.on_session_switch('migration-chat-b')
+            switched.append(True)
+    def trace(sql):
+        if switched and 'SELECT * FROM claims' in sql:
+            raw_after.append(sql)
+        if phase == 'after-intent' and 'INSERT INTO embedding_migration_points' in sql:
+            switch()
+    original = module._own_rows
+    def select(*args):
+        rows = original(*args)
+        if phase == 'after-selection':
+            switch()
+        return rows
+    f.mp.setattr(module, '_own_rows', select)
+    f.a._conn.set_trace_callback(trace)
+    try:
+        result = f.public(provider_migration=True)
+    finally:
+        f.a._conn.set_trace_callback(None)
+    assert switched == [True] and raw_after == []
+    assert result['status'] == 'refused' and result['alias_switched'] is False, result
+    assert result['error'] == 'migration_owner_or_route_changed'
+    assert f.embedding_posts == []
+    assert not any(method == 'PUT' and path.endswith('/points') for method,path,_ in f.qdrant_requests)
+    assert f.alias() == f.old_target and f.old_unchanged()
+
+
+def _migration_queued_delete(f, first):
+    cid, target = f.ids['a_private'], first['collection']
+    with f.a._claim_transaction(f.a._conn):
+        hint = f.m._record_claim_vector_target(f.a._conn, cid, collection=target,
+            manifest_hash=f.new_hash, status='active')
+        f.m._outbox_enqueue('delete','claim',cid,
+            {**hint,'reason':'claim_content_rewritten'}, conn=f.a._conn)
+    blocked = f.public('b',provider_migration=True)
+    assert blocked['error'] == 'migration_claim_deletes_not_quiescent', blocked
+    return cid, target
+
+
+def _migration_retry_own_point(f, first, cid):
+    # Synthetic metadata fault/recovery fixture only; not an authority override.
+    # The next real public contribution must re-admit/re-embed under owner A.
+    with f.a._claim_transaction(f.a._conn):
+        f.a._conn.execute('DELETE FROM embedding_migration_points WHERE migration_id=? AND claim_id=?',
+                         (first['migration_id'],cid))
+
+
+def test_provider_migration_reclaimed_delete_local_row_cannot_send_after_ack(provider_migration_case):
+    f = provider_migration_case
+    first = f.public(provider_migration=True)
+    cid, target = _migration_queued_delete(f, first)
+    module = importlib.import_module(f.m.__name__ + '.provider_migration')
+    original = module.guarded_claim_delete
+    parked, release = threading.Event(), threading.Event()
+    old_result, calls, writer_blocked = [], [], []
+    def paused(*args, **kwargs):
+        if kwargs.get('outbox_lease', ('',''))[1] == 'stale-worker-a':
+            parked.set()
+            assert release.wait(20), 'test must release its owned stale worker'
+            result = original(*args, **kwargs)
+            calls.append(result)
+            return result
+        return original(*args, **kwargs)
+    f.mp.setattr(module,'guarded_claim_delete',paused)
+    def observe_wire(event):
+        method,path,_ = event
+        if method == 'POST' and path.endswith('/points/delete'):
+            contender = sqlite3.connect(str(f.a.db_path), timeout=0)
+            error = None
+            try:
+                try:
+                    contender.execute('BEGIN IMMEDIATE')
+                except sqlite3.OperationalError as exc:
+                    error = exc
+                assert error is not None, 'actual DELETE must hold cutover writer exclusion'
+                writer_blocked.append(True)
+            finally:
+                contender.close()
+    f.before_request = observe_wire
+    context = contextvars.copy_context()
+    def run_old():
+        old_result.append(f.m._outbox_process(1,db_path=str(f.a.db_path),worker_id='stale-worker-a'))
+    worker = threading.Thread(target=lambda:context.run(run_old),name='migration-owned-stale-delete')
+    worker.start()
+    try:
+        assert parked.wait(20), 'old worker must retain actual claimed row before effect admission'
+        with f.a._claim_transaction(f.a._conn):
+            f.a._conn.execute("UPDATE index_outbox SET lease_until=0 WHERE worker_id='stale-worker-a'")
+        successor = f.m._outbox_process(1,db_path=str(f.a.db_path),worker_id='successor-worker-b')
+        assert successor['ok'] == 1 and successor['fail'] == 0, successor
+        assert f.a._conn.execute('SELECT COUNT(*) FROM index_outbox WHERE object_id=?',(cid,)).fetchone()[0] == 0
+        _migration_retry_own_point(f,first,cid)
+        completed = f.public(provider_migration=True)
+        assert completed['status'] == 'completed', completed
+        sends = sum(method == 'POST' and path.endswith('/points/delete') for method,path,_ in f.qdrant_requests)
+    finally:
+        release.set()
+        worker.join(20)
+        assert not worker.is_alive(), 'owned stale worker must finish before fixture disposal'
+    assert old_result and calls == ['stale'] and writer_blocked
+    assert sum(method == 'POST' and path.endswith('/points/delete') for method,path,_ in f.qdrant_requests) == sends
+    assert set(f.m._qdrant_claim_state(target)) == set(f.ids.values())
+    assert f.alias() == target and f.old_unchanged()
+
+
+def test_provider_migration_unknown_delete_survives_successor_queue_ack(provider_migration_case):
+    f = provider_migration_case
+    first = f.public(provider_migration=True)
+    cid, target = _migration_queued_delete(f, first)
+    lost = []
+    def lose_response(event):
+        method,path,_ = event
+        if not lost and method == 'POST' and path.endswith('/points/delete'):
+            lost.append(True)
+            raise TimeoutError('synthetic loss AFTER real Qdrant DELETE response')
+    f.after_request = lose_response
+    failed = f.m._outbox_process(1,db_path=str(f.a.db_path),worker_id='unknown-delete-a')
+    assert lost == [True] and failed['fail'] == 1, failed
+    f.after_request = None
+    with f.a._claim_transaction(f.a._conn):
+        f.a._conn.execute("UPDATE index_outbox SET status='pending',next_retry_at=0 WHERE object_id=?",(cid,))
+    successor = f.m._outbox_process(1,db_path=str(f.a.db_path),worker_id='unknown-delete-b')
+    assert successor['ok'] == 1, successor
+    assert f.a._conn.execute('SELECT COUNT(*) FROM index_outbox WHERE object_id=?',(cid,)).fetchone()[0] == 0
+    assert f.a._conn.execute("SELECT COUNT(*) FROM claim_vector_delete_effects WHERE status='unknown'").fetchone()[0] == 1
+    _migration_retry_own_point(f,first,cid)
+    result = f.public(provider_migration=True)
+    assert result['status'] == 'refused' and result['error'] == 'migration_claim_deletes_not_quiescent', result
+    assert result['alias_switched'] is False and f.alias() == f.old_target and f.old_unchanged()
+
+
+def test_provider_migration_alias_response_loss_resume_stays_unknown(provider_migration_case):
+    f = provider_migration_case
+    first = f.public(provider_migration=True)
+    lost = []
+    def lose_response(event):
+        method,path,_ = event
+        if method == 'POST' and path == '/collections/aliases':
+            lost.append(True)
+            raise TimeoutError('synthetic loss AFTER actual atomic alias operation')
+    f.after_request = lose_response
+    before = f.public('b',provider_migration=True)
+    assert before['error'] == 'migration_alias_outcome_unknown' and before['alias_switched'] is None, before
+    assert f.alias() == first['collection'] and lost == [True]
+    f.after_request = None
+    count = len(f.embedding_posts)
+    posts = sum(method == 'POST' and path == '/collections/aliases' for method,path,_ in f.qdrant_requests)
+    after = f.public('b',provider_migration=True)
+    assert after['error'] == 'migration_alias_outcome_unknown' and after['alias_switched'] is None, after
+    assert after['alias_outcome'] == 'unknown'
+    assert len(f.embedding_posts) == count
+    assert sum(method == 'POST' and path == '/collections/aliases' for method,path,_ in f.qdrant_requests) == posts
+    assert f.old_unchanged()

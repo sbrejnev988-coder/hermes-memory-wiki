@@ -2801,6 +2801,7 @@ def _delete_claim_vector_targets(
     db_path: str,
     claim_id: str,
     payload: Optional[Dict[str, Any]] = None,
+    *, _outbox_lease=None,
 ) -> bool:
     """Delete a claim point from every location that may have accepted it.
 
@@ -2931,9 +2932,17 @@ def _delete_claim_vector_targets(
                     )
                 continue
 
-        if not _qdrant_delete_target(
-            claim_id, collection=collection, endpoint=endpoint,
-        ):
+        from .provider_migration import guarded_claim_delete
+        outcome = guarded_claim_delete(_runtime_module(), db_path, claim_id, collection, endpoint,
+            force_delete_active=force_delete_active, outbox_lease=_outbox_lease)
+        if outcome == 'preserved':
+            with sqlite3.connect(db_path, timeout=30.0) as lifecycle_db:
+                lifecycle_db.execute("""UPDATE claim_vector_targets SET status='active',updated_at=?
+                    WHERE claim_id=? AND endpoint=? AND collection=?""",
+                    (int(time.time()), str(claim_id), endpoint, collection))
+            lifecycle_db.close()
+            continue
+        if outcome != 'deleted':
             failed = True
             continue
 
@@ -3120,6 +3129,7 @@ def _outbox_process_scoped(batch_size=50, *, db_path: Optional[str] = None, work
                             )
                             if not _delete_claim_vector_targets(
                                 path, str(row["object_id"]), cleanup_hint,
+                                _outbox_lease=(str(row["id"]), worker_id),
                             ):
                                 raise RuntimeError("inactive claim cleanup failed")
                             performed_operation = "delete"
@@ -3141,6 +3151,7 @@ def _outbox_process_scoped(batch_size=50, *, db_path: Optional[str] = None, work
                             if latest is None:
                                 if not _delete_claim_vector_targets(
                                     path, str(row["object_id"]), claim_target_payload,
+                                    _outbox_lease=(str(row["id"]), worker_id),
                                 ):
                                     raise RuntimeError("inactive claim cleanup failed")
                                 performed_operation = "delete"
@@ -3180,6 +3191,7 @@ def _outbox_process_scoped(batch_size=50, *, db_path: Optional[str] = None, work
                                 if final_qpayload != qpayload:
                                     if not _delete_claim_vector_targets(
                                         path, str(row["object_id"]), claim_target_payload,
+                                        _outbox_lease=(str(row["id"]), worker_id),
                                     ):
                                         raise RuntimeError("raced claim cleanup failed")
                                     performed_operation = "delete"
@@ -3375,6 +3387,7 @@ def _outbox_process_scoped(batch_size=50, *, db_path: Optional[str] = None, work
                     else:
                         deleted = _delete_claim_vector_targets(
                             path, str(row["object_id"]), payload,
+                            _outbox_lease=(str(row["id"]), worker_id),
                         )
                     if not deleted:
                         raise RuntimeError("Qdrant delete failed")
@@ -10173,8 +10186,11 @@ class MemoryWikiProvider(MemoryProvider):
         return stats
 
     def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "", reset: bool = False, **kwargs) -> None:
-        self.session_id = new_session_id or self.session_id
-        if reset: self._maintenance()
+        # The native host may switch sessions on its background boundary while
+        # a foreground migration is active. Never rebind its raw-read authority.
+        with self._lock:
+            self.session_id = new_session_id or self.session_id
+            if reset: self._maintenance()
 
     def shutdown(self) -> None:
         if not self._lifecycle_lock.acquire(blocking=False):

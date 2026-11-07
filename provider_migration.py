@@ -85,6 +85,88 @@ def _install(conn):
         metadata_digest TEXT NOT NULL, state_json TEXT NOT NULL DEFAULT '',
         contributor_digest TEXT NOT NULL, status TEXT NOT NULL,
         updated_at INTEGER NOT NULL, PRIMARY KEY(migration_id,claim_id))''')
+    _install_delete_effects(conn)
+
+
+def _install_delete_effects(conn):
+    # A reclaimed queue row is not a lifetime receipt for an older HTTP send.
+    # Content-free, append-per-attempt intent survives queue ACK/removal.
+    conn.execute('''CREATE TABLE IF NOT EXISTS claim_vector_delete_effects(
+        id TEXT PRIMARY KEY, claim_id TEXT NOT NULL, endpoint TEXT NOT NULL,
+        collection TEXT NOT NULL, status TEXT NOT NULL,
+        created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL)''')
+
+
+def guarded_claim_delete(module, db_path, claim_id, collection, endpoint, *,
+                         force_delete_active=False, outbox_lease=None):
+    """Serialize real claim DELETE against cutover, retaining uncertain sends.
+
+    The original queue lease is checked in the SAME writer slot held through
+    remote dispatch/response. A timed-out/crashed send leaves an independent
+    pending/unknown receipt, even if a successor later ACKs the queue row.
+    """
+    db = sqlite3.connect(str(db_path), timeout=30.0)
+    db.row_factory = sqlite3.Row
+    effect = 'de_' + uuid.uuid4().hex
+
+    def leased():
+        if outbox_lease is None:
+            return True  # Existing non-outbox callers still take this effect lock.
+        if (type(outbox_lease) is not tuple or len(outbox_lease) != 2
+                or any(type(v) is not str or not v for v in outbox_lease)):
+            return False
+        return db.execute('''SELECT 1 FROM index_outbox
+            WHERE id=? AND worker_id=? AND object_type='claim' AND object_id=?
+              AND status='processing' AND lease_until>?''',
+            (*outbox_lease, str(claim_id), int(time.time()))).fetchone() is not None
+
+    def finish(status):
+        db.execute('UPDATE claim_vector_delete_effects SET status=?,updated_at=? WHERE id=?',
+                   (status, int(time.time()), effect))
+
+    try:
+        db.execute('PRAGMA busy_timeout=30000')
+        with db:
+            db.execute('BEGIN IMMEDIATE')
+            _install_delete_effects(db)
+            if not leased():
+                return 'stale'
+            stamp = int(time.time())
+            db.execute('''INSERT INTO claim_vector_delete_effects
+                (id,claim_id,endpoint,collection,status,created_at,updated_at)
+                VALUES(?,?,?,?,'pending',?,?)''',
+                (effect, str(claim_id), endpoint, collection, stamp, stamp))
+        # Intent has committed BEFORE the first possible remote effect. The
+        # stable writer slot is shared with migration's final validation/POST.
+        with db:
+            db.execute('BEGIN IMMEDIATE')
+            if not leased():
+                finish('cancelled')
+                return 'stale'
+            active = module._load_active_claim_index_snapshot(str(db_path), claim_id)
+            canonical = (module._qdrant_resolved_active_collection() or module._physical_collection_name()
+                         if active is not None and endpoint == module._normalized_qdrant_endpoint() else '')
+            if active is not None and collection == canonical:
+                if not force_delete_active:
+                    finish('cancelled')
+                    return 'preserved'
+                observed = module._qdrant_claim_point_state(claim_id, collection)
+                if observed is None:
+                    finish('cancelled')  # No DELETE was dispatched by this attempt.
+                    return 'unproven'
+                expected = module._qdrant_claim_payload(claim_id, str(active['index_text']), active,
+                    manifest_hash=module._manifest_hash(module._embedding_manifest()))
+                # Plaintext preview is not part of point identity. Migration
+                # deliberately omits it, unlike a configured ordinary writer.
+                if (module._qdrant_claim_reconciliation_state(observed)
+                        == module._qdrant_claim_reconciliation_state(expected)):
+                    finish('cancelled')
+                    return 'preserved'
+            deleted = module._qdrant_delete_target(claim_id, collection=collection, endpoint=endpoint)
+            finish('complete' if deleted else 'unknown')
+            return 'deleted' if deleted else 'unknown'
+    finally:
+        db.close()  # Exception/rollback retains the already committed pending intent.
 
 
 def _actor(provider, module):
@@ -170,7 +252,7 @@ def migrate(provider: Any, module: Any, limit: int = 0):
 
         # Existing native cross-process lock; no stale PID/TTL takeover and no
         # new privilege. Its order matches ordinary journaled native mutations.
-        with provider._journal_operation_scope():
+        with provider._lock, provider._journal_operation_scope():
             current()
             source = _alias(module)
             initial = _snapshot(provider, module, conn)
@@ -199,6 +281,7 @@ def migrate(provider: Any, module: Any, limit: int = 0):
                         or job['database_instance_id'] != instance):
                     raise Refused('migration_owner_or_route_changed')
                 if job['status'] == 'activation_unknown':
+                    alias_may_have_been_issued = True  # Preserve UNKNOWN on every resume.
                     raise Refused('migration_alias_outcome_unknown')
                 if job['status'] == 'write_unknown' or conn.execute(
                         "SELECT 1 FROM embedding_migration_points WHERE migration_id=? AND status='pending' LIMIT 1",
@@ -212,6 +295,7 @@ def migrate(provider: Any, module: Any, limit: int = 0):
             eligible = _own_rows(provider, conn)
             own_ready = 0
             for row in eligible:
+                current()
                 cid = str(row['id'])
                 md = _digest(dict(row))
                 receipt = conn.execute('''SELECT metadata_digest,state_json,status
@@ -227,6 +311,7 @@ def migrate(provider: Any, module: Any, limit: int = 0):
                 # precede the ORIGINAL actor/erasure/source fence.
                 stamp = int(time.time())
                 with provider._claim_transaction(conn):
+                    current()
                     module._record_claim_vector_target(conn, cid, collection=target,
                         endpoint=endpoint, manifest_hash=manifest_hash, status='write_pending')
                     conn.execute('''INSERT INTO embedding_migration_points
@@ -235,7 +320,11 @@ def migrate(provider: Any, module: Any, limit: int = 0):
                         DO UPDATE SET metadata_digest=excluded.metadata_digest,state_json='',
                             contributor_digest=excluded.contributor_digest,status='pending',updated_at=excluded.updated_at''',
                         (identifier, cid, md, _digest(anchor), stamp))
+                # on_session_switch shares provider._lock. Reentrant/native
+                # callbacks before hydration must also retain the first actor.
+                current()
                 fence = module._DisclosureFence(provider, conn)
+                current()
                 image = fence.index_claim(row, 'full_reindex')
 
                 def admit():
@@ -314,6 +403,9 @@ def migrate(provider: Any, module: Any, limit: int = 0):
                 if conn.execute("""SELECT 1 FROM index_outbox
                         WHERE object_type='claim' AND operation='delete'
                           AND status IN ('pending','processing','failed') LIMIT 1""").fetchone():
+                    raise Refused('migration_claim_deletes_not_quiescent')
+                if conn.execute("""SELECT 1 FROM claim_vector_delete_effects
+                        WHERE status NOT IN ('complete','cancelled') LIMIT 1""").fetchone():
                     raise Refused('migration_claim_deletes_not_quiescent')
                 if module._qdrant_claim_state(target) != expected:
                     raise Refused('migration_target_state_unproven')

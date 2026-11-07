@@ -80,6 +80,22 @@ registry позволяет согласованный откат и privacy cle
 очередь вместо её владельца. Сначала нужно штатно завершить/разрешить эти
 удаления; повторная проверка под тем же SQLite writer lock обязательна.
 
+Одной пустой очереди недостаточно: stale worker может сохранять локально
+уже reclaimed/ACKed row. Claim DELETE дополнительно проверяет исходный lease
+в том же SQLite writer slot, который удерживает до завершения реального HTTP
+effect. Отдельный content-free `claim_vector_delete_effects` intent коммитится
+до возможной отправки. Timeout/исключение оставляет `unknown`/`pending` даже
+после успешного ACK преемником; cutover не разрешён, пока такой исход не
+разрешён отдельной процедурой. Автоматического сброса UNKNOWN нет. Эта
+граница требует согласованно обновлённых writers; старые уже загруженные
+процессы без нового effect fence должны быть отдельно quiesced до live run.
+
+Native `on_session_switch` и мигратор разделяют provider lock. Кроме того,
+original actor проверяется после отбора, до intent и до raw hydration —
+новый fence не может молча принять права другой session. Повторный вход
+после `activation_unknown` сохраняет `alias_switched=null`, без нового
+embedding или alias POST; `false` не подменяет неразрешённую активацию.
+
 `completed` относится к проверенному миграционному snapshot. Это не установка,
 не restart и не доказательство работоспособности live-бота. Для приёмки нужен
 непустой настоящий vector/hybrid поиск; FTS или rerank сами по себе недостаточны.
